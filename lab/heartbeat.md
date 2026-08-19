@@ -12,3 +12,4 @@
 - 2026-08-20 03:44 JST — Heartbeat. Harvested lodge/whence/ember/lede/nook/hatch/kerf already on main. Spawned Skeptic + 10 Gen2 (reimpl perch/cinch/erst, hybrids ember×erst sheaf×tenure visa×hatch, lode mutation, cinch destroyer, candidates 38–39). ~12–16 slots filled. Phase still first-selection closeout; Gen2 clock at 04:00.
 - 2026-08-20 03:53 JST — Skeptic filed `lab/judges/FIRST_SKEPTIC.md`. Tomorrow-test survivors: winnow, cinch, invert, zanei. Disagreement preserved; do not collapse the night to four tools.
 - 2026-08-20 03:55 JST — candidate-36 `lapse` shipped (parent demo 0). Clock-cut disagreement. Vacancy filled with mutation-46 (two readings in, named clock out).
+- 2026-08-20 03:57 JST — mutation-34 pin v0.4: extract-and-keep is identity if origin still holds the body. Parent demo 0. Vacancy → mutation-47 (renamed-package extract).

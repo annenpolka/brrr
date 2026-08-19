@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 04:45 JST
+- Clock: 2026-08-20 04:48 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (prompt now: harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -40,7 +40,7 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | mutation-69 | 01a01b85-3a6f-77f2-a6bf-cb96e7158c54 | xref — getenv call-site DUE | running |
 | hybrid-12 | 01a01b85-3a6f-77f2-a6bf-cbac00204512 | braid — composed-strand occupancy | running |
 | lockset-tock | 01a01b85-3a6f-77f2-a6bf-cbc603f5dce4 | LOCKSET_TOCK.md | running |
-| mutation-75 | 01a01b85-78b8-7713-825c-14dca964e76b | plait locus-ECHO (parent 64) | running |
+| mutation-75 | 01a01b85-78b8-7713-825c-14dca964e76b | wale — locus-ECHO (CANDIDATE mutation-64) | done — mutation-64__wale |
 | mutation-76 | 01a01b85-78b8-7713-825c-14f7d39cba1e | pin leftover as pointer (parent 66) | running |
 | mutation-77 | 01a01b85-78b8-7713-825c-150e04a92eb8 | berth grep --follow (parent 67) | running |
 | mutation-78 | 01a01b85-78b8-7713-825c-151223bfdfc3 | lien blame invert (parent 68) | running |

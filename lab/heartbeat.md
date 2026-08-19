@@ -41,4 +41,4 @@
 - 2026-08-20 04:33 JST — mutation-57 `lien`: `git diff |` natal-record CI gate. Demo 78/78. Vacancy → mutation-68 lien blame.
 - 2026-08-20 04:33 JST — DESTROYER_ASSAY: mutate. DUE vs LATENT real; rustc 12k DUE is LLVM opcodes. Vacancy → mutation-65 getenv xref.
 - 2026-08-20 04:33 JST — DESTROYER_PIN_V5: mutate. v0.4 leftover-stub closed; leftover is not a pointer. Vacancy → mutation-66.
-- 2026-08-20 04:36 JST — mutation-51 `peal` collected (already harvested): chime as `rg |` filter; v2 recovers FILE from LINE:text pins. Demo 26. Ambiguous-seed mutation deferred — slots full.
+- 2026-08-20 04:36 JST — mutation-51 `peal` collected (already harvested): chime as `rg |` filter; v2 recovers FILE from LINE:text pins. Demo 26. Ambiguous-seed mutation deferred — slots full. Killed duplicate pin-v0.5 destroyer, duplicate assay-xref, duplicate chaff. Loop prompt now harvest-only at capacity.

@@ -98,6 +98,36 @@ AnthropicMessagesClient mtime  ClientFactory.swift (committed)
 
 `--sig` collapses to `options` — but the diff is `capture(contextGraphemes:)` leaking through a Swift property span. Same-session dirty-vs-dirty pairs (RequestComposer vs adapters, both mtime, lag 0d) flood the list: that is not "hasn't been saved through", that is "two buffers in one sitting".
 
+### After the improvement (v0.2)
+
+Changes driven by the transcript above:
+
+- rank dirty callees first, then cohorts that include a code caller file, then signature diffs, then lag (so `review.rs` is not buried under older plans)
+- drop unscoped defs whose span exceeds 160 lines or whose header does not contain the name (`verify_token` swallowing `git.rs`)
+- skip both-mtime pairs on the same calendar day (two dirty buffers in one sitting)
+- stop-list `missing` / `beta` (one-line test "defs" that ranked like API changes)
+
+Forced `insert_scar --limit 2` now leads with the compiled callers:
+
+```
+$ ./skew --repo kizu --limit 2 insert_scar
+insert_scar
+  changed  body  4 files  lag 16d
+    AGENTS.md
+    plans/large-scale-refactor.md
+    src/app.rs          2026-04-25  commit
+    src/app/review.rs   2026-04-25  commit
+insert_scar
+  changed  sig   1 file   lag 18d
+    plans/v0.2.md
+```
+
+Unscoped kizu: `verify_token` gone; `insert_scar` with `review.rs` is in the top 8. HookCmd / e2e helpers still occupy same-day 0d slots — real file-clock lags, just not the JSX story.
+
+tenaoshi unscoped is now the pre-commit verb: dirty adapter/request types vs *committed* `ClientFactory` / `ContractHarness` / `KinsokuEngine`. RequestComposer↔adapter 0d mtime pairs disappeared. `writeBack` still misses (caller mtimes newer) — coarseness, not a ranking bug.
+
+sitbone `JSONSessionStore --limit 2` puts the test file before the ADR (code callers first). `tick` / `deserted` / `activeProfile` stay, with tests attached.
+
 ## Dogfood targets
 
 | Target | Result |
@@ -117,11 +147,11 @@ AnthropicMessagesClient mtime  ClientFactory.swift (committed)
 ## Failures
 
 - Same-file sleep is invisible (by design). Intra-file `odd_caller` will never fire.
-- A later unrelated save of a caller file clears the skew (kizu `benches/operations.rs` shares scar.rs's last commit; tenaoshi `writeBack` callers have newer mtimes).
+- A later unrelated save of a caller file clears the skew (kizu `benches/operations.rs` shares scar.rs's last commit; tenaoshi `writeBack` callers have newer mtimes than the dirty callee).
 - `git show caller_file_commit:callee_path` still does not follow renames (`missing-then`, hidden by default).
-- Naive brace/indent spans: `verify_token` ate 1000 lines of `git.rs`; Swift `options` leaked `capture()`; `activeProfile` swallows neighbors.
-- Unscoped English leftovers (`beta`, `missing`) still appear as one-line "defs" in tests.
-- `--limit` is per historical-body cohort, so one symbol can occupy the whole page with plan files.
+- Naive brace/indent spans: Swift `options` still leaks `capture()`; `activeProfile` swallows neighbors. Huge-span drop killed `verify_token` but not small property spans.
+- `--limit` is still per historical-body cohort. v0.2 ranking makes the code cohort win `--limit 2`; a docs-only era can still occupy a later slot.
+- Same-day 0d code lags (`HookCmd` tests, e2e helpers) outrank a 16d body lag when they have a signature-shaped header. File clock has no "this save was a refactor split" bit.
 
 ## Suggested mutations
 
@@ -132,4 +162,4 @@ AnthropicMessagesClient mtime  ClientFactory.swift (committed)
 
 ## Kill / keep
 
-**Keep, with a ranking/span fix.** The fixture and kizu `insert_scar` prove the join still answers the ancestor's question without blame, and the dirty-`fresh.py` / tenaoshi WORKTREE view is a new verb unseen could not say. Kill only if compiled callers cannot be ranked above sleeping plans, or if same-session dirty-vs-dirty noise is the whole tool. v1 ranking almost hid the primitive the same way unseen v1 hid `insert_scar` under word-frequency ghosts.
+**Keep.** v0.2 makes the file-clock join visible: kizu `insert_scar` compiled callers (`review.rs`, `app.rs`) lead a forced query; tenaoshi unscoped is committed files lagging dirty callees, not same-session buffer noise; the fixture's `fresh.py` only appears once the callee clock is mtime. Kill only if a later mutation cannot live without line blame for cases like tenaoshi `writeBack` (caller file saved after the def file). That miss is the flipped assumption working as designed.

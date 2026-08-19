@@ -7,3 +7,5 @@
 - 2026-08-20 00:25 JST — Parent re-ran demos: aka, unfmt-08, held, slip, reverb, haunt, deja, zanei, unfmt-13 all PASS. Empirical credibility of first ships is high.
 - 2026-08-20 00:31 JST — Original 16/16 Gen-1 complete. Parent demos also PASS for akin, also, rift, winnow. Mutation wave 2 (06–09) + candidates 21–23 spawned. 16 workers still live.
 - 2026-08-20 00:43 JST — mutation-02 `sluice` shipped (parent demo 40/40 PASS). Diversity wave names: sic, tell, flume, zure, nigh, cleave, folk, when, glean, pinch. Hybrid-01 (slip×unfmt) spawned into the vacancy.
+- 2026-08-20 00:54 JST — sic/tell/when parent demos PASS. Early critics spawned. Reimpl of unfmt started.
+- 2026-08-20 01:07 JST — Entering Gen-1 development. New ships: cleave, glean, skew, once, spoor, pinch, hitch, moor (hybrid PASS). Spawned hitch×pinch hybrid, spoor attach-pid mutation, held reimpl, candidates 26–28, cleave mutation.

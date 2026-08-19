@@ -20,7 +20,7 @@ Requires Python 3.9+ and `git`. No other dependencies. Point `--repo` at any git
 
 Exit 0 on a successful query. `--check` exits 1 if any skewed caller file is found (CI). Unscoped runs hide "ghosts" (the name did not exist yet at the caller file's clock); pass `--ghosts` or a symbol to include them.
 
-`--dirty` keeps only callees whose clock is worktree mtime — the pre-commit view of HEAD vs worktree.
+`--dirty` keeps only callees whose clock is worktree mtime — the pre-commit view of HEAD vs worktree. Unscoped ranking puts dirty callees first, then cohorts that include a code caller file, then signature diffs. Same-day dirty-vs-dirty pairs (two buffers in one sitting) are skipped.
 
 ## Examples
 

@@ -16,3 +16,4 @@
 - 2026-08-20 04:00 JST — DESTROYER_CINCH: mutate cinch/hasp; test-only red is CLEAN. Vacancy → mutation-48 (always run NEW).
 - 2026-08-20 04:00 JST — candidate-35 `twain`: a diff is two patches (oracle vs production). Parent demo 22/22. Vacancy → mutation-49 suggestion algebra.
 - 2026-08-20 04:02 JST — candidate-37 `ply`: typed syntactic strata of a patch. Parent demo 15/15. Vacancy → mutation-50 docs-only CI gate.
+- 2026-08-20 04:05 JST — mutation-35 `ambit`: under as a file stream (`rg | ambit`). Parent demo 0. Vacancy → mutation-51 chime stream.

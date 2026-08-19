@@ -59,3 +59,4 @@
 - 2026-08-20 04:52 JST — mutation-63 `mint` (book 74): visa-birth occupancy (OPEN/SPEC→BOUND). Parent demo 53/53. SPREAD is not a mint; sitbone/kizu first-parent births=0. Keep. Stain stays the leak CI. No spawn.
 - 2026-08-20 04:53 JST — mutation-67 `rove` (book 77): path-limited grep along file identity. Parent demo 99/99. kizu `10 の AI` --follow true=187 from either name; `--no-follow` old name true=13. v2 first-parent stitch from all reachable R records. Keep. Berth stays exists-follow. No spawn.
 - 2026-08-20 04:54 JST — mutation-68 `sire` (book 78): leftover locator → natal change. Parent demo 41/41. sitbone `CLAUDE.md:329` → e9b0f75 via=both (`git blame` is a2512fe). v0.4 is not float 0.4. Keep. Lien stays the CI gate. No spawn.
+- 2026-08-20 04:55 JST — hybrid-12 `gage` (book hybrid-13): clearance of the lockset (LOCKED-and-BOUND vs LOCKED-and-OPEN). Parent demo 33/33. Skip is not a lock (ugly: stain 1, gage empty). Keep. Not stain|alibi. No spawn.

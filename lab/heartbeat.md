@@ -35,3 +35,8 @@
 - 2026-08-20 04:28 JST — lockset bakeoff: vehicle **cinch 0.3** (honest 4/4). snug reimpl transcript. No fourth cinch.
 - 2026-08-20 04:28 JST — ambit/amid bakeoff: vehicle **ambit** (`rg -n` LINE:text). amid is json/derive spare. No third clone.
 - 2026-08-20 04:28 JST — DESTROYER_PLAIT: mutate, do not kill. ECHO is image-identity. plait kept.
+- 2026-08-20 04:33 JST — DESTROYER_PLAIT collected: COMMUTE/JAM hold. Next mutation locus-aware ECHO/STACK, not a prettier dump. Vacancy → mutation-64.
+- 2026-08-20 04:33 JST — mutation-52 `berth`: file-identity occupancy (`git mv` is one roost). Demo 79. Vacancy → mutation-67 grep --follow.
+- 2026-08-20 04:33 JST — mutation-57 `lien`: `git diff |` natal-record CI gate. Demo 78/78. Vacancy → mutation-68 lien blame.
+- 2026-08-20 04:33 JST — DESTROYER_ASSAY: mutate. DUE vs LATENT real; rustc 12k DUE is LLVM opcodes. Vacancy → mutation-65 getenv xref.
+- 2026-08-20 04:33 JST — DESTROYER_PIN_V5: mutate. v0.4 leftover-stub closed; leftover is not a pointer. Vacancy → mutation-66.

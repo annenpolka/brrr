@@ -144,6 +144,12 @@ if need not in files and not any(p.startswith("circuit-breaker/") for p in files
 print(f"skills ephemeral files: {len(files)}")
 PY
   pass "skills --root --files finds deleted skill trees"
+  set +e
+  "$WISP" --root -C "$SKILLS" --check -q
+  rc=$?
+  set -e
+  [ "$rc" = "0" ] || fail "skills --check should be 0 (clean delete, no remnants), got $rc"
+  pass "skills --check exit 0 (no leftover names)"
 fi
 if [ -d "$KIZU/.git" ]; then
   "$WISP" --root -C "$KIZU" --json --hide-tests > "$TMP/kizu.json"

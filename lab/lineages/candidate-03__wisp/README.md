@@ -17,7 +17,7 @@ Requires Python 3.10+ and `git`. No other dependencies.
 ./wisp                  # auto range: this branch vs main, else a history window
 ./wisp main HEAD        # explicit range
 ./wisp --root           # empty tree → HEAD (whole-repo ghosts)
-./wisp --check -q       # CI: exit 1 if remnants exist
+./wisp --check -q       # CI: exit 1 if code/comment remnants exist
 ```
 
 Exit codes: `0` ok, `1` remnants found with `--check`, `2` usage/git error.
@@ -35,10 +35,11 @@ Ephemeral files and symbols were added in some commit in `main..HEAD` and are go
 **2. Did a deleted experiment leave residue?**
 
 ```bash
-./wisp --root --remnants --json | jq '.remnants[] | select(.role=="comment" or .role=="code")'
+./wisp --root --remnants
+# or:  ./wisp --root --json | jq '.remnants[] | select(.role=="comment" or .role=="code")'
 ```
 
-A comment that still says `LegacyParser` after the class was deleted is a remnant.
+A comment that still says `LegacyParser` after the class was deleted is a remnant. So is kizu's `is_baseline_path`, abolished in an ADR but still named there.
 
 **3. CI: fail if this branch left ghosts in the source**
 

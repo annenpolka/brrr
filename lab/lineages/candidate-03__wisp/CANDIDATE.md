@@ -82,7 +82,43 @@ voidtrace v1: 251 symbols / 3042 remnants, dominated by types mentioned in `Void
 
 ### After the first improvement
 
-(filled after the language-scoped parser / remnant ranking pass)
+Changes: definition regexes are language-scoped (JS `let x =` no longer fires on Swift/Rust); markdown is not mined for defs; `.pkl` counts as source; `as foo` aliases and `let/const` bindings count as *live* names; remnants require CamelCase / long snake_case; names with ≥5 live code hits are dropped as missed aliases; `--check` ignores documentation hits.
+
+kizu 244 commits:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| symbols | 232 | 35 code + 97 tests |
+| remnants | 620 hits / 85 names (`fake_app`, `chars`, `span`, `take`, `head`) | 69 hits / 20 names |
+| time | 0.69s | ~0.7s |
+
+Poster-child remnant that v1 drowned and v2 surfaces:
+
+```
+is_baseline_path  doc:2
+  docs/adr/0007-…:26  `is_baseline_path` 関数廃止 → `BaselineMatcher` struct に置き換え
+clean_stale_events  comment:5
+  src/app.rs:237      `clean_stale_events`), or
+seed_diff_snapshots comment:3
+  src/app.rs:6048     `seed_diff_snapshots` keys the map by repo-relative paths
+```
+
+sitbone (clean delete, no leftover names):
+
+```
+EPHEMERAL FILES (1)
+  Sources/SitboneUI/FocusRiverView.swift  +14b1d6e3 -70ec7df6
+  Clean up: remove unused FocusRiverView + SettingsWindowController
+EPHEMERAL SYMBOLS (9)
+  FocusRiverView  struct  Sources/SitboneUI/FocusRiverView.swift
+  AppRiverRow     struct  Sources/SitboneUI/FocusRiverView.swift
+  NotchBarView / HoverDetector / setupNotch  (earlier UI that also died)
+REMNANTS (0)
+```
+
+voidtrace: 251 symbols / 3042 remnants → 10 symbols / 0 remnants. The v1 flood was `type DamageAmount` in `VoidTrace計画.md` plus Pkl classes the HEAD scanner skipped. v2 lists real retired operations (`ScaleFixedCritical`, `evaluateFixedMultishotRuntime`).
+
+skills: 13 ephemeral files unchanged (already the right signal). 0 remnants — those plugins were deleted cleanly.
 
 ## Dogfood targets
 
@@ -119,4 +155,4 @@ voidtrace v1: 251 symbols / 3042 remnants, dominated by types mentioned in `Void
 
 ## Kill / keep
 
-**Keep.** The interval-ghost + remnant pair is a real missing verb. Ephemeral *files* already pay rent on skills and sitbone. The v1 remnant ranking is not yet a CI-grade signal; that is the first mutation, not a reason to kill the primitive.
+**Keep.** The interval-ghost + remnant pair is a real missing verb. Ephemeral *files* already pay rent on skills and sitbone. After the ranking pass, remnants on kizu are comments and ADRs that still name abolished functions — the thing you actually wanted. `--check` is now plausible on a branch (docs ignored); `--root --check` on a long-lived repo will still fail, which is honest archaeology rather than a CI gate.

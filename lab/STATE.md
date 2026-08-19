@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 07:00 JST
+- Clock: 2026-08-20 07:03 JST
 - Phase: Dedicated destroyers (06:30–07:30), then Gen3 at 07:30
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -76,22 +76,22 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | hybrid-17 | 01a01bd4-9291-7c63-9bf2-7e0eed87952d | kit — copy+edit --code grain | done — hybrid-17__kit |
 | candidate-42 | 01a01bd4-9291-7c63-9bf2-7e115d7932c1 | maiden — tests that have never been red | done — candidate-42__maiden |
 | reimpl-10 | 01a01bd4-9291-7c63-9bf2-7e22b5f4b733 | cleat — leftover-relative import from PIN_V5 | done — reimpl-10__cleat |
-| destroyer-11 | (reserved 07:00 loop) | DESTROYER_SCARP | spawning |
-| destroyer-12 | (reserved 07:00 loop) | DESTROYER_BERTH | spawning |
-| destroyer-13 | (reserved 07:00 loop) | DESTROYER_LIEN | spawning |
-| destroyer-14 | (reserved 07:00 loop) | DESTROYER_TACIT | spawning |
-| destroyer-15 | (reserved 07:00 loop) | DESTROYER_BECK | spawning |
-| destroyer-16 | (reserved 07:00 loop) | DESTROYER_XREF | spawning |
-| destroyer-17 | (reserved 07:00 loop) | DESTROYER_WELD | spawning |
-| destroyer-18 | (reserved 07:00 loop) | DESTROYER_KEEL | spawning |
-| destroyer-19 | (reserved 07:00 loop) | DESTROYER_GIST | spawning |
-| destroyer-20 | (reserved 07:00 loop) | DESTROYER_VOW | spawning |
-| destroyer-21 | (reserved 07:00 loop) | DESTROYER_SMOLDER | spawning |
-| destroyer-22 | (reserved 07:00 loop) | DESTROYER_FORD | spawning |
-| destroyer-23 | (reserved 07:00 loop) | DESTROYER_BRAID | spawning |
-| destroyer-24 | (reserved 07:00 loop) | DESTROYER_PEAL | spawning |
-| destroyer-25 | (reserved 07:00 loop) | DESTROYER_MAIDEN | spawning |
-| destroyer-26 | (reserved 07:00 loop) | DESTROYER_WOOF | spawning |
+| destroyer-11 | 01a01c0a-bac4-7e72-bf24-30eb61df2b65 | DESTROYER_SCARP | running |
+| destroyer-12 | 01a01c0a-bac4-7e72-bf24-30f2c0cb0b69 | DESTROYER_BERTH | running |
+| destroyer-13 | 01a01c0a-bac4-7e72-bf24-3101ebf353a1 | DESTROYER_LIEN | running |
+| destroyer-14 | 01a01c0a-bac4-7e72-bf24-31193c5b0df5 | DESTROYER_TACIT | running |
+| destroyer-15 | 01a01c0a-bac4-7e72-bf24-312c21dc2037 | DESTROYER_BECK | running |
+| destroyer-16 | 01a01c0a-bac4-7e72-bf24-313a2692a2d4 | DESTROYER_XREF | running |
+| destroyer-17 | 01a01c0a-bac4-7e72-bf24-314d323ea3ef | DESTROYER_WELD | running |
+| destroyer-18 | 01a01c0a-bac4-7e72-bf24-315805457d17 | DESTROYER_KEEL | running |
+| destroyer-19 | 01a01c0a-bac4-7e72-bf24-316686f03657 | DESTROYER_GIST | running |
+| destroyer-20 | 01a01c0a-bac4-7e72-bf24-317b956f142b | DESTROYER_VOW | running |
+| destroyer-21 | 01a01c0a-bac4-7e72-bf24-31820dcf01c6 | DESTROYER_SMOLDER | running |
+| destroyer-22 | 01a01c0a-bac4-7e72-bf24-319682e434c5 | DESTROYER_FORD | running |
+| destroyer-23 | 01a01c0a-bac4-7e72-bf24-31af3a8e047d | DESTROYER_BRAID | running |
+| destroyer-24 | 01a01c0a-bac4-7e72-bf24-31b54ca124fc | DESTROYER_PEAL | running |
+| destroyer-25 | 01a01c0a-bac4-7e72-bf24-31cf722355bf | DESTROYER_MAIDEN | running |
+| destroyer-26 | 01a01c0a-bac4-7e72-bf24-31d208f14753 | DESTROYER_WOOF | running |
 
 Next free IDs: mutation-103, hybrid-18, candidate-43, reimpl-11, destroyer-27.
 
@@ -120,3 +120,4 @@ caulk, wad, flare, pup, seat, facet, quire, unsay, tally, dirge, sear, onset, wr
 - 2026-08-20 06:00 JST — 05:18 wave idle with complete CANDIDATE+demo. live=0. Harvested 16 by tool name. Reserved mutation-91..102 / hybrid-16..17 / candidate-42 / reimpl-10. Still Gen2 (destroyers at 06:30). No second pin-v0.5 destroyer, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
 - 2026-08-20 06:02 JST — Spawned those 16 with real subagent_ids (01a01bd4-…). live=16. Next free mutation-103 / hybrid-18 / candidate-43 / reimpl-11. Next loop ~06:15 still Gen2; 06:30 dedicated destroyers.
 - 2026-08-20 07:00 JST — Destroyer phase. 06:02 wave idle 13–39m. live=0. Harvested 16. Reserved destroyer-11..26 (scarp/berth/lien/tacit/beck/xref/weld/keel/gist/vow/smolder/ford/braid/peal/maiden/woof). No second pin-v0.5, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
+- 2026-08-20 07:03 JST — Spawned those 16 with real subagent_ids (01a01c0a-…). live=16. Next free mutation-103 / hybrid-18 / candidate-43 / reimpl-11 / destroyer-27. Gen3 at 07:30 if live drops.

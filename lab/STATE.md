@@ -2,48 +2,37 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 00:23 JST
-- Phase: Generation 1 — Cambrian explosion (until 01:15), then dogfood (01:15–03:00)
+- Clock: 2026-08-20 03:44 JST
+- Phase: First selection closing (03:00–04:00) → Gen2 breeding (04:00–06:30)
 - Parent role: coordinator only
-- Heartbeat scheduler: `01a01a85796e` every 15m, durable, foreground
+- Heartbeats: 15m loops (`01a01b54e731` background coordinator)
 
-## Active workers
+## Phase
 
-| ID | subagent_id | tool / assignment | status |
-| --- | --- | --- | --- |
-| candidate-01 | 01a01a85-796e-78d2-bfe0-dde59d683b37 | akin | running |
-| candidate-03 | 01a01a85-796f-76d0-988f-5bc4aa5c81e4 | wisp | running |
-| candidate-10 | 01a01a85-796f-76d0-988f-5c354be4601c | also | running |
-| candidate-11 | 01a01a85-796f-76d0-988f-5c49cc5231d5 | rift | running |
-| candidate-12 | 01a01a85-796f-76d0-988f-5c5b40ae9b40 | wraith | running |
-| candidate-14 | 01a01a85-7970-76f3-9304-ba467290f2a9 | unseen | running |
-| candidate-15 | 01a01a85-bf36-7370-8d54-8bed7c40c0c8 | winnow | running |
-| mutation-01 | 01a01a9f-346a-7601-9e43-6388555c1aa4 | aka → wire-keys only | running |
-| mutation-02 | 01a01a9f-346a-7601-9e43-6391a0670b24 | unfmt → stdin templates | running |
-| mutation-03 | 01a01a9f-346a-7601-9e43-63a8f9fbdf45 | held → emit predicates | running |
-| mutation-04 | 01a01a9f-346b-78e2-88a2-feeb66b194f6 | slip → gitless stream | running |
-| mutation-05 | 01a01a9f-346c-7dc0-92e1-7d0b51eef919 | rift → uncommitted vs history | running |
-| candidate-17 | 01a01a9f-346c-7dc0-92e1-7d1a6e398700 | new (anti-ghost) | running |
-| candidate-18 | 01a01a9f-346c-7dc0-92e1-7d29b9b85e35 | new (anti-ghost) | running |
-| candidate-19 | 01a01a9f-346c-7dc0-92e1-7d332e733f0b | new (anti-ghost) | running |
-| candidate-20 | 01a01a9f-346c-7dc0-92e1-7d477ee4266d | new (anti-ghost) | running |
+First-selection judges Unix / Toolsmith / Heretic are filed. Skeptic judge spawned this heartbeat. Gen2 already underway (hybrids 05–11, reimpls 05–07, mutations 35–36). Do not collapse to one winner.
 
-## Completed (Gen 1 ships)
+## This heartbeat spawned
 
-| ID | tool | primitive | worktree |
-| --- | --- | --- | --- |
-| candidate-02 | aka | identifier inflection classes + one-sided patch check | .../ddfe15c70cd6 |
-| candidate-04 | reverb | preimage of a diff as a search query | .../5bd55fb413f6 |
-| candidate-05 | haunt | inverse dead-code: dead names still speaking | .../5bee2235e3dc |
-| candidate-06 | deja | RELAPSE / UNDOFIX / RESURRECT vs history | .../5bf60a115585 |
-| candidate-07 | zanei | leftover claims a diff just made false | .../5c00e96ceb84 |
-| candidate-08 | unfmt | inverse printf against a tree | .../5c1f75800762 |
-| candidate-09 | held | history eras where a predicate holds | .../5c2c16399eaa |
-| candidate-13 | unfmt | independent inverse-printf (convergent) | .../ba3259b5566f |
-| candidate-16 | slip | relocate file:line by fingerprint | .../8bf9fdfd09da |
+| id | assignment |
+| --- | --- |
+| 01a01b56-ac55-7841-b5ae-0f7da58ab879 | Skeptic first-select judge |
+| 01a01b56-ac55-7841-b5ae-0f833e22d922 | reimpl-05 perch |
+| 01a01b56-ac55-7841-b5ae-0f9f5da289c8 | hybrid-09 ember×erst |
+| 01a01b56-ac57-78d3-8363-5b30cc05ee23 | hybrid-10 sheaf×tenure |
+| 01a01b56-ac59-7c81-bcb8-b9d3066be4f9 | reimpl-06 cinch |
+| 01a01b56-ac5a-7b03-a99f-4358171642bb | mutation-36 lode |
+| 01a01b56-ac5a-7b03-a99f-436ea1e4cdb3 | destroyer cinch/hasp |
+| 01a01b56-ac5a-7b03-a99f-437a44b4b3bf | candidate-38 |
+| 01a01b56-ac5a-7b03-a99f-4384dc33a176 | candidate-39 |
+| 01a01b56-ac5a-7b03-a99f-4396ddef200b | reimpl-07 erst |
+| 01a01b56-ac5a-7b03-a99f-43a7c2ac9342 | hybrid-11 visa×hatch |
 
-## Decisions
+Still in flight from prior turn: candidate-35/36/37, mutation-34 pin extract.
 
-- 2026-08-19 23:53 JST — Same broad challenge to all Gen-1 candidates. Isolated worktrees.
-- 2026-08-19 23:56 JST — Saturated at 16 inventors.
-- 2026-08-20 00:23 JST — Nine ships. Refilled with 5 one-assumption mutations + 4 new candidates steered off the ghost-name cluster. Independent `unfmt` convergence preserved (both lineages kept).
+## Survivors (do not kill)
+
+invert/stump/lede, pin v0.3, when/whence, held/perch/tenure, zanei/ember, erst, sate/lodge, cinch/hasp, sow/hatch, tell/sheaf, flume/inlay, lees/visa, lode/orbit, under, cusp/kerf, doze/clink.
+
+## Kills / park
+
+haunt kill. folk park. nigh park (kerf). unfmt walkers park. pinch/hitch park (knot). kiln/clutch park (sinter).

@@ -1,6 +1,6 @@
-# Overnight lab — live board (2026-08-20 03:35 JST)
+# Overnight lab — live board (2026-08-20 03:44 JST)
 
-Hard end: **09:00 JST**. Phase: Gen-2 breeding + early adversarial. First selection already filed.
+Hard end: **09:00 JST**. Phase: first-selection closeout → Gen-2 breeding (04:00). First selection already filed. Skeptic judge in flight.
 
 Parent workspace is coordinator-only. Tools live in isolated worktrees under `~/.grok/worktrees/annenpolka-brrr/`. Reports copied to `lab/lineages/`.
 

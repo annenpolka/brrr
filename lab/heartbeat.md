@@ -14,3 +14,4 @@
 - 2026-08-20 03:55 JST — candidate-36 `lapse` shipped (parent demo 0). Clock-cut disagreement. Vacancy filled with mutation-46 (two readings in, named clock out).
 - 2026-08-20 03:57 JST — mutation-34 pin v0.4: extract-and-keep is identity if origin still holds the body. Parent demo 0. Vacancy → mutation-47 (renamed-package extract).
 - 2026-08-20 04:00 JST — DESTROYER_CINCH: mutate cinch/hasp; test-only red is CLEAN. Vacancy → mutation-48 (always run NEW).
+- 2026-08-20 04:00 JST — candidate-35 `twain`: a diff is two patches (oracle vs production). Parent demo 22/22. Vacancy → mutation-49 suggestion algebra.

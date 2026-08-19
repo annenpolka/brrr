@@ -13,3 +13,4 @@
 - 2026-08-20 03:53 JST — Skeptic filed `lab/judges/FIRST_SKEPTIC.md`. Tomorrow-test survivors: winnow, cinch, invert, zanei. Disagreement preserved; do not collapse the night to four tools.
 - 2026-08-20 03:55 JST — candidate-36 `lapse` shipped (parent demo 0). Clock-cut disagreement. Vacancy filled with mutation-46 (two readings in, named clock out).
 - 2026-08-20 03:57 JST — mutation-34 pin v0.4: extract-and-keep is identity if origin still holds the body. Parent demo 0. Vacancy → mutation-47 (renamed-package extract).
+- 2026-08-20 04:00 JST — DESTROYER_CINCH: mutate cinch/hasp; test-only red is CLEAN. Vacancy → mutation-48 (always run NEW).

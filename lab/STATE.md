@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 05:16 JST
+- Clock: 2026-08-20 05:18 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -44,22 +44,22 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | mutation-76 | 01a01b85-78b8-7713-825c-14f7d39cba1e | shunt — leftover import pointer (CANDIDATE mutation-66) | done — mutation-66__shunt |
 | mutation-77 | 01a01b85-78b8-7713-825c-150e04a92eb8 | rove — grep --follow (CANDIDATE mutation-67) | done — mutation-67__rove |
 | mutation-78 | 01a01b85-78b8-7713-825c-151223bfdfc3 | sire — leftover → natal (CANDIDATE mutation-68) | done — mutation-68__sire |
-| mutation-79 | (reserved 05:16 loop) | rime — weld remainder templates | spawning |
-| mutation-80 | (reserved 05:16 loop) | helm — relative leftover names extract | spawning |
-| mutation-81 | (reserved 05:16 loop) | tinder — smolder --follow dest rename | spawning |
-| mutation-82 | (reserved 05:16 loop) | lash — xref one-hop getenv wrappers | spawning |
-| mutation-83 | (reserved 05:16 loop) | blot — gist empty diagnostics:[] | spawning |
-| mutation-84 | (reserved 05:16 loop) | crib — copy occupancy (`exists SRC`) | spawning |
-| mutation-85 | (reserved 05:16 loop) | loam — seep construct Type() | spawning |
-| mutation-86 | (reserved 05:16 loop) | weir — ford recursive merge-parent join | spawning |
-| mutation-87 | (reserved 05:16 loop) | hank — braid --emit composed covering | spawning |
-| mutation-88 | (reserved 05:16 loop) | aloud — tacit BLAST of later-explicit defaults | spawning |
-| mutation-89 | (reserved 05:16 loop) | troth — vow --apply from host role | spawning |
-| mutation-90 | (reserved 05:16 loop) | woof — weft --only prose (not docs/**) | spawning |
-| hybrid-14 | (reserved 05:16 loop) | neap — liken×wane overlay deaths | spawning |
-| hybrid-15 | (reserved 05:16 loop) | brand — gage×mint visa-birth lockset | spawning |
-| candidate-41 | (reserved 05:16 loop) | beck — first pipeline stage that produced this byte | spawning |
-| reimpl-09 | (reserved 05:16 loop) | prove — xref rebuilt from DESTROYER_ASSAY | spawning |
+| mutation-79 | 01a01bad-eb91-7d80-9aa0-102692b0ef4e | rime — weld remainder templates | running |
+| mutation-80 | 01a01bad-eb91-7d80-9aa0-103933d805f6 | helm — relative leftover names extract | running |
+| mutation-81 | 01a01bad-eb91-7d80-9aa0-1040781e71b7 | tinder — smolder --follow dest rename | running |
+| mutation-82 | 01a01bad-eb91-7d80-9aa0-10577f92fd3e | lash — xref one-hop getenv wrappers | running |
+| mutation-83 | 01a01bad-eb91-7d80-9aa0-106220b8e2a1 | blot — gist empty diagnostics:[] | running |
+| mutation-84 | 01a01bad-eb91-7d80-9aa0-10705faa92a6 | crib — copy occupancy (`exists SRC`) | running |
+| mutation-85 | 01a01bad-eb91-7d80-9aa0-108fb5d992c5 | loam — seep construct Type() | running |
+| mutation-86 | 01a01bad-eb91-7d80-9aa0-109aeaf41ba5 | weir — ford recursive merge-parent join | running |
+| mutation-87 | 01a01bad-eb91-7d80-9aa0-10aab0ac23cc | hank — braid --emit composed covering | running |
+| mutation-88 | 01a01bad-eb91-7d80-9aa0-10b74c14745b | aloud — tacit BLAST of later-explicit defaults | running |
+| mutation-89 | 01a01bad-eb91-7d80-9aa0-10c17b74e5bd | troth — vow --apply from host role | running |
+| mutation-90 | 01a01bad-eb91-7d80-9aa0-10d91539263d | woof — weft --only prose (not docs/**) | running |
+| hybrid-14 | 01a01bad-eb91-7d80-9aa0-10efdf7d691d | neap — liken×wane overlay deaths | running |
+| hybrid-15 | 01a01bad-eb91-7d80-9aa0-10ff54c76990 | brand — gage×mint visa-birth lockset | running |
+| candidate-41 | 01a01bad-eb91-7d80-9aa0-1108ac34ccbe | beck — first pipeline stage that produced this byte | running |
+| reimpl-09 | 01a01bad-eb91-7d80-9aa0-111c7624da18 | prove — xref rebuilt from DESTROYER_ASSAY | running |
 
 Next free IDs: mutation-91, hybrid-16, candidate-42, reimpl-10.
 
@@ -84,3 +84,4 @@ weld, keel, liken, ford, smolder, seep, ditto, gist, vow, xref, braid (loop-spaw
 - 2026-08-20 04:32 JST — 15m loop spawned mutation-59..69 + hybrid-12 while parent also spawned. Over capacity.
 - 2026-08-20 04:36 JST — peal collected (keep). Loop prompt capped: harvest-only if live ≥ 12. Next spawn IDs ≥ mutation-79. 06:30 destroyers. 08:20 judges. 08:40 EVOLUTION_REPORT.md.
 - 2026-08-20 05:16 JST — Loop fire: all 04:32 in-flight workers idle with complete CANDIDATE+demo (mtime ≤ 05:02). live=0. Harvested 11 by tool name. Reserved mutation-79..90 / hybrid-14..15 / candidate-41 / reimpl-09. No second pin-v0.5 destroyer, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
+- 2026-08-20 05:18 JST — Spawned those 16 with real subagent_ids (01a01bad-…). live=16. Next free mutation-91 / hybrid-16 / candidate-42 / reimpl-10.

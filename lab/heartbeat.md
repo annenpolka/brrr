@@ -54,3 +54,4 @@
 - 2026-08-20 04:45 JST — mutation-62 `scree` (book 73): largest unlocked production (chaff as object). Parent demo 0. v0.2 timeout is unknown, not slack. Keep as invert transcript; cinch 0.3 stays the lockset vehicle. No spawn.
 - 2026-08-20 04:48 JST — mutation-64 `wale` (book 75): plait ECHO is locus, not image-identity. Parent demo 30/30. Gold COMMUTE/JAM/PR#7 hold. Duplicate-site `return 0` is MULTI apply-each. Keep. Plait stays the vehicle; wale is the destroyer peel. No spawn.
 - 2026-08-20 04:48 JST — mutation-59 `twixt` (book 70): scarp as awk over a clock log. Parent demo 0. Stream SLEEP DILATE REST vs scarp's first pair only. v0.2 unlabeled ticks are REST; host_sleep rides along. Keep. Scarp stays the pair filter. No spawn.
+- 2026-08-20 04:49 JST — mutation-60 `yaw` (book 71): kernel slew, not NTP. Parent demo 0. POSIX CLOCK_MONOTONIC − RAW = −7.488s SLEW; scarp names the same offset `ntp=`. Keep. Scarp stays the pair/sleep filter. No spawn.

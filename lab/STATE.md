@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 08:45 JST
+- Clock: 2026-08-20 08:58 JST
 - Phase: Preservation — EVOLUTION_REPORT.md written; stop spawning; delete scheduler at 09:00
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -158,3 +158,4 @@ FINAL_UNIX/TOOLSMITH/HERETIC/SKEPTIC/EMPIRICIST/COMPOSER/TOMORROW/KILL/CONVERGE/
 - 2026-08-20 08:16 JST — Gen3 idle 10–31m, all Keep. live=0. Harvested 16. Reserved final jury judge-01..16 (Unix/Toolsmith/Heretic/Skeptic + 12 independent perspectives). No second pin-v0.5 / third ambit / fourth cinch / leftover-name / walker. REPORT at 08:40.
 - 2026-08-20 08:18 JST — Spawned those 16 with real subagent_ids (01a01c4f-…). live=16. Next fire harvest FINAL_*.md then write EVOLUTION_REPORT.md at 08:40.
 - 2026-08-20 08:45 JST — Jury idle 13–22m. Harvested 16 FINAL_*.md. Wrote EVOLUTION_REPORT.md (8 constitution sections). live=0. **Stop spawning.** Delete scheduler 01a01b54e731 at 09:00.
+- 2026-08-20 08:58 JST — REPORT already on disk (8 sections). live=0. No harvest. No spawn. Loop kept 2m for 09:00 scheduler_delete.

@@ -29,3 +29,9 @@
 - 2026-08-20 04:20 JST — hybrid-10 `thatch`: covering path-condition stacks, then occupy them. Parent demo 23/23. Vacancy → mutation-58 exclusive-A cover.
 - 2026-08-20 04:22 JST — mutation-35 `amid` (duplicate spawn) independently rebuilt ambit. Parent demo 0. Convergent. Vacancy → ambit/amid bakeoff, not a third clone.
 - 2026-08-20 04:23 JST — mutation-48 cinch 0.3: always-run NEW + timeout=unknown. Parent demo 0. Competes with snug. Vacancy → lockset bakeoff.
+- 2026-08-20 04:28 JST — mutation-46 `scarp`: lapse as a Unix filter (two cuts in, named clock out). Parent demo 0. Darwin `time.monotonic()` is awake, not machine. Vacancy → mutation-59 stream + mutation-60 slew object + reimpl-08.
+- 2026-08-20 04:28 JST — mutation-53 `stain`: admit CI default is empty stdout (production leaked no machine). Parent harvest 105/105 claimed. Vacancy → mutation-63 visa-birth.
+- 2026-08-20 04:28 JST — mutation-55 `tock`: snug lockset; splice timeout is unknown, not wheat. Vacancy → mutation-62 unlocked production.
+- 2026-08-20 04:28 JST — lockset bakeoff: vehicle **cinch 0.3** (honest 4/4). snug reimpl transcript. No fourth cinch.
+- 2026-08-20 04:28 JST — ambit/amid bakeoff: vehicle **ambit** (`rg -n` LINE:text). amid is json/derive spare. No third clone.
+- 2026-08-20 04:28 JST — DESTROYER_PLAIT: mutate, do not kill. ECHO is image-identity. plait kept.

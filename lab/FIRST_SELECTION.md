@@ -1,6 +1,6 @@
 # First selection (formalized 2026-08-20 02:25 JST)
 
-Independent judges: Toolsmith (`FIRST_TOOLSMITH.md`), Heretic (`FIRST_HERETIC.md`). Unix judge still writing. Coordinator synthesizes **several survivors**, not one winner. Disagreement is evidence.
+Independent judges: Toolsmith (`FIRST_TOOLSMITH.md`), Heretic (`FIRST_HERETIC.md`), Unix (`FIRST_UNIX.md`), Skeptic (`FIRST_SKEPTIC.md`). Coordinator synthesizes **several survivors**, not one winner. Disagreement is evidence.
 
 ## Intersection (both keep)
 
@@ -31,6 +31,16 @@ Independent judges: Toolsmith (`FIRST_TOOLSMITH.md`), Heretic (`FIRST_HERETIC.md
 ## Kills
 
 haunt (worse wraith). folk (0 orphans). nigh as default (cusp remains). akin similarity (once/port only). unfmt-08/13 as products (invert is the vehicle; stencil is walker spare).
+
+## Skeptic (arrived 03:52)
+
+Default **no**. Would I type this tomorrow *instead of* `git`/`rg`/`jq`?
+
+**Four survivors only:** winnow, cinch, invert, zanei (thin).
+
+Dropped from the earlier intersection: when, sate, held/perch, pin, erst, sow, coast — demos paid rent; they did not beat a Unix one-liner in this judge’s probes (`git log --full-history -- path`, `git apply --check --reverse`, `rg seen_hunk_fingerprint`).
+
+Coordinator does **not** collapse to four. Skeptic vetoes daily PATH, not evolution slots. Unix/Heretic objects stay in the breeding pool.
 
 ## Unix judge (arrived 02:30)
 

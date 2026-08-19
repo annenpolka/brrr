@@ -27,3 +27,4 @@
 - 2026-08-20 04:17 JST — mutation-36 `assay`: DUE vs LATENT env ABI. Parent demo 77/77. Vacancy → assay destroyer (12k rustc DUE).
 - 2026-08-20 04:18 JST — mutation-47 pin v0.5: stub origin prefers extracted body over basename bait. Parent demo 0. Vacancy → pin v0.5 destroyer.
 - 2026-08-20 04:20 JST — hybrid-10 `thatch`: covering path-condition stacks, then occupy them. Parent demo 23/23. Vacancy → mutation-58 exclusive-A cover.
+- 2026-08-20 04:22 JST — mutation-35 `amid` (duplicate spawn) independently rebuilt ambit. Parent demo 0. Convergent. Vacancy → ambit/amid bakeoff, not a third clone.

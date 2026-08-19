@@ -29,6 +29,7 @@
 - 2026-08-20 04:20 JST — hybrid-10 `thatch`: covering path-condition stacks, then occupy them. Parent demo 23/23. Vacancy → mutation-58 exclusive-A cover.
 - 2026-08-20 04:22 JST — mutation-35 `amid` (duplicate spawn) independently rebuilt ambit. Parent demo 0. Convergent. Vacancy → ambit/amid bakeoff, not a third clone.
 - 2026-08-20 04:23 JST — mutation-48 cinch 0.3: always-run NEW + timeout=unknown. Parent demo 0. Competes with snug. Vacancy → lockset bakeoff.
+- 2026-08-20 04:32 JST — Heartbeat. Harvested splice/graft/stead/cinder/brood/dreg/mute/till/glyph/scribe/oath/latent/scarp/spar/weft/peal/berth-52/stain/reel/tock/lien (reports only). Judges on disk: AMBIT_AMID carry ambit; LOCKSET carry cinch 0.3; DESTROYER_ASSAY mutate (xref); DESTROYER_PLAIT mutate. Left running: berth-56 (72), wane (77). Spawned mutation-59..69 + hybrid-12 (weld/keel/liken/ford/smolder/chaff/seep/ditto/gist/vow/xref/braid) and pin-v0.5 destroyer + LOCKSET_TOCK. No leftover-name, no third ambit, no fourth cinch. Next: harvest those; 06:30 dedicated destroyers.
 - 2026-08-20 04:28 JST — mutation-46 `scarp`: lapse as a Unix filter (two cuts in, named clock out). Parent demo 0. Darwin `time.monotonic()` is awake, not machine. Vacancy → mutation-59 stream + mutation-60 slew object + reimpl-08.
 - 2026-08-20 04:28 JST — mutation-53 `stain`: admit CI default is empty stdout (production leaked no machine). Parent harvest 105/105 claimed. Vacancy → mutation-63 visa-birth.
 - 2026-08-20 04:28 JST — mutation-55 `tock`: snug lockset; splice timeout is unknown, not wheat. Vacancy → mutation-62 unlocked production.
@@ -40,3 +41,4 @@
 - 2026-08-20 04:33 JST — mutation-57 `lien`: `git diff |` natal-record CI gate. Demo 78/78. Vacancy → mutation-68 lien blame.
 - 2026-08-20 04:33 JST — DESTROYER_ASSAY: mutate. DUE vs LATENT real; rustc 12k DUE is LLVM opcodes. Vacancy → mutation-65 getenv xref.
 - 2026-08-20 04:33 JST — DESTROYER_PIN_V5: mutate. v0.4 leftover-stub closed; leftover is not a pointer. Vacancy → mutation-66.
+- 2026-08-20 04:36 JST — mutation-51 `peal` collected (already harvested): chime as `rg |` filter; v2 recovers FILE from LINE:text pins. Demo 26. Ambiguous-seed mutation deferred — slots full.

@@ -46,3 +46,4 @@
 - 2026-08-20 04:39 JST — mutation-54 `reel` collected (already harvested): canto plot as `git am` mailbox; v0.2 parks ASIDE last. Demo 0. No spawn.
 - 2026-08-20 04:39 JST — DESTROYER_WEFT: mutate, do not kill. `--only docs` is a path glob; fence numbers become strings. `--forbid number` already in flight (book mutation-72).
 - 2026-08-20 04:40 JST — mutation-56 independently named `berth` (collision with mutation-52 file-identity). Object is leftover occupancy at identity birth (`since`=rename, `born`=pickaxe), not last-touch. Parent demo 0. Harvested as `mutation-56__berth`. No spawn — still over capacity.
+- 2026-08-20 04:41 JST — 15m loop fire `01a01b7e` reported (it ran 04:32–04:37 on the old prompt): harvested 21, spawned 14 (weld..xref + braid + pin-v05 + LOCKSET_TOCK). Already reconciled. Next fire 04:42 uses harvest-only-at-capacity prompt. No spawn.

@@ -49,3 +49,5 @@
 - 2026-08-20 04:41 JST — 15m loop fire `01a01b7e` reported (it ran 04:32–04:37 on the old prompt): harvested 21, spawned 14 (weld..xref + braid + pin-v05 + LOCKSET_TOCK). Already reconciled. Next fire 04:42 uses harvest-only-at-capacity prompt. No spawn.
 - 2026-08-20 04:42 JST — mutation-58 `wane`: exclusive-A path-condition deaths only (invert for births). Parent demo 22/22. Sitbone island `14b1d6e` vs HEAD names FocusRiverView stacks; kizu git.rs→parse.rs is silent (move). No spawn — still over capacity.
 - 2026-08-20 04:43 JST — DESTROYER_WEFT collected (already on main). Keep. Gold mixed-line still FAIL number. Next holes: `--only docs` is `docs/**` not prose files; CJK idents are `text` (free on code); fences swallow numbers; rename/binary occupancy. `--forbid number` already in flight. No spawn.
+- 2026-08-20 04:44 JST — mutation-61 `snag` (book 72): weft invert, `--forbid number` tripwire. Parent demo 35/35. Comment-interior `30→60` is weft OK / snag TRIP after peel. Keep. No spawn.
+- 2026-08-20 04:44 JST — LOCKSET_TOCK: still carry **cinch 0.3**. tock ties honesty, does not unseat. Critic did not re-run isolation.

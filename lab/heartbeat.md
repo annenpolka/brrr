@@ -45,3 +45,4 @@
 - 2026-08-20 04:38 JST — mutation-49 `spar` collected (already harvested): suggestion-patch algebra, no tree. v0.2 pairwise stays inside `original_commit_id`. Demo 27 / selftest 30. No spawn — still over capacity.
 - 2026-08-20 04:39 JST — mutation-54 `reel` collected (already harvested): canto plot as `git am` mailbox; v0.2 parks ASIDE last. Demo 0. No spawn.
 - 2026-08-20 04:39 JST — DESTROYER_WEFT: mutate, do not kill. `--only docs` is a path glob; fence numbers become strings. `--forbid number` already in flight (book mutation-72).
+- 2026-08-20 04:40 JST — mutation-56 independently named `berth` (collision with mutation-52 file-identity). Object is leftover occupancy at identity birth (`since`=rename, `born`=pickaxe), not last-touch. Parent demo 0. Harvested as `mutation-56__berth`. No spawn — still over capacity.

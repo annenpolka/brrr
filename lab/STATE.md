@@ -20,7 +20,7 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | mutation-56 | 01a01b72-9ec6-7a02-a148-30ab671d6314 | identity-birth occupancy (also named berth) | done — mutation-56__berth |
 | mutation-58 | 01a01b77-5c56-7860-b7e2-6e83e85235f0 | wane — exclusive-A stack deaths | done — mutation-58__wane |
 | destroyer-weft | 01a01b7b-56a8-7ab1-a86b-473d6e82628b | weft docs gate | done — DESTROYER_WEFT.md |
-| mutation-70 | 01a01b83-58fe-7d33-a0be-369add59f9ac | scarp clock-log stream (parent said 59) | running |
+| mutation-70 | 01a01b83-58fe-7d33-a0be-369add59f9ac | twixt — clock-log stream (CANDIDATE mutation-59) | done — mutation-59__twixt |
 | mutation-71 | 01a01b83-58ff-7043-bd7c-ca6d114126bb | Darwin slew object (parent 60) | running |
 | mutation-72 | 01a01b83-58ff-7043-bd7c-ca791fbb8e0c | snag — `--forbid number` (CANDIDATE mutation-61) | done — mutation-61__snag |
 | mutation-73 | 01a01b83-58ff-7043-bd7c-ca8d558a5463 | scree — unlocked production (CANDIDATE mutation-62) | done — mutation-62__scree |

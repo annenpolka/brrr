@@ -2,37 +2,42 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 03:44 JST
-- Phase: First selection closing (03:00–04:00) → Gen2 breeding (04:00–06:30)
+- Clock: 2026-08-20 03:45 JST
+- Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
-- Heartbeats: 15m loops (`01a01b54e731` background coordinator)
+- Heartbeat scheduler: `01a01b54e731` every 15m
 
-## Phase
+## Active workers
 
-First-selection judges Unix / Toolsmith / Heretic are filed. Skeptic judge spawned this heartbeat. Gen2 already underway (hybrids 05–11, reimpls 05–07, mutations 35–36). Do not collapse to one winner.
+| ID | subagent_id | tool / assignment | status |
+| --- | --- | --- | --- |
+| in-flight pin | 01a01b4e-cf18-75e3-a104-68eccd2ce458 | pin (worktree has `pin`+`demo.sh`, no CANDIDATE yet) | running |
+| in-flight fixtures | 01a01b4e-cf18-75e3-a104-68d75d860db5 | fixtures busy/block/parallel/mix | running |
+| empty-03:35 | 01a01b4e-cf18-75e3-a104-68c4fac8d0d5 | no CANDIDATE | maybe stalled |
+| empty-03:41 | 01a01b53-e0f2-7ac0-8ef7-d9e749cfbd30 | no CANDIDATE | maybe stalled |
+| mutation-34 | 01a01b59-bd03-7f81-b375-7aef996a20c5 | splice — concat inverse-printf | running |
+| mutation-35 | 01a01b59-bd03-7f81-b375-7af0a920e5e8 | graft — when overlay unapplied patch | running |
+| mutation-36 | 01a01b59-bd03-7f81-b375-7b063d5322bd | stead — occupancy UNKNOWN/SHALLOW | running |
+| mutation-37 | 01a01b59-bd03-7f81-b375-7b1b1f81ed30 | cinder — generated afterimages are ash | running |
+| mutation-38 | 01a01b59-bd03-7f81-b375-7b25473b632b | brood — erst domain tags | running |
+| mutation-39 | 01a01b59-bd03-7f81-b375-7b38e10f95bc | dreg — SUPERSEDED as a patch | running |
+| mutation-40 | 01a01b59-bd04-73e2-91aa-55ed51711c40 | mute — unlocked PR production | running |
+| mutation-41 | 01a01b59-bd04-73e2-91aa-55fbce2020ab | till — hatch rename-follow | running |
+| mutation-42 | 01a01b59-bd04-73e2-91aa-5605c67bbb29 | glyph — sheaf --follow | running |
+| mutation-43 | 01a01b59-bd04-73e2-91aa-5619b44f8074 | scribe — SARIF locator rewrite | running |
+| mutation-44 | 01a01b59-bd04-73e2-91aa-5626f39aaddb | oath — assertion-literal visa | running |
+| mutation-45 | 01a01b59-bd04-73e2-91aa-563272f0f33a | latent — DUE vs LATENT getenv | running |
 
-## This heartbeat spawned
+## Harvested this heartbeat (reports only, no code merge)
 
-| id | assignment |
-| --- | --- |
-| 01a01b56-ac55-7841-b5ae-0f7da58ab879 | Skeptic first-select judge |
-| 01a01b56-ac55-7841-b5ae-0f833e22d922 | reimpl-05 perch |
-| 01a01b56-ac55-7841-b5ae-0f9f5da289c8 | hybrid-09 ember×erst |
-| 01a01b56-ac57-78d3-8363-5b30cc05ee23 | hybrid-10 sheaf×tenure |
-| 01a01b56-ac59-7c81-bcb8-b9d3066be4f9 | reimpl-06 cinch |
-| 01a01b56-ac5a-7b03-a99f-4358171642bb | mutation-36 lode |
-| 01a01b56-ac5a-7b03-a99f-436ea1e4cdb3 | destroyer cinch/hasp |
-| 01a01b56-ac5a-7b03-a99f-437a44b4b3bf | candidate-38 |
-| 01a01b56-ac5a-7b03-a99f-4384dc33a176 | candidate-39 |
-| 01a01b56-ac5a-7b03-a99f-4396ddef200b | reimpl-07 erst |
-| 01a01b56-ac5a-7b03-a99f-43a7c2ac9342 | hybrid-11 visa×hatch |
+hatch, kerf, whence, ember, lede; named hybrids cinch/sinter/tenure/hasp/dowel/lodge refreshed. Lineages under `lab/lineages/`.
 
-Still in flight from prior turn: candidate-35/36/37, mutation-34 pin extract.
+## Vehicles in flight (Unix sixteen + heretic extras)
 
-## Survivors (do not kill)
+invert/stump/lede → splice. pin (in-flight harden). when/whence → graft. held/perch/tenure → stead. zanei/ember → cinder. erst → brood. sate/lodge → dreg. cinch/hasp → mute. sow/hatch → till. tell/sheaf → glyph. flume/inlay → scribe. lees/visa → oath. lode/orbit → latent.
 
-invert/stump/lede, pin v0.3, when/whence, held/perch/tenure, zanei/ember, erst, sate/lodge, cinch/hasp, sow/hatch, tell/sheaf, flume/inlay, lees/visa, lode/orbit, under, cusp/kerf, doze/clink.
+## Decisions
 
-## Kills / park
-
-haunt kill. folk park. nigh park (kerf). unfmt walkers park. pinch/hitch park (knot). kiln/clutch park (sinter).
+- 2026-08-19 23:53 JST — Same broad challenge to all Gen-1 candidates. Isolated worktrees.
+- 2026-08-20 02:25 JST — First selection: several survivors, not one winner. Haunt killed. Folk parked.
+- 2026-08-20 03:45 JST — Continue breeding; do not spawn leftover-name search or a second inverse-printf walker. Pin slot already occupied. 06:30 destroyers. 08:20 judges. 08:40 preservation + EVOLUTION_REPORT.md.

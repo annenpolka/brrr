@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 04:38 JST
+- Clock: 2026-08-20 04:39 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (prompt now: harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -19,7 +19,7 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | --- | --- | --- | --- |
 | mutation-56 | 01a01b72-9ec6-7a02-a148-30ab671d6314 | brood since=identity-birth | running |
 | mutation-58 | 01a01b77-5c56-7860-b7e2-6e83e85235f0 | thatch exclusive-A | running |
-| destroyer-weft | 01a01b7b-56a8-7ab1-a86b-473d6e82628b | weft docs gate | running |
+| destroyer-weft | 01a01b7b-56a8-7ab1-a86b-473d6e82628b | weft docs gate | done — DESTROYER_WEFT.md |
 | mutation-70 | 01a01b83-58fe-7d33-a0be-369add59f9ac | scarp clock-log stream (parent said 59) | running |
 | mutation-71 | 01a01b83-58ff-7043-bd7c-ca6d114126bb | Darwin slew object (parent 60) | running |
 | mutation-72 | 01a01b83-58ff-7043-bd7c-ca791fbb8e0c | weft `--forbid number` (parent 61) | running |

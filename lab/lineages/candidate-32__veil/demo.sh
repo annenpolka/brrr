@@ -38,6 +38,12 @@ echo "---- json status ----"
 porc="$("${VEIL[@]}" -C "$UGLY" --from "$BASE" --to HEAD --porcelain)"
 echo "$porc" | grep -q $'LIVE\tadd\tshop.py' || { echo "missing LIVE add"; echo "$porc"; exit 1; }
 echo "$porc" | grep -q $'VEIL\tcheckout\tshop.py' || { echo "missing VEIL checkout"; echo "$porc"; exit 1; }
+n_checkout="$(echo "$porc" | grep -c $'VEIL\tcheckout\t' || true)"
+if [[ "$n_checkout" -ne 1 ]]; then
+  echo "VEIL checkout should appear once, got $n_checkout" >&2
+  echo "$porc" >&2
+  exit 1
+fi
 echo "$porc" | grep -q $'BARE\tretry_budget\tshop.py' || { echo "missing BARE retry_budget"; echo "$porc"; exit 1; }
 echo "$porc" | grep -q $'VEIL\tloadTemplate\tsrc/loader.ts' || { echo "missing VEIL loadTemplate"; echo "$porc"; exit 1; }
 echo "$porc" | grep -q $'LIVE\tcompose\tsrc/composer.ts' || { echo "missing LIVE compose"; echo "$porc"; exit 1; }

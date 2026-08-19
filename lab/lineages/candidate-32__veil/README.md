@@ -47,6 +47,8 @@ A comment-only edit is `CLEAN` (no production names changed). A new `retry_budge
 
 `--porcelain` is a stable TSV: `STATUS  QUALNAME  FILE  TEST  VIA`.
 
+Unexported helpers that no test cites are hidden (they drowned the report). `--all-names` brings them back. Unexported names that are **VEIL** still show: a mock of a hidden helper is the whole point.
+
 ### 3. The ugly fixture (spaces, unicode, nested git, JS module mock)
 
 ```bash

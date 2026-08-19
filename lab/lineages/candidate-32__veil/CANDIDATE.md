@@ -59,9 +59,33 @@ Dogfood, 2026-08-20, read-only `-C` (originals not mutated):
 | skills | HEAD~1 | CLEAN | 0 | 0 | 0 | docs-only |
 | tenaoshi | HEAD~1 | EXPOSED | 0 | 0 | 13 | **bug:** `Engine/Tests/.../OraclesGenerated.swift` treated as production (`Tests` ≠ `tests`) |
 
-### After the first improvement
+### After the first improvement (v0.2)
 
-See the next commit. Planned from the transcript above: case-insensitive test dirs, brace-accurate def spans, public/`export`/`pub` names as the default review object (internal helpers stopped drowning the cover-type).
+Fixes from the v0.1 dogfood, not from taste:
+
+1. `Tests/` and `TenaoshiEngineTests` are test paths (case-insensitive; `*Tests` segments).
+2. Brace-accurate def spans, so an edit to `touch()` does not mark neighboring `keep()` as changed. v0.1's 4000-char window was a firehose.
+3. Unexported **BARE** helpers are hidden by default (`--all-names` restores them). Unexported **VEIL** still prints — that is the theater.
+4. Duplicate porcelain rows from walking a `@patch` decorator twice.
+
+Re-run on the same ranges:
+
+| repo | range | v0.1 | v0.2 |
+| --- | --- | --- | --- |
+| soul-writer | HEAD~3 | OPEN 16/7/25 | **EXPOSED 13/0/4** |
+| voidtrace | HEAD~1 | EXPOSED 11/0/37 | **COVERED 5/0/0** |
+| kizu | HEAD~5 | EXPOSED 20/0/582 | EXPOSED 19/0/233 |
+| sitbone | HEAD~1 | EXPOSED 0/0/7 | EXPOSED 0/0/4 (`EndSessionButton` still BARE) |
+| tenaoshi | HEAD~1 | EXPOSED 0/0/13 (oracles as prod) | **CLEAN** |
+| this repo | vs v0.1 | — | EXPOSED 8 LIVE / 8 BARE on `veil.py` (tests cite `analyze`, not `classify_name`) |
+
+Surprise: soul-writer's seven VEILs were **false**. `formatLastError` / `getRetryAfterMs` did not change; v0.1 hashed a window that overlapped the edited `CerebrasClient`. After brace spans they vanish, and `CerebrasClient` is LIVE via `cerebras.test.ts`. The ugly fixture still reports VEIL on `checkout` and `loadTemplate` — the object is real, the first dogfood hit was a span bug.
+
+voidtrace `evaluate.ts` internals (`createPhaseEvents`, …) were unexported BARE. Public `evaluateScenario` / `executeForcedSlashDurationRule` are LIVE. Status COVERED: the production diff's *public* names are cited.
+
+sitbone still names the finding a reviewer wants: new SwiftUI views with no XCTest citation.
+
+Self `--self-test` and `./demo.sh` still exit 0 (13 unit tests).
 
 ## Dogfood targets
 
@@ -77,9 +101,10 @@ See the next commit. Planned from the transcript above: case-insensitive test di
 
 ## Failures
 
-- `Tests/` (Swift) and `TenaoshiEngineTests` were not test paths. Generated oracles became BARE production.
-- Unexported TS/Rust helpers in a touched file dominate BARE.
-- Duplicate porcelain rows for one `@patch` (decorator Call visited twice).
+- v0.1: `Tests/` (Swift) treated as production. Fixed.
+- v0.1: overlapping def windows invented VEIL/BARE. Fixed for braces; Python already used AST dumps.
+- kizu HEAD~5 is still a file-split firehose (233 pub names born in new files). Cover-type is not occupancy; `akin`/`once` own that.
+- Short JS `vi.mock('node:fs/promises')` is ignored (external). Correct, but a test that *only* mocks node builtins never veils a SUT — SCRIPT status is a mutation.
 - Python `import shop` must not LIVE every name in `shop.py` — citation of the *name* is required. (Caught in self-test design, not dogfood.)
 
 ## Suggested mutations

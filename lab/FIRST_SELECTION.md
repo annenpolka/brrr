@@ -32,6 +32,14 @@ Independent judges: Toolsmith (`FIRST_TOOLSMITH.md`), Heretic (`FIRST_HERETIC.md
 
 haunt (worse wraith). folk (0 orphans). nigh as default (cusp remains). akin similarity (once/port only). unfmt-08/13 as products (invert is the vehicle; stencil is walker spare).
 
-## Gen-2 mandate (04:00 starts early)
+## Unix judge (arrived 02:30)
 
-Breed invert, pin, when/chime, perch, zanei, erst, sate, sow, cinch, alibi, sinter, coast, orbit. Hybrids must synthesize objects, not feature lists. Reimpls of invert and perch to test primitive strength.
+Sixteen orthogonal **mutate** vehicles (pipe them, do not merge): invert, pin, flume, tell, perch, sate, erst, sic, sow, zanei, lode, lees, cinch, under, cusp, doze.
+
+Haunt killed. Folk parked. Invert is not “the winner”; it is the inverse-printf filter. Pin is a different object.
+
+New after selection: **stump** (invert hardened vs destroyer), **tide** (oracle careers: STABLE/DRIFT/RATCHET/FLIPFLOP/VANISH/BLESS), **pin v0.3** (destroyer regressions).
+
+## Gen-2 mandate (started early, continues through 06:30)
+
+Breed the Unix sixteen plus heretic extras (when, alibi, clutch/sinter, coast, sow). Hybrids synthesize objects. Reimpls test primitive strength. Do not invent another leftover-name search.

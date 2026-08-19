@@ -9,3 +9,4 @@
 - 2026-08-20 00:43 JST — mutation-02 `sluice` shipped (parent demo 40/40 PASS). Diversity wave names: sic, tell, flume, zure, nigh, cleave, folk, when, glean, pinch. Hybrid-01 (slip×unfmt) spawned into the vacancy.
 - 2026-08-20 00:54 JST — sic/tell/when parent demos PASS. Early critics spawned. Reimpl of unfmt started.
 - 2026-08-20 01:07 JST — Entering Gen-1 development. New ships: cleave, glean, skew, once, spoor, pinch, hitch, moor (hybrid PASS). Spawned hitch×pinch hybrid, spoor attach-pid mutation, held reimpl, candidates 26–28, cleave mutation.
+- 2026-08-20 01:31 JST — reimpl-02 `dwelt` matches held on sitbone/skills (parent demo PASS) — held primitive is real. New: alibi (tests×old prod), coast (post-waitpid), sow (prod worlds as fixtures), owe, under, cusp. Top-6 mutations 14–19 plus alibi×winnow hybrid in flight.

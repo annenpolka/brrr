@@ -25,3 +25,4 @@
 - 2026-08-20 04:14 JST — reimpl-07 `brood` matches erst sitbone gold (0.4 + threshold, no SiteObserver). Parent demo 0. Vacancy → mutation-56 since=identity-birth.
 - 2026-08-20 04:16 JST — hybrid-09 `kith`: natal record (claim+kin) not ember|erst. Parent demo 52/52. Vacancy → mutation-57 check-only.
 - 2026-08-20 04:17 JST — mutation-36 `assay`: DUE vs LATENT env ABI. Parent demo 77/77. Vacancy → assay destroyer (12k rustc DUE).
+- 2026-08-20 04:18 JST — mutation-47 pin v0.5: stub origin prefers extracted body over basename bait. Parent demo 0. Vacancy → pin v0.5 destroyer.

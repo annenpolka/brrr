@@ -2,8 +2,8 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 07:34 JST
-- Phase: Generation 3 — exploit strongest lineages (until 08:20), then final jury
+- Clock: 2026-08-20 08:16 JST
+- Phase: Final jury (08:20–08:40), then REPORT 08:40–09:00
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
 
@@ -92,28 +92,44 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | destroyer-24 | 01a01c0a-bac4-7e72-bf24-31b54ca124fc | DESTROYER_PEAL | done — mutate |
 | destroyer-25 | 01a01c0a-bac4-7e72-bf24-31cf722355bf | DESTROYER_MAIDEN | done — mutate |
 | destroyer-26 | 01a01c0a-bac4-7e72-bf24-31d208f14753 | DESTROYER_WOOF | done — mutate |
-| mutation-103 | 01a01c27-4df0-7683-956b-a7bef4531e96 | lurch — scarp as a stream of cuts | running |
-| mutation-104 | 01a01c27-4df0-7683-956b-a7c21cde45fa | holt — berth all-reachable R default | running |
-| mutation-105 | 01a01c27-4df0-7683-956b-a7dcb7b045d8 | noun — lien workspace version identity | running |
-| mutation-106 | 01a01c27-4df0-7683-956b-a7e54e910ccf | preen — tacit unfold constructed default | running |
-| mutation-107 | 01a01c27-4df0-7683-956b-a7f166988a06 | innard — beck $() / mid 2>&1 | running |
-| mutation-108 | 01a01c27-4df0-7683-956b-a80abe33b027 | shim — xref rustup/xcselect + *getenv | running |
-| mutation-109 | 01a01c27-4df0-7683-956b-a8198f3d8e17 | stile — weld proving-string floor (not walker) | running |
-| mutation-110 | 01a01c27-4df0-7683-956b-a823089447b4 | shoal — keel remotes are not --any-repo | running |
-| mutation-111 | 01a01c27-4df0-7683-956b-a83964829f8b | rune — gist dest-own UTF-16 character | running |
-| mutation-112 | 01a01c27-4df0-7683-956b-a84f50db0a0c | proxy — vow follow expected=name | running |
-| mutation-113 | 01a01c27-4df0-7683-956b-a854aa58992d | binom — smolder/lien package-scoped version | running |
-| mutation-114 | 01a01c27-4df0-7683-956b-a862c741cfa4 | hydra — ford octopus + first-parent join | running |
-| hybrid-18 | 01a01c27-4df0-7683-956b-a87d610a8a68 | tilde — braid NFC path+line image | running |
-| hybrid-19 | 01a01c27-4df0-7683-956b-a88d2215a6d4 | seed — peal seed is not first locator | running |
-| candidate-43 | 01a01c27-4df0-7683-956b-a89983a67baf | badge — maiden identity ≠ string id | running |
-| reimpl-11 | 01a01c27-4df0-7683-956b-a8a24a7d1c61 | solder — weld from DESTROYER_WELD behavior | running |
+| mutation-103 | 01a01c27-4df0-7683-956b-a7bef4531e96 | lurch — scarp as a stream of cuts | done — mutation-103__lurch |
+| mutation-104 | 01a01c27-4df0-7683-956b-a7c21cde45fa | holt — berth all-reachable R default | done — mutation-104__holt |
+| mutation-105 | 01a01c27-4df0-7683-956b-a7dcb7b045d8 | noun — lien workspace version identity | done — mutation-105__noun |
+| mutation-106 | 01a01c27-4df0-7683-956b-a7e54e910ccf | preen — tacit unfold constructed default | done — mutation-106__preen |
+| mutation-107 | 01a01c27-4df0-7683-956b-a7f166988a06 | innard — beck $() / mid 2>&1 | done — mutation-107__innard |
+| mutation-108 | 01a01c27-4df0-7683-956b-a80abe33b027 | shim — xref rustup/xcselect + *getenv | done — mutation-108__shim |
+| mutation-109 | 01a01c27-4df0-7683-956b-a8198f3d8e17 | stile — weld proving-string floor (not walker) | done — mutation-109__stile |
+| mutation-110 | 01a01c27-4df0-7683-956b-a823089447b4 | shoal — keel remotes are not --any-repo | done — mutation-110__shoal |
+| mutation-111 | 01a01c27-4df0-7683-956b-a83964829f8b | rune — gist dest-own UTF-16 character | done — mutation-111__rune |
+| mutation-112 | 01a01c27-4df0-7683-956b-a84f50db0a0c | proxy — vow follow expected=name | done — mutation-112__proxy |
+| mutation-113 | 01a01c27-4df0-7683-956b-a854aa58992d | binom — smolder/lien package-scoped version | done — mutation-113__binom |
+| mutation-114 | 01a01c27-4df0-7683-956b-a862c741cfa4 | hydra — ford octopus + first-parent join | done — mutation-114__hydra |
+| hybrid-18 | 01a01c27-4df0-7683-956b-a87d610a8a68 | tilde — braid NFC path+line image | done — hybrid-18__tilde |
+| hybrid-19 | 01a01c27-4df0-7683-956b-a88d2215a6d4 | seed — peal seed is not first locator | done — hybrid-19__seed |
+| candidate-43 | 01a01c27-4df0-7683-956b-a89983a67baf | badge — maiden identity ≠ string id | done — candidate-43__badge |
+| reimpl-11 | 01a01c27-4df0-7683-956b-a8a24a7d1c61 | solder — weld from DESTROYER_WELD behavior | done — reimpl-11__solder |
+| judge-01 | (reserved 08:16 loop) | FINAL_UNIX | spawning |
+| judge-02 | (reserved 08:16 loop) | FINAL_TOOLSMITH | spawning |
+| judge-03 | (reserved 08:16 loop) | FINAL_HERETIC | spawning |
+| judge-04 | (reserved 08:16 loop) | FINAL_SKEPTIC | spawning |
+| judge-05 | (reserved 08:16 loop) | FINAL_EMPIRICIST | spawning |
+| judge-06 | (reserved 08:16 loop) | FINAL_COMPOSER | spawning |
+| judge-07 | (reserved 08:16 loop) | FINAL_TOMORROW | spawning |
+| judge-08 | (reserved 08:16 loop) | FINAL_KILL | spawning |
+| judge-09 | (reserved 08:16 loop) | FINAL_CONVERGE | spawning |
+| judge-10 | (reserved 08:16 loop) | FINAL_WEIRD | spawning |
+| judge-11 | (reserved 08:16 loop) | FINAL_VEHICLES | spawning |
+| judge-12 | (reserved 08:16 loop) | FINAL_GEN3 | spawning |
+| judge-13 | (reserved 08:16 loop) | FINAL_LINEAGE | spawning |
+| judge-14 | (reserved 08:16 loop) | FINAL_EXTINCT | spawning |
+| judge-15 | (reserved 08:16 loop) | FINAL_NOVELTY | spawning |
+| judge-16 | (reserved 08:16 loop) | FINAL_DISAGREE | spawning |
 
-Next free IDs: mutation-115, hybrid-20, candidate-44, reimpl-12, destroyer-27.
+Next free IDs: mutation-115, hybrid-20, candidate-44, reimpl-12, destroyer-27, judge-17.
 
 ## Harvested this heartbeat
 
-DESTROYER_SCARP/BERTH/LIEN/TACIT/BECK/XREF/WELD/KEEL/GIST/VOW/SMOLDER/FORD/BRAID/PEAL/MAIDEN/WOOF — all **mutate, do not kill**. TACIT from /tmp (never committed to worktree).
+lurch, holt, noun, preen, innard, shim, stile, shoal, rune, proxy, binom, hydra, tilde, seed, badge, solder (Gen3; all Keep).
 
 ## Vehicles (carry)
 
@@ -139,3 +155,4 @@ DESTROYER_SCARP/BERTH/LIEN/TACIT/BECK/XREF/WELD/KEEL/GIST/VOW/SMOLDER/FORD/BRAID
 - 2026-08-20 07:03 JST — Spawned those 16 with real subagent_ids (01a01c0a-…). live=16. Next free mutation-103 / hybrid-18 / candidate-43 / reimpl-11 / destroyer-27. Gen3 at 07:30 if live drops.
 - 2026-08-20 07:32 JST — Destroyer wave complete (all mutate). live=0. Harvested 16 DESTROYER_*.md to lab/judges/. Reserved Gen3 mutation-103..114 / hybrid-18..19 / candidate-43 / reimpl-11. No second pin-v0.5, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
 - 2026-08-20 07:34 JST — Spawned those 16 with real subagent_ids (01a01c27-…). live=16. Next free mutation-115 / hybrid-20 / candidate-44 / reimpl-12. Jury 08:20; REPORT 08:40.
+- 2026-08-20 08:16 JST — Gen3 idle 10–31m, all Keep. live=0. Harvested 16. Reserved final jury judge-01..16 (Unix/Toolsmith/Heretic/Skeptic + 12 independent perspectives). No second pin-v0.5 / third ambit / fourth cinch / leftover-name / walker. REPORT at 08:40.

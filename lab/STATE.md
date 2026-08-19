@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 08:16 JST
+- Clock: 2026-08-20 08:18 JST
 - Phase: Final jury (08:20–08:40), then REPORT 08:40–09:00
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -108,22 +108,22 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | hybrid-19 | 01a01c27-4df0-7683-956b-a88d2215a6d4 | seed — peal seed is not first locator | done — hybrid-19__seed |
 | candidate-43 | 01a01c27-4df0-7683-956b-a89983a67baf | badge — maiden identity ≠ string id | done — candidate-43__badge |
 | reimpl-11 | 01a01c27-4df0-7683-956b-a8a24a7d1c61 | solder — weld from DESTROYER_WELD behavior | done — reimpl-11__solder |
-| judge-01 | (reserved 08:16 loop) | FINAL_UNIX | spawning |
-| judge-02 | (reserved 08:16 loop) | FINAL_TOOLSMITH | spawning |
-| judge-03 | (reserved 08:16 loop) | FINAL_HERETIC | spawning |
-| judge-04 | (reserved 08:16 loop) | FINAL_SKEPTIC | spawning |
-| judge-05 | (reserved 08:16 loop) | FINAL_EMPIRICIST | spawning |
-| judge-06 | (reserved 08:16 loop) | FINAL_COMPOSER | spawning |
-| judge-07 | (reserved 08:16 loop) | FINAL_TOMORROW | spawning |
-| judge-08 | (reserved 08:16 loop) | FINAL_KILL | spawning |
-| judge-09 | (reserved 08:16 loop) | FINAL_CONVERGE | spawning |
-| judge-10 | (reserved 08:16 loop) | FINAL_WEIRD | spawning |
-| judge-11 | (reserved 08:16 loop) | FINAL_VEHICLES | spawning |
-| judge-12 | (reserved 08:16 loop) | FINAL_GEN3 | spawning |
-| judge-13 | (reserved 08:16 loop) | FINAL_LINEAGE | spawning |
-| judge-14 | (reserved 08:16 loop) | FINAL_EXTINCT | spawning |
-| judge-15 | (reserved 08:16 loop) | FINAL_NOVELTY | spawning |
-| judge-16 | (reserved 08:16 loop) | FINAL_DISAGREE | spawning |
+| judge-01 | 01a01c4f-d862-7dc1-94b1-fc843d532b27 | FINAL_UNIX | running |
+| judge-02 | 01a01c4f-d862-7dc1-94b1-fc90d9711749 | FINAL_TOOLSMITH | running |
+| judge-03 | 01a01c4f-d862-7dc1-94b1-fca15281cf9d | FINAL_HERETIC | running |
+| judge-04 | 01a01c4f-d862-7dc1-94b1-fcb4dcee771b | FINAL_SKEPTIC | running |
+| judge-05 | 01a01c4f-d862-7dc1-94b1-fcc0e4d23122 | FINAL_EMPIRICIST | running |
+| judge-06 | 01a01c4f-d862-7dc1-94b1-fcdf8fce6b03 | FINAL_COMPOSER | running |
+| judge-07 | 01a01c4f-d862-7dc1-94b1-fce24f958494 | FINAL_TOMORROW | running |
+| judge-08 | 01a01c4f-d862-7dc1-94b1-fcfa2c13e72b | FINAL_KILL | running |
+| judge-09 | 01a01c4f-d862-7dc1-94b1-fd0db4f8d299 | FINAL_CONVERGE | running |
+| judge-10 | 01a01c4f-d862-7dc1-94b1-fd159bd9fcd7 | FINAL_WEIRD | running |
+| judge-11 | 01a01c4f-d862-7dc1-94b1-fd2b4cc72cfd | FINAL_VEHICLES | running |
+| judge-12 | 01a01c4f-d862-7dc1-94b1-fd3fb4fc5ae2 | FINAL_GEN3 | running |
+| judge-13 | 01a01c4f-d862-7dc1-94b1-fd43fc7546a0 | FINAL_LINEAGE | running |
+| judge-14 | 01a01c4f-d862-7dc1-94b1-fd50a1dc5d4d | FINAL_EXTINCT | running |
+| judge-15 | 01a01c4f-d862-7dc1-94b1-fd612afcfd1d | FINAL_NOVELTY | running |
+| judge-16 | 01a01c4f-d862-7dc1-94b1-fd7140c2a628 | FINAL_DISAGREE | running |
 
 Next free IDs: mutation-115, hybrid-20, candidate-44, reimpl-12, destroyer-27, judge-17.
 
@@ -156,3 +156,4 @@ lurch, holt, noun, preen, innard, shim, stile, shoal, rune, proxy, binom, hydra,
 - 2026-08-20 07:32 JST — Destroyer wave complete (all mutate). live=0. Harvested 16 DESTROYER_*.md to lab/judges/. Reserved Gen3 mutation-103..114 / hybrid-18..19 / candidate-43 / reimpl-11. No second pin-v0.5, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
 - 2026-08-20 07:34 JST — Spawned those 16 with real subagent_ids (01a01c27-…). live=16. Next free mutation-115 / hybrid-20 / candidate-44 / reimpl-12. Jury 08:20; REPORT 08:40.
 - 2026-08-20 08:16 JST — Gen3 idle 10–31m, all Keep. live=0. Harvested 16. Reserved final jury judge-01..16 (Unix/Toolsmith/Heretic/Skeptic + 12 independent perspectives). No second pin-v0.5 / third ambit / fourth cinch / leftover-name / walker. REPORT at 08:40.
+- 2026-08-20 08:18 JST — Spawned those 16 with real subagent_ids (01a01c4f-…). live=16. Next fire harvest FINAL_*.md then write EVOLUTION_REPORT.md at 08:40.

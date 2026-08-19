@@ -18,3 +18,4 @@
 - 2026-08-20 04:02 JST — candidate-37 `ply`: typed syntactic strata of a patch. Parent demo 15/15. Vacancy → mutation-50 docs-only CI gate.
 - 2026-08-20 04:05 JST — mutation-35 `ambit`: under as a file stream (`rg | ambit`). Parent demo 0. Vacancy → mutation-51 chime stream.
 - 2026-08-20 04:07 JST — reimpl-05 `roost` matches perch gold (sitbone holders, skills README ghost) and names merge origin. Parent demo 58/58. Vacancy → mutation-52 --follow.
+- 2026-08-20 04:08 JST — candidate-38 `plait`: suggestion composition algebra (COMMUTE/STACK/JAM). Parent demo 35/35. Converges with mutation-49. Vacancy → plait destroyer.

@@ -6,3 +6,4 @@
 - 2026-08-20 00:23 JST — 9/16 Gen-1 ships. New named tools: also (birth cohort), rift (clean-merge semantic conflicts). Harvested CANDIDATE.md into lab/lineages/. Spawned mutation-01..05 and candidate-17..20. Still 16 live workers.
 - 2026-08-20 00:25 JST — Parent re-ran demos: aka, unfmt-08, held, slip, reverb, haunt, deja, zanei, unfmt-13 all PASS. Empirical credibility of first ships is high.
 - 2026-08-20 00:31 JST — Original 16/16 Gen-1 complete. Parent demos also PASS for akin, also, rift, winnow. Mutation wave 2 (06–09) + candidates 21–23 spawned. 16 workers still live.
+- 2026-08-20 00:43 JST — mutation-02 `sluice` shipped (parent demo 40/40 PASS). Diversity wave names: sic, tell, flume, zure, nigh, cleave, folk, when, glean, pinch. Hybrid-01 (slip×unfmt) spawned into the vacancy.

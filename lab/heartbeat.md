@@ -20,3 +20,4 @@
 - 2026-08-20 04:07 JST — reimpl-05 `roost` matches perch gold (sitbone holders, skills README ghost) and names merge origin. Parent demo 58/58. Vacancy → mutation-52 --follow.
 - 2026-08-20 04:08 JST — candidate-38 `plait`: suggestion composition algebra (COMMUTE/STACK/JAM). Parent demo 35/35. Converges with mutation-49. Vacancy → plait destroyer.
 - 2026-08-20 04:09 JST — hybrid-11 `admit`: world+visa clearance, not hatch|visa. Parent demo 79/79. Vacancy → mutation-53 bound-only CI.
+- 2026-08-20 04:10 JST — candidate-39 `canto`: name-closed plot of a mixed commit. Parent demo 15/15. Vacancy → mutation-54 split-emit.

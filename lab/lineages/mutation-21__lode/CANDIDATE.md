@@ -60,7 +60,8 @@ PYTHON_BASIC_REPL
 PYTHON_GIL
 PYTHON_FROZEN_MODULES
 …
-# 276 --app names; PYTHONHOME still missing
+# 275 --app names; PYTHONHOME still missing (no underscore; help table)
+# ./demo.sh v0.1: 60/61 — rustc RUSTC_LOG false FAIL from grep -q SIGPIPE
 ```
 
 Synthetic host + `@rpath/libplugin.dylib`:
@@ -90,9 +91,37 @@ RUSTC_LOG
 
 `PATH`'s `rustc` is a rustup proxy and does not load the driver — pass the sysroot binary.
 
-### After the improvement
+### After the improvement (v0.2: help-table / `$VAR` / runtime-bare)
 
-(filled after the PYTHONHOME pass)
+Walking libpython was necessary and not sufficient. `PYTHONHOME` is not a NUL-terminated token and has no underscore, so `is_valid_env_token` dropped it. CPython spells it three ways:
+
+```
+PYTHONHOME      : alternate <prefix> directory …
+  PYTHONHOME = \x00
+Consider setting $PYTHONHOME to <prefix>[:<exec_prefix>]
+```
+
+v0.2 harvests those encodings and treats interpreter families (`PYTHONHOME`, `PERL5LIB`, `RUBYOPT`) as valid even without `_`. `--app` keeps them.
+
+```
+$ ./lode --names --app python3 | grep -E '^(PYTHONHOME|PYTHONPATH|PYTHONSTARTUP)$'
+PYTHONHOME
+PYTHONPATH
+PYTHONSTARTUP
+
+$ ./lode --dump-abi --app python3 | awk -F'\t' '$1=="PYTHONHOME"'
+PYTHONHOME  string  …/Python.framework/…/Python  cstring-assign
+```
+
+The stub is still empty (`--solo`). The name is sourced from the loaded image, which is the point.
+
+Demo `grep -q` on the 12k-name rustc harvest also lied: `grep -q` closes the pipe, `echo` gets SIGPIPE, `set -o pipefail` turns a hit into FAIL. Exact-line match is now a bash `[[ ]]` (`has_line`).
+
+```
+$ ./lode --names --app $REALC   # has_line RUSTC_LOG → PASS
+```
+
+`./demo.sh`: **64/64**.
 
 ## Dogfood targets
 
@@ -107,19 +136,20 @@ RUSTC_LOG
 
 - `/usr/lib/libSystem.B.dylib` is not a file on modern macOS (dyld shared cache). Treating unresolved `/usr/lib` and `/System` install names as `skip`, not `miss`, is load-bearing.
 - `GO_` as a prefix seed slices `CARGO_HOME` into `GO_HOME`. Prefix peel has to live with ancestor `PREFIX_SEEDS`.
-- `PYTHONHOME` is not a NUL-terminated cstring in libpython and has no underscore, so `is_valid_env_token` rejects it even after the walk. It sits in a help table (`PYTHONHOME      : alternate <prefix>`) and as `  PYTHONHOME = \x00`.
+- `PYTHONHOME` is not a NUL-terminated cstring in libpython and has no underscore. After the walk it still hid in `PYTHONHOME      :` and `  PYTHONHOME = \x00` until v0.2.
 - rustup's `~/.cargo/bin/rustc` is not rustc. Same class of miss as the python3 stub, one wrapper further out.
+- `grep -q` + `pipefail` + a 12k-name harvest is a false FAIL (SIGPIPE). The ABI was fine.
 
 ## Failures
 
-- `lode --app python3` still misses `PYTHONHOME` / `PYTHONPATH` (no underscore; help-table encoding). The walk found the *other* `PYTHON_*` names.
-- Image harvest still emits compiler tokens (`PYTHON_BASIC_REPLFN`). `--app` is not a proof.
+- Image harvest still emits compiler tokens (`PYTHON_BASIC_REPLFN`, `RUSTC_LOGU`). `--app` is not a proof.
 - Full harvest of `librustc_driver` (204MB) is ~19s even with prefix peel.
 - macOS `--vs-pid` still uses `ps eww`.
+- `JAVA` as a runtime prefix would accept `JAVASCRIPT` if it appeared as a token.
+- rustup/pyenv shims are still not followed.
 
 ## Suggested mutations
 
-- Extract help-table / `$VAR` / runtime-bare names (`PYTHONHOME`) from loaded images.
 - Follow rustup/pyenv shims to the real image set.
 - `--trace`: getenv interposer ∪ static ABI.
 - Live `/proc/pid/maps` + `dlopen` images.
@@ -127,4 +157,4 @@ RUSTC_LOG
 
 ## Kill / keep
 
-**Keep.** The ancestor's object was right; the image it asked was wrong. Walking the load list makes `lode python3` and `lode rustc` true columns. `PYTHONHOME` still hiding in a help table is the next hour, not a reason to kill.
+**Keep.** The ancestor's object was right; the image it asked was wrong. Walking the load list plus help-table/runtime-bare extraction makes `lode python3` print `PYTHONHOME` from libpython and `lode rustc` print `RUSTC_LOG` from `librustc_driver`. That is the missing Unix column.

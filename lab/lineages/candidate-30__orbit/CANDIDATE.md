@@ -39,9 +39,9 @@ Not leftover names. Not format inversion. Not `env`. Not `ldd`.
 
 ## Empirical transcript
 
-### v0.1 (this commit)
+### v0.1 (commit `776505a`)
 
-Selftest ok. `./demo.sh` 0.
+Selftest ok. `./demo.sh` 0 after `--env` for DYLD (see failure 5).
 
 PATH swap of two `tool` scripts is a different orbit (exit 1). Relative shebang `beta → gamma → python3` follows. Missing interpreter warns.
 
@@ -67,6 +67,33 @@ v0.1 failures (the improvement target):
 5. Prefixing `DYLD_PRINT_LIBRARIES=1 ./orbit` does not work: orbit's shebang is `/usr/bin/env`, a restricted binary. Had to `--env`. That is the primitive eating its own tail.
 6. `--path A:B` for `tool` replaced PATH, so `#!/usr/bin/env python3` became "not on PATH" and the payload stayed the script.
 
+### v0.2 (this commit) — one improvement from those failures
+
+The harvest was looking at the wrong image and calling the shared cache a broken link. Changes driven by the table above, not taste:
+
+- dyld shared-cache libs are `shared-cache`, not `MISSING`. Verdict no longer lies on python3/cargo/ls.
+- scan first-party dylibs + every hop (guise rustup, shebang scripts, payload). `PYTHONPATH` is `from=dylib:…/Python`. `RUSTUP_TOOLCHAIN` is `from=guise,rustup`. `ORBIT_FIXTURE_VAR` survives `beta→gamma→python3`.
+- env tokens must match a known prefix; explode glued `KIZU_*`/`XDG_*`; drop Mach-O `DATA_CONST` / `DYLD_BIND` / trailing `_`.
+- `--path` binds the *name* only; shebang `env python3` still uses the process PATH.
+- `pyvenv.cfg` only when present next to chosen or payload (`~/.venv/pyvenv.cfg` on a uv venv whose python is a symlink to a base interpreter).
+- invocation SIP is the first Mach-O the kernel loads (`/usr/bin/python3` shim, `/usr/bin/env` for `#!/usr/bin/env`), not the payload's codesign.
+
+After:
+
+| name | v0.1 lie | v0.2 |
+| --- | --- | --- |
+| python3 | libSystem MISSING; no PYTHONPATH | shared-cache 1, missing 0; `env.PYTHONPATH named from dylib:Python` |
+| /usr/bin/python3 | unrestricted payload | `RESTRICTED` + `proxy xcselect` + `DYLD_* stripped` |
+| cargo | 7 dylibs MISSING; JID9_ | shared-cache 7; `RUSTUP_TOOLCHAIN` named on rustup |
+| node stub vs /tmp copy | MISSING drowned in libSystem | cellar: libnode ok; copy: **MISSING @rpath/libnode.147.dylib** only |
+| kizu | one glued token | `KIZU_STATE_DIR` + `XDG_CONFIG_HOME` |
+| danbot venv | no cfg (followed the uv python) | `present ~/junks/danbot/.venv/pyvenv.cfg` |
+| `./orbit` itself | DYLD prefix stripped by `/usr/bin/env` | documented; `--env` is the overlay |
+
+`./demo.sh` 0. `./orbit --selftest` ok.
+
+Remaining noise: cargo still names ~240 `CARGO_*` (many are real crate-build env); git ~210 `GIT_*` (git's actual vocabulary, plus some macros). Prefix filter is the right shape; an allowlist would lie about unknown `KIZU_*`.
+
 ## Dogfood targets
 
 - `/opt/homebrew/bin/python3` vs `/usr/bin/python3`
@@ -75,6 +102,7 @@ v0.1 failures (the improvement target):
 - `/bin/ls` vs Homebrew `git`
 - `pip3`
 - `kizu` at `/Users/annenpolka/ghq/github.com/annenpolka/kizu/target/debug/kizu`
+- `/Users/annenpolka/junks/danbot/.venv/bin/python`
 - fixtures in `fixtures/`
 
 ## Surprises
@@ -86,7 +114,7 @@ v0.1 failures (the improvement target):
 
 ## Failures
 
-See v0.1 list above. The primitive is right; the harvest is looking at the wrong image and calling the shared cache a broken link.
+v0.1 list above, all addressed except "git/cargo name many PREFIX_* strings" (some macros remain). Scanning libnode (70MB) makes `orbit node` slower than `orbit python3`. Universal binaries still run `otool` once (now de-duped). Shell functions (`git` is a zsh wrapper here) are outside the binary orbit — PATH-binds `/opt/homebrew/bin/git`.
 
 ## Suggested mutations
 
@@ -97,4 +125,4 @@ See v0.1 list above. The primitive is right; the harvest is looking at the wrong
 
 ## Kill / keep
 
-**Keep.** The object (guise vs payload vs this-copy rpath vs SIP filter) is not `ldd` and not `env`. v0.1 is loud and wrong about shared-cache "missing" and named-env; that is a harvest bug, not a primitive bug.
+**Keep.** The object (guise vs payload vs this-copy rpath vs SIP filter) is not `ldd` and not `env`. v0.2 makes the harvest match the object.

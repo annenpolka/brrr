@@ -39,11 +39,13 @@ Load list of Homebrew python3 — the stub plus libpython, libc skipped:
 # skip  /usr/lib/libSystem.B.dylib
 ```
 
-The stub owes nothing; the image set owes `PYTHON_*`:
+The stub owes nothing; the image set owes `PYTHONHOME` (help table / `PYTHONHOME =` in libpython, no underscore):
 
 ```bash
 ./lode --names --app --solo python3    # empty
-./lode --names --app python3           # PYTHON_GIL, PYTHON_FROZEN_MODULES, …
+./lode --names --app python3           # PYTHONHOME, PYTHONPATH, PYTHON_GIL, …
+./lode --dump-abi --app python3 | grep PYTHONHOME
+# PYTHONHOME  string  …/Python  cstring-assign
 ```
 
 A rustc trampoline vs its driver dylib (`@rpath` resolved via `LC_RPATH`):

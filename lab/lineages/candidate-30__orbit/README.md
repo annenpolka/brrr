@@ -30,7 +30,7 @@ orbit --json node > /tmp/node.orbit
 orbit diff /tmp/node.orbit /tmp/copy.orbit
 ```
 
-`--path` changes how the *name* is bound. `--env KEY=VAL` overlays the world the image is scored against (empty VAL unsets). `--no-proxy` stops at the guise (do not follow rustup / xcselect / shebang).
+`--path` changes how the *name* is bound (shebang `env python3` still uses the process PATH). `--env KEY=VAL` overlays the world the image is scored against (empty VAL unsets). `--no-proxy` stops at the guise. `--no-scan-dylibs` skips libpython/libnode. Prefixing `DYLD_*=` on `./orbit` does nothing: the shebang is `/usr/bin/env`, which is SIP-restricted — use `--env` instead.
 
 ## Examples
 

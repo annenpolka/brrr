@@ -29,6 +29,14 @@ has() {
   [[ "$hay" == *"$needle"* ]]
 }
 
+# Exact name line. Do not `echo | grep -q` huge harvests: grep -q closes the
+# pipe, echo gets SIGPIPE, and `set -o pipefail` makes a hit look like failure.
+has_line() {
+  local needle="$1"
+  local hay="$2"
+  [[ "$hay" == "$needle" || "$hay" == "$needle"$'\n'* || "$hay" == *$'\n'"$needle" || "$hay" == *$'\n'"$needle"$'\n'* ]]
+}
+
 echo "== selftest =="
 if "$LODE" --selftest; then
   ok "selftest"
@@ -225,17 +233,17 @@ if cc -dynamiclib -o "$BUILD/libplugin.dylib" "$LOAD/plugin.c" -install_name @rp
   fi
   solo="$("$LODE" --names --app --solo "$BUILD/host")"
   walk="$("$LODE" --names --app "$BUILD/host")"
-  if echo "$solo" | grep -qx LODE_MAIN_ONLY; then
+  if has_line LODE_MAIN_ONLY "$solo"; then
     ok "solo host LODE_MAIN_ONLY"
   else
     bad "solo host LODE_MAIN_ONLY" "$solo"
   fi
-  if echo "$solo" | grep -qx LODE_PLUGIN_HOME; then
+  if has_line LODE_PLUGIN_HOME "$solo"; then
     bad "solo hides plugin name" "$solo"
   else
     ok "solo hides plugin name"
   fi
-  if echo "$walk" | grep -qx LODE_PLUGIN_HOME && echo "$walk" | grep -qx LODE_MAIN_ONLY; then
+  if has_line LODE_PLUGIN_HOME "$walk" && has_line LODE_MAIN_ONLY "$walk"; then
     ok "walk joins plugin getenv"
   else
     bad "walk joins plugin getenv" "$walk"
@@ -272,21 +280,26 @@ if [[ -n "$PY_BIN" ]]; then
     echo "  note  stub leaked: $psolo"
     ok "python3 stub --solo ran"
   fi
-  if echo "$pwalk" | grep -q '^PYTHON_'; then
+  if has "PYTHON_" "$pwalk"; then
     ok "python3 walk finds PYTHON_* in libpython"
   else
     bad "python3 walk finds PYTHON_* in libpython" "$pwalk"
   fi
-  if echo "$pwalk" | grep -qx PYTHON_GIL; then
+  if has_line PYTHON_GIL "$pwalk"; then
     ok "python3 PYTHON_GIL from libpython"
   else
     echo "  note  PYTHON_GIL absent; other PYTHON_* still count"
     ok "python3 walk harvested PYTHON family"
   fi
-  if echo "$pwalk" | grep -qx PYTHONHOME; then
-    ok "python3 PYTHONHOME"
+  if has_line PYTHONHOME "$pwalk"; then
+    ok "python3 PYTHONHOME from libpython"
   else
-    echo "  note  PYTHONHOME still missing (help-table / no underscore) — improve next"
+    bad "python3 PYTHONHOME from libpython" "$(echo "$pwalk" | grep PYTHON | head)"
+  fi
+  if has_line PYTHONPATH "$pwalk"; then
+    ok "python3 PYTHONPATH from libpython"
+  else
+    bad "python3 PYTHONPATH from libpython" "$(echo "$pwalk" | grep PYTHON | head)"
   fi
   pabi="$("$LODE" --dump-abi --app "$PY_BIN" || true)"
   if echo "$pabi" | awk -F'\t' '$1 ~ /^PYTHON_/ && $3 ~ /Python|libpython/ {found=1} END{exit !found}'; then
@@ -311,19 +324,19 @@ if command -v rustc >/dev/null 2>&1; then
       bad "rustc @rpath resolves librustc_driver" "$rimg"
     fi
     rsolo="$("$LODE" --names --app --solo "$REALC" || true)"
-    if echo "$rsolo" | grep -qx RUSTC_LOG; then
+    if has_line RUSTC_LOG "$rsolo"; then
       bad "rustc stub --solo has RUSTC_LOG" "$rsolo"
     else
       ok "rustc stub --solo hides RUSTC_LOG"
     fi
     rwalk="$("$LODE" --names --app "$REALC" || true)"
-    echo "  note  rustc walk names: $(echo "$rwalk" | grep -c . || true)"
-    if echo "$rwalk" | grep -qx RUSTC_LOG; then
+    echo "  note  rustc walk names: $(printf '%s\n' "$rwalk" | grep -c . || true)"
+    if has_line RUSTC_LOG "$rwalk"; then
       ok "rustc walk RUSTC_LOG from driver"
     else
-      bad "rustc walk RUSTC_LOG from driver" "$(echo "$rwalk" | grep RUSTC_ | head)"
+      bad "rustc walk RUSTC_LOG from driver" "$(printf '%s\n' "$rwalk" | grep RUSTC_ | head)"
     fi
-    if echo "$rwalk" | grep -qx RUSTC_BOOTSTRAP; then
+    if has_line RUSTC_BOOTSTRAP "$rwalk"; then
       ok "rustc walk RUSTC_BOOTSTRAP"
     else
       echo "  note  RUSTC_BOOTSTRAP absent"

@@ -1,33 +1,64 @@
-# brrr — Overnight Developer Tool Evolution Lab
+# yoke
 
-Autonomous overnight search for developer tools that do not meaningfully exist yet.
+Join spec clauses to generated witnesses and print the slack.
 
-Experiment window: **2026-08-19 23:45 JST → 2026-08-20 09:00 JST**.
+`just spec-check` answers a boolean: *if I regenerated right now, would committed artifacts move?* That is file-level, expensive, and silent about *which clause* drifted. yoke answers the missing question-word:
 
-Coordinator stays in the parent workspace. Candidates live in isolated git worktrees. Do not merge a candidate into `main` unless a later generation explicitly promotes it.
+> for each stable clause id, is the generated projection taut, slack, hand, split, or riven?
 
-## Layout
+It does **not** run Pkl or the generator. The join key is the clause id (`EPF-001`, `FLT-001`, `BEM-001`).
 
-- `Overnight Developer Tool Evolution Lab — Master Prompt.md` — the night's constitution
-- `lab/STATE.md` — live experiment board (generation, workers, decisions)
-- `lab/PROTOCOL.md` — how candidates report, how judges score
-- `lab/heartbeat.md` — heartbeat log
-- `lab/lineages/` — collected candidate reports copied out of worktrees
-- `EVOLUTION_REPORT.md` — written in the last twenty minutes
+## Install / run
 
-## Phases (JST)
+Python 3.10+, `git` on `PATH`. No other dependencies.
 
-| Window | Generation |
+```bash
+chmod +x ./yoke
+./yoke --help
+./demo.sh
+```
+
+Exit `0` if every clause is taut, `1` if any slack/hand/split/riven remains, `2` on tool error.
+
+## Examples
+
+**1. Is this worktree's generated tree still heeling to specs/ ?**
+
+```bash
+./yoke -C ~/src/tenaoshi
+# yoke  spec=:  gen=:  clauses=74  taut=74 slack=0 hand=0 split=0 riven=0
+```
+
+**2. Spec moved. Generated did not. (or the other way.)**
+
+```bash
+# committed spec vs dirty generated
+./yoke -C ~/src/tenaoshi --spec HEAD --gen :
+# slack CTR-001  … spec clause has no generated witness
+# hand  EPF-001  … generated id has no spec parent
+
+# which clauses the spec edit actually moved, and which generated files cite them
+./yoke -C ~/src/tenaoshi --punch HEAD
+# removed   CTR-001
+# added     EPF-001   specs/tenaoshi.pkl:27  →  docs/SPEC.md:19, contracts/testcases/EPF-001.json:1
+```
+
+**3. Pipe it.**
+
+```bash
+./yoke -C ~/src/voidtrace HEAD --json | jq '.counts'
+./yoke -C ~/src/relico --only slack,hand,split,riven --tsv
+./yoke -C ~/src/voidtrace --files   # file-level leash from @generated banners
+```
+
+`--spec` / `--gen` take a git ref or `:` (worktree, including untracked). `yoke HEAD` means both sides at HEAD.
+
+## Verdicts
+
+| verdict | meaning |
 | --- | --- |
-| 23:45–01:15 | Gen 1 Cambrian explosion |
-| 01:15–03:00 | Gen 1 development / dogfood |
-| 03:00–04:00 | First selection (independent judges) |
-| 04:00–06:30 | Gen 2 mutations, hybrids, reimplementations |
-| 06:30–07:30 | Adversarial destroyers |
-| 07:30–08:20 | Gen 3 exploitation |
-| 08:20–08:40 | Final jury |
-| 08:40–09:00 | Preservation + `EVOLUTION_REPORT.md` |
-
-## Rule
-
-Until 09:00 JST, a finished worker is a vacancy. Fill it.
+| taut | spec and generated witnesses agree (narrower projections allowed) |
+| slack | spec is ahead: generated missing or older body |
+| hand | generated has no live spec parent |
+| split | some witnesses match spec, others drifted (partial regen) |
+| riven | conflict markers on a spec or generated witness |

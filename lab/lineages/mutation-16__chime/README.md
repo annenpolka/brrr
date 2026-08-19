@@ -64,7 +64,7 @@ Line 8 is the fallthrough of `if user is None: return`. Every later arm — lock
 | `--json` | NDJSON records |
 | `--group` | cluster `same` vs `deeper` |
 | `--exact` | identical stacks only |
-| `--braces` | keep `{` / `}` / blank lines (dropped by default) |
+| `--braces` | keep `{` / `}` / blank / eval-header lines (dropped by default) |
 | `--others` | omit the seed line |
 | `--same-as FILE:LINE` | seed alias |
 

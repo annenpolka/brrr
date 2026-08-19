@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 06:00 JST
+- Clock: 2026-08-20 06:02 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -60,22 +60,22 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | hybrid-15 | 01a01bad-eb91-7d80-9aa0-10ff54c76990 | brand — gage×mint visa-birth lockset | done — hybrid-15__brand |
 | candidate-41 | 01a01bad-eb91-7d80-9aa0-1108ac34ccbe | beck — first pipeline stage that produced this byte | done — candidate-41__beck |
 | reimpl-09 | 01a01bad-eb91-7d80-9aa0-111c7624da18 | prove — xref rebuilt from DESTROYER_ASSAY | done — reimpl-09__prove |
-| mutation-91 | (reserved 06:00 loop) | caulk — rime --complete truncated refuse | spawning |
-| mutation-92 | (reserved 06:00 loop) | wad — inlined Rust env::var via CString | spawning |
-| mutation-93 | (reserved 06:00 loop) | flare — log/SARIF → publishDiagnostics | spawning |
-| mutation-94 | (reserved 06:00 loop) | pup — ditto\|crib occupancy without sh | spawning |
-| mutation-95 | (reserved 06:00 loop) | seat — loam into existing XCTestCase | spawning |
-| mutation-96 | (reserved 06:00 loop) | facet — beck JSON field-cover | spawning |
-| mutation-97 | (reserved 06:00 loop) | quire — hank multi-file COMMUTE emit | spawning |
-| mutation-98 | (reserved 06:00 loop) | unsay — aloud --emit ALOUD→TACIT | spawning |
-| mutation-99 | (reserved 06:00 loop) | tally — woof --chg fence numbers only | spawning |
-| mutation-100 | (reserved 06:00 loop) | dirge — neap sibling-arm obituary | spawning |
-| mutation-101 | (reserved 06:00 loop) | sear — brand --follow slot identity | spawning |
-| mutation-102 | (reserved 06:00 loop) | onset — troth held of actual-bound | spawning |
-| hybrid-16 | (reserved 06:00 loop) | writ — troth×alibi locked expected vs actual | spawning |
-| hybrid-17 | (reserved 06:00 loop) | kit — copy+edit --code grain | spawning |
-| candidate-42 | (reserved 06:00 loop) | maiden — tests that have never been red | spawning |
-| reimpl-10 | (reserved 06:00 loop) | cleat — leftover-relative import from PIN_V5 | spawning |
+| mutation-91 | 01a01bd4-9291-7c63-9bf2-7d3b674d9299 | caulk — rime --complete truncated refuse | running |
+| mutation-92 | 01a01bd4-9291-7c63-9bf2-7d435f6c516d | wad — inlined Rust env::var via CString | running |
+| mutation-93 | 01a01bd4-9291-7c63-9bf2-7d526becaac9 | flare — log/SARIF → publishDiagnostics | running |
+| mutation-94 | 01a01bd4-9291-7c63-9bf2-7d6941774390 | pup — ditto\|crib occupancy without sh | running |
+| mutation-95 | 01a01bd4-9291-7c63-9bf2-7d75d4b8dcbb | seat — loam into existing XCTestCase | running |
+| mutation-96 | 01a01bd4-9291-7c63-9bf2-7d8a55cd1699 | facet — beck JSON field-cover | running |
+| mutation-97 | 01a01bd4-9291-7c63-9bf2-7d97e1cbfdad | quire — hank multi-file COMMUTE emit | running |
+| mutation-98 | 01a01bd4-9291-7c63-9bf2-7dafa2d8c0b3 | unsay — aloud --emit ALOUD→TACIT | running |
+| mutation-99 | 01a01bd4-9291-7c63-9bf2-7db4d4bb2bf3 | tally — woof --chg fence numbers only | running |
+| mutation-100 | 01a01bd4-9291-7c63-9bf2-7dcc60155bd9 | dirge — neap sibling-arm obituary | running |
+| mutation-101 | 01a01bd4-9291-7c63-9bf2-7dde88d57660 | sear — brand --follow slot identity | running |
+| mutation-102 | 01a01bd4-9291-7c63-9bf2-7de3116f0063 | onset — troth held of actual-bound | running |
+| hybrid-16 | 01a01bd4-9291-7c63-9bf2-7df33e3684b1 | writ — troth×alibi locked expected vs actual | running |
+| hybrid-17 | 01a01bd4-9291-7c63-9bf2-7e0eed87952d | kit — copy+edit --code grain | running |
+| candidate-42 | 01a01bd4-9291-7c63-9bf2-7e115d7932c1 | maiden — tests that have never been red | running |
+| reimpl-10 | 01a01bd4-9291-7c63-9bf2-7e22b5f4b733 | cleat — leftover-relative import from PIN_V5 | running |
 
 Next free IDs: mutation-103, hybrid-18, candidate-43, reimpl-11.
 
@@ -102,3 +102,4 @@ rime, helm, tinder, lash, blot, crib, loam, weir, hank, aloud, troth, woof, neap
 - 2026-08-20 05:16 JST — Loop fire: all 04:32 in-flight workers idle with complete CANDIDATE+demo (mtime ≤ 05:02). live=0. Harvested 11 by tool name. Reserved mutation-79..90 / hybrid-14..15 / candidate-41 / reimpl-09. No second pin-v0.5 destroyer, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
 - 2026-08-20 05:18 JST — Spawned those 16 with real subagent_ids (01a01bad-…). live=16. Next free mutation-91 / hybrid-16 / candidate-42 / reimpl-10.
 - 2026-08-20 06:00 JST — 05:18 wave idle with complete CANDIDATE+demo. live=0. Harvested 16 by tool name. Reserved mutation-91..102 / hybrid-16..17 / candidate-42 / reimpl-10. Still Gen2 (destroyers at 06:30). No second pin-v0.5 destroyer, no third ambit, no fourth cinch, no leftover-name, no inverse-printf walker.
+- 2026-08-20 06:02 JST — Spawned those 16 with real subagent_ids (01a01bd4-…). live=16. Next free mutation-103 / hybrid-18 / candidate-43 / reimpl-11. Next loop ~06:15 still Gen2; 06:30 dedicated destroyers.

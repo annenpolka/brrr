@@ -62,6 +62,8 @@ end: interrupted  TARGET STILL ALIVE
 
 The linger process is still running. cling dumps open files and residue so far. Use `cling snapshot PID` when you do not want to wait at all.
 
+A wrapper that `exec`s is followed: the report's `command` / `execs` list the last live image (hold.py → `cargo test`), and leftovers come from the last `lsof` taken *while the pid still existed*.
+
 ## Flags (attach)
 
 | flag | what |

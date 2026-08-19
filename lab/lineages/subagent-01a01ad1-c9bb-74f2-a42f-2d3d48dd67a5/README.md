@@ -1,33 +1,47 @@
-# brrr — Overnight Developer Tool Evolution Lab
+# pin
 
-Autonomous overnight search for developer tools that do not meaningfully exist yet.
+Mint a durable fingerprint address from a `file:line` once; resolve it onto any later tree. The stored object is the pin, not a locator string.
 
-Experiment window: **2026-08-19 23:45 JST → 2026-08-20 09:00 JST**.
+## Install / run
 
-Coordinator stays in the parent workspace. Candidates live in isolated git worktrees. Do not merge a candidate into `main` unless a later generation explicitly promotes it.
+```bash
+chmod +x ./pin
+./pin --help
+./demo.sh
+```
 
-## Layout
+Requires Python 3. `git` is optional when both `--from-dir` and `--to-dir` are set.
 
-- `Overnight Developer Tool Evolution Lab — Master Prompt.md` — the night's constitution
-- `lab/STATE.md` — live experiment board (generation, workers, decisions)
-- `lab/PROTOCOL.md` — how candidates report, how judges score
-- `lab/heartbeat.md` — heartbeat log
-- `lab/lineages/` — collected candidate reports copied out of worktrees
-- `EVOLUTION_REPORT.md` — written in the last twenty minutes
+## Interaction
 
-## Phases (JST)
+```
+pin mint  [--from <ref> | --from-dir DIR] path:line     # once
+pin resolve [--to <ref> | --to-dir DIR] pin1.…          # any later tree
+pin show pin1.…
+```
 
-| Window | Generation |
-| --- | --- |
-| 23:45–01:15 | Gen 1 Cambrian explosion |
-| 01:15–03:00 | Gen 1 development / dogfood |
-| 03:00–04:00 | First selection (independent judges) |
-| 04:00–06:30 | Gen 2 mutations, hybrids, reimplementations |
-| 06:30–07:30 | Adversarial destroyers |
-| 07:30–08:20 | Gen 3 exploitation |
-| 08:20–08:40 | Final jury |
-| 08:40–09:00 | Preservation + `EVOLUTION_REPORT.md` |
+`pin resolve` refuses `path:line`. That is the point.
 
-## Rule
+## Examples
 
-Until 09:00 JST, a finished worker is a vacancy. Fill it.
+Mint the line a review comment would have cited, store the token, throw away the SHA:
+
+```bash
+./pin mint --repo ~/src/kizu --from b4e6a5d src/app.rs:529
+# pin1.eJytU01v...
+```
+
+Later, on today's tree, no path, no line, no SHA of origin:
+
+```bash
+./pin resolve --repo ~/src/kizu --to HEAD pin1.eJytU01v...
+# src/app.rs:529  →  src/app/layout.rs:17   moved   0.93
+```
+
+A pinfile of review bookmarks that survive a godfile split:
+
+```bash
+./pin mint --repo ~/src/kizu --from b4e6a5d --file review.pins --name seen src/app.rs:529
+./pin resolve --repo ~/src/kizu --file review.pins
+# seen  src/app.rs:529  →  src/app/layout.rs:17
+```

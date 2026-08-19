@@ -42,13 +42,13 @@ clutch  specs/main.pkl  …  die=sha256:bbbb…  SPLIT
 not the same generation.
 
 ```bash
-./clutch -C ~/ghq/github.com/annenpolka/voidtrace docs/generated packages/spec-artifacts
+./clutch -C ~/ghq/github.com/annenpolka/voidtrace
 ```
 
-`docs/generated/AI_UX.md` cites the same parent as `SPEC.md` but its last
-commit is 28 parent-moves behind. The file still says it was generated from
-`specs/main.pkl`. The lot is ragged; `spec-check` may still be green because
-the generator emits identical bytes.
+One clutch, parent `specs/main.pkl`, **RAGGED ages 0–28**. `SPEC.md` is on
+the current die; `AI_UX.md` has not been rewritten in 28 spec commits.
+`spec-check` can still be green (the generator emits identical bytes). The
+lot is not.
 
 **3. Relico oracles as a clutch.** `docs/SPEC.md` was re-laid with the spec;
 `oracles_generated.rs` lagged one parent commit; the TS unit/e2e oracles

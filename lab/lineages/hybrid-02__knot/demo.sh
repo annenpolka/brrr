@@ -104,13 +104,21 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 kinds = {e["kind"] for e in r.get("conversation") or []}
 via = r.get("knot", {}).get("via") or []
+stage0 = (r.get("stages") or [{}])[0].get("pid")
+knot_pid = (r.get("knot") or {}).get("pid")
 print("  kinds", sorted(kinds))
 print("  via  ", via)
 print("  knot ", r.get("knot", {}).get("comm"), r.get("knot", {}).get("cmd"))
+print("  pids stage0", stage0, "knot", knot_pid)
 assert "pipe-empty" in kinds or "pipe-read" in kinds, kinds
-# The joint object: conversation spans a pipe AND a child-wait.
-assert "child-wait" in kinds or "child-wait" in via, (kinds, via, r.get("knot"))
-print("ok   joint conversation spans pipe + child-wait")
+assert "child-wait" in kinds or "child-wait" in via or any(
+    "child-wait" in str((e or {}).get("detail") or "") for e in r.get("conversation") or []
+), (kinds, via, r.get("knot"))
+# Synthesis: knot is the inner writer, not the pipeline-stage parent.
+assert knot_pid and stage0 and knot_pid != stage0, (stage0, knot_pid, r.get("knot"))
+cmd = (r.get("knot") or {}).get("cmd") or ""
+assert "hidden_producer" in cmd or "[child]" in cmd or "Python" in cmd, cmd
+print("ok   joint knot is inner writer, conversation spans pipe + child-wait")
 PY
 echo
 
@@ -144,8 +152,8 @@ echo
 
 echo "-- 10. human report (cpu middle)"
 python3 "$KNOT" --label 0=fast_producer --label 1=cpu_stage --label 2=fast_consumer \
-  -- python3 "$ROOT/fixtures/fast_producer.py" 65536 \
-  + python3 "$ROOT/fixtures/cpu_stage.py" 8000 \
+  -- python3 "$ROOT/fixtures/fast_producer.py" 1048576 \
+  + python3 "$ROOT/fixtures/cpu_stage.py" 25000 \
   + python3 "$ROOT/fixtures/fast_consumer.py" \
   >"$TMP/cpu.human.out"
 echo

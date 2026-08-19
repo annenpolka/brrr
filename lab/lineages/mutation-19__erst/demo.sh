@@ -156,6 +156,11 @@ if [ -d "$SITBONE/.git" ]; then
     || fail "sitbone PresenceArbiter: expected 0.4 or threshold↔presentThreshold"
   grep -F 'PresenceArbiter' "$FIX/sitbone-pa.txt" >/dev/null \
     || fail "sitbone: expected PresenceArbiter in report"
+  grep -F 'threshold↔presentThreshold' "$FIX/sitbone-pa.txt" >/dev/null \
+    || fail "sitbone: expected threshold↔presentThreshold natal pair"
+  if grep -F 'SiteObserver.swift' "$FIX/sitbone-pa.txt" >/dev/null; then
+    fail "sitbone: SiteObserver.threshold=0.7 is a different domain"
+  fi
   pass "sitbone e9b0f75 PresenceArbiter (hysteresis + ident natal keys)"
 
   "$ERST" --no-color -C "$SITBONE" 1fcdec6 | tee "$FIX/sitbone-t1.txt"
@@ -164,6 +169,11 @@ if [ -d "$SITBONE/.git" ]; then
     || fail "sitbone 1fcdec6: expected t1↔driftDelay leftovers"
   grep -E 'SPEC.md|README.md|CLAUDE.md|FocusStateMachine' "$FIX/sitbone-t1.txt" >/dev/null \
     || fail "sitbone 1fcdec6: expected leftover T1 in docs/tests"
+  grep -F 't1↔driftDelay' "$FIX/sitbone-t1.txt" >/dev/null \
+    || fail "sitbone 1fcdec6: expected t1↔driftDelay pair"
+  if grep -E 'counters↔updatedCounters|radius↔cornerRadius|window↔focusedWindow' "$FIX/sitbone-t1.txt" >/dev/null; then
+    fail "sitbone 1fcdec6: local lint renames should not be natal pairs"
+  fi
   pass "sitbone 1fcdec6 (t1→driftDelay, leftover T1 kin)"
 else
   echo "demo skip: sitbone not present"

@@ -193,9 +193,11 @@ out = sys.argv[2]
 held = os.path.join(out, "held.txt")
 assert os.path.exists(held)
 paths = [x["path"] for x in r.get("open_leftovers") or []]
-attach_paths = [x["path"] for x in (r.get("open_at_attach") or {}).get("files") or []]
-assert any(p.endswith("held.txt") for p in paths) or any(p.endswith("held.txt") for p in attach_paths), (
-    r.get("open_leftovers"), r.get("open_at_attach")
+assert any(p.endswith("held.txt") for p in paths), (
+    "expected last-live open leftover",
+    r.get("open_leftovers"),
+    r.get("open_last"),
+    r.get("lsof_samples"),
 )
 print("open leftovers", len(r.get("open_leftovers") or []), "attach_open", (r.get("open_at_attach") or {}).get("count"))
 PY
@@ -251,8 +253,6 @@ cleanup_pid "$LINGER"
 
 echo "== missing pid is a hard error =="
 set +e
-"$CLING" attach --quiet 1 2>"$WORK/missing.err"
-# pid 1 exists on macOS; use a surely-dead pid
 "$CLING" attach --quiet 9999999 2>"$WORK/missing.err"
 MRC=$?
 set -e
@@ -284,8 +284,11 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 print(f"  kizu attach end={r['end_reason']} duration={r['duration_ms']}ms waitpid={r['waitpid_ms']}ms settle={r['settle_ms']}ms")
 print(f"  leaked={len(r['leaked_processes'])} late={len(r['late_writes'])} git+={len(r['git_residue']['introduced'])} tmp={len(r['tmp_residue'])} alive={r['target_alive']}")
+print(f"  command={str(r.get('command'))[:80]!r} execs={len(r.get('execs') or [])}")
 assert r["end_reason"] in {"exited", "gone", "group-empty"}
 assert r["target_alive"] is False
+cmd = r.get("command") or ""
+assert "cargo" in cmd, ("exec not followed; still the hold wrapper", cmd, r.get("execs"))
 PY
     pass "kizu cargo test attach"
   fi

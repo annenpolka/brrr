@@ -96,9 +96,43 @@ Dogfood, first pass:
 `SPEC.md` but no `source` field, so it sat in a MUTE clutch of one instead
 of joining `specs/main.pkl`.
 
-### After the improvement
+### After the improvement (v0.2, this commit)
 
-(filled in after the first real-usage patch)
+Changes, all forced by the first dogfood:
+
+1. **Banner-first + skip list.** A file is a receipt only if the first lines
+   claim *this file* was generated (`Generated from`, `@generated`,
+   `生成物 —`, `automatically @generated`), or the name is `*.generated.*` /
+   `OraclesGenerated.swift`, or JSON carries `sourceFingerprint`. `justfile`,
+   `AGENTS.md`, `spec-gen.ts`, `.gitignore` are never receipts. Parents with
+   globs or `、` are rejected.
+2. **Skip `.pnpm-store`, `_build`, `wdio-logs`.**
+3. **Stamp-join.** A stamp-only JSON file inherits the parent of a sibling
+   that carries the same die.
+4. **`GENERATED.md` directory map.** `Source: specs/main.pkl` attaches
+   `*.generated.*` under that package.
+5. **Dirty parent is a clutch flag, not a member STALE.** Age-0 + dirty
+   parent + clean artifact = `NOW`. Age>0 stays `COLD`. The 0-vs-28 rag is
+   visible while a spec-gen is in flight.
+
+Re-runs:
+
+- **voidtrace whole tree** (no path filter): **one clutch**, 14 files,
+  `specs/main.pkl`, die `sha256:a859a559…` (IR currency), **RAGGED ages
+  0–28**, `parent=dirty`. `capabilities.generated.json` and
+  `engine.generated.json` **joined by stamp**. `GENERATED.md` joined as
+  COLD 26. `AI_UX.md` COLD 28. `CONTRACTS.md` / `schema-index.generated.ts`
+  COLD 2. Zero `.pnpm-store` hits. This is the cheap `spec-check`: the lot
+  is ragged without regenerating anything.
+- **tenaoshi**: 3 files, all FRESH age 0 on `specs/tenaoshi.pkl`. Exit 0.
+  justfile / AGENTS.md / spec-gen.ts gone.
+- **relico**: 5 files, **RAGGED 0–4**. SPEC.md + renderer oracles FRESH;
+  `oracles_generated.rs` COLD 1; unit/e2e oracles COLD 4. The forgotten
+  regen is the object. No wdio-logs, no justfile orphan.
+- **kizu --locks**: Cargo.lock FRESH. **sitbone / skills**: no receipts
+  (honest empty). **koyomi**: MUTE filename-only corpora; `_build` skipped.
+
+`./demo.sh`  covers selftest + fixture + these dogfood assertions.
 
 ## Dogfood targets
 
@@ -123,12 +157,16 @@ of joining `specs/main.pkl`.
 
 ## Failures
 
-- Default walk of voidtrace is unusable because `.pnpm-store` files say
-  "generated".
-- Prose files (justfile, AGENTS.md, spec-gen.ts, ARCHITECTURE.md, .gitignore)
-  match generation vocabulary without being receipts.
-- Stamp-only JSON manifests do not join the clutch they belong to.
-- `GENERATED.md` already names the parent of a whole package and is ignored.
+- v0.1 default walk of voidtrace drowned in `.pnpm-store`. Fixed in v0.2.
+- v0.1 prose files (justfile, AGENTS.md, spec-gen.ts) matched generation
+  vocabulary. Fixed in v0.2.
+- VoidTrace JSON schemas (`*.schema.json`) are generated but carry no
+  receipt and are not named `*.generated.*`, so they still sit outside the
+  clutch. `GENERATED.md` inherit only attaches files already detected.
+- tenaoshi `contracts/testcases/*.json` are generated (listed in spec-gen.ts)
+  with no colophon. Mute. Would need recipe-output mining.
+- koyomi corpora are named `*_generated.mbt` with no cited parent, so MUTE.
+- sitbone has no generated testimony at all.
 
 ## Suggested mutations
 

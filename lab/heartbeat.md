@@ -51,3 +51,4 @@
 - 2026-08-20 04:43 JST — DESTROYER_WEFT collected (already on main). Keep. Gold mixed-line still FAIL number. Next holes: `--only docs` is `docs/**` not prose files; CJK idents are `text` (free on code); fences swallow numbers; rename/binary occupancy. `--forbid number` already in flight. No spawn.
 - 2026-08-20 04:44 JST — mutation-61 `snag` (book 72): weft invert, `--forbid number` tripwire. Parent demo 35/35. Comment-interior `30→60` is weft OK / snag TRIP after peel. Keep. No spawn.
 - 2026-08-20 04:44 JST — LOCKSET_TOCK: still carry **cinch 0.3**. tock ties honesty, does not unseat. Critic did not re-run isolation.
+- 2026-08-20 04:45 JST — mutation-62 `scree` (book 73): largest unlocked production (chaff as object). Parent demo 0. v0.2 timeout is unknown, not slack. Keep as invert transcript; cinch 0.3 stays the lockset vehicle. No spawn.

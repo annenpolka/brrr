@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 04:55 JST
+- Clock: 2026-08-20 04:56 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (prompt now: harvest-only if live ≥ 12; IDs start at mutation-79)
@@ -27,7 +27,7 @@ Killed as exact duplicates: second pin-v0.5 destroyer `cbb7330b2f94`; parent ass
 | mutation-74 | 01a01b83-58ff-7043-bd7c-ca9de8268f23 | mint — visa-birth (CANDIDATE mutation-63) | done — mutation-63__mint |
 | reimpl-08 | 01a01b83-58ff-7043-bd7c-caabddbe949e | scarp from behavior | running |
 | hybrid-13 | 01a01b83-58ff-7043-bd7c-cab44ea3ccc2 | gage — lockset clearance (CANDIDATE hybrid-12) | done — hybrid-12__gage |
-| candidate-40 | 01a01b83-5900-7902-9188-72c70d715bf7 | new object | running |
+| candidate-40 | 01a01b83-5900-7902-9188-72c70d715bf7 | tacit — omitted vs restated default | done — candidate-40__tacit |
 | mutation-59 | 01a01b85-3a6f-77f2-a6bf-caff208a0972 | weld — concat starts at expr | running |
 | mutation-60 | 01a01b85-3a6f-77f2-a6bf-cb0da2df3d3e | keel — pin origin ≠ root SHAs | running |
 | mutation-61 | 01a01b85-3a6f-77f2-a6bf-cb18bdfdf84b | liken — graft --same-as invert | running |

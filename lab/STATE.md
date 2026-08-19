@@ -2,7 +2,7 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 04:36 JST
+- Clock: 2026-08-20 04:38 JST
 - Phase: Generation 2 — breeding Unix vehicles (until 06:30), then dedicated destroyers
 - Parent role: coordinator only
 - Heartbeat scheduler: `01a01b54e731` every 15m (prompt now: harvest-only if live ≥ 12; IDs start at mutation-79)

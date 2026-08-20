@@ -1,0 +1,2395 @@
+#!/usr/bin/env python3
+"""lodge — occupancy of mixed image-claims (git range + review stream).
+
+sate occupies a unified diff. plea occupies a review-suggestion stream.
+Concatenating them is two reports and two vocabularies (TAKEN/OPEN vs
+APPLIED/PENDING). lodge ingests both as the same object: a before→after
+image claim. Cross-origin equal cores fuse into one occupancy (via=both).
+One status vocabulary: APPLIED / PENDING / MIXED / DUPLEX / SUPERSEDED.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterator
+
+VERSION = "0.2.0"  # 0.1 exact-core fuse; 0.2 range path-rewrite + subset via=both
+
+FATES = ("APPLIED", "PENDING", "MIXED", "DUPLEX", "SUPERSEDED")
+SKIP_FATES = ("SKIP", "BINARY", "EMPTY", "NOFILE")
+VIA = ("hunk", "plea", "both")
+
+EXIT_APPLIED = 0
+EXIT_PENDING = 1
+EXIT_SPLIT = 2
+EXIT_ERROR = 3
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+GENERIC_RE = re.compile(
+    r"^[\s{}\[\]().,:;]*$"
+    r"|^\s*(else:?|end|pass|break|continue|return|fi|then|do|done|"
+    r"end\.?|\);?|//|/\*|\*/|#)\s*$",
+    re.I,
+)
+PATH_LINE_RE = re.compile(
+    r"^(?:(?:path|file|filename)\s*:\s*)?+"
+    r"(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?\s*$"
+)
+HEADING_PATH_RE = re.compile(
+    r"^#{1,6}\s+`?(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)`?"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?"
+)
+HTML_PATH_RE = re.compile(
+    r"""<!--\s*(?:filepath|path|file)\s*:\s*([^\s>]+)""",
+    re.I,
+)
+IN_TICK_PATH_RE = re.compile(
+    r"""(?:commented on|in)\s+`([^`]+\.[A-Za-z0-9+]+)`""",
+    re.I,
+)
+
+Norm = Callable[[str], str]
+FUZZ_RATIO = 0.85
+
+
+# ---------------------------------------------------------------------------
+# claims
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Claim:
+    id: str
+    path: str
+    before: list[str]
+    after: list[str]
+    minus: list[str] = field(default_factory=list)
+    plus: list[str] = field(default_factory=list)
+    origin: str = "plea"  # hunk | plea | both
+    file_kind: str = "modify"  # modify | create | delete | rename
+    side: str = "RIGHT"
+    start: int | None = None
+    end: int | None = None
+    commit_id: str | None = None
+    original_commit_id: str | None = None
+    in_reply_to: str | None = None
+    body: str = ""
+    recon: str = ""
+    source: str = ""
+    header: str = ""
+    witnesses: list[str] = field(default_factory=list)
+    covers: list[str] = field(default_factory=list)
+    tagged: list[tuple[str, str]] = field(default_factory=list)
+    old_path: str = ""
+    moved_from: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.witnesses:
+            self.witnesses = [self.id]
+
+
+@dataclass
+class Verdict:
+    fate: str
+    path: str
+    claim: str
+    method: str
+    via: str = "plea"
+    header: str = ""
+    file_kind: str = "modify"
+    before_hits: int = 0
+    after_hits: int = 0
+    near_before: float = 0.0
+    near_after: float = 0.0
+    near_line: int | None = None
+    note: str = ""
+    collide: list[str] = field(default_factory=list)
+    echo: list[str] = field(default_factory=list)
+    covers: list[str] = field(default_factory=list)
+    witnesses: list[str] = field(default_factory=list)
+    sandwich: str | None = None
+    recon: str = ""
+    start: int | None = None
+    end: int | None = None
+    moved_from: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "fate": self.fate,
+            "via": self.via,
+            "path": self.path,
+            "claim": self.claim,
+            "method": self.method,
+            "header": self.header,
+            "kind": self.file_kind,
+            "before_hits": self.before_hits,
+            "after_hits": self.after_hits,
+            "near_before": round(self.near_before, 3),
+            "near_after": round(self.near_after, 3),
+            "near_line": self.near_line,
+            "note": self.note,
+            "collide": self.collide,
+            "echo": self.echo,
+            "covers": self.covers,
+            "witnesses": self.witnesses,
+            "sandwich": self.sandwich,
+            "recon": self.recon,
+            "start": self.start,
+            "end": self.end,
+            "moved_from": self.moved_from or None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# paths / git
+# ---------------------------------------------------------------------------
+
+def unquote_git_path(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        out = bytearray()
+        i = 0
+        n = len(inner)
+        while i < n:
+            if inner[i] == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt == "n":
+                    out.append(0x0A)
+                    i += 2
+                elif nxt == "t":
+                    out.append(0x09)
+                    i += 2
+                elif nxt == "r":
+                    out.append(0x0D)
+                    i += 2
+                elif nxt in '"\\':
+                    out.append(ord(nxt))
+                    i += 2
+                elif nxt in "01234567":
+                    j = i + 1
+                    acc = 0
+                    c = 0
+                    while c < 3 and j < n and inner[j] in "01234567":
+                        acc = (acc << 3) + int(inner[j])
+                        j += 1
+                        c += 1
+                    out.append(acc & 0xFF)
+                    i = j
+                else:
+                    out.append(ord(nxt))
+                    i += 2
+            else:
+                out.append(ord(inner[i]))
+                i += 1
+        return out.decode("utf-8", "replace")
+    return s
+
+
+def strip_ab_prefix(path: str) -> str:
+    path = unquote_git_path(path)
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def looks_dev_null(path: str) -> bool:
+    return path in ("/dev/null", "a:/dev/null", "b:/dev/null") or path.endswith(
+        "/dev/null"
+    )
+
+
+def _next_git_path(rest: str) -> tuple[str, str]:
+    rest = rest.lstrip()
+    if rest.startswith('"'):
+        i = 1
+        out = ['"']
+        while i < len(rest):
+            if rest[i] == "\\" and i + 1 < len(rest):
+                out.append(rest[i : i + 2])
+                i += 2
+                continue
+            out.append(rest[i])
+            if rest[i] == '"':
+                return "".join(out), rest[i + 1 :]
+            i += 1
+        return rest, ""
+    sp = rest.find(" ")
+    if sp == -1:
+        return rest, ""
+    return rest[:sp], rest[sp:]
+
+
+def parse_diff_git_paths(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git ") :]
+    if rest.lstrip().startswith('"'):
+        a, rest2 = _next_git_path(rest)
+        b, _ = _next_git_path(rest2)
+        if a and b:
+            return strip_ab_prefix(a), strip_ab_prefix(b)
+    idx = rest.find(" b/")
+    idx2 = rest.find(' "b/')
+    if idx2 != -1 and (idx == -1 or idx2 < idx):
+        old = rest[:idx2]
+        new = rest[idx2 + 1 :]
+        return strip_ab_prefix(old), strip_ab_prefix(new)
+    if idx != -1:
+        return strip_ab_prefix(rest[:idx]), strip_ab_prefix(rest[idx + 1 :])
+    parts = rest.split(" ", 1)
+    if len(parts) != 2:
+        return None
+    return strip_ab_prefix(parts[0]), strip_ab_prefix(parts[1])
+
+
+def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True)
+
+
+def is_git_repo(root: Path) -> bool:
+    proc = git(["rev-parse", "--is-inside-work-tree"], root)
+    return proc.returncode == 0 and proc.stdout.decode().strip() == "true"
+
+
+def read_tree_file(root: Path, path: str, against: str | None) -> list[str] | None:
+    if not path or looks_dev_null(path):
+        return None
+    if against is None:
+        p = root / path
+        try:
+            data = p.read_bytes()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, OSError):
+            return None
+        if b"\0" in data[:8192]:
+            return None
+        return data.decode("utf-8", "replace").splitlines()
+    proc = git(["show", f"{against}:{path}"], root)
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def default_against(root: Path, explicit: str | None, worktree: bool) -> str | None:
+    if worktree:
+        return None
+    if explicit is not None:
+        return explicit
+    if is_git_repo(root):
+        return "HEAD"
+    return None
+
+
+def patch_of_rev(root: Path, rev: str) -> str:
+    if ".." in rev:
+        proc = git(["diff", "--find-renames", "--patch", rev], root)
+    else:
+        proc = git(["show", "--format=", "--patch", "--find-renames", rev], root)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"git show/diff failed for {rev}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# unified diff → claims
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    header: str
+    tagged: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def before(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] in " -"]
+
+    @property
+    def after(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] in " +"]
+
+    @property
+    def minus(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] == "-"]
+
+    @property
+    def plus(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] == "+"]
+
+
+@dataclass
+class _FilePatch:
+    old_path: str
+    new_path: str
+    kind: str
+    hunks: list[_Hunk] = field(default_factory=list)
+    binary: bool = False
+    rename: bool = False
+
+    @property
+    def path(self) -> str:
+        if self.kind == "delete":
+            return self.old_path
+        return self.new_path or self.old_path
+
+
+def parse_patch(text: str) -> list[_FilePatch]:
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    files: list[_FilePatch] = []
+    while i < n and not (
+        lines[i].startswith("diff --git ")
+        or lines[i].startswith("--- ")
+        or lines[i].startswith("*** ")
+    ):
+        i += 1
+    current: _FilePatch | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None:
+            files.append(current)
+            current = None
+
+    while i < n:
+        line = lines[i]
+        if line.startswith("diff --git "):
+            flush()
+            parsed = parse_diff_git_paths(line)
+            if not parsed:
+                i += 1
+                continue
+            old, new = parsed
+            current = _FilePatch(old_path=old, new_path=new, kind="modify")
+            i += 1
+            while i < n:
+                l2 = lines[i]
+                if l2.startswith("diff --git ") or l2.startswith("@@ "):
+                    break
+                if l2.startswith("new file mode"):
+                    current.kind = "create"
+                elif l2.startswith("deleted file mode"):
+                    current.kind = "delete"
+                elif l2.startswith("rename from "):
+                    current.rename = True
+                    current.kind = "rename"
+                    current.old_path = l2[len("rename from ") :]
+                elif l2.startswith("rename to "):
+                    current.rename = True
+                    current.kind = "rename"
+                    current.new_path = l2[len("rename to ") :]
+                elif l2.startswith("GIT binary patch") or l2.startswith("Binary files "):
+                    current.binary = True
+                elif l2.startswith("--- "):
+                    rhs = l2[4:].strip()
+                    if looks_dev_null(rhs):
+                        current.kind = "create"
+                        current.old_path = "/dev/null"
+                    else:
+                        p = strip_ab_prefix(rhs)
+                        if p:
+                            current.old_path = p
+                elif l2.startswith("+++ "):
+                    rhs = l2[4:].strip()
+                    if looks_dev_null(rhs):
+                        current.kind = "delete"
+                        current.new_path = "/dev/null"
+                    else:
+                        p = strip_ab_prefix(rhs)
+                        if p:
+                            current.new_path = p
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if line.startswith("--- ") and (current is None or not current.hunks):
+            if current is None:
+                rhs = line[4:].strip()
+                old = "/dev/null" if looks_dev_null(rhs) else strip_ab_prefix(rhs)
+                kind = "create" if looks_dev_null(rhs) else "modify"
+                current = _FilePatch(old_path=old, new_path=old, kind=kind)
+            i += 1
+            if i < n and lines[i].startswith("+++ "):
+                rhs = lines[i][4:].strip()
+                if looks_dev_null(rhs):
+                    current.kind = "delete"
+                    current.new_path = "/dev/null"
+                else:
+                    current.new_path = strip_ab_prefix(rhs)
+                    if current.kind != "create":
+                        current.kind = "modify"
+                i += 1
+            continue
+
+        if line.startswith("@@ ") and current is not None:
+            m = HUNK_RE.match(line)
+            if not m:
+                i += 1
+                continue
+            hunk = _Hunk(
+                old_start=int(m.group(1)),
+                old_count=int(m.group(2) or "1"),
+                new_start=int(m.group(3)),
+                new_count=int(m.group(4) or "1"),
+                header=line,
+            )
+            i += 1
+            while i < n:
+                hl = lines[i]
+                if hl.startswith("@@ ") or hl.startswith("diff --git ") or hl.startswith(
+                    "--- "
+                ):
+                    break
+                if hl.startswith("\\"):
+                    i += 1
+                    continue
+                if not hl:
+                    hunk.tagged.append((" ", ""))
+                    i += 1
+                    continue
+                tag = hl[0]
+                if tag in " +-":
+                    hunk.tagged.append((tag, hl[1:]))
+                    i += 1
+                    continue
+                break
+            current.hunks.append(hunk)
+            continue
+
+        if line.startswith("GIT binary patch") or line.startswith("Binary files "):
+            if current is not None:
+                current.binary = True
+            i += 1
+            continue
+        i += 1
+    flush()
+    return files
+
+
+def hunk_claims(fp: _FilePatch, source: str, rev: str = "") -> list[Claim]:
+    path = fp.path
+    prefix = f"hunk:{rev}:" if rev else "hunk:"
+    out: list[Claim] = []
+    if fp.binary and not fp.hunks:
+        out.append(
+            Claim(
+                id=f"{prefix}{path}#bin",
+                path=path,
+                before=[],
+                after=[],
+                origin="hunk",
+                file_kind="binary",
+                source=source,
+                header="(binary)",
+            )
+        )
+        return out
+    if not fp.hunks:
+        cid = f"{prefix}{path}#0"
+        if fp.kind == "create":
+            out.append(
+                Claim(
+                    id=cid,
+                    path=fp.new_path,
+                    before=[],
+                    after=[],
+                    minus=[],
+                    plus=[],
+                    origin="hunk",
+                    file_kind="create",
+                    source=source,
+                    header="(new file)",
+                )
+            )
+        elif fp.kind == "delete":
+            out.append(
+                Claim(
+                    id=cid,
+                    path=fp.old_path,
+                    before=[],
+                    after=[],
+                    origin="hunk",
+                    file_kind="delete",
+                    source=source,
+                    header="(deleted)",
+                )
+            )
+        elif fp.kind == "rename":
+            out.append(
+                Claim(
+                    id=cid,
+                    path=fp.new_path,
+                    before=[],
+                    after=[],
+                    origin="hunk",
+                    file_kind="rename",
+                    source=source,
+                    header="(rename)",
+                    recon=fp.old_path,
+                )
+            )
+        return out
+    for i, h in enumerate(fp.hunks, 1):
+        kind = fp.kind if fp.kind in ("create", "delete", "rename") else "modify"
+        end = h.new_start + max(h.new_count, 1) - 1
+        out.append(
+            Claim(
+                id=f"{prefix}{path}#{i}",
+                path=path,
+                before=h.before,
+                after=h.after,
+                minus=h.minus,
+                plus=h.plus,
+                origin="hunk",
+                file_kind=kind,
+                start=h.new_start,
+                end=end,
+                source=source,
+                header=h.header,
+                tagged=list(h.tagged),
+                recon="hunk",
+                old_path=""
+                if looks_dev_null(fp.old_path) or fp.old_path == path
+                else fp.old_path,
+            )
+        )
+    return out
+
+
+def claims_from_patch(text: str, source: str = "patch", rev: str = "") -> list[Claim]:
+    out: list[Claim] = []
+    for fp in parse_patch(text):
+        out.extend(hunk_claims(fp, source=source, rev=rev))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# review stream → claims (range reconstruction, not all-plus)
+# ---------------------------------------------------------------------------
+
+def _strip_cr(s: str) -> str:
+    return s.replace("\r", "")
+
+
+def _as_int(v) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(*vals):
+    for v in vals:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _as_lines(val) -> list[str] | None:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [_strip_cr(str(x)).rstrip("\n") for x in val]
+    if isinstance(val, str):
+        return _strip_cr(val).splitlines()
+    return None
+
+
+def parse_diff_hunk(diff_hunk: str) -> tuple[int, int, list[tuple[str, str]]] | None:
+    text = _strip_cr(diff_hunk)
+    lines = text.splitlines()
+    if not lines:
+        return None
+    header_i = 0
+    while header_i < len(lines) and not lines[header_i].startswith("@@"):
+        header_i += 1
+    if header_i >= len(lines):
+        return None
+    m = HUNK_RE.match(lines[header_i])
+    if not m:
+        return None
+    old_start = int(m.group(1))
+    new_start = int(m.group(3))
+    tagged: list[tuple[str, str]] = []
+    for L in lines[header_i + 1 :]:
+        if L.startswith("\\"):
+            continue
+        if not L:
+            tagged.append((" ", ""))
+            continue
+        tag = L[0]
+        if tag in " +-":
+            tagged.append((tag, L[1:]))
+        else:
+            tagged.append((" ", L))
+    return old_start, new_start, tagged
+
+
+def _in_range(loc: int, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+    return lo <= loc <= hi
+
+
+def lines_in_range(
+    tagged: list[tuple[str, str]],
+    old_start: int,
+    new_start: int,
+    side: str,
+    start: int,
+    end: int,
+) -> list[str]:
+    old_ln, new_ln = old_start, new_start
+    out: list[str] = []
+    right = side in ("RIGHT", "NEW", "+")
+    for tag, text in tagged:
+        if tag == "+":
+            if right and _in_range(new_ln, start, end):
+                out.append(text)
+            new_ln += 1
+        elif tag == "-":
+            if not right and _in_range(old_ln, start, end):
+                out.append(text)
+            old_ln += 1
+        else:
+            loc = new_ln if right else old_ln
+            if _in_range(loc, start, end):
+                out.append(text)
+            old_ln += 1
+            new_ln += 1
+    return out
+
+
+def side_new_lines(tagged: list[tuple[str, str]], side: str) -> list[str]:
+    if side in ("LEFT", "OLD", "-"):
+        return [t for tag, t in tagged if tag in " -"]
+    return [t for tag, t in tagged if tag in " +"]
+
+
+def extract_suggestions(body: str) -> list[list[str]]:
+    if not body:
+        return []
+    body = _strip_cr(body)
+    out: list[list[str]] = []
+    for m in SUGGEST_RE.finditer(body):
+        raw = m.group(1)
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        out.append(raw.splitlines())
+    return out
+
+
+def reconstruct_before(obj: dict) -> tuple[list[str], str, int | None, int | None]:
+    explicit = _as_lines(obj.get("before"))
+    if explicit is not None:
+        start = _as_int(obj.get("start_line") or obj.get("original_start_line"))
+        end = _as_int(obj.get("line") or obj.get("original_line"))
+        return explicit, "explicit", start, end
+
+    side = str(obj.get("side") or obj.get("start_side") or "RIGHT").upper()
+    end = _as_int(
+        _first(obj.get("line"), obj.get("original_line"), obj.get("originalLine"))
+    )
+    start = _as_int(
+        _first(
+            obj.get("start_line"),
+            obj.get("original_start_line"),
+            obj.get("startLine"),
+            obj.get("originalStartLine"),
+            end,
+        )
+    )
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    parsed = parse_diff_hunk(diff_hunk) if diff_hunk else None
+    if parsed and start is not None and end is not None:
+        old_start, new_start, tagged = parsed
+        got = lines_in_range(tagged, old_start, new_start, side, start, end)
+        if got:
+            return got, "range", start, end
+        n = max(1, abs(end - start) + 1)
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return side_lines[-n:], "hunk-tail", start, end
+    if parsed:
+        old_start, new_start, tagged = parsed
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return [side_lines[-1]], "hunk-last", start, end
+    return [], "none", start, end
+
+
+def obj_to_claims(obj: dict, source: str = "json") -> list[Claim]:
+    path = obj.get("path") or obj.get("filename") or obj.get("file") or ""
+    if not path:
+        return []
+    cid = str(_first(obj.get("id"), obj.get("html_url"), obj.get("url"), path) or path)
+    afters = _as_lines(obj.get("after"))
+    body = obj.get("body") or obj.get("comment") or obj.get("suggestion") or ""
+    sug = extract_suggestions(body) if isinstance(body, str) else []
+    if afters is not None:
+        images = [afters]
+    elif sug:
+        images = sug
+    else:
+        return []
+    before, recon, start, end = reconstruct_before(obj)
+    side = str(obj.get("side") or "RIGHT").upper()
+    in_reply = obj.get("in_reply_to_id") or obj.get("in_reply_to")
+    commit = obj.get("commit_id") or obj.get("commitId")
+    orig = obj.get("original_commit_id") or obj.get("originalCommitId")
+    out: list[Claim] = []
+    for i, after in enumerate(images):
+        ident = cid if len(images) == 1 else f"{cid}#{i + 1}"
+        out.append(
+            Claim(
+                id=str(ident),
+                path=str(path),
+                before=list(before),
+                after=list(after),
+                minus=list(before),
+                plus=list(after),
+                origin="plea",
+                side=side,
+                start=start,
+                end=end,
+                commit_id=str(commit) if commit else None,
+                original_commit_id=str(orig) if orig else None,
+                in_reply_to=str(in_reply) if in_reply else None,
+                body=body if isinstance(body, str) else "",
+                recon=recon,
+                source=source,
+                header=f"@@ suggestion {ident} @@",
+            )
+        )
+    return out
+
+
+def _iter_json_objs(text: str) -> Iterator[dict]:
+    text = text.strip()
+    if not text:
+        return
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            if isinstance(data, dict):
+                if "comments" in data and isinstance(data["comments"], list):
+                    for o in data["comments"]:
+                        if isinstance(o, dict):
+                            yield o
+                    return
+                yield data
+                return
+            if isinstance(data, list):
+                for o in data:
+                    if isinstance(o, dict):
+                        yield o
+                return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line[:1] != "{":
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(o, dict):
+            yield o
+
+
+def parse_markdown_stream(text: str, source: str = "markdown") -> list[Claim]:
+    text = _strip_cr(text)
+    claims: list[Claim] = []
+    path = ""
+    start: int | None = None
+    end: int | None = None
+    pending_quote: list[str] | None = None
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    seq = 0
+
+    def remember_path(p: str, a: str | None, b: str | None) -> None:
+        nonlocal path, start, end
+        path = p
+        start = int(a) if a else None
+        end = int(b) if b else start
+
+    while i < n:
+        L = lines[i]
+        hm = HEADING_PATH_RE.match(L.strip())
+        if hm:
+            remember_path(hm.group("path"), hm.group("a"), hm.group("b"))
+            i += 1
+            continue
+        html = HTML_PATH_RE.search(L)
+        if html:
+            path = html.group(1)
+            i += 1
+            continue
+        tick = IN_TICK_PATH_RE.search(L)
+        if tick:
+            path = tick.group(1)
+            i += 1
+            continue
+        pm = PATH_LINE_RE.match(L.strip().strip("`"))
+        if pm and not L.strip().startswith("```"):
+            remember_path(pm.group("path"), pm.group("a"), pm.group("b"))
+            i += 1
+            continue
+        stripped = L.strip()
+        if stripped.startswith("```") and not stripped.startswith("```suggestion"):
+            lang = stripped[3:].strip()
+            i += 1
+            block: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if lang.lower() in ("", "text", "code", "diff"):
+                pending_quote = block
+            continue
+        if stripped.startswith("```suggestion"):
+            i += 1
+            after: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                after.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if not path:
+                i += 1 if i < n else 0
+                continue
+            seq += 1
+            before = pending_quote if pending_quote is not None else []
+            recon = "markdown-quote" if before else "markdown"
+            claims.append(
+                Claim(
+                    id=f"md{seq}:{path}",
+                    path=path,
+                    before=list(before),
+                    after=list(after),
+                    minus=list(before),
+                    plus=list(after),
+                    origin="plea",
+                    start=start,
+                    end=end,
+                    recon=recon,
+                    source=source,
+                    header=f"@@ suggestion md{seq}:{path} @@",
+                )
+            )
+            pending_quote = None
+            continue
+        i += 1
+    return claims
+
+
+def load_stream(text: str, source: str = "stream") -> list[Claim]:
+    text = text.lstrip("\ufeff")
+    claims: list[Claim] = []
+    stripped = text.lstrip()
+    looks_json = stripped[:1] in "[{"
+    if looks_json:
+        for obj in _iter_json_objs(text):
+            claims.extend(obj_to_claims(obj, source=source))
+        if claims:
+            return claims
+    md = parse_markdown_stream(text, source=source)
+    if md:
+        return md
+    for obj in _iter_json_objs(text):
+        claims.extend(obj_to_claims(obj, source=source))
+    return claims
+
+
+def sniff(text: str) -> str:
+    raw = text.lstrip("\ufeff")
+    s = raw.lstrip()
+    if not s:
+        return "empty"
+    if s.startswith("diff --git ") or s.startswith("diff --cc "):
+        return "patch"
+    if s.startswith("--- ") or s.startswith("*** "):
+        return "patch"
+    if s.startswith("@@ "):
+        return "patch"
+    if s.startswith("From ") and "\ndiff --git " in raw:
+        return "patch"
+    if s.startswith("commit ") and "\ndiff --git " in raw:
+        return "patch"
+    if "```suggestion" in raw:
+        return "stream"
+    if s[:1] in "[{":
+        return "stream"
+    if '"diff_hunk"' in raw or '"diffHunk"' in raw:
+        return "stream"
+    return "auto"
+
+
+def ingest_text(text: str, source: str) -> list[Claim]:
+    kind = sniff(text)
+    if kind == "empty":
+        return []
+    if kind == "patch":
+        return claims_from_patch(text, source=source)
+    if kind == "stream":
+        return load_stream(text, source=source)
+    stream = load_stream(text, source=source)
+    if stream:
+        return stream
+    return claims_from_patch(text, source=source)
+
+
+# ---------------------------------------------------------------------------
+# matching
+# ---------------------------------------------------------------------------
+
+def ident(s: str) -> str:
+    return s
+
+
+def space_norm(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).rstrip()
+
+
+def apply_norm(lines: list[str], norm: Norm) -> list[str]:
+    return [norm(L) for L in lines]
+
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    first = needle[0]
+    start = 0
+    length = len(hay)
+    while start < length:
+        try:
+            j = hay.index(first, start)
+        except ValueError:
+            break
+        if hay[j : j + n] == needle:
+            hits.append(j)
+        start = j + 1
+    return hits
+
+
+def is_subseq(hay: list[str], needle: list[str]) -> bool:
+    if not needle:
+        return False
+    it = iter(hay)
+    try:
+        for x in needle:
+            while next(it) != x:
+                pass
+        return True
+    except StopIteration:
+        return False
+
+
+def is_contig(hay: list[str], needle: list[str]) -> bool:
+    if not needle or not hay or len(needle) > len(hay):
+        return False
+    n = len(needle)
+    for i in range(len(hay) - n + 1):
+        if hay[i : i + n] == needle:
+            return True
+    return False
+
+
+def significant(lines: list[str]) -> list[str]:
+    out = []
+    for L in lines:
+        s = L.strip()
+        if len(s) < 8:
+            continue
+        if GENERIC_RE.match(L) or GENERIC_RE.match(s):
+            continue
+        out.append(L)
+    if out:
+        return out
+    return [L for L in lines if L.strip()]
+
+
+def best_overlap(
+    hay: list[str], needle: list[str], hint: int | None = None
+) -> tuple[float, int]:
+    if not needle:
+        return 1.0, 0
+    if not hay:
+        return 0.0, 0
+    n = len(needle)
+    if n > len(hay):
+        hits = sum(1 for a, b in zip(needle, hay) if a == b)
+        return hits / n, 0
+    cands: set[int] = set()
+    max_start = len(hay) - n
+    if hint is not None:
+        base = max(0, min(hint, max_start))
+        for d in range(0, 160):
+            cands.add(max(0, base - d))
+            cands.add(min(max_start, base + d))
+    ranked = sorted(enumerate(needle), key=lambda iv: len(iv[1]), reverse=True)[:4]
+    for idx, line in ranked:
+        if len(line.strip()) < 4:
+            continue
+        start = 0
+        while True:
+            try:
+                j = hay.index(line, start)
+            except ValueError:
+                break
+            cands.add(max(0, min(j - idx, max_start)))
+            start = j + 1
+    if not cands:
+        step = max(1, n // 2)
+        cands.update(range(0, max_start + 1, step))
+    best_r, best_p = -1.0, 0
+    for p in cands:
+        window = hay[p : p + n]
+        hits = sum(1 for a, b in zip(needle, window) if a == b)
+        r = hits / n
+        if r > best_r:
+            best_r, best_p = r, p
+            if r == 1.0:
+                break
+    return max(0.0, best_r), best_p
+
+
+def unexplained(
+    small_hits: list[int], big_hits: list[int], small: list[str], big: list[str]
+) -> list[int]:
+    if not small or not big_hits or not big:
+        return list(small_hits)
+    offsets = find_all(big, small)
+    explained: set[int] = set()
+    for bp in big_hits:
+        if not offsets:
+            if small == big:
+                explained.add(bp)
+        for off in offsets:
+            explained.add(bp + off)
+    return [p for p in small_hits if p not in explained]
+
+
+def overlaps_locus(
+    hit: int,
+    n: int,
+    start: int | None,
+    end: int | None,
+    slack: int = 2,
+) -> bool:
+    if start is None and end is None:
+        return True
+    a = start if start is not None else end
+    b = end if end is not None else start
+    if a is None:
+        return True
+    file_lo = min(a, b) - 1 - slack
+    file_hi = max(a, b) + slack
+    return hit < file_hi and (hit + n) > file_lo
+
+
+def loci_overlap(a: Claim, b: Claim) -> bool:
+    if a.path != b.path:
+        return False
+    if (
+        a.start is not None
+        and a.end is not None
+        and b.start is not None
+        and b.end is not None
+    ):
+        lo_a, hi_a = (a.start, a.end) if a.start <= a.end else (a.end, a.start)
+        lo_b, hi_b = (b.start, b.end) if b.start <= b.end else (b.end, b.start)
+        if not (hi_a < lo_b or hi_b < lo_a):
+            return True
+        return False
+    sa = set(significant(a.minus or a.before))
+    sb = set(significant(b.minus or b.before))
+    if sa and sb and sa & sb:
+        return True
+    return a.start is None or b.start is None
+
+
+def core_plus(c: Claim) -> list[str]:
+    return list(c.plus) if c.plus else list(c.after)
+
+
+def core_minus(c: Claim) -> list[str]:
+    return list(c.minus) if c.minus else list(c.before)
+
+
+def cores_equal(a: Claim, b: Claim) -> bool:
+    pa, pb = core_plus(a), core_plus(b)
+    if pa and pb and pa == pb:
+        return True
+    if pa and pb and [x.strip() for x in pa] == [x.strip() for x in pb]:
+        return True
+    sa, sb = significant(pa), significant(pb)
+    if sa and sb and sa == sb:
+        return True
+    # both deletes
+    if not pa and not pb:
+        ma, mb = core_minus(a), core_minus(b)
+        if ma and mb and ma == mb:
+            return True
+    return False
+
+
+def cores_subset(inner: Claim, outer: Claim) -> bool:
+    pi, po = core_plus(inner), core_plus(outer)
+    if pi and po and is_contig(po, pi) and pi != po:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# occupancy kernel (prefix rule + locus)
+# ---------------------------------------------------------------------------
+
+def classify_claim(
+    file_lines: list[str] | None,
+    claim: Claim,
+    norm: Norm,
+    fuzz: bool = False,
+) -> Verdict:
+    path = claim.path
+    header = claim.header or f"@@ {claim.origin} {claim.id} @@"
+
+    def V(fate: str, method: str, note: str = "", **kw) -> Verdict:
+        v = Verdict(
+            fate=fate,
+            path=path,
+            claim=claim.id,
+            method=method,
+            via=claim.origin,
+            header=header,
+            file_kind=claim.file_kind,
+            note=note,
+            recon=claim.recon,
+            start=claim.start,
+            end=claim.end,
+            witnesses=list(claim.witnesses),
+            covers=list(claim.covers),
+            moved_from=claim.moved_from,
+        )
+        for k, val in kw.items():
+            setattr(v, k, val)
+        return v
+
+    if claim.file_kind == "binary":
+        return V("BINARY", "binary")
+    if not claim.path:
+        return V("SKIP", "no-path")
+
+    if claim.file_kind == "rename" and not claim.before and not claim.after:
+        # occupancy of a pure rename is presence of the new path
+        return V(
+            "SKIP" if file_lines is not None else "SUPERSEDED",
+            "rename-no-hunks",
+        )
+
+    if not claim.before and not claim.after and not claim.minus and not claim.plus:
+        if claim.file_kind == "create":
+            if file_lines is None:
+                return V("PENDING", "missing-create")
+            return V("APPLIED", "exists")
+        if claim.file_kind == "delete":
+            if file_lines is None:
+                return V("APPLIED", "missing-delete")
+            return V("PENDING", "exists")
+        return V("SKIP", "empty-claim")
+
+    if claim.before and claim.after and claim.before == claim.after:
+        return V("SKIP", "noop")
+
+    # Empty cores are meaningful (pure add / pure delete). Only fall back
+    # to before/after when the ingest never filled minus/plus.
+    minus = list(claim.minus)
+    plus = list(claim.plus)
+    if not minus and not plus:
+        minus = list(claim.before)
+        plus = list(claim.after)
+
+    if file_lines is None:
+        if plus and not minus:
+            return V("PENDING", "missing-create")
+        if minus and not plus:
+            return V("APPLIED", "missing-delete")
+        if claim.file_kind == "create":
+            return V("PENDING", "missing-create")
+        if claim.file_kind == "delete":
+            return V("APPLIED", "missing-delete")
+        return V("SUPERSEDED", "missing-file")
+
+    hay = apply_norm(file_lines, norm)
+    before = apply_norm(claim.before, norm)
+    after = apply_norm(claim.after, norm)
+    minus_n = apply_norm(minus, norm)
+    plus_n = apply_norm(plus, norm)
+    sig_minus = significant(minus_n)
+    sig_plus = significant(plus_n)
+
+    before_hits = find_all(hay, before) if before else []
+    after_hits = find_all(hay, after) if after else []
+    hint = max(0, (claim.end or claim.start or claim.start or 1) - 1)
+    if claim.origin == "hunk" and claim.start:
+        hint = max(0, claim.start - 1)
+    nb, pb = best_overlap(hay, before, hint) if before else (0.0, 0)
+    na, pa = best_overlap(hay, after, hint) if after else (0.0, 0)
+    near_line = (pa if na >= nb else pb) + 1
+    extra = dict(
+        before_hits=len(before_hits),
+        after_hits=len(after_hits),
+        near_before=nb,
+        near_after=na,
+        near_line=near_line,
+    )
+
+    # Pure addition: after present ⇒ APPLIED even if context (before) is a
+    # prefix of after. sate v2; without this, feature hunks DUPLEX themselves.
+    if plus_n and not minus_n:
+        if after_hits:
+            return V("APPLIED", "exact-after", **extra)
+        if before_hits:
+            return V("PENDING", "exact-before", **extra)
+        if sig_plus and find_all(hay, sig_plus):
+            return V("APPLIED", "add-core", **extra)
+        if sig_plus and is_subseq(hay, sig_plus):
+            return V("APPLIED", "add-subseq", **extra)
+        if fuzz and na >= FUZZ_RATIO:
+            return V("APPLIED", f"fuzz-after:{na:.2f}", **extra)
+        if fuzz and nb >= FUZZ_RATIO:
+            return V("PENDING", f"fuzz-before:{nb:.2f}", **extra)
+        return V("SUPERSEDED", "add-neither", **extra)
+
+    # Pure deletion
+    if minus_n and not plus_n:
+        if before_hits:
+            return V("PENDING", "exact-before", **extra)
+        if after_hits:
+            return V("APPLIED", "exact-after", **extra)
+        if sig_minus and is_subseq(hay, sig_minus):
+            return V("PENDING", "del-subseq", **extra)
+        return V("APPLIED", "deleted", **extra)
+
+    # Exact blocks (modify)
+    if after_hits and before_hits:
+        leftover_before = unexplained(before_hits, after_hits, before, after)
+        leftover_after = unexplained(after_hits, before_hits, after, before)
+        if leftover_before and leftover_after:
+            lb = [
+                h
+                for h in leftover_before
+                if overlaps_locus(h, len(before), claim.start, claim.end)
+            ]
+            la = [
+                h
+                for h in leftover_after
+                if overlaps_locus(h, len(after), claim.start, claim.end)
+            ]
+            if lb and not la:
+                return V(
+                    "PENDING",
+                    "exact-before-locus",
+                    note=f"before@{lb[:3]} after-elsewhere@{leftover_after[:3]}",
+                    **extra,
+                )
+            if la and not lb:
+                return V(
+                    "APPLIED",
+                    "exact-after-locus",
+                    note=f"after@{la[:3]} before-elsewhere@{leftover_before[:3]}",
+                    **extra,
+                )
+            if lb and la:
+                return V(
+                    "DUPLEX",
+                    "exact-both-locus",
+                    note=f"before@{lb[:3]} after@{la[:3]}",
+                    **extra,
+                )
+            if claim.start is None and claim.end is None:
+                return V(
+                    "DUPLEX",
+                    "exact-both",
+                    note=f"before@{leftover_before[:3]} after@{leftover_after[:3]}",
+                    **extra,
+                )
+            return V(
+                "DUPLEX",
+                "exact-both-off-locus",
+                note=f"before@{leftover_before[:3]} after@{leftover_after[:3]}",
+                **extra,
+            )
+        if after_hits and not leftover_before:
+            return V("APPLIED", "exact-after", **extra)
+        if before_hits and not leftover_after:
+            return V("PENDING", "exact-before", **extra)
+        return V("DUPLEX", "exact-both", **extra)
+    if after_hits:
+        return V("APPLIED", "exact-after", **extra)
+    if before_hits:
+        return V("PENDING", "exact-before", **extra)
+
+    minus_sub = is_subseq(hay, sig_minus) if sig_minus else False
+    plus_sub = is_subseq(hay, sig_plus) if sig_plus else False
+    sig_minus_hits = find_all(hay, sig_minus) if sig_minus else []
+    sig_plus_hits = find_all(hay, sig_plus) if sig_plus else []
+
+    if sig_plus_hits and sig_minus_hits:
+        if abs((sig_plus_hits[0] - sig_minus_hits[0])) > max(
+            len(sig_plus), len(sig_minus), 3
+        ):
+            return V("DUPLEX", "core-both-apart", **extra)
+        return V("MIXED", "core-both-near", **extra)
+    if sig_plus_hits and not minus_sub:
+        return V("APPLIED", "core-plus", **extra)
+    if sig_minus_hits and not plus_sub:
+        return V("PENDING", "core-minus", **extra)
+    if plus_sub and minus_sub:
+        return V("MIXED", "subseq-both", **extra)
+    if plus_sub and not minus_sub:
+        return V("APPLIED", "subseq-plus", **extra)
+    if minus_sub and not plus_sub:
+        return V("PENDING", "subseq-minus", **extra)
+
+    if fuzz:
+        if na >= FUZZ_RATIO and nb < 0.5:
+            return V("APPLIED", f"fuzz-after:{na:.2f}", **extra)
+        if nb >= FUZZ_RATIO and na < 0.5:
+            return V("PENDING", f"fuzz-before:{nb:.2f}", **extra)
+        if sig_plus or sig_minus:
+            p_ratio = (
+                sum(1 for L in sig_plus if L in hay) / len(sig_plus) if sig_plus else 0.0
+            )
+            m_ratio = (
+                sum(1 for L in sig_minus if L in hay) / len(sig_minus)
+                if sig_minus
+                else 0.0
+            )
+            if p_ratio >= 0.5 and m_ratio >= 0.5:
+                return V("MIXED", f"fuzz-cores:{m_ratio:.2f}/{p_ratio:.2f}", **extra)
+
+    if sig_plus or sig_minus:
+        p_hit = sum(1 for L in sig_plus if L in hay)
+        m_hit = sum(1 for L in sig_minus if L in hay)
+        if p_hit and m_hit:
+            return V(
+                "MIXED",
+                "line-bag",
+                note=f"plus={p_hit}/{len(sig_plus)} minus={m_hit}/{len(sig_minus)}",
+                **extra,
+            )
+        if p_hit and not m_hit:
+            return V("APPLIED", "line-plus", **extra)
+        if m_hit and not p_hit:
+            return V("PENDING", "line-minus", **extra)
+
+    return V("SUPERSEDED", "neither", **extra)
+
+
+# ---------------------------------------------------------------------------
+# fusion — the joint: equal cores from hunk + plea become one occupancy
+# ---------------------------------------------------------------------------
+
+def range_aliases(hunks: list[Claim]) -> dict[str, str]:
+    """old path → new path implied by the git range (rename, or 1:1 delete+create)."""
+    aliases: dict[str, str] = {}
+    deleted = [h for h in hunks if h.file_kind == "delete"]
+    created = [h for h in hunks if h.file_kind == "create"]
+    for h in hunks:
+        if h.old_path and h.old_path != h.path and not looks_dev_null(h.old_path):
+            aliases[h.old_path] = h.path
+    if len(deleted) == 1 and len(created) == 1:
+        aliases[deleted[0].path] = created[0].path
+    return aliases
+
+
+def path_related(
+    h: Claim, p: Claim, aliases: dict[str, str], deleted: set[str]
+) -> bool:
+    if h.path == p.path:
+        return True
+    if h.old_path and h.old_path == p.path:
+        return True
+    if aliases.get(p.path) == h.path:
+        return True
+    if h.file_kind == "create" and p.path in deleted:
+        return True
+    return False
+
+
+def fuse_claims(claims: list[Claim]) -> list[Claim]:
+    hunks = [c for c in claims if c.origin == "hunk"]
+    pleas = [c for c in claims if c.origin == "plea"]
+    others = [c for c in claims if c.origin not in ("hunk", "plea")]
+    used_h: set[int] = set()
+    used_p: set[int] = set()
+    fused: list[Claim] = []
+    aliases = range_aliases(hunks)
+    deleted_paths = {h.path for h in hunks if h.file_kind == "delete"}
+
+    for i, h in enumerate(hunks):
+        for j, p in enumerate(pleas):
+            if j in used_p:
+                continue
+            if not path_related(h, p, aliases, deleted_paths):
+                continue
+            # Same plus at a non-overlapping locus is the generic-after lie
+            # (cli/cli `return nil, err` seven lines later). Skip locus when
+            # the range rewrote the path — the comment's line number is on
+            # the old file.
+            rewritten = p.path != h.path
+            known_loci = (
+                h.start is not None
+                and p.start is not None
+                and not rewritten
+                and h.file_kind == "modify"
+            )
+            if known_loci and not loci_overlap(h, p):
+                continue
+            if not cores_equal(h, p):
+                # subset: plea is inside the hunk's plus — witness, don't collapse
+                if cores_subset(p, h) and (not known_loci or loci_overlap(h, p)):
+                    if h.id not in p.covers:
+                        p.covers.append(h.id)
+                    if p.id not in h.covers:
+                        h.covers.append(p.id)
+                    p.origin = "both"
+                    p.witnesses = [h.id, p.id]
+                continue
+            # equal cores: one occupancy, via=both, occupy the live path
+            tighter = p
+            moved_from = p.path if p.path != h.path else ""
+            merged = Claim(
+                id=p.id,
+                path=h.path,
+                before=list(tighter.before),
+                after=list(tighter.after),
+                minus=list(tighter.minus),
+                plus=list(tighter.plus),
+                origin="both",
+                file_kind=h.file_kind if h.file_kind != "modify" else p.file_kind,
+                side=p.side,
+                start=p.start if p.start is not None and not moved_from else h.start,
+                end=p.end if p.end is not None and not moved_from else h.end,
+                commit_id=p.commit_id or h.commit_id,
+                original_commit_id=p.original_commit_id,
+                in_reply_to=p.in_reply_to,
+                body=p.body,
+                recon=p.recon or h.recon,
+                source=f"{h.source}+{p.source}",
+                header=p.header or h.header,
+                witnesses=[h.id, p.id],
+                covers=list(dict.fromkeys([*h.covers, *p.covers])),
+                tagged=list(h.tagged),
+                old_path=p.path if moved_from else (h.old_path or ""),
+                moved_from=moved_from,
+            )
+            fused.append(merged)
+            used_h.add(i)
+            used_p.add(j)
+            break
+
+    out: list[Claim] = []
+    out.extend(fused)
+    for i, h in enumerate(hunks):
+        if i not in used_h:
+            out.append(h)
+    for j, p in enumerate(pleas):
+        if j not in used_p:
+            out.append(p)
+    out.extend(others)
+    return out
+
+
+def annotate_stream(claims: list[Claim], verdicts: list[Verdict]) -> None:
+    by_id = {c.id: c for c in claims}
+    for i, va in enumerate(verdicts):
+        ca = by_id.get(va.claim)
+        if ca is None:
+            continue
+        for j, vb in enumerate(verdicts):
+            if i == j:
+                continue
+            cb = by_id.get(vb.claim)
+            if cb is None:
+                continue
+            if ca.path != cb.path:
+                continue
+            covered = ca.id in cb.covers or cb.id in ca.covers
+            related = (
+                covered
+                or loci_overlap(ca, cb)
+                or cores_equal(ca, cb)
+                or cores_subset(ca, cb)
+                or cores_subset(cb, ca)
+            )
+            if not related:
+                continue
+            if cores_equal(ca, cb) or covered:
+                if cb.id not in va.echo:
+                    va.echo.append(cb.id)
+            else:
+                if cb.id not in va.collide:
+                    va.collide.append(cb.id)
+        if va.covers and not va.note:
+            va.note = "covers:" + ",".join(va.covers[:4])
+        elif va.collide and not va.note:
+            va.note = "collide:" + ",".join(va.collide[:4])
+        elif va.echo and not va.note:
+            va.note = "echo:" + ",".join(va.echo[:4])
+
+
+def classify_stream(
+    claims: list[Claim],
+    root: Path,
+    against: str | None,
+    norm: Norm,
+    fuzz: bool = False,
+) -> list[Verdict]:
+    cache: dict[str, list[str] | None] = {}
+    verdicts: list[Verdict] = []
+    for c in claims:
+        if c.path not in cache:
+            cache[c.path] = read_tree_file(root, c.path, against)
+        verdicts.append(classify_claim(cache[c.path], c, norm, fuzz=fuzz))
+    annotate_stream(claims, verdicts)
+    return verdicts
+
+
+def sandwich_claim(
+    claim: Claim,
+    root: Path,
+    now: Verdict,
+    norm: Norm,
+    fuzz: bool,
+) -> None:
+    ref = claim.original_commit_id or claim.commit_id
+    if not ref or not is_git_repo(root):
+        return
+    then_lines = read_tree_file(root, claim.path, ref)
+    then = classify_claim(then_lines, claim, norm, fuzz=fuzz)
+    now.sandwich = then.fate
+
+
+# ---------------------------------------------------------------------------
+# reports
+# ---------------------------------------------------------------------------
+
+def material(verdicts: list[Verdict]) -> list[Verdict]:
+    return [v for v in verdicts if v.fate not in SKIP_FATES]
+
+
+def counted(verdicts: list[Verdict]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for v in verdicts:
+        c[v.fate] = c.get(v.fate, 0) + 1
+    return c
+
+
+def via_counted(verdicts: list[Verdict]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for v in material(verdicts):
+        c[v.via] = c.get(v.via, 0) + 1
+    return c
+
+
+def unanimous(verdicts: list[Verdict]) -> str:
+    s = {v.fate for v in material(verdicts)}
+    if not s:
+        return "EMPTY"
+    if len(s) == 1:
+        return next(iter(s))
+    return "SPLIT"
+
+
+def exit_for(uni: str) -> int:
+    if uni in ("APPLIED", "EMPTY"):
+        return EXIT_APPLIED
+    if uni == "PENDING":
+        return EXIT_PENDING
+    return EXIT_SPLIT
+
+
+def format_human(verdicts: list[Verdict], title: str) -> str:
+    uni = unanimous(verdicts)
+    c = counted(verdicts)
+    vc = via_counted(verdicts)
+    bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+    vbits = " ".join(f"{k}={v}" for k, v in sorted(vc.items()) if v)
+    n = len(material(verdicts))
+    lines = [
+        f"lodge  {title}  n={n}  unanimous={uni}  {bits}  via {vbits}".rstrip()
+    ]
+    for v in verdicts:
+        if v.fate in SKIP_FATES:
+            continue
+        loc = f"{v.path}  #{v.claim}"
+        extra = f"  via={v.via}  {v.method}"
+        if v.recon:
+            extra += f"  recon={v.recon}"
+        if v.witnesses and v.via == "both":
+            extra += "  witnesses=" + ",".join(v.witnesses[:4])
+        if v.covers:
+            extra += "  covers=" + ",".join(v.covers[:4])
+        if v.sandwich:
+            extra += f"  then={v.sandwich}"
+        if v.moved_from:
+            extra += f"  from={v.moved_from}"
+        if v.note:
+            extra += f"  {v.note}"
+        lines.append(f"{v.fate:<11} {loc}{extra}")
+    return "\n".join(lines) + "\n"
+
+
+def format_tsv(verdicts: list[Verdict]) -> str:
+    rows = [
+        "fate\tvia\tpath\tclaim\tmethod\trecon\twitnesses\tcollide\techo\tcovers\tmoved_from\tnear_line"
+    ]
+    for v in verdicts:
+        if v.fate in SKIP_FATES:
+            continue
+        rows.append(
+            "\t".join(
+                [
+                    v.fate,
+                    v.via,
+                    v.path,
+                    str(v.claim),
+                    v.method,
+                    v.recon,
+                    ",".join(v.witnesses),
+                    ",".join(v.collide),
+                    ",".join(v.echo),
+                    ",".join(v.covers),
+                    v.moved_from,
+                    "" if v.near_line is None else str(v.near_line),
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def format_json(verdicts: list[Verdict], extra: dict) -> str:
+    payload = {
+        **extra,
+        "unanimous": unanimous(verdicts),
+        "counts": counted(verdicts),
+        "via": via_counted(verdicts),
+        "claims": [v.as_dict() for v in verdicts if v.fate not in SKIP_FATES],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _write_tree(root: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+
+def _patch(old: str, new: str, path: str) -> str:
+    import difflib
+
+    a = old.splitlines(keepends=True)
+    b = new.splitlines(keepends=True)
+    if a and not a[-1].endswith("\n"):
+        a[-1] += "\n"
+    if b and not b[-1].endswith("\n"):
+        b[-1] += "\n"
+    lines = list(
+        difflib.unified_diff(a, b, fromfile=f"a/{path}", tofile=f"b/{path}", n=3)
+    )
+    return "".join(lines)
+
+
+def selftest(fuzz: bool = False) -> int:
+    failed = 0
+    passed = 0
+
+    def t(name: str, fn: Callable[[], None]) -> None:
+        nonlocal failed, passed
+        try:
+            fn()
+            passed += 1
+            print(f"  ok  {name}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAIL {name}: {e}", file=sys.stderr)
+
+    def occupy(tree: dict[str, str], claims: list[Claim]) -> list[Verdict]:
+        with tempfile.TemporaryDirectory(prefix="lodge-st-") as td:
+            root = Path(td)
+            _write_tree(root, tree)
+            fused = fuse_claims(claims)
+            return classify_stream(fused, root, None, ident, fuzz=fuzz)
+
+    CLI_HUNK = (
+        "@@ -339,7 +342,11 @@ func show(number ...string) error {\n"
+        " func pullRequestForCurrentBranch() (*github.PullRequest, error) {\n"
+        " \tproject := project()\n"
+        " \tclient := github.NewClient(project.Host)\n"
+        "-\theadWithOwner := fmt.Sprintf(\"%s:%s\", project.Owner, currentBranch())\n"
+        "+\tcurrentBranch, err := context.CurrentBranch()\n"
+        "+\tif err != nil {\n"
+        "+\t\treturn &github.PullRequest{}, err"
+    )
+    CLI_BODY = (
+        "It's fine to return nil in place of pointers when an error occurs:\r\n"
+        "```suggestion\r\n"
+        "\t\treturn nil, err\r\n"
+        "```"
+    )
+
+    def recon_cli_range():
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "side": "RIGHT",
+            "line": None,
+            "original_line": 347,
+            "diff_hunk": CLI_HUNK,
+            "body": CLI_BODY,
+        }
+        claims = obj_to_claims(obj)
+        if len(claims) != 1:
+            raise AssertionError(claims)
+        c = claims[0]
+        if c.before != ["\t\treturn &github.PullRequest{}, err"]:
+            raise AssertionError(f"before={c.before!r}")
+        if c.after != ["\t\treturn nil, err"]:
+            raise AssertionError(f"after={c.after!r}")
+        if c.recon != "range":
+            raise AssertionError(c.recon)
+        plus = [
+            ln[1:]
+            for ln in CLI_HUNK.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        ]
+        if plus == c.before:
+            raise AssertionError("range collapsed to all-plus")
+        if len(plus) < 3:
+            raise AssertionError(plus)
+
+    t("recon-cli-range-not-all-plus", recon_cli_range)
+
+    def cli_locus_not_duplex():
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "side": "RIGHT",
+            "original_line": 347,
+            "diff_hunk": CLI_HUNK,
+            "body": CLI_BODY,
+        }
+        claims = obj_to_claims(obj)
+        lines = [""] * 360
+        lines[341] = "func pullRequestForCurrentBranch() (*github.PullRequest, error) {"
+        lines[344] = "\tcurrentBranch, err := context.CurrentBranch()"
+        lines[345] = "\tif err != nil {"
+        lines[346] = "\t\treturn &github.PullRequest{}, err"
+        lines[347] = "\t}"
+        lines[352] = "\tprs, err := client.FetchPullRequests(&project, filterParams, 10, nil)"
+        lines[353] = "\t\treturn nil, err"
+        src = "\n".join(lines) + "\n"
+        v = occupy({"command/pr.go": src}, claims)
+        if unanimous(v) != "PENDING":
+            raise AssertionError(f"{v[0].fate} {v[0].method} {v[0].note}")
+        if v[0].method != "exact-before-locus":
+            raise AssertionError(v[0].method)
+        if "alias" in v[0].as_dict():
+            raise AssertionError("one vocabulary: no alias field")
+
+    t("cli-generic-after-is-open-not-duplex", cli_locus_not_duplex)
+
+    def recon_empty_suggestion():
+        hunk = (
+            "@@ -202,25 +202,37 @@ <h3 id=\"ImportPaths\">Import paths</h3>\n"
+            " </p>\n"
+            "+\n"
+            "+w"
+        )
+        obj = {
+            "id": "empty",
+            "path": "doc/code.html",
+            "side": "RIGHT",
+            "original_line": 221,
+            "diff_hunk": hunk,
+            "body": "don't think this line is intended haha\n```suggestion\n```",
+        }
+        c = obj_to_claims(obj)[0]
+        if c.before != ["w"]:
+            raise AssertionError(c.before)
+        if c.after != []:
+            raise AssertionError(f"empty suggestion must delete, got {c.after!r}")
+
+    t("recon-empty-suggestion-is-delete", recon_empty_suggestion)
+
+    def occupy_fates():
+        c = Claim(
+            id="c",
+            path="a.py",
+            before=["    return a - b"],
+            after=["    return a + b"],
+            origin="plea",
+        )
+        v = occupy({"a.py": "def add(a, b):\n    return a - b\n"}, [c])
+        if unanimous(v) != "PENDING":
+            raise AssertionError(v[0].fate)
+        v = occupy({"a.py": "def add(a, b):\n    return a + b\n"}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+        v = occupy({"a.py": "def add(a, b):\n    return a * b\n"}, [c])
+        if unanimous(v) != "SUPERSEDED":
+            raise AssertionError(v[0].fate)
+        both = "def add(a, b):\n    return a - b\n\ndef add(a, b):\n    return a + b\n"
+        v = occupy({"a.py": both}, [c])
+        if unanimous(v) != "DUPLEX":
+            raise AssertionError(v[0].fate)
+        mix = Claim(
+            id="m",
+            path="m.py",
+            before=["    a = 1", "    b = 2"],
+            after=["    a = 10", "    b = 20"],
+            origin="plea",
+        )
+        mid = "def f():\n    a = 10\n    b = 2\n    return a + b\n"
+        v = occupy({"m.py": mid}, [mix])
+        if unanimous(v) != "MIXED":
+            raise AssertionError(v[0].fate)
+
+    t("occupy-four-fates-one-vocab", occupy_fates)
+
+    def addition_prefix_not_duplex():
+        old = "a\nb\nc\nd\ne\nf\n"
+        new = "a\nb\nc\nd\ne\nf\nNEW_LINE_ONE\nNEW_LINE_TWO\n"
+        pa = _patch(old, new, "t.py")
+        hunks = claims_from_patch(pa, source="st")
+        v = occupy({"t.py": new}, hunks)
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(f"{unanimous(v)} {[x.method for x in v]}")
+        if any(x.fate == "DUPLEX" for x in v):
+            raise AssertionError("addition hunk must not DUPLEX on its own context")
+
+    t("addition-prefix-is-applied-not-duplex", addition_prefix_not_duplex)
+
+    def sniff_mixed():
+        p = _patch("x = 1\n", "x = 2\n", "app.py")
+        if sniff(p) != "patch":
+            raise AssertionError(sniff(p))
+        j = '{"path":"app.py","before":["x = 1"],"after":["x = 2"],"id":"r"}\n'
+        if sniff(j) != "stream":
+            raise AssertionError(sniff(j))
+        if sniff("```suggestion\nnope\n```") != "stream":
+            raise AssertionError("md")
+
+    t("sniff-patch-vs-stream", sniff_mixed)
+
+    def fuse_equal_cores_one_row():
+        old = "def add(a, b):\n    return a - b\n"
+        new = "def add(a, b):\n    return a + b\n"
+        pa = _patch(old, new, "src/add.py")
+        hunks = claims_from_patch(pa, source="git", rev="HEAD")
+        plea = Claim(
+            id="alice",
+            path="src/add.py",
+            before=["    return a - b"],
+            after=["    return a + b"],
+            origin="plea",
+            start=2,
+            end=2,
+            recon="explicit",
+        )
+        fused = fuse_claims(hunks + [plea])
+        both = [c for c in fused if c.origin == "both"]
+        if len(both) != 1:
+            raise AssertionError([c.origin for c in fused])
+        if len(fused) != 1:
+            raise AssertionError("concatenation would keep 2; fusion keeps 1")
+        v = occupy({plea.path: new}, hunks + [plea])
+        if len(material(v)) != 1:
+            raise AssertionError(v)
+        if v[0].via != "both" or v[0].fate != "APPLIED":
+            raise AssertionError(v[0])
+        v2 = occupy({plea.path: old}, hunks + [plea])
+        if v2[0].via != "both" or v2[0].fate != "PENDING":
+            raise AssertionError(v2[0])
+
+    t("fuse-equal-cores-one-occupancy", fuse_equal_cores_one_row)
+
+    def collide_not_fuse():
+        old = "def add(a, b):\n    return a - b\n"
+        new = "def add(a, b):\n    return a + b\n"
+        pa = _patch(old, new, "src/add.py")
+        hunks = claims_from_patch(pa, source="git", rev="HEAD")
+        bob = Claim(
+            id="bob",
+            path="src/add.py",
+            before=["    return a - b"],
+            after=["    return a * b"],
+            origin="plea",
+            start=2,
+            end=2,
+        )
+        fused = fuse_claims(hunks + [bob])
+        if any(c.origin == "both" for c in fused):
+            raise AssertionError("different cores must not fuse")
+        if len(fused) != 2:
+            raise AssertionError(fused)
+        v = occupy({"src/add.py": new}, hunks + [bob])
+        by = {x.claim: x for x in v}
+        hunk_v = [x for x in v if x.via == "hunk"][0]
+        if hunk_v.fate != "APPLIED":
+            raise AssertionError(hunk_v)
+        if by["bob"].fate not in ("SUPERSEDED", "PENDING"):
+            raise AssertionError(by["bob"])
+        if "bob" not in hunk_v.collide and hunk_v.claim not in by["bob"].collide:
+            raise AssertionError((hunk_v.collide, by["bob"].collide))
+
+    t("collide-different-cores-two-occupancies", collide_not_fuse)
+
+    def subset_covers_not_collapse():
+        old = "def f():\n    a = 1\n    b = 2\n    return a + b\n"
+        new = "def f():\n    a = 10\n    b = 20\n    return a + b\n"
+        pa = _patch(old, new, "m.py")
+        hunks = claims_from_patch(pa, source="git")
+        # reviewer only asked for a=10, not b=20
+        p = Claim(
+            id="partial",
+            path="m.py",
+            before=["    a = 1"],
+            after=["    a = 10"],
+            origin="plea",
+            start=2,
+            end=2,
+        )
+        fused = fuse_claims(hunks + [p])
+        if len(fused) != 2:
+            raise AssertionError("subset must not collapse the hunk into one row")
+        partial = [c for c in fused if c.id == "partial"][0]
+        if partial.origin != "both":
+            raise AssertionError(f"subset should witness via=both, got {partial.origin}")
+        if hunks[0].id not in partial.covers:
+            raise AssertionError(partial.covers)
+        v = occupy({"m.py": new}, hunks + [p])
+        by = {x.claim: x for x in v}
+        if by["partial"].via != "both" or by["partial"].fate != "APPLIED":
+            raise AssertionError(by["partial"])
+        hunk_v = [x for x in v if x.via == "hunk"][0]
+        if "partial" in hunk_v.collide:
+            raise AssertionError(f"subset must echo, not collide: {hunk_v.collide}")
+        if "partial" not in hunk_v.echo and hunk_v.claim not in by["partial"].echo:
+            raise AssertionError((hunk_v.echo, by["partial"].echo))
+
+    t("subset-covers-does-not-collapse", subset_covers_not_collapse)
+
+    def fuse_across_delete_create():
+        # cli/cli shape: review on command/pr.go, range deletes it and
+        # creates pkg/cmd/pr/pr.go already holding the after-image.
+        text = (
+            "diff --git a/command/pr.go b/command/pr.go\n"
+            "deleted file mode 100644\n"
+            "--- a/command/pr.go\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-return err\n"
+            "diff --git a/pkg/cmd/pr/pr.go b/pkg/cmd/pr/pr.go\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/pkg/cmd/pr/pr.go\n"
+            "@@ -0,0 +1 @@\n"
+            "+return nil\n"
+        )
+        hunks = claims_from_patch(text, source="git", rev="HEAD")
+        plea = Claim(
+            id="mislav",
+            path="command/pr.go",
+            before=["return err"],
+            after=["return nil"],
+            origin="plea",
+            start=1,
+            end=1,
+            recon="explicit",
+        )
+        fused = fuse_claims(hunks + [plea])
+        both = [c for c in fused if c.origin == "both"]
+        if len(both) != 1:
+            raise AssertionError([(c.origin, c.path, c.file_kind) for c in fused])
+        if both[0].path != "pkg/cmd/pr/pr.go":
+            raise AssertionError(both[0].path)
+        if both[0].moved_from != "command/pr.go":
+            raise AssertionError(both[0].moved_from)
+        v = occupy({"pkg/cmd/pr/pr.go": "return nil\n"}, hunks + [plea])
+        both_v = [x for x in v if x.via == "both"]
+        if not both_v or both_v[0].fate != "APPLIED":
+            raise AssertionError([(x.fate, x.via, x.method, x.path) for x in v])
+        if any(x.via == "plea" and x.fate == "SUPERSEDED" for x in v):
+            raise AssertionError("old-path SUPERSEDED leaked past rewrite")
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(unanimous(v))
+
+    t("fuse-across-delete-create-rename", fuse_across_delete_create)
+
+    def jsonl_and_markdown():
+        text = (
+            '{"path":"mod.py","before":["TIMEOUT = 30"],'
+            '"after":["TIMEOUT = 60"],"id":"r1"}\n'
+            '{"path":"mod.py","before":["retries = 3"],'
+            '"after":["retries = 5"],"id":"r2"}\n'
+        )
+        claims = load_stream(text)
+        v = occupy({"mod.py": "TIMEOUT = 60\nretries = 3\n"}, claims)
+        fates = [x.fate for x in material(v)]
+        if fates != ["APPLIED", "PENDING"]:
+            raise AssertionError(fates)
+        md = (
+            "# src/add.py:2\n"
+            "```\n"
+            "    return a - b\n"
+            "```\n"
+            "```suggestion\n"
+            "    return a + b\n"
+            "```\n"
+        )
+        claims = load_stream(md)
+        v = occupy({"src/add.py": "def add(a, b):\n    return a + b\n"}, claims)
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("ingest-jsonl-and-markdown", jsonl_and_markdown)
+
+    def stream_collide_echo():
+        text = (
+            '{"path":"a.py","before":["x = 1"],"after":["x = 2"],"id":"r1","line":1}\n'
+            '{"path":"a.py","before":["x = 1"],"after":["x = 3"],"id":"r2","line":1}\n'
+            '{"path":"a.py","before":["x = 1"],"after":["x = 2"],"id":"r3","line":1}\n'
+        )
+        claims = load_stream(text)
+        v = occupy({"a.py": "x = 1\n"}, claims)
+        by = {x.claim: x for x in v}
+        if "r2" not in by["r1"].collide:
+            raise AssertionError(by["r1"].collide)
+        if "r3" not in by["r1"].echo:
+            raise AssertionError(by["r1"].echo)
+
+    t("stream-collide-and-echo", stream_collide_echo)
+
+    def sandwich_git():
+        with tempfile.TemporaryDirectory(prefix="lodge-git-") as td:
+            root = Path(td)
+            git(["init", "-q", "-b", "main"], root)
+            git(["config", "user.name", "lodge"], root)
+            git(["config", "user.email", "lodge@test"], root)
+            git(["config", "commit.gpgsign", "false"], root)
+            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t0"], root)
+            t0 = git(["rev-parse", "HEAD"], root).stdout.decode().strip()
+            (root / "app.py").write_text("x = 2\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t1"], root)
+            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+            patch = patch_of_rev(root, "HEAD")
+            hunks = claims_from_patch(patch, source="git", rev="HEAD")
+            plea = Claim(
+                id="bump",
+                path="app.py",
+                before=["x = 1"],
+                after=["x = 2"],
+                origin="plea",
+                original_commit_id=t0,
+                recon="explicit",
+            )
+            fused = fuse_claims(hunks + [plea])
+            if not (len(fused) == 1 and fused[0].origin == "both"):
+                raise AssertionError([c.origin for c in fused])
+            against = default_against(root, None, worktree=False)
+            if against != "HEAD":
+                raise AssertionError(against)
+            now = classify_stream(fused, root, against, ident)
+            if unanimous(now) != "APPLIED":
+                raise AssertionError(f"HEAD occupancy {now[0].fate} (dirty leaked)")
+            wt = classify_stream(fused, root, None, ident)
+            if unanimous(wt) != "PENDING":
+                raise AssertionError(wt[0].fate)
+            sandwich_claim(fused[0], root, now[0], ident, False)
+            if now[0].sandwich != "PENDING":
+                raise AssertionError(now[0].sandwich)
+            parent = classify_stream(fused, root, "HEAD^", ident)
+            if unanimous(parent) != "PENDING":
+                raise AssertionError(parent[0].fate)
+
+    t("fused-sandwich-HEAD-not-worktree", sandwich_git)
+
+    def weird_path():
+        c = Claim(
+            id="jp",
+            path="docs/計画 (1).md",
+            before=["alpha"],
+            after=["beta"],
+            origin="plea",
+        )
+        v = occupy({"docs/計画 (1).md": "beta\n"}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("weird-path-spaces-japanese", weird_path)
+
+    def json_has_no_alias():
+        v = Verdict(
+            fate="APPLIED",
+            path="a.py",
+            claim="c",
+            method="exact-after",
+            via="both",
+        )
+        d = v.as_dict()
+        if "alias" in d:
+            raise AssertionError(d)
+        if d["via"] != "both" or d["fate"] != "APPLIED":
+            raise AssertionError(d)
+
+    t("json-one-vocabulary-no-alias", json_has_no_alias)
+
+    print(f"selftest  {passed} passed  {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+lodge — occupancy of mixed image-claims (git range + review stream)
+
+A hunk and a review suggestion are the same object: a before→after image
+claim. sate occupies a patch. plea occupies a stream. Piping them is two
+reports (and plea's TAKEN/OPEN/STALE aliases). lodge sniffs each input,
+occupies every claim with one kernel, and fuses equal cores from opposite
+origins into one occupancy (via=both).
+
+Usage:
+  lodge --git REV FILE       git range + review stream (the joint)
+  lodge FILE [FILE ...]      patch and/or JSON/JSONL/markdown, sniffed
+  lodge --git REV            range only (still the same kernel)
+  lodge -                    stdin, sniffed
+  gh api …/comments | lodge --git main...HEAD -C repo
+  lodge --selftest
+
+Tree:
+  -C DIR           tree root (default: cwd)
+  --against REF    read files from git REF (default: HEAD if git, else worktree)
+  --worktree       occupy the dirty worktree, not HEAD
+
+Matching:
+  --ignore-space   collapse horizontal whitespace
+  --fuzz           accept windows with ≥0.85 line overlap
+  --sandwich       also classify plea claims against original_commit_id
+  --no-fuse        keep hunk and plea as separate rows (debug concatenation)
+
+Join:
+  Equal cores collapse to via=both. A suggestion that is a plus-subset of a
+  hunk is via=both without dropping the hunk (covers/echo, not collide).
+  A review on a deleted path fuses with the create/rename the range landed.
+
+Output:
+  --json / --tsv / --quiet
+  --report-only    always exit 0
+  --only / --pick FATE[,FATE]   APPLIED,PENDING,MIXED,DUPLEX,SUPERSEDED
+  --via hunk|plea|both
+
+Exit:
+  0  unanimous APPLIED (or empty)
+  1  unanimous PENDING
+  2  SPLIT / MIXED / DUPLEX / SUPERSEDED
+  3  error
+"""
+
+
+def resolve_only(s: str | None) -> set[str] | None:
+    if not s:
+        return None
+    out = set()
+    for part in s.split(","):
+        p = part.strip().upper()
+        if not p:
+            continue
+        out.add(p)
+    return out or None
+
+
+def emit(verdicts: list[Verdict], args: argparse.Namespace, extra: dict) -> int:
+    only = resolve_only(args.only or args.pick)
+    if only:
+        verdicts = [v for v in verdicts if v.fate in only or v.fate in SKIP_FATES]
+    if args.via:
+        want = {x.strip().lower() for x in args.via.split(",") if x.strip()}
+        verdicts = [v for v in verdicts if v.via in want or v.fate in SKIP_FATES]
+    title = extra.get("title") or "stdin"
+    if args.json:
+        sys.stdout.write(
+            format_json(verdicts, {k: v for k, v in extra.items() if k != "title"})
+        )
+    elif args.tsv:
+        sys.stdout.write(format_tsv(verdicts))
+    else:
+        if not args.quiet:
+            sys.stdout.write(format_human(verdicts, str(title)))
+        else:
+            uni = unanimous(verdicts)
+            c = counted(verdicts)
+            vc = via_counted(verdicts)
+            bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+            vbits = " ".join(f"{k}={v}" for k, v in sorted(vc.items()) if v)
+            sys.stdout.write(f"{uni}\t{bits}\tvia {vbits}\n")
+    code = exit_for(unanimous(verdicts))
+    if args.report_only:
+        return 0
+    return code
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="lodge",
+        description="Occupancy of mixed image-claims (git range + review stream)",
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("files", nargs="*", help="patch and/or review stream, or -")
+    p.add_argument("-C", default=".", metavar="DIR", help="tree root")
+    p.add_argument("--against", default=None, metavar="REF", help="git ref (default HEAD)")
+    p.add_argument("--worktree", action="store_true", help="read dirty worktree files")
+    p.add_argument("--git", metavar="REV", help="ingest git show REV / git diff A..B as claims")
+    p.add_argument("--ignore-space", action="store_true")
+    p.add_argument("--fuzz", dest="fuzz", action="store_true", default=False)
+    p.add_argument("--no-fuzz", dest="fuzz", action="store_false")
+    p.add_argument("--sandwich", action="store_true")
+    p.add_argument("--no-fuse", action="store_true", help="do not collapse equal cores")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--only", metavar="FATE[,FATE]")
+    p.add_argument("--pick", metavar="FATE[,FATE]")
+    p.add_argument("--via", metavar="hunk|plea|both")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(HELP)
+        return 0
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"lodge {VERSION}")
+        return 0
+    if args.selftest:
+        return selftest(fuzz=args.fuzz)
+
+    root = Path(args.C).resolve()
+    claims: list[Claim] = []
+    sources: list[str] = []
+
+    if args.git:
+        try:
+            text = patch_of_rev(root, args.git)
+        except RuntimeError as e:
+            print(f"lodge: {e}", file=sys.stderr)
+            return EXIT_ERROR
+        hunks = claims_from_patch(text, source=f"git:{args.git}", rev=args.git)
+        claims.extend(hunks)
+        sources.append(f"git:{args.git}")
+
+    texts: list[tuple[str, str]] = []
+    files = list(args.files)
+    if files == ["-"] or (not files and not args.git and not sys.stdin.isatty()):
+        texts.append(("stdin", sys.stdin.read()))
+        files = [f for f in files if f != "-"]
+    elif "-" in files:
+        texts.append(("stdin", sys.stdin.read()))
+        files = [f for f in files if f != "-"]
+    for f in files:
+        try:
+            texts.append((f, Path(f).read_text(encoding="utf-8")))
+        except OSError as e:
+            print(f"lodge: {e}", file=sys.stderr)
+            return EXIT_ERROR
+
+    for src, text in texts:
+        got = ingest_text(text, source=src)
+        claims.extend(got)
+        sources.append(src)
+
+    if not claims:
+        if not args.git and not texts:
+            sys.stdout.write(HELP)
+            return EXIT_ERROR
+        print("lodge: no image claims in input", file=sys.stderr)
+        return 0 if args.report_only else EXIT_APPLIED
+
+    if not args.no_fuse:
+        claims = fuse_claims(claims)
+
+    against = default_against(root, args.against, args.worktree)
+    norm = space_norm if args.ignore_space else ident
+    verdicts = classify_stream(claims, root, against, norm, fuzz=args.fuzz)
+    if args.sandwich:
+        cmap = {c.id: c for c in claims}
+        for v in verdicts:
+            c = cmap.get(v.claim)
+            if c:
+                sandwich_claim(c, root, v, norm, args.fuzz)
+
+    title = "+".join(sources) if sources else "stdin"
+    try:
+        return emit(
+            verdicts,
+            args,
+            {
+                "title": title,
+                "tree": str(root),
+                "against": against if against is not None else ":worktree",
+                "n": len(material(verdicts)),
+                "fused": not args.no_fuse,
+            },
+        )
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

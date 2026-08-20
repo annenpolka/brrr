@@ -1,0 +1,2464 @@
+#!/usr/bin/env python3
+"""erst — natal keys inflect, so renamed siblings still count as unpaid kin.
+
+Query a commit or a diff (never FILE:LINE). Every birth cohort that change
+touches is scored at HEAD. Keys are not exact bytes: snake/camel/kebab/pascal
+are one identity, and a same-line historical rename (t1 ↔ driftDelay) is too.
+
+This is not aka. aka catalogs inflection pacts in a tree. erst only expands
+the natal keys of *this change's* birth cohort. t1 and driftDelay share no
+stem; they become one key because the line itself used to be named t1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+VERSION = "0.2.0"
+
+STOP = frozenset(
+    """
+    a an the and or for from with this that these those are was were been being
+    have has had not but can will into over such than then them they their its
+    true false none null undefined void nil yes no ok err error result
+    int str bool char float double long short byte string number object array
+    list dict map set type var let const func function fn def class struct enum
+    trait interface public private protected static final async await return
+    import export use using require include package module self super new
+    delete typeof instanceof where select insert update value values name data
+    file line path text todo fixme note hack pub mut impl mod crate ref inout
+    some any sizeof typedef unsigned signed volatile register break continue
+    switch case default else elif endif try catch throw throws finally yield
+    begin end do done fi esac int8 int16 int32 int64 uint usize isize
+    echo export local readonly unset shift test
+    init initializer initialise initialize constructor destructor
+    json yaml xml html http https url uri status response request
+    timeinterval nsstring sendable view body some
+    """.split()
+)
+
+# Single-segment names that flood a tree if echoed. Still valid natal keys
+# when they actually swap on a line; echo then requires a bound literal.
+GENERIC_IDENTS = frozenset(
+    """
+    threshold timeout delay alpha weight score value index count size
+    length width height radius padding spacing color state status flag
+    mode kind code path name data text file line item node key id
+    error result config option param args argv handle buffer offset
+    start end min max low high left right top bottom next prev
+    enabled disabled visible hidden open close read write
+    present absent unknown default
+    counters counter window current geometry geo radius panel
+    reader view item node site
+    """.split()
+)
+
+# Stem pairs reject these added segments: updatedCounters is not erstwhile counters.
+STEM_NOISE = frozenset(
+    """
+    updated update new old tmp temp current next prev raw the my
+    inner outer left right copy clone dummy fake mock test
+    """.split()
+)
+
+SLOT_RE = re.compile(
+    r"(?:(?:public|private|internal|fileprivate|protected|static|open)\s+)*"
+    r"(?:(?:let|var|const|val)\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]{1,40})?\s*="
+)
+
+EXCLUDE_PATHSPEC = [
+    ":(exclude)*.lock",
+    ":(exclude)*-lock.json",
+    ":(exclude)*-lock.yaml",
+    ":(exclude)*/node_modules/*",
+    ":(exclude)*/target/*",
+    ":(exclude)*/dist/*",
+    ":(exclude)*/build/*",
+    ":(exclude)*/vendor/*",
+    ":(exclude)*.min.js",
+    ":(exclude)*.min.css",
+    ":(exclude)*.map",
+    ":(exclude)*.png",
+    ":(exclude)*.jpg",
+    ":(exclude)*.jpeg",
+    ":(exclude)*.gif",
+    ":(exclude)*.webp",
+    ":(exclude)*.ico",
+    ":(exclude)*.pdf",
+    ":(exclude)*.woff*",
+    ":(exclude)*.bin",
+    ":(exclude)*.pbxproj",
+]
+
+# t1 is two chars. Natal short names must survive.
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+SHORT_NATAL = re.compile(r"^[A-Za-z]\d+$")
+NUM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d+(?:\.\d+)?)(ms|us|ns|px|em|rem|kb|mb|gb|mib|kib|gib|s)?(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+STR_RE = re.compile(r""""([^"\n]{2,80})"|'([^'\n]{2,80})'""")
+CODE_EXT = frozenset(
+    {
+        ".swift",
+        ".py",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".go",
+        ".java",
+        ".kt",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".rb",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".json",
+        ".plist",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".cs",
+    }
+)
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+LOC_RE = re.compile(r"^(.*?):(\d+)(?::\d+)?$")
+COMMON_NUM = frozenset({"0", "1", "2", "10", "100"})
+RANGE_RE = re.compile(r"\.\.\.?<?$")
+STYLE_BEFORE = re.compile(
+    r"(?:opacity|response|duration|delay|brightness|saturation|hue|damping"
+    r"|milliseconds|seconds|font|width|height|radius|padding|spacing|"
+    r"weight|size)\s*[\(:]?\s*$",
+    re.IGNORECASE,
+)
+STYLE_LINE = re.compile(
+    r"(opacity|brightness|saturation|hue|spring|yaw|pitch|colorhue)",
+    re.I,
+)
+THRESHOLD_LINE = re.compile(r"(threshold|閾値|score|ema|timeout|retry|delay)", re.I)
+OS_BEFORE = re.compile(r"(macos|iphoneos|ipados|osx)\s*$", re.I)
+ADAPTER_RE = re.compile(
+    r"""(?:CodingKeys|serde|rename|serializedName|json\s*\(|=\s*["'])""",
+    re.I,
+)
+
+MAX_EVENTS = 80
+MAX_COHORTS = 24
+MAX_MEMBERS = 40
+LOG_L_TIMEOUT = 25
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AddedLine:
+    path: str
+    line: int
+    text: str
+
+
+@dataclass
+class Hunk:
+    path: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list[tuple[str, str]]
+
+
+@dataclass
+class Replacement:
+    path: str
+    old_line: int
+    old_text: str
+    new_line: int
+    new_text: str
+
+
+@dataclass
+class Deletion:
+    path: str
+    old_line: int
+    text: str
+
+
+@dataclass
+class Birth:
+    commit: str
+    date: str
+    subject: str
+    path: str
+    region: list[str]
+    uncommitted: bool = False
+
+
+@dataclass
+class Hit:
+    path: str
+    line: int
+    text: str
+
+
+@dataclass
+class Member:
+    status: str  # paid | owing | ok | gone | echo | alias
+    path: str | None
+    line: int | None
+    text: str | None
+    birth_path: str
+    birth_line: int
+    birth_text: str
+    shared: list[str] = field(default_factory=list)
+    holds: str | None = None
+
+
+@dataclass
+class Cohort:
+    kind: str  # owing | split
+    birth: Birth
+    keys: list[str]
+    abandoned: list[str]
+    adopted: list[str]
+    pairs: list[str] = field(default_factory=list)
+    paid: list[Member] = field(default_factory=list)
+    owing: list[Member] = field(default_factory=list)
+    ok: list[Member] = field(default_factory=list)
+    gone: list[Member] = field(default_factory=list)
+    echo: list[Member] = field(default_factory=list)
+    alias: list[Member] = field(default_factory=list)
+    factions: dict[str, int] = field(default_factory=dict)
+
+    def debt(self) -> bool:
+        return bool(
+            self.owing
+            or self.echo
+            or (self.kind == "split" and len(self.factions) > 1)
+        )
+
+
+@dataclass
+class Change:
+    spec: str
+    kind: str  # commit | range | wt | stdin
+    commit: str | None
+    parent: str | None
+    date: str
+    subject: str
+    diff: str
+    hunks: list[Hunk]
+    replacements: list[Replacement]
+    additions: list[AddedLine]
+    deletions: list[Deletion]
+
+
+@dataclass
+class Report:
+    change: Change
+    cohorts: list[Cohort]
+
+
+# ---------------------------------------------------------------------------
+# git / paths
+# ---------------------------------------------------------------------------
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"erst: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(
+    repo: str,
+    args: list[str],
+    *,
+    check: bool = True,
+    timeout: int | None = None,
+) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        timeout=timeout,
+    )
+    if check and r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip()
+        die(err or f"git {' '.join(args)} failed (exit {r.returncode})")
+    return r.stdout.decode("utf-8", "replace")
+
+
+def git_ok(
+    repo: str,
+    args: list[str],
+    timeout: int | None = None,
+) -> tuple[int, str]:
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def find_repo(start: str) -> str:
+    r = subprocess.run(
+        ["git", "-C", start, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        die(f"not a git repository: {start}")
+    return r.stdout.decode("utf-8", "replace").strip()
+
+
+def unquote_git_path(path: str) -> str:
+    path = path.split("\t", 1)[0]
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        inner = path[1:-1]
+        out: list[str] = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt in '"\\nrtab':
+                    out.append(
+                        {"n": "\n", "r": "\r", "t": "\t", "a": "\a", "b": "\b"}.get(
+                            nxt, nxt
+                        )
+                    )
+                    i += 2
+                    continue
+                if nxt.isdigit():
+                    out.append(chr(int(inner[i + 1 : i + 4], 8)))
+                    i += 4
+                    continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
+    return path
+
+
+def looks_like_location(spec: str) -> bool:
+    m = LOC_RE.match(spec)
+    if not m:
+        return False
+    path = m.group(1)
+    if path in {".", ".."}:
+        return False
+    if "/" in path or Path(path).suffix or " " in path:
+        return True
+    if re.search(r"\.[A-Za-z0-9]{1,8}$", path):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# tokenize + inflection
+# ---------------------------------------------------------------------------
+
+
+def _string_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in STR_RE.finditer(text)]
+
+
+def _in_span(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(a <= pos < b for a, b in spans)
+
+
+def keep_ident(w: str) -> bool:
+    if SHORT_NATAL.match(w):
+        return True
+    if len(w) < 3:
+        return False
+    if w.lower() in STOP:
+        return False
+    if len(w) == 40 and all(c in "0123456789abcdefABCDEF" for c in w):
+        return False
+    return True
+
+
+def tokenize(text: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind: str, value: str) -> None:
+        key = (kind, value)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    spans = _string_spans(text)
+    for m in STR_RE.finditer(text):
+        s = (m.group(1) or m.group(2) or "").strip()
+        if len(s) >= 2:
+            add("str", s)
+
+    for m in IDENT_RE.finditer(text):
+        if _in_span(m.start(), spans):
+            continue
+        w = m.group(0)
+        if not keep_ident(w):
+            continue
+        add("id", w)
+
+    for m in NUM_RE.finditer(text):
+        if _in_span(m.start(), spans):
+            continue
+        n = m.group(1)
+        if n in COMMON_NUM:
+            continue
+        add("num", n)
+
+    return found
+
+
+def token_values(text: str) -> set[str]:
+    out: set[str] = set()
+    for k, v in tokenize(text):
+        if k == "id":
+            out.add(v.lower())
+        else:
+            out.add(v)
+    return out
+
+
+def literal_values(text: str) -> set[str]:
+    return {v for k, v in tokenize(text) if k in ("num", "str")}
+
+
+def ident_values(text: str) -> set[str]:
+    return {v for k, v in tokenize(text) if k == "id"}
+
+
+def is_number_token(tok: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?", tok))
+
+
+def ident_parts(name: str) -> tuple[str, ...]:
+    s = name.replace("-", "_")
+    parts: list[str] = []
+    for chunk in s.split("_"):
+        if not chunk:
+            continue
+        bits = re.findall(
+            r"[A-Z]+(?=[A-Z][a-z0-9])|[A-Z]?[a-z]+|[A-Z]+|\d+", chunk
+        )
+        if bits:
+            parts.extend(b.lower() for b in bits if b)
+        else:
+            parts.append(chunk.lower())
+    return tuple(parts) if parts else (name.lower(),)
+
+
+def surfaces(name: str) -> set[str]:
+    parts = list(ident_parts(name))
+    if not parts:
+        return {name}
+    camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
+    pascal = "".join(p.capitalize() for p in parts)
+    snake = "_".join(parts)
+    kebab = "-".join(parts)
+    const = "_".join(p.upper() for p in parts)
+    out = {name, name.lower(), name.upper(), camel, pascal, snake, kebab, const}
+    if SHORT_NATAL.match(name):
+        out.add(name.lower())
+        out.add(name.upper())
+    return {s for s in out if s}
+
+
+def same_inflection(a: str, b: str) -> bool:
+    return ident_parts(a) == ident_parts(b)
+
+
+def stem_related(a: str, b: str) -> bool:
+    pa, pb = ident_parts(a), ident_parts(b)
+    if not pa or not pb:
+        return False
+    if pa == pb:
+        return True
+    # presentThreshold contains threshold as a trailing segment.
+    # updatedCounters is prefix-noise + counters — not erstwhile identity.
+    if pa == pb[-len(pa) :]:
+        extra = pb[: -len(pa)]
+        word = "".join(pa)
+        if extra and all(p in STEM_NOISE for p in extra):
+            return False
+        return len(pa) > 1 or len(word) >= 6
+    if pb == pa[-len(pb) :]:
+        extra = pa[: -len(pb)]
+        word = "".join(pb)
+        if extra and all(p in STEM_NOISE for p in extra):
+            return False
+        return len(pb) > 1 or len(word) >= 6
+    return False
+
+
+def slot_idents(text: str) -> list[str]:
+    """Declared / assigned names (`t1: Type =`, `let threshold =`)."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in SLOT_RE.finditer(text):
+        w = m.group(1)
+        if not keep_ident(w):
+            continue
+        if w.lower() in seen:
+            continue
+        seen.add(w.lower())
+        found.append(w)
+    return found
+
+
+def pair_idents(
+    old_ids: Iterable[str],
+    new_ids: Iterable[str],
+    *,
+    one_to_one: bool = True,
+    stem: bool = True,
+) -> list[tuple[str, str]]:
+    """Pair abandoned idents with adopted ones.
+
+    Order: same inflection (present_threshold ↔ presentThreshold), then
+    stem containment (threshold ↔ presentThreshold), then leftover 1-to-1
+    (t1 ↔ driftDelay) only when the abandoned name is distinctive.
+    Same-surface leftovers are not pairs.
+    """
+    old = list(dict.fromkeys(old_ids))
+    new = list(dict.fromkeys(new_ids))
+    new_l = {n.lower() for n in new}
+    old_l = {o.lower() for o in old}
+    abandoned = [o for o in old if o.lower() not in new_l]
+    adopted = [n for n in new if n.lower() not in old_l]
+    pairs: list[tuple[str, str]] = []
+    used_o: set[str] = set()
+    used_n: set[str] = set()
+
+    def take(o: str, n: str) -> None:
+        used_o.add(o.lower())
+        used_n.add(n.lower())
+        pairs.append((o, n))
+
+    for o in abandoned:
+        cands = [
+            n
+            for n in adopted
+            if n.lower() not in used_n and same_inflection(o, n) and o.lower() != n.lower()
+        ]
+        if len(cands) == 1:
+            take(o, cands[0])
+
+    if stem:
+        for o in abandoned:
+            if o.lower() in used_o:
+                continue
+            cands = [
+                n for n in adopted if n.lower() not in used_n and stem_related(o, n)
+            ]
+            if len(cands) == 1:
+                take(o, cands[0])
+
+    if one_to_one:
+        left_o = [o for o in abandoned if o.lower() not in used_o]
+        left_n = [n for n in adopted if n.lower() not in used_n]
+        # t1 ↔ driftDelay: short natal or multi-segment on the abandoned side.
+        if len(left_o) == 1 and len(left_n) == 1 and distinctive_ident(left_o[0]):
+            take(left_o[0], left_n[0])
+    return pairs
+
+
+def pair_line_idents(old_text: str, new_text: str) -> list[tuple[str, str]]:
+    """Prefer declaration-slot names; fall back to all idents without 1:1."""
+    slots = pair_idents(slot_idents(old_text), slot_idents(new_text), one_to_one=True)
+    if slots:
+        return slots
+    # Inflection only on the full ident sets — no stem, no leftover 1:1.
+    # That stops `window` ↔ `focusedWindow`, `radius` ↔ `cornerRadius`,
+    # and `geo` ↔ `geometry`. Stem pairing is declaration-slot only.
+    return pair_idents(
+        ident_values(old_text),
+        ident_values(new_text),
+        one_to_one=False,
+        stem=False,
+    )
+
+
+def distinctive_ident(name: str) -> bool:
+    if SHORT_NATAL.match(name):
+        return True
+    parts = ident_parts(name)
+    if len(parts) >= 2:
+        return True
+    if name.lower() in GENERIC_IDENTS:
+        return False
+    return len(name) >= 8
+
+
+def number_context_ok(text: str, num: str) -> bool:
+    for m in re.finditer(re.escape(num), text):
+        before = text[max(0, m.start() - 24) : m.start()]
+        after = text[m.end() : m.end() + 2]
+        if RANGE_RE.search(before) or after.startswith(".."):
+            continue
+        if re.search(r"[A-Za-z]$", before) or before.endswith("-"):
+            if re.search(r"[A-Za-z0-9]-$", before) or re.search(r"[A-Za-z]$", before):
+                continue
+        if STYLE_BEFORE.search(before):
+            continue
+        if re.search(r"[\*\/]\s*$", before):
+            continue
+        if after.startswith("+"):
+            continue
+        if OS_BEFORE.search(before):
+            continue
+        return True
+    return False
+
+
+def float_hit_ok(text: str, num: str) -> bool:
+    if "." not in num:
+        return True
+    if STYLE_LINE.search(text) and not THRESHOLD_LINE.search(text):
+        return False
+    return True
+
+
+def best_ancestral_line(region: list[str], query_text: str) -> str | None:
+    if not region:
+        return None
+    q = token_values(query_text)
+    best = region[0]
+    best_n = -1
+    for line in region:
+        n = len(token_values(line) & q)
+        if n > best_n:
+            best_n = n
+            best = line
+    return best
+
+
+def interesting_literal(tok: str, text: str) -> bool:
+    if is_number_token(tok):
+        if tok in COMMON_NUM:
+            return False
+        if not number_context_ok(text, tok):
+            return False
+        if not float_hit_ok(text, tok):
+            return False
+    return True
+
+
+def path_is_code(path: str) -> bool:
+    return any(path.lower().endswith(ext) for ext in CODE_EXT)
+
+
+def path_is_doc_or_test(path: str) -> bool:
+    low = path.replace("\\", "/").lower()
+    base = low.rsplit("/", 1)[-1]
+    if low.endswith(".md") or "/docs/" in f"/{low}" or "/doc/" in f"/{low}":
+        return True
+    if "test" in base or "/test" in f"/{low}" or "/tests/" in f"/{low}":
+        return True
+    if "/spec/" in f"/{low}" or base.startswith("spec"):
+        return True
+    return False
+
+
+def short_int(tok: str) -> bool:
+    return is_number_token(tok) and "." not in tok and len(tok) <= 2
+
+
+def acceptable_debt_literal(tok: str, text: str, path: str) -> bool:
+    if not interesting_literal(tok, text):
+        return False
+    if short_int(tok):
+        if not path_is_code(path):
+            return False
+        if not re.search(
+            rf"[A-Za-z_][A-Za-z0-9_]*\s*[:=]{{1,2}}\s*{re.escape(tok)}\b", text
+        ):
+            return False
+    return True
+
+
+def num_appears_bare(text: str, num: str) -> bool:
+    for m in re.finditer(re.escape(num), text):
+        before = text[m.start() - 1] if m.start() else ""
+        after = text[m.end() : m.end() + 1]
+        if before.isdigit() or before == ".":
+            continue
+        if after.isdigit() or after == ".":
+            continue
+        return True
+    return False
+
+
+def holds_literal(text: str, tok: str) -> bool:
+    if tok in token_values(text):
+        return True
+    if is_number_token(tok) and num_appears_bare(text, tok):
+        if THRESHOLD_LINE.search(text) or re.search(
+            rf"[=:<>]\s*{re.escape(tok)}\b", text
+        ):
+            return True
+    return False
+
+
+def holds_surface(text: str, surface: str) -> bool:
+    """Unquoted token only. Quoted `= \"t1\"` is an adapter, not a code ident."""
+    if not surface:
+        return False
+    spans = _string_spans(text)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", surface):
+        pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(surface)}(?![A-Za-z0-9_])")
+    else:
+        pat = re.compile(rf"(?<![A-Za-z0-9]){re.escape(surface)}(?![A-Za-z0-9])")
+    for m in pat.finditer(text):
+        if not _in_span(m.start(), spans):
+            return True
+    return False
+
+
+def holds_ident_forms(text: str, name: str) -> bool:
+    return any(holds_surface(text, s) for s in surfaces(name))
+
+
+def quoted_only_hold(text: str, name: str) -> bool:
+    """True when the name lives only inside quotes (CodingKeys = \"t1\")."""
+    if holds_ident_forms(text, name):
+        return False
+    for s in surfaces(name):
+        if re.search(rf"""['"]{re.escape(s)}['"]""", text):
+            return True
+    return False
+
+
+def slot_value(natal_text: str, hit_text: str, natal_lit: str) -> str | None:
+    n_lits = literal_values(natal_text)
+    h_lits = literal_values(hit_text)
+    if natal_lit in h_lits:
+        return natal_lit
+    vanished = n_lits - h_lits
+    appeared = h_lits - n_lits
+    if natal_lit in vanished and len(appeared) == 1:
+        return next(iter(appeared))
+    if natal_lit in vanished:
+        natal_is_num = is_number_token(natal_lit)
+        same = [x for x in appeared if is_number_token(x) == natal_is_num]
+        if len(same) == 1:
+            return same[0]
+        if len(appeared) == 1:
+            return next(iter(appeared))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# diff parse
+# ---------------------------------------------------------------------------
+
+
+def parse_hunks(diff: str) -> list[Hunk]:
+    hunks: list[Hunk] = []
+    path = ""
+    i = 0
+    lines = diff.splitlines()
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            path = ""
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            rest = line[4:]
+            if rest.startswith("/dev/null"):
+                path = ""
+            else:
+                if rest.startswith("b/"):
+                    rest = rest[2:]
+                path = unquote_git_path(rest)
+            i += 1
+            continue
+        m = HUNK_RE.match(line)
+        if m and path:
+            old_start = int(m.group(1))
+            old_count = int(m.group(2) or "1")
+            new_start = int(m.group(3))
+            new_count = int(m.group(4) or "1")
+            body: list[tuple[str, str]] = []
+            i += 1
+            while i < len(lines):
+                l = lines[i]
+                if l.startswith("diff --git ") or l.startswith("@@ "):
+                    break
+                if l.startswith("\\"):
+                    i += 1
+                    continue
+                if l.startswith("+") or l.startswith("-") or l.startswith(" "):
+                    body.append((l[0], l[1:]))
+                    i += 1
+                    continue
+                break
+            hunks.append(Hunk(path, old_start, old_count, new_start, new_count, body))
+            continue
+        i += 1
+    return hunks
+
+
+def pair_hunk(h: Hunk) -> tuple[list[Replacement], list[AddedLine], list[Deletion]]:
+    replacements: list[Replacement] = []
+    additions: list[AddedLine] = []
+    deletions: list[Deletion] = []
+    minuses: list[tuple[int, str]] = []
+    pluses: list[tuple[int, str]] = []
+
+    def flush() -> None:
+        n = min(len(minuses), len(pluses))
+        for i in range(n):
+            ol, ot = minuses[i]
+            nl, nt = pluses[i]
+            replacements.append(Replacement(h.path, ol, ot, nl, nt))
+        for i in range(n, len(minuses)):
+            ol, ot = minuses[i]
+            deletions.append(Deletion(h.path, ol, ot))
+        for i in range(n, len(pluses)):
+            nl, nt = pluses[i]
+            additions.append(AddedLine(h.path, nl, nt))
+        minuses.clear()
+        pluses.clear()
+
+    old_line = h.old_start
+    new_line = h.new_start
+    for kind, text in h.lines:
+        if kind == " ":
+            flush()
+            old_line += 1
+            new_line += 1
+        elif kind == "-":
+            minuses.append((old_line, text))
+            old_line += 1
+        elif kind == "+":
+            pluses.append((new_line, text))
+            new_line += 1
+    flush()
+    return replacements, additions, deletions
+
+
+def events_from_hunks(
+    hunks: Iterable[Hunk],
+) -> tuple[list[Replacement], list[AddedLine], list[Deletion]]:
+    replacements: list[Replacement] = []
+    additions: list[AddedLine] = []
+    deletions: list[Deletion] = []
+    for h in hunks:
+        r, a, d = pair_hunk(h)
+        replacements.extend(r)
+        additions.extend(a)
+        deletions.extend(d)
+    return replacements, additions, deletions
+
+
+def added_from_hunks(hunks: Iterable[Hunk]) -> list[AddedLine]:
+    out: list[AddedLine] = []
+    for h in hunks:
+        new_line = h.new_start
+        for kind, text in h.lines:
+            if kind == " ":
+                new_line += 1
+            elif kind == "+":
+                out.append(AddedLine(h.path, new_line, text))
+                new_line += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# change ingest
+# ---------------------------------------------------------------------------
+
+
+def commit_meta(repo: str, spec: str) -> tuple[str, str, str]:
+    code, out = git_ok(repo, ["log", "-1", "--format=%H%x09%cI%x09%s", spec])
+    if code != 0 or not out.strip():
+        die(f"not a commit: {spec}")
+    parts = out.strip().split("\t", 2)
+    if len(parts) < 3:
+        die(f"could not parse commit metadata for {spec}")
+    return parts[0], parts[1], parts[2]
+
+
+def is_commit_ish(repo: str, spec: str) -> bool:
+    code, _ = git_ok(repo, ["rev-parse", "--verify", spec + "^{commit}"])
+    return code == 0
+
+
+def load_change(repo: str, spec: str | None, *, wt: bool, from_stdin: bool) -> Change:
+    if from_stdin or spec == "-":
+        diff = sys.stdin.read()
+        hunks = parse_hunks(diff)
+        r, a, d = events_from_hunks(hunks)
+        parent = git(repo, ["rev-parse", "HEAD"]).strip()
+        return Change(
+            spec="-",
+            kind="stdin",
+            commit=None,
+            parent=parent,
+            date="",
+            subject="stdin diff",
+            diff=diff,
+            hunks=hunks,
+            replacements=r,
+            additions=a,
+            deletions=d,
+        )
+
+    if wt or spec in {"wt", "WORKTREE", "working-tree"}:
+        diff = git(repo, ["diff", "-U0", "--find-renames", "HEAD"])
+        hunks = parse_hunks(diff)
+        r, a, d = events_from_hunks(hunks)
+        parent = git(repo, ["rev-parse", "HEAD"]).strip()
+        return Change(
+            spec="wt",
+            kind="wt",
+            commit="UNCOMMITTED",
+            parent=parent,
+            date="",
+            subject="working tree",
+            diff=diff,
+            hunks=hunks,
+            replacements=r,
+            additions=a,
+            deletions=d,
+        )
+
+    if spec is None:
+        spec = "HEAD"
+
+    if looks_like_location(spec):
+        die(
+            "pass a commit or a diff, not FILE:LINE "
+            "(erst starts from a change; natal keys inflect from the rename itself)"
+        )
+
+    if ".." in spec:
+        left, right = spec.split("..", 1)
+        right = right.lstrip(".")
+        left = left or "HEAD"
+        right = right or "HEAD"
+        if not is_commit_ish(repo, left) or not is_commit_ish(repo, right):
+            die(f"not a commit range: {spec}")
+        diff = git(repo, ["diff", "-U0", "--find-renames", left, right])
+        full, date, subject = commit_meta(repo, right)
+        hunks = parse_hunks(diff)
+        r, a, d = events_from_hunks(hunks)
+        parent = git(repo, ["rev-parse", left]).strip()
+        return Change(
+            spec=spec,
+            kind="range",
+            commit=full,
+            parent=parent,
+            date=date,
+            subject=subject,
+            diff=diff,
+            hunks=hunks,
+            replacements=r,
+            additions=a,
+            deletions=d,
+        )
+
+    if not is_commit_ish(repo, spec):
+        die(f"not a commit: {spec}")
+
+    full, date, subject = commit_meta(repo, spec)
+    code, parent_out = git_ok(repo, ["rev-parse", f"{full}^"])
+    parent = parent_out.strip() if code == 0 else None
+    if parent:
+        diff = git(repo, ["diff", "-U0", "--find-renames", parent, full])
+    else:
+        diff = git(repo, ["show", "--format=", "-U0", "--find-renames", full])
+    hunks = parse_hunks(diff)
+    r, a, d = events_from_hunks(hunks)
+    return Change(
+        spec=spec,
+        kind="commit",
+        commit=full,
+        parent=parent,
+        date=date,
+        subject=subject,
+        diff=diff,
+        hunks=hunks,
+        replacements=r,
+        additions=a,
+        deletions=d,
+    )
+
+
+# ---------------------------------------------------------------------------
+# birth
+# ---------------------------------------------------------------------------
+
+_birth_cache: dict[tuple[str, str, str, int], Birth | None] = {}
+_added_cache: dict[tuple[str, str], list[AddedLine]] = {}
+_grep_cache: dict[tuple[str, str, str], list[Hit]] = {}
+
+
+def birth_of_line(repo: str, path: str, line: int, at: str, debug: bool) -> Birth | None:
+    key = (repo, at, path, line)
+    if key in _birth_cache:
+        return _birth_cache[key]
+    spec = f"{line},{line}:{path}"
+    args_follow = [
+        "log",
+        "-L",
+        spec,
+        at,
+        "-p",
+        "--pretty=format:%x1e%H%x09%cI%x09%s",
+        "--follow",
+    ]
+    code, out = git_ok(repo, args_follow, timeout=LOG_L_TIMEOUT)
+    if code != 0 or not out.strip():
+        code, out = git_ok(
+            repo,
+            ["log", "-L", spec, at, "-p", "--pretty=format:%x1e%H%x09%cI%x09%s"],
+            timeout=LOG_L_TIMEOUT,
+        )
+    if code != 0 or not out.strip():
+        _birth_cache[key] = None
+        return None
+    records = [r for r in out.split("\x1e") if r.strip()]
+    if not records:
+        _birth_cache[key] = None
+        return None
+    oldest = records[-1]
+    header, _, body = oldest.partition("\n")
+    parts = header.strip().split("\t", 2)
+    if len(parts) < 3:
+        _birth_cache[key] = None
+        return None
+    commit, date, subject = parts[0], parts[1], parts[2]
+    region: list[str] = []
+    birth_path = path
+    for line_txt in body.splitlines():
+        if line_txt.startswith("+++ "):
+            rest = line_txt[4:]
+            if rest.startswith("b/"):
+                rest = rest[2:]
+            if not rest.startswith("/dev/null"):
+                birth_path = unquote_git_path(rest)
+        if line_txt.startswith("+") and not line_txt.startswith("+++"):
+            region.append(line_txt[1:])
+    if debug:
+        print(
+            f"debug: birth {commit[:8]} {path}:{line} region={region[:3]!r}",
+            file=sys.stderr,
+        )
+    b = Birth(commit, date, subject, birth_path, region, uncommitted=False)
+    _birth_cache[key] = b
+    return b
+
+
+def added_lines_in_commit(repo: str, commit: str) -> list[AddedLine]:
+    key = (repo, commit)
+    if key in _added_cache:
+        return _added_cache[key]
+    if commit == "UNCOMMITTED":
+        diff = git(repo, ["diff", "-U0", "--find-renames", "HEAD"])
+    else:
+        code, parent_out = git_ok(repo, ["rev-parse", f"{commit}^"])
+        parent = parent_out.strip() if code == 0 else None
+        if parent:
+            diff = git(repo, ["diff", "-U0", "--find-renames", parent, commit])
+        else:
+            diff = git(repo, ["show", "--format=", "-U0", "--find-renames", commit])
+    added = added_from_hunks(parse_hunks(diff))
+    _added_cache[key] = added
+    return added
+
+
+def this_change_as_birth(change: Change) -> Birth:
+    return Birth(
+        commit=change.commit or "STDIN",
+        date=change.date,
+        subject=change.subject,
+        path="",
+        region=[],
+        uncommitted=change.kind in {"wt", "stdin"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# grep / locate
+# ---------------------------------------------------------------------------
+
+
+def parse_grep_line(line: str, tree: str | None) -> Hit | None:
+    raw = line
+    if tree:
+        prefix = tree + ":"
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+    m = re.match(r"^(.*):(\d+):(.*)$", raw)
+    if not m:
+        return None
+    return Hit(m.group(1), int(m.group(2)), m.group(3))
+
+
+def grep_token(repo: str, token: str, tree: str | None) -> list[Hit]:
+    cache_key = (repo, tree or "WT", token)
+    if cache_key in _grep_cache:
+        return _grep_cache[cache_key]
+    args = ["grep", "-n", "-I", "-F"]
+    wordish = (
+        not is_number_token(token)
+        and " " not in token
+        and "." not in token
+        and "-" not in token
+    )
+    if wordish:
+        args.append("-w")
+    # Short natal names are case-exact (t1 vs T1 are both wanted; we grep each).
+    if is_number_token(token) or not SHORT_NATAL.match(token):
+        if not SHORT_NATAL.match(token or ""):
+            args.append("-i")
+    args.extend(["-e", token])
+    if tree:
+        args.append(tree)
+    args.extend(["--", ".", *EXCLUDE_PATHSPEC])
+    code, out = git_ok(repo, args)
+    if code not in (0, 1):
+        _grep_cache[cache_key] = []
+        return []
+    hits: list[Hit] = []
+    for line in out.splitlines():
+        h = parse_grep_line(line, tree)
+        if not h:
+            continue
+        if is_number_token(token):
+            if not number_context_ok(h.text, token):
+                continue
+            if not float_hit_ok(h.text, token):
+                continue
+            if token not in token_values(h.text):
+                if not num_appears_bare(h.text, token):
+                    continue
+                if not THRESHOLD_LINE.search(h.text) and not re.search(
+                    rf"[=:<>]\s*{re.escape(token)}\b", h.text
+                ):
+                    continue
+        else:
+            if not (
+                holds_surface(h.text, token)
+                or holds_ident_forms(h.text, token)
+                or quoted_only_hold(h.text, token)
+                or token.lower() in h.text.lower()
+            ):
+                continue
+        hits.append(h)
+    _grep_cache[cache_key] = hits
+    return hits
+
+
+def grep_ident_forms(repo: str, name: str, tree: str | None) -> list[Hit]:
+    seen: set[tuple[str, int]] = set()
+    out: list[Hit] = []
+    for s in sorted(surfaces(name), key=len, reverse=True):
+        if len(s) < 2:
+            continue
+        for h in grep_token(repo, s, tree):
+            loc = (h.path, h.line)
+            if loc in seen:
+                continue
+            if holds_surface(h.text, s) or quoted_only_hold(h.text, name):
+                seen.add(loc)
+                out.append(h)
+    return out
+
+
+def read_tree_lines(repo: str, tree: str | None, path: str) -> list[str] | None:
+    if tree is None:
+        p = Path(repo) / path
+        if not p.is_file():
+            return None
+        try:
+            return p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+    code, out = git_ok(repo, ["show", f"{tree}:{path}"])
+    if code != 0:
+        return None
+    return out.splitlines()
+
+
+def follow_line(
+    repo: str,
+    tree: str | None,
+    natal: AddedLine,
+    key: str,
+) -> Hit | None:
+    lines = read_tree_lines(repo, tree, natal.path)
+    natal_strip = natal.text.strip()
+    q = token_values(natal.text)
+    ids = ident_values(natal.text)
+    if lines is not None:
+        for i, t in enumerate(lines, 1):
+            if t.strip() == natal_strip:
+                return Hit(natal.path, i, t)
+        best: Hit | None = None
+        best_n = -1
+        for i, t in enumerate(lines, 1):
+            toks = token_values(t)
+            ov = len(toks & q)
+            hid = ident_values(t)
+            if ids:
+                if any(
+                    same_inflection(a, b) or a.lower() == b.lower()
+                    for a in ids
+                    for b in hid
+                ):
+                    ov += 2
+                elif any(holds_ident_forms(t, a) for a in ids):
+                    ov += 2
+            if key and (
+                key in toks
+                or holds_ident_forms(t, key)
+                or (is_number_token(key) and slot_value(natal.text, t, key))
+            ):
+                ov += 2
+            if ov > best_n:
+                best_n = ov
+                best = Hit(natal.path, i, t)
+        if best is not None and best_n >= 2:
+            return best
+
+    search = sorted(ids, key=len, reverse=True)[:4]
+    for ident in search:
+        hits = grep_ident_forms(repo, ident, tree)
+        same = [h for h in hits if h.path == natal.path]
+        pool = same or hits
+        scored: list[tuple[int, Hit]] = []
+        for h in pool:
+            ov = len(token_values(h.text) & q)
+            if ov:
+                scored.append((ov, h))
+        if scored:
+            scored.sort(key=lambda x: -x[0])
+            return scored[0][1]
+    return None
+
+
+def locate_natal(
+    repo: str,
+    tree: str | None,
+    natal: AddedLine,
+    keys: list[str],
+    paid_locs: set[tuple[str, int]],
+    paid_texts: set[str],
+) -> list[Hit]:
+    sib_tokens = token_values(natal.text)
+    search_keys = [k for k in keys if k.lower() in sib_tokens or holds_ident_forms(natal.text, k)]
+    if not search_keys:
+        lits = [t for t in literal_values(natal.text) if t not in COMMON_NUM]
+        search_keys = sorted(lits, key=len, reverse=True)[:3]
+    if not search_keys:
+        search_keys = sorted(sib_tokens, key=len, reverse=True)[:3]
+    if not search_keys:
+        return []
+
+    def key_rank(k: str) -> tuple[int, int]:
+        if is_number_token(k) or " " in k:
+            return (0, -len(k))
+        if distinctive_ident(k):
+            return (1, -len(k))
+        return (2, -len(k))
+
+    search_keys = sorted(search_keys, key=key_rank)
+
+    lit_keys = [k for k in keys if is_number_token(k) or " " in k]
+    distinct_id_keys = [k for k in keys if not is_number_token(k) and " " not in k and distinctive_ident(k)]
+
+    candidates: list[Hit] = []
+    for key in search_keys:
+        if is_number_token(key) or " " in key:
+            hits = grep_token(repo, key, tree)
+        else:
+            hits = grep_ident_forms(repo, key, tree)
+            if not distinctive_ident(key):
+                # Generic ident (threshold): keep hits bound to a natal literal
+                # or distinctive sibling, plus leftover docs/tests. Other
+                # modules' same-spelled locals (SiteObserver.threshold=0.7)
+                # are not this family.
+                filtered: list[Hit] = []
+                for h in hits:
+                    if any(holds_literal(h.text, lit) for lit in lit_keys):
+                        filtered.append(h)
+                        continue
+                    if any(holds_ident_forms(h.text, d) for d in distinct_id_keys):
+                        filtered.append(h)
+                        continue
+                    if path_is_doc_or_test(h.path):
+                        filtered.append(h)
+                hits = filtered
+        if hits:
+            candidates = hits
+            break
+    if not candidates:
+        return []
+
+    scored: list[tuple[int, bool, Hit]] = []
+    natal_strip = natal.text.strip()
+    for h in candidates:
+        if (h.path, h.line) in paid_locs:
+            continue
+        if h.text.strip() in paid_texts and h.path == natal.path:
+            continue
+        overlap = token_values(h.text) & sib_tokens
+        score = len(overlap)
+        if any(holds_ident_forms(h.text, k) for k in keys if not is_number_token(k)):
+            score += 2
+        if h.text.strip() == natal_strip:
+            score += 4
+        if h.path == natal.path:
+            score += 1
+        if score <= 0:
+            continue
+        literal = any(is_number_token(tok) or " " in tok for tok in overlap)
+        scored.append((score, literal, h))
+    if not scored:
+        return []
+    best = max(s for s, _, _ in scored)
+    kept: list[Hit] = []
+    for score, literal, h in scored:
+        if score < best:
+            continue
+        if score >= 2 or h.path == natal.path or literal:
+            kept.append(h)
+    if best == 1 and len(kept) > 8:
+        same = [h for h in kept if h.path == natal.path]
+        kept = same or kept[:5]
+    elif len(kept) > 12:
+        same = [h for h in kept if h.path == natal.path]
+        kept = same or kept[:12]
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# cohort analysis
+# ---------------------------------------------------------------------------
+
+
+def rarity_lits(added: list[AddedLine]) -> dict[str, list[AddedLine]]:
+    index: dict[str, list[AddedLine]] = {}
+    for al in added:
+        for tok in literal_values(al.text):
+            if not acceptable_debt_literal(tok, al.text, al.path):
+                continue
+            index.setdefault(tok, []).append(al)
+    n = len(added) or 1
+    cap = max(8, int(n * 0.08))
+    out: dict[str, list[AddedLine]] = {}
+    for tok, lines in index.items():
+        uniq: dict[tuple[str, int], AddedLine] = {(x.path, x.line): x for x in lines}
+        vals = list(uniq.values())
+        if len(vals) < 2:
+            continue
+        if len(vals) > cap:
+            continue
+        out[tok] = vals
+    return out
+
+
+def rarity_idents(added: list[AddedLine]) -> dict[str, list[AddedLine]]:
+    """Cluster birth-added lines by inflection class of a distinctive ident."""
+    index: dict[tuple[str, ...], list[tuple[str, AddedLine]]] = {}
+    for al in added:
+        seen_stems: set[tuple[str, ...]] = set()
+        for ident in ident_values(al.text):
+            if not distinctive_ident(ident):
+                continue
+            stem = ident_parts(ident)
+            if stem in seen_stems:
+                continue
+            seen_stems.add(stem)
+            index.setdefault(stem, []).append((ident, al))
+    n = len(added) or 1
+    cap = max(8, int(n * 0.08))
+    out: dict[str, list[AddedLine]] = {}
+    for stem, rows in index.items():
+        uniq: dict[tuple[str, int], AddedLine] = {}
+        label = rows[0][0]
+        for ident, al in rows:
+            uniq[(al.path, al.line)] = al
+            if same_inflection(ident, label) and ident != label:
+                label = ident
+        vals = list(uniq.values())
+        if len(vals) < 2 or len(vals) > cap:
+            continue
+        out[label] = vals
+    return out
+
+
+def eval_tree_for(change: Change) -> str | None:
+    if change.kind in {"wt", "stdin"}:
+        return None
+    return "HEAD"
+
+
+def paid_new_locs(change: Change) -> set[tuple[str, int]]:
+    locs = {(r.path, r.new_line) for r in change.replacements}
+    locs |= {(a.path, a.line) for a in change.additions}
+    return locs
+
+
+def paid_new_texts(change: Change) -> set[str]:
+    texts = {r.new_text.strip() for r in change.replacements}
+    texts |= {a.text.strip() for a in change.additions}
+    return texts
+
+
+def natal_lines_sharing(
+    added: list[AddedLine],
+    tokens: set[str],
+    skip: set[tuple[str, str]] | None = None,
+) -> list[AddedLine]:
+    out: list[AddedLine] = []
+    seen: set[tuple[str, int]] = set()
+    id_keys = [t for t in tokens if not is_number_token(t) and " " not in t]
+    lit_keys = {t for t in tokens if is_number_token(t) or " " in t}
+    for al in added:
+        loc = (al.path, al.line)
+        if loc in seen:
+            continue
+        if skip and (al.path, al.text.strip()) in skip:
+            continue
+        vals = token_values(al.text)
+        shared_lit = vals & lit_keys if lit_keys else set()
+        shared_id = any(holds_ident_forms(al.text, k) or quoted_only_hold(al.text, k) for k in id_keys)
+        if not shared_lit and not shared_id:
+            continue
+        if lit_keys and not shared_lit:
+            # Generic ident-only (`threshold` at 0.7) is not this 0.4 family.
+            if not any(
+                distinctive_ident(k) and holds_ident_forms(al.text, k) for k in id_keys
+            ):
+                continue
+        seen.add(loc)
+        out.append(al)
+    return out
+
+
+def member_from_hit(
+    status: str,
+    natal: AddedLine,
+    hit: Hit | None,
+    shared: Iterable[str],
+    holds: str | None = None,
+) -> Member:
+    if hit is None:
+        return Member(
+            status="gone",
+            path=None,
+            line=None,
+            text=None,
+            birth_path=natal.path,
+            birth_line=natal.line,
+            birth_text=natal.text,
+            shared=sorted(shared),
+            holds=holds,
+        )
+    return Member(
+        status=status,
+        path=hit.path,
+        line=hit.line,
+        text=hit.text,
+        birth_path=natal.path,
+        birth_line=natal.line,
+        birth_text=natal.text,
+        shared=sorted(shared),
+        holds=holds,
+    )
+
+
+def classify_hit(
+    hit_text: str,
+    abandoned: set[str],
+    adopted: set[str],
+) -> str:
+    has_ab_id = False
+    has_ad_id = False
+    has_ab_lit = False
+    has_ad_lit = False
+    quoted_ab = False
+    for t in abandoned:
+        if is_number_token(t) or " " in t:
+            if holds_literal(hit_text, t):
+                has_ab_lit = True
+        else:
+            if holds_ident_forms(hit_text, t):
+                has_ab_id = True
+            elif quoted_only_hold(hit_text, t):
+                quoted_ab = True
+    for t in adopted:
+        if is_number_token(t) or " " in t:
+            if holds_literal(hit_text, t):
+                has_ad_lit = True
+        else:
+            if holds_ident_forms(hit_text, t):
+                has_ad_id = True
+    if quoted_ab and (has_ad_id or ADAPTER_RE.search(hit_text)):
+        return "alias"
+    if quoted_ab and not has_ab_id:
+        return "alias"
+    if (has_ad_id or has_ad_lit) and not has_ab_id and not has_ab_lit:
+        return "ok"
+    if has_ab_id or has_ab_lit:
+        return "owing"
+    return "ok"
+
+
+def format_pair(old: str, new: str) -> str:
+    return f"{old}↔{new}"
+
+
+def analyze_path_a(
+    repo: str,
+    change: Change,
+    *,
+    debug: bool,
+    max_members: int,
+) -> list[Cohort]:
+    tree = eval_tree_for(change)
+    paid_locs = paid_new_locs(change)
+    paid_texts = paid_new_texts(change)
+    parent = change.parent
+    if not parent:
+        return []
+
+    events: list[tuple[set[str], set[str], list[tuple[str, str]], str, int, str, str | None, int | None, str | None]] = []
+
+    for r in change.replacements:
+        lit_ab = {
+            t
+            for t in (literal_values(r.old_text) - literal_values(r.new_text))
+            if acceptable_debt_literal(t, r.old_text, r.path)
+        }
+        lit_ad = {
+            t
+            for t in (literal_values(r.new_text) - literal_values(r.old_text))
+            if interesting_literal(t, r.new_text)
+        }
+        id_pairs = pair_line_idents(r.old_text, r.new_text)
+        id_ab = {o for o, _ in id_pairs}
+        id_ad = {n for _, n in id_pairs}
+        # Literal-only bump still carries erstwhile names from this line later
+        # (birth region). Require a swap of *something*.
+        if not id_pairs and not (lit_ab and lit_ad):
+            continue
+        events.append(
+            (
+                lit_ab | id_ab,
+                lit_ad | id_ad,
+                id_pairs,
+                r.path,
+                r.old_line,
+                r.old_text,
+                r.new_text,
+                r.new_line,
+                r.path,
+            )
+        )
+        if len(events) >= MAX_EVENTS:
+            break
+
+    buckets: dict[tuple[str, frozenset[str]], dict] = {}
+    for abandoned, adopted, id_pairs, path, old_line, old_text, new_text, new_line, new_path in events:
+        birth = birth_of_line(repo, path, old_line, parent, debug)
+        if birth is None:
+            birth = Birth(
+                commit=change.commit or "UNKNOWN",
+                date=change.date,
+                subject=change.subject,
+                path=path,
+                region=[old_text],
+                uncommitted=change.kind in {"wt", "stdin"},
+            )
+        natal_added = (
+            added_lines_in_commit(repo, birth.commit)
+            if birth.commit not in {"UNKNOWN"}
+            else []
+        )
+        anc = best_ancestral_line(birth.region, old_text) or old_text
+        # Erstwhile names live on the birth line even when this change only
+        # bumped a number on the already-renamed descendant.
+        hist_pairs = pair_line_idents(anc, new_text or old_text)
+        if not hist_pairs:
+            hist_pairs = pair_idents(
+                ident_values(anc),
+                ident_values(old_text) | ident_values(new_text or ""),
+                one_to_one=True,
+            )
+        all_pairs = list(id_pairs)
+        seen_p = {(a.lower(), b.lower()) for a, b in all_pairs}
+        for a, b in hist_pairs:
+            if (a.lower(), b.lower()) not in seen_p:
+                all_pairs.append((a, b))
+                seen_p.add((a.lower(), b.lower()))
+        new_lits = literal_values(new_text) if new_text is not None else set()
+        birth_debt_lits = {
+            t
+            for t in (literal_values(anc) - new_lits)
+            if acceptable_debt_literal(t, anc, birth.path or path)
+        }
+        erst_names = {o for o, _ in all_pairs}
+        # Birth ident that never made it onto the new line is debt even without
+        # a pair from this hunk (t1 on the ancestral mega-line).
+        for ident in ident_values(anc):
+            if any(same_inflection(ident, n) for n in ident_values(new_text or "")):
+                if not any(s.lower() == ident.lower() for s in ident_values(new_text or "")):
+                    erst_names.add(ident)
+                    continue
+            if ident.lower() in {n.lower() for n in ident_values(new_text or "")}:
+                continue
+            if any(same_inflection(ident, n) or stem_related(ident, n) for n in ident_values(new_text or old_text)):
+                erst_names.add(ident)
+        debt = set(abandoned) | birth_debt_lits | erst_names
+        if not debt:
+            continue
+        adopted_ids = {n for _, n in all_pairs} | set(adopted)
+        keys = sorted(debt, key=lambda s: (-len(s), s))
+        skip_self = {(path, old_text.strip())}
+        natal = [
+            n
+            for n in natal_lines_sharing(natal_added, debt, skip=skip_self)
+            if n.path != path or n.text.strip() != old_text.strip()
+        ]
+        cid = (birth.commit, frozenset(x.lower() for x in debt))
+        bkt = buckets.get(cid)
+        if bkt is None:
+            bkt = {
+                "birth": birth,
+                "abandoned": set(debt),
+                "adopted": set(adopted_ids),
+                "pairs": list(all_pairs),
+                "keys": list(keys),
+                "natal": {(n.path, n.line): n for n in natal},
+                "paid": [],
+            }
+            buckets[cid] = bkt
+        else:
+            bkt["abandoned"] |= debt
+            bkt["adopted"] |= adopted_ids
+            for p in all_pairs:
+                if p not in bkt["pairs"]:
+                    bkt["pairs"].append(p)
+            for n in natal:
+                bkt["natal"][(n.path, n.line)] = n
+        if new_text is not None and new_path is not None and new_line is not None:
+            holds = next(iter(adopted_ids), None)
+            bkt["paid"].append(
+                Member(
+                    status="paid",
+                    path=new_path,
+                    line=new_line,
+                    text=new_text,
+                    birth_path=path,
+                    birth_line=old_line,
+                    birth_text=old_text,
+                    shared=sorted(debt),
+                    holds=holds,
+                )
+            )
+
+    cohorts: list[Cohort] = []
+    for bkt in buckets.values():
+        owing: list[Member] = []
+        ok: list[Member] = []
+        gone: list[Member] = []
+        alias: list[Member] = []
+        seen_now: set[tuple[str, int]] = set()
+        abandoned: set[str] = bkt["abandoned"]
+        adopted: set[str] = bkt["adopted"]
+        keys: list[str] = sorted(abandoned, key=lambda s: (-len(s), s))
+
+        for natal in bkt["natal"].values():
+            hits = locate_natal(repo, tree, natal, keys, paid_locs, paid_texts)
+            if not hits:
+                gone.append(
+                    member_from_hit(
+                        "gone", natal, None, abandoned & token_values(natal.text)
+                    )
+                )
+                if len(gone) + len(owing) >= max_members:
+                    break
+                continue
+            for h in hits:
+                loc = (h.path, h.line)
+                if loc in seen_now:
+                    continue
+                seen_now.add(loc)
+                shared = token_values(natal.text) & token_values(h.text)
+                st = classify_hit(h.text, abandoned, adopted)
+                holds = None
+                for k in keys:
+                    if is_number_token(k):
+                        sv = slot_value(natal.text, h.text, k)
+                        if sv:
+                            holds = sv
+                            break
+                    elif holds_ident_forms(h.text, k) or quoted_only_hold(h.text, k):
+                        holds = k
+                        break
+                mem = member_from_hit(
+                    st,
+                    natal,
+                    h,
+                    shared or (abandoned & token_values(natal.text)),
+                    holds,
+                )
+                if st == "owing":
+                    owing.append(mem)
+                elif st == "alias":
+                    alias.append(mem)
+                else:
+                    ok.append(mem)
+                if len(owing) >= max_members:
+                    break
+            if len(owing) >= max_members:
+                break
+
+        for m in bkt["paid"]:
+            if m.path is not None and m.line is not None:
+                seen_now.add((m.path, m.line))
+
+        echo: list[Member] = []
+        for key in keys:
+            if is_number_token(key) or " " in key:
+                hits = grep_token(repo, key, tree)
+            elif distinctive_ident(key):
+                hits = grep_ident_forms(repo, key, tree)
+            else:
+                hits = [
+                    h
+                    for h in grep_ident_forms(repo, key, tree)
+                    if path_is_doc_or_test(h.path)
+                ]
+            if len(hits) > 50:
+                hits = hits[:50]
+            for h in hits:
+                loc = (h.path, h.line)
+                if loc in seen_now or loc in paid_locs:
+                    continue
+                if h.text.strip() in paid_texts:
+                    continue
+                st = classify_hit(h.text, abandoned, adopted)
+                if st == "alias":
+                    seen_now.add(loc)
+                    alias.append(
+                        Member(
+                            status="alias",
+                            path=h.path,
+                            line=h.line,
+                            text=h.text,
+                            birth_path=h.path,
+                            birth_line=h.line,
+                            birth_text=h.text,
+                            shared=[key],
+                            holds=key,
+                        )
+                    )
+                    continue
+                if st != "owing":
+                    continue
+                seen_now.add(loc)
+                echo.append(
+                    Member(
+                        status="echo",
+                        path=h.path,
+                        line=h.line,
+                        text=h.text,
+                        birth_path=h.path,
+                        birth_line=h.line,
+                        birth_text=h.text,
+                        shared=[key],
+                        holds=key,
+                    )
+                )
+                if len(echo) >= max_members:
+                    break
+            if len(echo) >= max_members:
+                break
+
+        factions: dict[str, int] = {}
+        for m in bkt["paid"]:
+            if m.holds:
+                factions[m.holds] = factions.get(m.holds, 0) + 1
+        for m in owing:
+            tag = m.holds or (m.shared[0] if m.shared else "?")
+            factions[tag] = factions.get(tag, 0) + 1
+
+        pair_labels = [format_pair(a, b) for a, b in bkt["pairs"]]
+        cohorts.append(
+            Cohort(
+                kind="owing",
+                birth=bkt["birth"],
+                keys=keys,
+                abandoned=sorted(abandoned, key=lambda s: (-len(s), s)),
+                adopted=sorted(adopted, key=lambda s: (-len(s), s)),
+                pairs=pair_labels,
+                paid=bkt["paid"],
+                owing=owing,
+                ok=ok,
+                gone=gone,
+                echo=echo,
+                alias=alias,
+                factions=factions,
+            )
+        )
+        if len(cohorts) >= MAX_COHORTS:
+            break
+    return cohorts
+
+
+def analyze_path_b(
+    repo: str,
+    change: Change,
+    already: set[tuple[str, frozenset[str]]],
+    *,
+    debug: bool,
+    max_members: int,
+) -> list[Cohort]:
+    added = change.additions + [
+        AddedLine(r.path, r.new_line, r.new_text) for r in change.replacements
+    ]
+    if len(added) > 800:
+        added = added[:800]
+    clusters = rarity_lits(added)
+    id_clusters = rarity_idents(added)
+    if not clusters and not id_clusters:
+        return []
+    tree = eval_tree_for(change)
+    birth = this_change_as_birth(change)
+    cohorts: list[Cohort] = []
+
+    def emit(key: str, natal_lines: list[AddedLine], identish: bool) -> None:
+        cid = (birth.commit, frozenset({key.lower()}))
+        if cid in already:
+            return
+        owing: list[Member] = []
+        ok: list[Member] = []
+        gone: list[Member] = []
+        paid: list[Member] = []
+        factions: dict[str, int] = {}
+        seen_now: set[tuple[str, int]] = set()
+
+        for natal in natal_lines:
+            h = follow_line(repo, tree, natal, key)
+            if h is None:
+                gone.append(member_from_hit("gone", natal, None, {key}))
+                continue
+            loc = (h.path, h.line)
+            if loc in seen_now:
+                continue
+            seen_now.add(loc)
+            if identish:
+                if holds_ident_forms(h.text, key) or quoted_only_hold(h.text, key):
+                    holds = key
+                else:
+                    hid = ident_values(h.text)
+                    partner = None
+                    for ident in hid:
+                        if same_inflection(ident, key) or stem_related(ident, key):
+                            partner = ident
+                            break
+                    holds = partner
+            else:
+                holds = slot_value(natal.text, h.text, key)
+                if holds is None:
+                    toks = literal_values(h.text)
+                    holds = key if key in toks else None
+            if holds is None:
+                gone.append(member_from_hit("gone", natal, None, {key}))
+                continue
+            factions[holds] = factions.get(holds, 0) + 1
+            shared = {key} if key.lower() in {holds.lower()} or holds_ident_forms(h.text, key) else {holds}
+            if holds.lower() == key.lower() or same_inflection(str(holds), key):
+                # Same identity at HEAD — ok until a faction splits.
+                ok.append(member_from_hit("ok", natal, h, shared, holds))
+            else:
+                paid.append(member_from_hit("paid", natal, h, shared, holds))
+            if len(ok) + len(paid) + len(owing) >= max_members:
+                break
+
+        moved = {k: n for k, n in factions.items() if k.lower() != key.lower() and not same_inflection(str(k), key)}
+        still = sum(
+            n
+            for k, n in factions.items()
+            if k.lower() == key.lower() or same_inflection(str(k), key)
+        )
+        if moved and still > 0:
+            owing = [
+                Member(
+                    status="owing",
+                    path=m.path,
+                    line=m.line,
+                    text=m.text,
+                    birth_path=m.birth_path,
+                    birth_line=m.birth_line,
+                    birth_text=m.birth_text,
+                    shared=m.shared,
+                    holds=m.holds,
+                )
+                for m in ok
+            ]
+            ok = []
+            kind = "split"
+        else:
+            kind = "split" if len(factions) > 1 else "owing"
+
+        if debug:
+            print(
+                f"debug: path-b key={key!r} natal={len(natal_lines)} factions={factions}",
+                file=sys.stderr,
+            )
+
+        cohorts.append(
+            Cohort(
+                kind=kind,
+                birth=birth,
+                keys=[key],
+                abandoned=[key],
+                adopted=sorted(moved.keys(), key=len, reverse=True),
+                paid=paid,
+                owing=owing,
+                ok=ok,
+                gone=gone,
+                factions=factions,
+            )
+        )
+        already.add(cid)
+
+    for lit, natal_lines in sorted(
+        clusters.items(), key=lambda kv: (-len(kv[1]), -len(kv[0]), kv[0])
+    ):
+        emit(lit, natal_lines, identish=False)
+        if len(cohorts) >= MAX_COHORTS:
+            return cohorts
+    for ident, natal_lines in sorted(
+        id_clusters.items(), key=lambda kv: (-len(kv[1]), -len(kv[0]), kv[0])
+    ):
+        emit(ident, natal_lines, identish=True)
+        if len(cohorts) >= MAX_COHORTS:
+            return cohorts
+    return cohorts
+
+
+def merge_cohorts(cohorts: list[Cohort]) -> list[Cohort]:
+    by: dict[tuple[str, frozenset[str]], Cohort] = {}
+    order: list[tuple[str, frozenset[str]]] = []
+    for c in cohorts:
+        cid = (c.birth.commit, frozenset(x.lower() for x in (c.abandoned or c.keys)))
+        if cid not in by:
+            by[cid] = c
+            order.append(cid)
+            continue
+        other = by[cid]
+        if other.kind == "owing" and c.kind == "split" and other.paid:
+            continue
+        if c.paid and not other.paid:
+            by[cid] = c
+            continue
+
+        def ext(dst: list[Member], extra: list[Member]) -> None:
+            seen = {(m.path, m.line, m.birth_path, m.birth_line) for m in dst}
+            for m in extra:
+                k = (m.path, m.line, m.birth_path, m.birth_line)
+                if k not in seen:
+                    dst.append(m)
+                    seen.add(k)
+
+        ext(other.paid, c.paid)
+        ext(other.owing, c.owing)
+        ext(other.ok, c.ok)
+        ext(other.gone, c.gone)
+        ext(other.echo, c.echo)
+        ext(other.alias, c.alias)
+        for k, n in c.factions.items():
+            other.factions[k] = max(other.factions.get(k, 0), n)
+        for p in c.pairs:
+            if p not in other.pairs:
+                other.pairs.append(p)
+        if c.kind == "split" and len(c.factions) > 1:
+            other.kind = "split"
+    return [by[k] for k in order]
+
+
+def analyze_change(
+    repo: str,
+    change: Change,
+    *,
+    debug: bool,
+    max_members: int,
+    path_b: bool = True,
+) -> list[Cohort]:
+    a = analyze_path_a(repo, change, debug=debug, max_members=max_members)
+    already = {
+        (c.birth.commit, frozenset(x.lower() for x in (c.abandoned or c.keys)))
+        for c in a
+    }
+    b: list[Cohort] = []
+    if path_b:
+        b = analyze_path_b(
+            repo, change, already, debug=debug, max_members=max_members
+        )
+    cohorts = merge_cohorts(a + b)
+    cohorts.sort(
+        key=lambda c: (
+            0 if c.kind == "owing" and c.paid else 1,
+            -len(c.owing),
+            -(len(c.factions) - 1),
+            c.birth.commit,
+        )
+    )
+    return cohorts[:MAX_COHORTS]
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def colorize(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def format_member(prefix: str, m: Member, color: bool, code: str) -> list[str]:
+    tag = colorize(color, code, f"{prefix:<6}")
+    if m.status == "gone" or m.path is None:
+        return [f"{tag} {m.birth_path}:{m.birth_line}: {m.birth_text.strip()}"]
+    loc = f"{m.path}:{m.line}:"
+    line = f"{tag} {loc} {m.text.strip() if m.text else ''}"
+    extra = []
+    if m.holds:
+        extra.append(f"holds {m.holds}")
+    out = [line]
+    if extra:
+        out.append(f"       ({'; '.join(extra)})")
+    return out
+
+
+def format_cohort(c: Cohort, color: bool) -> str:
+    b = c.birth
+    birth_bit = f"{b.commit[:12]}  {b.date}  {b.subject}".strip()
+    lines: list[str] = []
+    if c.kind == "split" and len(c.factions) > 1:
+        fac = "  ".join(
+            f"{val}×{n}" for val, n in sorted(c.factions.items(), key=lambda kv: -kv[1])
+        )
+        head = colorize(color, "33", "split ")
+        lines.append(f"{head} {len(c.factions)} factions  ·  {birth_bit}")
+        lines.append(f"       HEAD {fac}")
+    else:
+        n_ow = len(c.owing)
+        head = colorize(color, "31", "owing ")
+        lines.append(f"{head} {n_ow} unpaid  ·  {birth_bit}")
+    if c.pairs:
+        lines.append(f"nee    {', '.join(c.pairs)}")
+    if c.keys:
+        lines.append(f"keys   {', '.join(c.keys)}")
+    if c.abandoned or c.adopted:
+        ab = ", ".join(c.abandoned) if c.abandoned else "—"
+        ad = ", ".join(c.adopted) if c.adopted else "—"
+        if c.adopted:
+            lines.append(f"delta  {ab} → {ad}")
+        else:
+            lines.append(f"token  {ab}")
+    if c.paid:
+        lines.append("")
+        for m in c.paid[:12]:
+            lines.extend(format_member("paid", m, color, "36"))
+    if c.owing:
+        lines.append("")
+        for m in c.owing[:MAX_MEMBERS]:
+            lines.extend(format_member("owing", m, color, "31"))
+        if len(c.owing) > MAX_MEMBERS:
+            lines.append(f"       … {len(c.owing) - MAX_MEMBERS} more owing")
+    if c.echo:
+        lines.append("")
+        for m in c.echo[:MAX_MEMBERS]:
+            lines.extend(format_member("echo", m, color, "35"))
+        if len(c.echo) > MAX_MEMBERS:
+            lines.append(f"       … {len(c.echo) - MAX_MEMBERS} more echo")
+    if c.alias:
+        lines.append("")
+        for m in c.alias[:8]:
+            lines.extend(format_member("alias", m, color, "34"))
+    if c.gone:
+        lines.append("")
+        for m in c.gone[:8]:
+            lines.extend(format_member("gone", m, color, "33"))
+    if c.kind == "split" and c.ok and not c.owing:
+        lines.append("")
+        for m in c.ok[:8]:
+            holds = m.holds or "?"
+            tag = colorize(color, "32", f"{holds:<6}")
+            loc = f"{m.path}:{m.line}:" if m.path else f"{m.birth_path}:{m.birth_line}:"
+            txt = (m.text or m.birth_text).strip()
+            lines.append(f"{tag} {loc} {txt}")
+    return "\n".join(lines)
+
+
+def format_report(rep: Report, color: bool, *, show_empty: bool) -> str:
+    ch = rep.change
+    who = ch.commit[:12] if ch.commit else ch.spec
+    header = f"change {ch.kind}  {who}  {ch.subject}".strip()
+    chunks = [header]
+    if not rep.cohorts:
+        chunks.append("")
+        chunks.append("no unpaid kin at HEAD")
+        return "\n".join(chunks)
+    shown = [c for c in rep.cohorts if c.debt() or show_empty]
+    if not shown:
+        chunks.append("")
+        chunks.append("no unpaid kin at HEAD")
+        return "\n".join(chunks)
+    for i, c in enumerate(shown):
+        chunks.append("")
+        if i:
+            chunks.append("---")
+            chunks.append("")
+        chunks.append(format_cohort(c, color))
+    return "\n".join(chunks)
+
+
+def member_json(m: Member) -> dict:
+    return {
+        "status": m.status,
+        "path": m.path,
+        "line": m.line,
+        "text": m.text,
+        "birth_path": m.birth_path,
+        "birth_line": m.birth_line,
+        "birth_text": m.birth_text,
+        "shared": m.shared,
+        "holds": m.holds,
+    }
+
+
+def cohort_json(c: Cohort) -> dict:
+    return {
+        "kind": c.kind,
+        "birth": {
+            "commit": c.birth.commit,
+            "date": c.birth.date,
+            "subject": c.birth.subject,
+            "path": c.birth.path,
+            "region": c.birth.region,
+            "uncommitted": c.birth.uncommitted,
+        },
+        "keys": c.keys,
+        "abandoned": c.abandoned,
+        "adopted": c.adopted,
+        "pairs": c.pairs,
+        "paid": [member_json(m) for m in c.paid],
+        "owing": [member_json(m) for m in c.owing],
+        "ok": [member_json(m) for m in c.ok],
+        "gone": [member_json(m) for m in c.gone],
+        "echo": [member_json(m) for m in c.echo],
+        "alias": [member_json(m) for m in c.alias],
+        "factions": c.factions,
+    }
+
+
+def report_json(rep: Report) -> dict:
+    ch = rep.change
+    return {
+        "version": VERSION,
+        "change": {
+            "spec": ch.spec,
+            "kind": ch.kind,
+            "commit": ch.commit,
+            "parent": ch.parent,
+            "date": ch.date,
+            "subject": ch.subject,
+        },
+        "cohorts": [cohort_json(c) for c in rep.cohorts],
+    }
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def run_selftest() -> None:
+    fails: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            fails.append(msg)
+
+    toks = token_values("TIMEOUT = 30  # 15s later")
+    expect("timeout" in toks, f"ident TIMEOUT missing: {toks}")
+    expect("30" in toks, f"num 30 missing: {toks}")
+    expect("15" in toks, f"unit 15s should yield 15: {toks}")
+
+    toks = token_values("t1: TimeInterval = 15")
+    expect("t1" in toks, f"short natal t1 missing: {toks}")
+    expect("15" in toks, f"15 missing next to t1: {toks}")
+
+    toks = token_values("presentThreshold: Double = 0.45")
+    expect("0.45" in toks, f"float missing: {toks}")
+    expect("presentthreshold" in toks, f"camel missing: {toks}")
+
+    toks = token_values(
+        'const P = "data/fixtures/golden/direct-critical-armor.scenario.json";'
+    )
+    expect("critical" not in toks, f"idents leaked from string: {toks}")
+
+    expect(same_inflection("present_threshold", "presentThreshold"), "snake/camel")
+    expect(same_inflection("present-threshold", "PresentThreshold"), "kebab/pascal")
+    expect(same_inflection("t1", "T1"), "t1/T1")
+    expect(not same_inflection("t1", "driftDelay"), "t1 is not an inflection of driftDelay")
+    expect(stem_related("threshold", "presentThreshold"), "threshold ⊂ presentThreshold")
+    expect("T1" in surfaces("t1"), f"T1 surface of t1: {surfaces('t1')}")
+    expect("present_threshold" in surfaces("presentThreshold"), "snake surface")
+
+    pairs = pair_idents({"t1", "TimeInterval"}, {"driftDelay", "TimeInterval"})
+    expect(pairs == [("t1", "driftDelay")], f"1:1 rename pair: {pairs}")
+
+    pairs = pair_idents({"present_threshold"}, {"presentThreshold"})
+    expect(
+        pairs == [("present_threshold", "presentThreshold")],
+        f"inflection pair: {pairs}",
+    )
+
+    pairs = pair_idents({"threshold", "Double"}, {"presentThreshold", "Double"})
+    expect(
+        pairs == [("threshold", "presentThreshold")],
+        f"stem-containment pair: {pairs}",
+    )
+
+    expect(
+        slot_idents("t1: TimeInterval = 15") == ["t1"],
+        f"slot t1: {slot_idents('t1: TimeInterval = 15')}",
+    )
+    expect(
+        slot_idents("present_threshold = 0.4") == ["present_threshold"],
+        f"slot snake: {slot_idents('present_threshold = 0.4')}",
+    )
+    expect(
+        slot_idents("return (.drift(since: now), updatedCounters)") == [],
+        "return-site is not a declaration slot",
+    )
+    expect(
+        pair_line_idents("t1: TimeInterval = 15", "driftDelay: TimeInterval = 15")
+        == [("t1", "driftDelay")],
+        "slot 1:1 t1↔driftDelay",
+    )
+    expect(
+        pair_line_idents(
+            "return (.drift(since: now), counters)",
+            "return (.drift(since: now), updatedCounters)",
+        )
+        == [],
+        f"local counters→updatedCounters is not natal: {pair_line_idents('return (.drift(since: now), counters)', 'return (.drift(since: now), updatedCounters)')}",
+    )
+    expect(
+        pair_line_idents(
+            "AXUIElementCopyAttributeValue(window, title)",
+            "AXUIElementCopyAttributeValue(focusedWindow, title)",
+        )
+        == [],
+        "window↔focusedWindow is not a natal pair",
+    )
+    expect(
+        pair_line_idents(
+            ".shadow(color: phaseColor, radius: 8)",
+            "center: CGPoint(x: cornerRadius, y: 0)",
+        )
+        == [],
+        "radius↔cornerRadius is not a natal pair",
+    )
+    expect(
+        not stem_related("counters", "updatedCounters"),
+        "updated- prefix is stem noise",
+    )
+    expect(
+        stem_related("threshold", "presentThreshold"),
+        "present+threshold stays related",
+    )
+
+    expect(holds_ident_forms("T1 = 15秒（FLOW→DRIFT閾値）", "t1"), "T1 holds t1")
+    expect(holds_ident_forms("t1: 15", "T1"), "t1 holds T1")
+    expect(
+        holds_ident_forms("present_threshold: 0.4", "presentThreshold"),
+        "snake holds camel",
+    )
+    expect(
+        not holds_ident_forms("presentThreshold: Double = 0.45", "threshold"),
+        "camel must not hold bare threshold as a token",
+    )
+    expect(quoted_only_hold('case flowThreshold = "t1"', "t1"), "CodingKeys t1")
+    expect(
+        not holds_ident_forms('case flowThreshold = "t1"', "t1"),
+        "quoted t1 is not a code ident",
+    )
+
+    expect(number_context_ok("timeout: 300", "300"), "bare 300 should pass")
+    expect(
+        not number_context_ok("if !(200..<300).contains(code)", "300"),
+        "range bound 300 should fail",
+    )
+    expect(not float_hit_ok("yaw: 0.4, pitch: 0.0", "0.4"), "gaze yaw")
+    expect(not holds_literal("ema=0.42", "0.4"), "0.4 must not match 0.42")
+    expect(
+        not acceptable_debt_literal("5", "## 5. Run just check", "README.md"),
+        "heading 5 in markdown is not debt",
+    )
+    expect(
+        acceptable_debt_literal("0.4", "threshold: Double = 0.4,", "PresenceArbiter.swift"),
+        "float threshold is debt",
+    )
+
+    expect(looks_like_location("config.py:1"), "config.py:1 is a location")
+    expect(not looks_like_location("HEAD"), "HEAD is not a location")
+    expect(not looks_like_location("e9b0f75"), "short hash is not a location")
+
+    expect(distinctive_ident("t1"), "t1 distinctive")
+    expect(distinctive_ident("present_threshold"), "two-part distinctive")
+    expect(not distinctive_ident("threshold"), "bare threshold is generic")
+
+    st = classify_hit("T1 = 15秒", {"t1", "15"}, {"driftDelay"})
+    expect(st == "owing", f"docs T1 should owe: {st}")
+    st = classify_hit("driftDelay: TimeInterval = 15", {"t1"}, {"driftDelay"})
+    expect(st == "ok", f"paid rename is ok: {st}")
+    st = classify_hit('case flowThreshold = "t1"', {"t1"}, {"driftDelay"})
+    expect(st == "alias", f"CodingKeys should alias: {st}")
+    st = classify_hit("present_threshold: 0.4", {"present_threshold", "0.4"}, {"presentThreshold", "0.45"})
+    expect(st == "owing", f"old snake surface owes: {st}")
+
+    diff = """diff --git a/core.py b/core.py
+--- a/core.py
++++ b/core.py
+@@ -1,2 +1,2 @@
+-t1 = 15
+-present_threshold = 0.4
++driftDelay = 15
++presentThreshold = 0.45
+"""
+    hunks = parse_hunks(diff)
+    r, a, d = events_from_hunks(hunks)
+    expect(len(r) == 2, f"two replacements, got {r}")
+    p0 = pair_idents(ident_values(r[0].old_text), ident_values(r[0].new_text))
+    p1 = pair_idents(ident_values(r[1].old_text), ident_values(r[1].new_text))
+    expect(p0 == [("t1", "driftDelay")], f"hunk t1 pair {p0}")
+    expect(p1 == [("present_threshold", "presentThreshold")], f"hunk snake pair {p1}")
+
+    if fails:
+        print("selftest FAILED:")
+        for f in fails:
+            print(" -", f)
+        raise SystemExit(1)
+    print("selftest ok")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="erst",
+        description=(
+            "From a commit or a diff, list natal cohorts still unpaid at HEAD. "
+            "Natal keys inflect (t1 ↔ driftDelay, snake/camel); renamed siblings count. "
+            "No FILE:LINE — the change is the query."
+        ),
+    )
+    p.add_argument(
+        "change",
+        nargs="?",
+        help="commit, A..B range, 'wt', or '-' (stdin diff). Default: HEAD",
+    )
+    p.add_argument("-C", "--repo", default=os.getcwd(), help="repository working tree")
+    p.add_argument("--wt", action="store_true", help="analyze the working tree vs HEAD")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--check", action="store_true", help="exit 1 if any cohort is unpaid")
+    p.add_argument("--all", action="store_true", help="include intact (non-debt) cohorts")
+    p.add_argument(
+        "--no-birth-clusters",
+        action="store_true",
+        help="skip Path B (change-as-birth clusters)",
+    )
+    p.add_argument("--max", type=int, default=40, help="max members listed per cohort")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="version", version=f"erst {VERSION}")
+    args = p.parse_args(argv)
+
+    if args.selftest:
+        run_selftest()
+        return 0
+
+    repo = find_repo(args.repo)
+    color = (
+        (not args.no_color)
+        and sys.stdout.isatty()
+        and os.environ.get("TERM") != "dumb"
+    )
+    from_stdin = args.change == "-"
+    change = load_change(repo, args.change, wt=args.wt, from_stdin=from_stdin)
+
+    if not change.replacements and not change.additions and not change.deletions:
+        if args.json:
+            print(json.dumps(report_json(Report(change, [])), indent=2, ensure_ascii=False))
+        else:
+            print(f"erst: empty diff for {change.spec}")
+        return 1 if args.check else 0
+
+    cohorts = analyze_change(
+        repo,
+        change,
+        debug=args.debug,
+        max_members=args.max,
+        path_b=not args.no_birth_clusters,
+    )
+    drifted = any(c.debt() for c in cohorts)
+    shown = cohorts if args.all else [c for c in cohorts if c.debt()]
+    rep = Report(change, shown)
+
+    if args.json:
+        print(json.dumps(report_json(rep), indent=2, ensure_ascii=False))
+    else:
+        print(format_report(rep, color, show_empty=args.all))
+
+    return 1 if args.check and drifted else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

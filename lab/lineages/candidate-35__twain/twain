@@ -1,0 +1,1604 @@
+#!/usr/bin/env python3
+"""twain — a unified diff is two patches.
+
+git apply / sate occupy a mixed patch as one before→after claim.
+alibi runs tests. Neither asks the reviewer question about the *patch*:
+
+  did the oracle-half land without the production-half,
+  the production-half without oracles,
+  or oracles that never mention the production change?
+
+twain splits a unified diff into oracle vs production, occupies each half
+against a tree, and reports whether the oracle-half binds the production-half.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+
+VERSION = "0.2.0"  # 0.1 path+cfg(test); 0.2 split contiguous seams, after⇒APPLIED
+
+EXIT_LOCKED = 0
+EXIT_UNLOCKED = 1  # MUTE / LOOSE / HOLLOW / PENDING / PROD_AHEAD / ORACLE_AHEAD
+EXIT_SPLIT = 2  # SEAM / SPLIT / MIXED occupancy
+EXIT_ERROR = 3
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+GENERIC_RE = re.compile(
+    r"^[\s{}\[\]().,:;]*$"
+    r"|^\s*(else:?|end|pass|break|continue|return|fi|then|do|done|"
+    r"end\.?|\);?|//|/\*|\*/|#)\s*$",
+    re.I,
+)
+IDENT_RE = re.compile(r"\w+", re.UNICODE)
+STRING_RE = re.compile(r'"(?:\\.|[^"\\]){2,}"|\'(?:\\.|[^\'\\]){2,}\'')
+CFG_TEST_RE = re.compile(r"^\s*#\[cfg\(test\)\]")
+MOD_TESTS_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+tests\b")
+PY_TEST_RE = re.compile(r"^(\s*)(?:async\s+)?(?:def\s+test_|class\s+Test)")
+SWIFT_XC_RE = re.compile(r"^\s*(?:open\s+|public\s+|final\s+)*class\s+\w+\s*:\s*XCTestCase\b")
+GO_TEST_RE = re.compile(r"^func\s+Test[A-Z]\w*\s*\(")
+JS_DESCRIBE_RE = re.compile(r"^\s*(?:describe|it|test)\s*\(")
+
+KEYWORDS = {
+    "the", "and", "for", "from", "this", "that", "with", "true", "false",
+    "null", "none", "undefined", "self", "this", "super", "return", "class",
+    "struct", "enum", "func", "function", "def", "let", "var", "const",
+    "pub", "public", "private", "protected", "static", "async", "await",
+    "import", "export", "from", "use", "mod", "fn", "impl", "trait", "type",
+    "where", "if", "else", "elif", "switch", "case", "match", "when",
+    "while", "loop", "break", "continue", "try", "catch", "except", "finally",
+    "throw", "raise", "new", "delete", "void", "int", "str", "string",
+    "bool", "boolean", "float", "double", "long", "char", "byte", "nil",
+    "some", "okay", "err", "error", "ok", "yes", "not", "init", "main",
+    "test", "tests", "spec", "describe", "assert", "expect", "should",
+    "equal", "equals", "assertEqual", "XCTAssert", "XCTAssertEqual",
+    "XCTAssertTrue", "XCTAssertFalse", "assert_eq", "assert_ne",
+    "pytest", "unittest", "setup", "teardown", "before", "after",
+    "TODO", "FIXME", "NOTE", "XXX", "pass", "self", "cls", "args", "kwargs",
+    "std", "fmt", "io", "fs", "os", "sys", "path", "paths", "file", "files",
+    "line", "lines", "name", "value", "data", "item", "items", "result",
+    "results", "config", "options", "option", "param", "params", "arg",
+    "msg", "message", "text", "body", "head", "header", "index", "count",
+    "size", "len", "length", "key", "keys", "map", "list", "dict", "set",
+    "vec", "vector", "array", "slice", "iter", "into", "to", "of", "in",
+    "on", "at", "as", "or", "is", "it", "an", "a", "be", "by", "do",
+    "get", "set", "add", "set", "put", "run", "call", "apply", "create",
+    "update", "remove", "delete", "insert", "push", "pop", "next", "prev",
+    "left", "right", "start", "end", "first", "last", "new", "old",
+    "src", "lib", "app", "cli", "ui", "core", "util", "utils", "common",
+    "package", "module", "namespace", "interface", "protocol", "object",
+    "string", "number", "integer", "boolean", "export", "default",
+    "extends", "implements", "override", "required", "optional",
+    "available", "deprecated", "inline", "guard", "defer", "weak",
+    "unowned", "lazy", "mutating", "throws", "rethrows", "try", "catch",
+    "import", "from", "as", "in", "is", "nil", "self", "Self", "Type",
+    "Any", "any", "never", "unknown", "void", "null", "undefined",
+    "true", "false", "None", "True", "False", "NULL", "YES", "NO",
+}
+
+# Path role. Oracle paths are tests, goldens, snapshots, contract cases.
+TEST_DIR_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__|spec|specs|testdata|e2e|__snapshots__|"
+    r"goldens?|snapshots?|testcases|fixtures|experiments|"
+    r"TenaoshiEngineTests|Sitbone\w*Tests)(?:/|$)",
+    re.I,
+)
+TEST_FILE_RE = re.compile(
+    r"(?:^|/)(?:test_[^/]+|[^/]+_test|[^/]+_spec|[^/]+Tests?|[^/]+Spec|"
+    r"tests?|test_support|OraclesGenerated)(?:\.[^/]+)?$",
+    re.I,
+)
+TEST_EXT_RE = re.compile(r"\.(?:test|spec)\.[^/]+$", re.I)
+SNAP_RE = re.compile(
+    r"(?:\.(?:snap|snapshot)$|\.expected(?:\.[^/]+)?$"
+    r"|\.(?:scenario|experiment|scenario-patch)\.json$"
+    r"|(?:^|/)expected[^/]*\.(?:json|txt|xml)$)",
+    re.I,
+)
+GENERATED_RE = re.compile(
+    r"\.generated\.[^/]+$|(?:^|/)(?:docs/)?generated/",
+    re.I,
+)
+IGNORE_DIR_RE = re.compile(
+    r"(?:^|/)(?:docs?|plans?|adr|benches?|examples?|scratch|\.agents|"
+    r"node_modules|\.git|\.build|target|dist|vendor)(?:/|$)",
+    re.I,
+)
+IGNORE_FILE_RE = re.compile(
+    r"(?:^|/)(?:README(?:\.[^/]+)?|CHANGELOG(?:\.[^/]+)?|LICENSE|AGENTS(?:\.[^/]+)?|"
+    r"CLAUDE(?:\.[^/]+)?|SPEC(?:\.[^/]+)?|justfile|Makefile|Cargo\.lock|"
+    r"package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$",
+    re.I,
+)
+IGNORE_EXT_RE = re.compile(r"\.(?:md|rst|txt|lock)$", re.I)
+SOURCE_EXT = {
+    ".rs", ".py", ".swift", ".ts", ".tsx", ".js", ".jsx", ".go", ".kt",
+    ".java", ".c", ".h", ".cc", ".cpp", ".hpp", ".rb", ".php", ".cs",
+    ".mjs", ".cjs", ".toml", ".yaml", ".yml", ".json", ".pkl",
+}
+
+
+# ---------------------------------------------------------------------------
+# git / paths
+# ---------------------------------------------------------------------------
+
+def unquote_git_path(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        out = bytearray()
+        i = 0
+        n = len(inner)
+        while i < n:
+            if inner[i] == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt == "n":
+                    out.append(0x0A)
+                    i += 2
+                elif nxt == "t":
+                    out.append(0x09)
+                    i += 2
+                elif nxt == "r":
+                    out.append(0x0D)
+                    i += 2
+                elif nxt in '"\\':
+                    out.append(ord(nxt))
+                    i += 2
+                elif nxt in "01234567":
+                    j = i + 1
+                    acc = 0
+                    c = 0
+                    while c < 3 and j < n and inner[j] in "01234567":
+                        acc = (acc << 3) + int(inner[j])
+                        j += 1
+                        c += 1
+                    out.append(acc & 0xFF)
+                    i = j
+                else:
+                    out.append(ord(nxt))
+                    i += 2
+            else:
+                out.append(ord(inner[i]))
+                i += 1
+        return out.decode("utf-8", "replace")
+    return s
+
+
+def strip_ab_prefix(path: str) -> str:
+    path = unquote_git_path(path)
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def looks_dev_null(path: str) -> bool:
+    return path in ("/dev/null", "a:/dev/null", "b:/dev/null") or path.endswith("/dev/null")
+
+
+def _next_git_path(rest: str) -> tuple[str, str]:
+    rest = rest.lstrip()
+    if rest.startswith('"'):
+        i = 1
+        out = ['"']
+        while i < len(rest):
+            if rest[i] == "\\" and i + 1 < len(rest):
+                out.append(rest[i : i + 2])
+                i += 2
+                continue
+            out.append(rest[i])
+            if rest[i] == '"':
+                return "".join(out), rest[i + 1 :]
+            i += 1
+        return rest, ""
+    sp = rest.find(" ")
+    if sp == -1:
+        return rest, ""
+    return rest[:sp], rest[sp:]
+
+
+def parse_diff_git_paths(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git ") :]
+    if rest.lstrip().startswith('"'):
+        a, rest2 = _next_git_path(rest)
+        b, _ = _next_git_path(rest2)
+        if a and b:
+            return strip_ab_prefix(a), strip_ab_prefix(b)
+    idx = rest.find(" b/")
+    idx2 = rest.find(' "b/')
+    if idx2 != -1 and (idx == -1 or idx2 < idx):
+        old = rest[:idx2]
+        new = rest[idx2 + 1 :]
+        return strip_ab_prefix(old), strip_ab_prefix(new)
+    if idx != -1:
+        return strip_ab_prefix(rest[:idx]), strip_ab_prefix(rest[idx + 1 :])
+    parts = rest.split(" ", 1)
+    if len(parts) != 2:
+        return None
+    return strip_ab_prefix(parts[0]), strip_ab_prefix(parts[1])
+
+
+def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "1"},
+    )
+
+
+def is_git_repo(root: Path) -> bool:
+    proc = git(["rev-parse", "--is-inside-work-tree"], root)
+    return proc.returncode == 0 and proc.stdout.decode().strip() == "true"
+
+
+def read_tree_file(root: Path, path: str, against: str | None) -> list[str] | None:
+    if not path or looks_dev_null(path):
+        return None
+    if against is None:
+        p = root / path
+        try:
+            data = p.read_bytes()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, OSError):
+            return None
+        if b"\0" in data[:8192]:
+            return None
+        return data.decode("utf-8", "replace").splitlines()
+    proc = git(["show", f"{against}:{path}"], root)
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def patch_of_rev(root: Path, rev: str) -> str:
+    if "..." in rev:
+        proc = git(["diff", "--find-renames", "--patch", rev], root)
+    elif ".." in rev:
+        proc = git(["diff", "--find-renames", "--patch", rev], root)
+    else:
+        proc = git(["diff", "--find-renames", "--patch", f"{rev}^", rev], root)
+        if proc.returncode != 0:
+            proc = git(["show", "--format=", "--patch", "--find-renames", rev], root)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"git diff failed for {rev}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# patch parse
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Hunk:
+    old_path: str
+    new_path: str
+    old_start: int
+    new_start: int
+    header: str
+    lines: list[tuple[str, str]]  # op, text without +/- prefix
+    file_kind: str = "modify"
+    binary: bool = False
+    index: int = 0
+
+    @property
+    def path(self) -> str:
+        return self.new_path if self.new_path and not looks_dev_null(self.new_path) else self.old_path
+
+    @property
+    def plus(self) -> list[str]:
+        return [t for op, t in self.lines if op == "+"]
+
+    @property
+    def minus(self) -> list[str]:
+        return [t for op, t in self.lines if op == "-"]
+
+    @property
+    def context(self) -> list[str]:
+        return [t for op, t in self.lines if op == " "]
+
+    @property
+    def before(self) -> list[str]:
+        return [t for op, t in self.lines if op in " -"]
+
+    @property
+    def after(self) -> list[str]:
+        return [t for op, t in self.lines if op in " +"]
+
+    @property
+    def core_lines(self) -> list[str]:
+        return [t for op, t in self.lines if op in "+-"]
+
+
+def parse_patch(text: str) -> list[Hunk]:
+    hunks: list[Hunk] = []
+    old_path = new_path = ""
+    file_kind = "modify"
+    binary = False
+    pending_header = ""
+    hunk: Hunk | None = None
+    per_file = 0
+
+    def flush_hunk() -> None:
+        nonlocal hunk
+        if hunk is not None:
+            hunks.append(hunk)
+            hunk = None
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            flush_hunk()
+            paths = parse_diff_git_paths(raw)
+            old_path = paths[0] if paths else ""
+            new_path = paths[1] if paths else ""
+            file_kind = "modify"
+            binary = False
+            pending_header = raw
+            per_file = 0
+            continue
+        if raw.startswith("old mode ") or raw.startswith("new mode "):
+            continue
+        if raw.startswith("similarity index") or raw.startswith("dissimilarity index"):
+            continue
+        if raw.startswith("rename from "):
+            file_kind = "rename"
+            old_path = strip_ab_prefix(raw[len("rename from ") :])
+            continue
+        if raw.startswith("rename to "):
+            file_kind = "rename"
+            new_path = strip_ab_prefix(raw[len("rename to ") :])
+            continue
+        if raw.startswith("copy from ") or raw.startswith("copy to "):
+            continue
+        if raw.startswith("index "):
+            continue
+        if raw.startswith("Binary files ") or raw.startswith("GIT binary patch"):
+            binary = True
+            flush_hunk()
+            per_file += 1
+            hunks.append(
+                Hunk(
+                    old_path=old_path,
+                    new_path=new_path,
+                    old_start=0,
+                    new_start=0,
+                    header=pending_header or "binary",
+                    lines=[],
+                    file_kind="binary",
+                    binary=True,
+                    index=per_file,
+                )
+            )
+            hunk = None
+            continue
+        if raw.startswith("--- "):
+            rhs = raw[4:]
+            old_path = "/dev/null" if looks_dev_null(rhs) else strip_ab_prefix(rhs)
+            if looks_dev_null(rhs):
+                file_kind = "create"
+            continue
+        if raw.startswith("+++ "):
+            rhs = raw[4:]
+            new_path = "/dev/null" if looks_dev_null(rhs) else strip_ab_prefix(rhs)
+            if looks_dev_null(rhs):
+                file_kind = "delete"
+            continue
+        m = HUNK_RE.match(raw)
+        if m:
+            flush_hunk()
+            per_file += 1
+            hunk = Hunk(
+                old_path=old_path,
+                new_path=new_path,
+                old_start=int(m.group(1)),
+                new_start=int(m.group(3)),
+                header=raw,
+                lines=[],
+                file_kind=file_kind,
+                binary=binary,
+                index=per_file,
+            )
+            continue
+        if hunk is None:
+            continue
+        if raw.startswith("\\"):  # "\ No newline at end of file"
+            continue
+        if raw.startswith("+"):
+            hunk.lines.append(("+", raw[1:]))
+        elif raw.startswith("-"):
+            hunk.lines.append(("-", raw[1:]))
+        elif raw.startswith(" "):
+            hunk.lines.append((" ", raw[1:]))
+        elif raw == "":
+            hunk.lines.append((" ", ""))
+        else:
+            # stray line; treat as context
+            hunk.lines.append((" ", raw))
+    flush_hunk()
+    return hunks
+
+
+def emit_patch(hunks: list[Hunk]) -> str:
+    out: list[str] = []
+    current = None
+    for h in hunks:
+        if h.binary:
+            continue
+        key = (h.old_path, h.new_path, h.file_kind)
+        if key != current:
+            current = key
+            live = h.path
+            a = h.old_path if h.old_path and not looks_dev_null(h.old_path) else live
+            b = h.new_path if h.new_path and not looks_dev_null(h.new_path) else live
+            out.append(f"diff --git a/{a} b/{b}")
+            if h.file_kind == "create":
+                out.append("new file mode 100644")
+                out.append("--- /dev/null")
+                out.append(f"+++ b/{b}")
+            elif h.file_kind == "delete":
+                out.append("deleted file mode 100644")
+                out.append(f"--- a/{a}")
+                out.append("+++ /dev/null")
+            else:
+                out.append(f"--- a/{a}")
+                out.append(f"+++ b/{b}")
+        old_n = sum(1 for op, _ in h.lines if op in " -")
+        new_n = sum(1 for op, _ in h.lines if op in " +")
+        out.append(f"@@ -{h.old_start},{old_n} +{h.new_start},{new_n} @@")
+        for op, text in h.lines:
+            out.append(op + text)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+# ---------------------------------------------------------------------------
+# roles
+# ---------------------------------------------------------------------------
+
+def path_role(path: str) -> str:
+    """ignore | oracle | prod | source (needs line tags)."""
+    if not path or looks_dev_null(path):
+        return "ignore"
+    norm = path.replace("\\", "/")
+    if GENERATED_RE.search(norm):
+        return "ignore"
+    if IGNORE_DIR_RE.search(norm) or IGNORE_FILE_RE.search(norm) or IGNORE_EXT_RE.search(norm):
+        return "ignore"
+    if TEST_DIR_RE.search(norm) or TEST_FILE_RE.search(norm) or TEST_EXT_RE.search(norm) or SNAP_RE.search(norm):
+        return "oracle"
+    ext = Path(norm).suffix.lower()
+    if ext in SOURCE_EXT or ext == "":
+        return "source"
+    # unknown extension: ignore (assets, lock-adjacent)
+    return "ignore"
+
+
+def tag_lines(path: str, lines: list[str]) -> list[str]:
+    """Per-line role: oracle | prod | ignore."""
+    role = path_role(path)
+    n = len(lines)
+    if n == 0:
+        return []
+    if role == "ignore":
+        return ["ignore"] * n
+    if role == "oracle":
+        return ["oracle"] * n
+    # source: default prod, paint in-file test regions
+    tags = ["prod"] * n
+    ext = Path(path).suffix.lower()
+    if ext == ".rs":
+        i = 0
+        while i < n:
+            if CFG_TEST_RE.match(lines[i]):
+                j = i + 1
+                while j < n and not lines[j].strip():
+                    j += 1
+                if j < n and MOD_TESTS_RE.match(lines[j]):
+                    start = i
+                    depth = 0
+                    seen = False
+                    k = j
+                    end = n - 1
+                    while k < n:
+                        depth += lines[k].count("{") - lines[k].count("}")
+                        if "{" in lines[k]:
+                            seen = True
+                        if seen and depth <= 0:
+                            end = k
+                            break
+                        k += 1
+                    for t in range(start, end + 1):
+                        tags[t] = "oracle"
+                    i = end + 1
+                    continue
+            i += 1
+    elif ext == ".py":
+        i = 0
+        while i < n:
+            m = PY_TEST_RE.match(lines[i])
+            if m:
+                indent = len(m.group(1))
+                tags[i] = "oracle"
+                i += 1
+                while i < n:
+                    raw = lines[i]
+                    if not raw.strip():
+                        tags[i] = "oracle"
+                        i += 1
+                        continue
+                    lead = len(raw) - len(raw.lstrip(" \t"))
+                    if lead <= indent and not raw.lstrip().startswith("#"):
+                        break
+                    tags[i] = "oracle"
+                    i += 1
+                continue
+            i += 1
+    elif ext == ".swift":
+        i = 0
+        while i < n:
+            if SWIFT_XC_RE.match(lines[i]):
+                for k in range(i, n):
+                    tags[k] = "oracle"
+                break
+            i += 1
+    elif ext == ".go":
+        for i, line in enumerate(lines):
+            if GO_TEST_RE.match(line):
+                tags[i] = "oracle"
+    elif ext in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+        # path-based already caught *.test.ts; in-file describe is too greedy
+        pass
+    return tags
+
+
+def reconstruct_after(before: list[str] | None, file_hunks: list[Hunk]) -> list[str]:
+    """Apply hunks in file order onto before-image. Create → plus lines only."""
+    if any(h.file_kind == "create" for h in file_hunks):
+        out: list[str] = []
+        for h in file_hunks:
+            out.extend(h.after)
+        return out
+    if before is None:
+        out = []
+        for h in file_hunks:
+            out.extend(h.after)
+        return out
+    # sequential apply; hunks should be in file order
+    text = list(before)
+    delta = 0
+    for h in sorted(file_hunks, key=lambda x: x.old_start):
+        start = h.old_start - 1 + delta
+        old_n = sum(1 for op, _ in h.lines if op in " -")
+        # if misaligned, still splice at recorded start
+        start = max(0, min(start, len(text)))
+        text[start : start + old_n] = h.after
+        delta += len(h.after) - old_n
+    return text
+
+
+def _role_for_line(tags: list[str], idx: int, fallback: str) -> str:
+    if 0 <= idx < len(tags):
+        r = tags[idx]
+        if r != "ignore":
+            return r
+    return fallback
+
+
+def hunk_events(
+    h: Hunk, tags_before: list[str], tags_after: list[str], fallback: str
+) -> list[tuple[str, str, str]]:
+    """(op, text, role) for each hunk line. Context is tagged from the after side."""
+    out: list[tuple[str, str, str]] = []
+    bi = h.old_start - 1
+    ai = h.new_start - 1
+    for op, text in h.lines:
+        if op == "+":
+            out.append((op, text, _role_for_line(tags_after, ai, fallback)))
+            ai += 1
+        elif op == "-":
+            out.append((op, text, _role_for_line(tags_before, bi, fallback)))
+            bi += 1
+        else:
+            role = _role_for_line(tags_after, ai, fallback)
+            if role == fallback:
+                role = _role_for_line(tags_before, bi, fallback)
+            out.append((op, text, role))
+            bi += 1
+            ai += 1
+    return out
+
+
+def one_cut(seq: list[str]) -> bool:
+    if not seq:
+        return True
+    i = 1
+    while i < len(seq) and seq[i] == seq[0]:
+        i += 1
+    return all(x == seq[i] for x in seq[i:]) if i < len(seq) else True
+
+
+def split_mixed_hunk(
+    h: Hunk, tags_before: list[str], tags_after: list[str]
+) -> list[tuple[Hunk, str]] | None:
+    """If a mixed hunk is a single prod|oracle cut, return two virtual hunks.
+
+    Interleaved changes stay SEAM (None).
+    """
+    pr = path_role(h.path)
+    fallback = "oracle" if pr == "oracle" else "prod"
+    events = hunk_events(h, tags_before, tags_after, fallback)
+    change = [r for op, _t, r in events if op in "+-" and r in ("prod", "oracle")]
+    roles = set(change)
+    if roles <= {"prod"} or roles <= {"oracle"} or not roles:
+        return None
+    if not one_cut(change):
+        return None
+    split: list[tuple[Hunk, str]] = []
+    for want in ("prod", "oracle"):
+        lines = [(op, text) for op, text, r in events if r == want]
+        if not any(op in "+-" for op, _t in lines):
+            continue
+        nh = Hunk(
+            old_path=h.old_path,
+            new_path=h.new_path,
+            old_start=h.old_start,
+            new_start=h.new_start,
+            header=h.header + f" twain:{want}",
+            lines=lines,
+            file_kind=h.file_kind if want == "prod" or h.file_kind != "create" else "modify",
+            binary=False,
+            index=h.index,
+        )
+        split.append((nh, want))
+    return split if len(split) == 2 else None
+
+
+def hunk_changed_roles(h: Hunk, tags_before: list[str], tags_after: list[str]) -> set[str]:
+    roles: set[str] = set()
+    bi = h.old_start - 1
+    ai = h.new_start - 1
+    for op, _text in h.lines:
+        if op == " ":
+            bi += 1
+            ai += 1
+        elif op == "-":
+            if 0 <= bi < len(tags_before):
+                roles.add(tags_before[bi])
+            bi += 1
+        elif op == "+":
+            if 0 <= ai < len(tags_after):
+                roles.add(tags_after[ai])
+            ai += 1
+    roles.discard("ignore")
+    if not roles:
+        # no tagged change: treat by path
+        r = path_role(h.path)
+        if r == "source":
+            r = "prod"
+        if r != "ignore":
+            roles.add(r)
+    return roles
+
+
+# ---------------------------------------------------------------------------
+# occupancy
+# ---------------------------------------------------------------------------
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    first = needle[0]
+    start = 0
+    length = len(hay)
+    while start < length:
+        try:
+            j = hay.index(first, start)
+        except ValueError:
+            break
+        if hay[j : j + n] == needle:
+            hits.append(j)
+        start = j + 1
+    return hits
+
+
+def is_subseq(hay: list[str], needle: list[str]) -> bool:
+    if not needle:
+        return False
+    it = iter(hay)
+    try:
+        for x in needle:
+            while next(it) != x:
+                pass
+        return True
+    except StopIteration:
+        return False
+
+
+def significant(lines: list[str]) -> list[str]:
+    out = []
+    for L in lines:
+        s = L.strip()
+        if len(s) < 8:
+            continue
+        if GENERIC_RE.match(L) or GENERIC_RE.match(s):
+            continue
+        out.append(L)
+    if out:
+        return out
+    return [L for L in lines if L.strip()]
+
+
+def occupy_hunk(file_lines: list[str] | None, h: Hunk) -> tuple[str, str]:
+    """Return (fate, method)."""
+    if h.binary:
+        return "SKIP", "binary"
+    minus = h.minus
+    plus = h.plus
+    before = h.before
+    after = h.after
+    if not before and not after and not minus and not plus:
+        if h.file_kind == "create":
+            return ("PENDING", "missing-create") if file_lines is None else ("APPLIED", "exists")
+        if h.file_kind == "delete":
+            return ("APPLIED", "missing-delete") if file_lines is None else ("PENDING", "exists")
+        return "SKIP", "empty"
+    if file_lines is None:
+        if plus and not minus:
+            return "PENDING", "missing-create"
+        if minus and not plus:
+            return "APPLIED", "missing-delete"
+        if h.file_kind == "create":
+            return "PENDING", "missing-create"
+        if h.file_kind == "delete":
+            return "APPLIED", "missing-delete"
+        return "SUPERSEDED", "missing-file"
+
+    hay = file_lines
+    before_hits = find_all(hay, before) if before else []
+    after_hits = find_all(hay, after) if after else []
+    sig_minus = significant(minus)
+    sig_plus = significant(plus)
+
+    # twain occupy: did this *half's after-image* land? Leftover befores
+    # (sate DUPLEX) still mean the after occupies. Forced by voidtrace
+    # sandwich: 2/110 prod hunks were DUPLEX against the commit that
+    # introduced them.
+    if after_hits:
+        return "APPLIED", "exact-after"
+    if plus and not minus:
+        if before_hits:
+            return "PENDING", "exact-before"
+        if sig_plus and find_all(hay, sig_plus):
+            return "APPLIED", "add-core"
+        if sig_plus and is_subseq(hay, sig_plus):
+            return "APPLIED", "add-subseq"
+        return "SUPERSEDED", "add-neither"
+
+    if minus and not plus:
+        if before_hits:
+            return "PENDING", "exact-before"
+        if sig_minus and is_subseq(hay, sig_minus):
+            return "PENDING", "del-subseq"
+        return "APPLIED", "deleted"
+
+    if before_hits:
+        return "PENDING", "exact-before"
+
+    plus_sub = is_subseq(hay, sig_plus) if sig_plus else False
+    minus_sub = is_subseq(hay, sig_minus) if sig_minus else False
+    if plus_sub and not minus_sub:
+        return "APPLIED", "subseq-plus"
+    if minus_sub and not plus_sub:
+        return "PENDING", "subseq-minus"
+    if plus_sub and minus_sub:
+        return "MIXED", "subseq-both"
+    return "SUPERSEDED", "neither"
+
+
+def _is_prefix(small: list[str], big: list[str]) -> bool:
+    if not small or len(small) >= len(big):
+        return False
+    return big[: len(small)] == small or find_all(big, small) != []
+
+
+def half_fate(fates: list[str]) -> str:
+    real = [f for f in fates if f not in ("SKIP", "EMPTY")]
+    if not real:
+        return "EMPTY"
+    uniq = set(real)
+    if uniq == {"APPLIED"}:
+        return "APPLIED"
+    if uniq == {"PENDING"}:
+        return "PENDING"
+    return "MIXED"
+
+
+# ---------------------------------------------------------------------------
+# bind
+# ---------------------------------------------------------------------------
+
+def tokens_of(lines: list[str]) -> set[str]:
+    out: set[str] = set()
+    for line in lines:
+        for s in STRING_RE.findall(line):
+            inner = s[1:-1]
+            if len(inner) >= 3 and not inner.startswith("http"):
+                out.add(inner)
+        for ident in IDENT_RE.findall(line):
+            if ident.isnumeric():
+                continue
+            if ident in KEYWORDS or ident.lower() in KEYWORDS:
+                continue
+            ascii_only = ident.isascii()
+            if ascii_only and len(ident) < 3:
+                continue
+            if not ascii_only and len(ident) < 2:
+                continue
+            out.add(ident)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HunkReport:
+    path: str
+    index: int
+    role: str  # oracle | prod | seam | ignore
+    fate: str
+    method: str
+    header: str
+    plus_n: int
+    minus_n: int
+    roles: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "index": self.index,
+            "role": self.role,
+            "fate": self.fate,
+            "method": self.method,
+            "header": self.header,
+            "plus": self.plus_n,
+            "minus": self.minus_n,
+            "roles": self.roles,
+        }
+
+
+@dataclass
+class Report:
+    status: str
+    kind: str
+    prod_fate: str
+    oracle_fate: str
+    bound: bool
+    bind: list[str]
+    prod_tokens: list[str]
+    oracle_tokens: list[str]
+    hunks: list[HunkReport]
+    against: str | None
+    rev: str | None
+    n_prod: int
+    n_oracle: int
+    n_seam: int
+    n_ignore: int
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "kind": self.kind,
+            "prod": {"fate": self.prod_fate, "n": self.n_prod},
+            "oracle": {"fate": self.oracle_fate, "n": self.n_oracle},
+            "seam": self.n_seam,
+            "ignore": self.n_ignore,
+            "bound": self.bound,
+            "bind": self.bind,
+            "prod_tokens": self.prod_tokens,
+            "oracle_tokens": self.oracle_tokens,
+            "against": self.against,
+            "rev": self.rev,
+            "hunks": [h.as_dict() for h in self.hunks],
+        }
+
+
+def classify_hunks(
+    hunks: list[Hunk],
+    root: Path,
+    against: str | None,
+    rev: str | None,
+) -> list[tuple[Hunk, str, list[str]]]:
+    """role, contributing line-roles."""
+    by_file: dict[str, list[Hunk]] = {}
+    for h in hunks:
+        by_file.setdefault(h.path, []).append(h)
+
+    # after-image: prefer rev blob; else reconstruct from against + hunks
+    after_cache: dict[str, list[str]] = {}
+    before_cache: dict[str, list[str] | None] = {}
+    for path, fh in by_file.items():
+        before_cache[path] = read_tree_file(root, path, against)
+        after_lines = None
+        if rev and ".." not in rev and is_git_repo(root):
+            after_lines = read_tree_file(root, path, rev)
+        if after_lines is None:
+            # worktree as after when occupying a dirty diff against HEAD
+            if against is not None:
+                wt = read_tree_file(root, path, None)
+                # only use worktree if it looks like the after-image
+                after_lines = reconstruct_after(before_cache[path], fh)
+                if wt is not None and fh:
+                    after_lines = wt if any(h.file_kind != "delete" for h in fh) else after_lines
+            else:
+                after_lines = reconstruct_after(before_cache[path], fh)
+        after_cache[path] = after_lines or []
+
+    tagged: list[tuple[Hunk, str, list[str]]] = []
+    for h in hunks:
+        path = h.path
+        tags_after = tag_lines(path, after_cache.get(path, []))
+        tags_before = tag_lines(path, before_cache.get(path) or [])
+        if h.binary:
+            tagged.append((h, "ignore", ["ignore"]))
+            continue
+        split = split_mixed_hunk(h, tags_before, tags_after)
+        if split:
+            for nh, role in split:
+                tagged.append((nh, role, [role]))
+            continue
+        roles = hunk_changed_roles(h, tags_before, tags_after)
+        if roles <= {"ignore"} or not roles:
+            pr = path_role(path)
+            if pr == "oracle":
+                tagged.append((h, "oracle", ["oracle"]))
+            elif pr == "source":
+                tagged.append((h, "prod", ["prod"]))
+            else:
+                tagged.append((h, "ignore", ["ignore"]))
+            continue
+        if roles == {"oracle"}:
+            tagged.append((h, "oracle", sorted(roles)))
+        elif roles == {"prod"}:
+            tagged.append((h, "prod", sorted(roles)))
+        elif "oracle" in roles and "prod" in roles:
+            tagged.append((h, "seam", sorted(roles)))
+        elif "oracle" in roles:
+            tagged.append((h, "oracle", sorted(roles)))
+        elif "prod" in roles:
+            tagged.append((h, "prod", sorted(roles)))
+        else:
+            tagged.append((h, "ignore", sorted(roles)))
+    return tagged
+
+
+def decide_status(
+    kind: str,
+    prod_fate: str,
+    oracle_fate: str,
+    bound: bool,
+    n_seam: int,
+) -> str:
+    if n_seam:
+        return "SEAM"
+    if prod_fate == "EMPTY" and oracle_fate == "EMPTY":
+        return "EMPTY"
+    if prod_fate == "APPLIED" and oracle_fate == "APPLIED":
+        return "LOCKED" if bound else "LOOSE"
+    if prod_fate == "APPLIED" and oracle_fate == "EMPTY":
+        return "MUTE"
+    if prod_fate == "APPLIED" and oracle_fate == "PENDING":
+        return "PROD_AHEAD"
+    if oracle_fate == "APPLIED" and prod_fate == "EMPTY":
+        return "HOLLOW"
+    if oracle_fate == "APPLIED" and prod_fate == "PENDING":
+        return "ORACLE_AHEAD"
+    if prod_fate == "PENDING" and oracle_fate in ("PENDING", "EMPTY"):
+        return "PENDING"
+    if oracle_fate == "PENDING" and prod_fate == "EMPTY":
+        return "PENDING"
+    return "SPLIT"
+
+
+def analyze(
+    hunks: list[Hunk],
+    root: Path,
+    against: str | None,
+    rev: str | None,
+) -> tuple[Report, list[tuple[Hunk, str, list[str]]]]:
+    tagged = classify_hunks(hunks, root, against, rev)
+    reports: list[HunkReport] = []
+    prod_fates: list[str] = []
+    oracle_fates: list[str] = []
+    prod_tok: set[str] = set()
+    oracle_tok: set[str] = set()
+    n_seam = n_ignore = 0
+
+    file_cache: dict[tuple[str, str | None], list[str] | None] = {}
+
+    def hay_of(path: str) -> list[str] | None:
+        key = (path, against)
+        if key not in file_cache:
+            file_cache[key] = read_tree_file(root, path, against)
+        return file_cache[key]
+
+    for h, role, roles in tagged:
+        fate, method = occupy_hunk(hay_of(h.path), h)
+        reports.append(
+            HunkReport(
+                path=h.path,
+                index=h.index,
+                role=role,
+                fate=fate,
+                method=method,
+                header=h.header,
+                plus_n=len(h.plus),
+                minus_n=len(h.minus),
+                roles=list(roles),
+            )
+        )
+        if role == "prod":
+            prod_fates.append(fate)
+            prod_tok |= tokens_of(h.core_lines)
+        elif role == "oracle":
+            oracle_fates.append(fate)
+            oracle_tok |= tokens_of(h.core_lines)
+        elif role == "seam":
+            n_seam += 1
+            prod_fates.append(fate)
+            oracle_fates.append(fate)
+            prod_tok |= tokens_of(h.core_lines)
+            oracle_tok |= tokens_of(h.core_lines)
+        else:
+            n_ignore += 1
+
+    pf = half_fate(prod_fates)
+    of = half_fate(oracle_fates)
+    bind = sorted(prod_tok & oracle_tok)
+    # seam hunks share their own tokens; require a bind across halves
+    # even if seam: still report intersection
+    bound = bool(bind)
+    n_prod = sum(1 for _, r, _ in tagged if r == "prod")
+    n_oracle = sum(1 for _, r, _ in tagged if r == "oracle")
+    if n_prod and n_oracle:
+        kind = "TWAIN"
+    elif n_seam and not n_prod and not n_oracle:
+        kind = "SEAM"
+    elif n_prod:
+        kind = "PROD"
+    elif n_oracle:
+        kind = "ORACLE"
+    else:
+        kind = "EMPTY"
+    if n_seam and kind == "TWAIN":
+        kind = "TWAIN"
+    status = decide_status(kind, pf, of, bound, n_seam)
+    # MUTE vs unbound TWAIN already handled; if only prod+seam with bind inside seam, SEAM wins
+    rep = Report(
+        status=status,
+        kind=kind,
+        prod_fate=pf,
+        oracle_fate=of,
+        bound=bound,
+        bind=bind[:40],
+        prod_tokens=sorted(prod_tok)[:40],
+        oracle_tokens=sorted(oracle_tok)[:40],
+        hunks=reports,
+        against=against if against is not None else ":worktree",
+        rev=rev,
+        n_prod=n_prod,
+        n_oracle=n_oracle,
+        n_seam=n_seam,
+        n_ignore=n_ignore,
+    )
+    return rep, tagged
+
+
+def status_exit(status: str) -> int:
+    if status in ("LOCKED", "EMPTY"):
+        return EXIT_LOCKED
+    if status in ("SEAM", "SPLIT"):
+        return EXIT_SPLIT
+    return EXIT_UNLOCKED
+
+
+# ---------------------------------------------------------------------------
+# format
+# ---------------------------------------------------------------------------
+
+def format_human(rep: Report, explain: bool) -> str:
+    lines = [
+        f"twain  {rep.status}  kind={rep.kind}  "
+        f"prod={rep.prod_fate}({rep.n_prod})  "
+        f"oracle={rep.oracle_fate}({rep.n_oracle})  "
+        f"seam={rep.n_seam}  bind={len(rep.bind)}  against={rep.against}"
+    ]
+    if rep.bind:
+        lines.append("  bind  " + "  ".join(rep.bind[:12]))
+    elif rep.n_prod and rep.n_oracle:
+        lines.append("  bind  (none)")
+    if explain:
+        if rep.prod_tokens:
+            lines.append("  prod_tokens  " + " ".join(rep.prod_tokens[:16]))
+        if rep.oracle_tokens:
+            lines.append("  oracle_tokens  " + " ".join(rep.oracle_tokens[:16]))
+    for h in rep.hunks:
+        if h.role == "ignore" and not explain:
+            continue
+        lines.append(
+            f"  {h.role:<7} {h.fate:<11} {h.path} #{h.index}  {h.method}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_tsv(rep: Report) -> str:
+    rows = [
+        "\t".join(
+            [
+                "status",
+                "kind",
+                "role",
+                "fate",
+                "path",
+                "index",
+                "method",
+                "bind",
+            ]
+        )
+    ]
+    bind = ",".join(rep.bind)
+    for h in rep.hunks:
+        rows.append(
+            "\t".join(
+                [
+                    rep.status,
+                    rep.kind,
+                    h.role,
+                    h.fate,
+                    h.path,
+                    str(h.index),
+                    h.method,
+                    bind,
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def format_porcelain(rep: Report) -> str:
+    return (
+        f"status {rep.status}\n"
+        f"kind {rep.kind}\n"
+        f"prod {rep.prod_fate} {rep.n_prod}\n"
+        f"oracle {rep.oracle_fate} {rep.n_oracle}\n"
+        f"seam {rep.n_seam}\n"
+        f"bound {int(rep.bound)}\n"
+        f"bind {len(rep.bind)}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _git_init(td: Path) -> None:
+    git(["init", "-q"], td)
+    git(["config", "user.email", "twain@test"], td)
+    git(["config", "user.name", "twain"], td)
+
+
+def _commit(td: Path, msg: str) -> str:
+    git(["add", "-A"], td)
+    git(["commit", "-q", "-m", msg], td)
+    proc = git(["rev-parse", "HEAD"], td)
+    return proc.stdout.decode().strip()
+
+
+def selftest() -> int:
+    fails = 0
+    passed = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal fails, passed
+        if cond:
+            passed += 1
+            print(f"  PASS  {name}")
+        else:
+            fails += 1
+            print(f"  FAIL  {name}" + (f"  {detail}" if detail else ""))
+
+    # parser + roles on a synthetic patch (no git)
+    patch = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,3 +1,4 @@
+ def add(a, b):
+-    return a + b
++    return a + b + bias()
++
+diff --git a/tests/test_add.py b/tests/test_add.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_add.py
+@@ -0,0 +1,3 @@
++from app import add, bias
++def test_bias():
++    assert add(1, 1) == 2 + bias()
+"""
+    hunks = parse_patch(patch)
+    check("parse two files", len(hunks) == 2, str(len(hunks)))
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "app.py").write_text("def add(a, b):\n    return a + b + bias()\n\n")
+        (td / "tests").mkdir()
+        (td / "tests/test_add.py").write_text(
+            "from app import add, bias\ndef test_bias():\n    assert add(1, 1) == 2 + bias()\n"
+        )
+        rep, _ = analyze(hunks, td, against=None, rev=None)
+        check("fixture LOCKED", rep.status == "LOCKED", rep.status)
+        check("fixture TWAIN", rep.kind == "TWAIN", rep.kind)
+        check("bind bias", "bias" in rep.bind, str(rep.bind))
+        check("prod applied", rep.prod_fate == "APPLIED", rep.prod_fate)
+        check("oracle applied", rep.oracle_fate == "APPLIED", rep.oracle_fate)
+
+    # MUTE: prod only
+    mute = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a + b
++    return a + b + 1
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "app.py").write_text("def add(a, b):\n    return a + b + 1\n")
+        rep, _ = analyze(parse_patch(mute), td, None, None)
+        check("MUTE", rep.status == "MUTE", rep.status)
+
+    # HOLLOW: tests only
+    hollow = """diff --git a/tests/test_add.py b/tests/test_add.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_add.py
+@@ -0,0 +1,2 @@
++def test_add():
++    assert add(1, 1) == 2
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "tests").mkdir()
+        (td / "tests/test_add.py").write_text("def test_add():\n    assert add(1, 1) == 2\n")
+        rep, _ = analyze(parse_patch(hollow), td, None, None)
+        check("HOLLOW", rep.status == "HOLLOW", rep.status)
+
+    # LOOSE: both halves, no shared tokens
+    loose = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a + b
++    return a - b
+diff --git a/tests/test_add.py b/tests/test_add.py
+--- a/tests/test_add.py
++++ b/tests/test_add.py
+@@ -1,2 +1,2 @@
+ def test_ok():
+-    assert True
++    assert not False
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "app.py").write_text("def add(a, b):\n    return a - b\n")
+        (td / "tests").mkdir()
+        (td / "tests/test_add.py").write_text("def test_ok():\n    assert not False\n")
+        rep, _ = analyze(parse_patch(loose), td, None, None)
+        check("LOOSE", rep.status == "LOOSE", f"{rep.status} bind={rep.bind}")
+
+    # v0.2: a cfg(test) suffix in the same hunk is a cut, not SEAM.
+    suffix = """diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,11 @@
+ pub fn add(a: i32, b: i32) -> i32 {
+-    a + b
++    a + b + bias()
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::*;
++    use super::*;
++    #[test]
++    fn bias_is_wired() {
++        assert_eq!(add(1, 1), 2 + bias());
++    }
+ }
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "src").mkdir()
+        (td / "src/lib.rs").write_text(
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + bias()\n}\n\n"
+            "#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n"
+            "    fn bias_is_wired() {\n        assert_eq!(add(1, 1), 2 + bias());\n    }\n}\n"
+        )
+        rep, tagged = analyze(parse_patch(suffix), td, None, None)
+        check("suffix cut LOCKED", rep.status == "LOCKED", f"{rep.status} tagged={[t[1] for t in tagged]}")
+        check("suffix split halves", rep.n_prod == 1 and rep.n_oracle == 1 and rep.n_seam == 0,
+              f"prod={rep.n_prod} oracle={rep.n_oracle} seam={rep.n_seam}")
+        check("suffix bind bias", "bias" in rep.bind, str(rep.bind))
+
+    # true SEAM: interleaved prod / oracle / prod in one hunk
+    seam = """diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,9 +1,12 @@
+ pub fn add(a: i32, b: i32) -> i32 {
+-    a
++    a + bias()
+ }
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn t() { assert_eq!(add(0, 0), bias()); }
+ }
+ pub fn other() -> i32 {
+-    1
++    2
+ }
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "src").mkdir()
+        (td / "src/lib.rs").write_text(
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + bias()\n}\n"
+            "#[cfg(test)]\nmod tests {\n    use super::*;\n"
+            "    #[test]\n    fn t() { assert_eq!(add(0, 0), bias()); }\n}\n"
+            "pub fn other() -> i32 {\n    2\n}\n"
+        )
+        rep, tagged = analyze(parse_patch(seam), td, None, None)
+        check("interleaved SEAM", rep.status == "SEAM", f"{rep.status} tagged={[t[1] for t in tagged]}")
+        check("SEAM hunk", rep.n_seam == 1, str(rep.n_seam))
+
+    # sandwich in a real git repo
+    with tempfile.TemporaryDirectory(prefix="twain-git-") as tmp:
+        td = Path(tmp)
+        _git_init(td)
+        (td / "app.py").write_text("def add(a, b):\n    return a + b\n")
+        (td / "tests").mkdir()
+        (td / "tests/test_add.py").write_text("def test_add():\n    assert add(1,1)==2\n")
+        c1 = _commit(td, "base")
+        (td / "app.py").write_text("def add(a, b):\n    return a + b + bias()\n")
+        (td / "tests/test_add.py").write_text(
+            "def test_add():\n    assert add(1,1)==2 + bias()\n"
+        )
+        c2 = _commit(td, "wire bias")
+        patch = patch_of_rev(td, c2)
+        hunks = parse_patch(patch)
+        rep_head, _ = analyze(hunks, td, against=c2, rev=c2)
+        rep_par, _ = analyze(hunks, td, against=c1, rev=c2)
+        check("sandwich LOCKED at HEAD", rep_head.status == "LOCKED", rep_head.status)
+        check("sandwich PENDING at parent", rep_par.status == "PENDING", rep_par.status)
+        check("bind bias in git", "bias" in rep_head.bind, str(rep_head.bind))
+
+        # --emit oracle applied onto parent → ORACLE_AHEAD
+        tagged = classify_hunks(hunks, td, against=c2, rev=c2)
+        oracle_h = [h for h, r, _ in tagged if r == "oracle"]
+        emitted = emit_patch(oracle_h)
+        check("emit oracle nonempty", "test_add.py" in emitted and "app.py" not in emitted, emitted[:200])
+
+    # addition prefix is APPLIED not DUPLEX
+    addp = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,4 @@
+ def add(a, b):
+     return a + b
++def bias():
++    return 1
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "app.py").write_text("def add(a, b):\n    return a + b\ndef bias():\n    return 1\n")
+        rep, _ = analyze(parse_patch(addp), td, None, None)
+        fate = rep.hunks[0].fate if rep.hunks else "?"
+        check("addition not DUPLEX", fate == "APPLIED", fate)
+
+    # ugly path with spaces + unicode
+    ugly = """diff --git a/src/file with spaces.rs b/src/file with spaces.rs
+--- a/src/file with spaces.rs
++++ b/src/file with spaces.rs
+@@ -1,3 +1,6 @@
+ pub fn add(a: i32, b: i32) -> i32 { a + b }
++pub fn 加算(a: i32, b: i32) -> i32 {
++    a + b
++}
+diff --git a/tests/加算_test.rs b/tests/加算_test.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/加算_test.rs
+@@ -0,0 +1,2 @@
++#[test]
++fn 加算_works() { assert_eq!(加算(1,1), 2); }
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "src").mkdir()
+        (td / "tests").mkdir()
+        (td / "src/file with spaces.rs").write_text(
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+            "pub fn 加算(a: i32, b: i32) -> i32 {\n    a + b\n}\n"
+        )
+        (td / "tests/加算_test.rs").write_text(
+            "#[test]\nfn 加算_works() { assert_eq!(加算(1,1), 2); }\n"
+        )
+        rep, _ = analyze(parse_patch(ugly), td, None, None)
+        check("ugly LOCKED", rep.status == "LOCKED", f"{rep.status} {[h.path for h in rep.hunks]}")
+        check("unicode bind", any("加算" in b for b in rep.bind), str(rep.bind))
+
+    # docs-only → EMPTY
+    docs = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-old
++new
+"""
+    with tempfile.TemporaryDirectory(prefix="twain-st-") as tmp:
+        td = Path(tmp)
+        (td / "README.md").write_text("new\n")
+        rep, _ = analyze(parse_patch(docs), td, None, None)
+        check("docs EMPTY", rep.status == "EMPTY", rep.status)
+
+    # goldens are oracles
+    check("golden path", path_role("data/fixtures/golden/x.expected.json") == "oracle")
+    check("tests.rs path", path_role("src/hook/tests.rs") == "oracle")
+    check("e2e path", path_role("tests/e2e/jsx-tsx.test.ts") == "oracle")
+    check("prod path", path_role("src/language/js_ts.rs") == "source")
+    check("plans ignore", path_role("plans/foo.md") == "ignore")
+    check("OraclesGenerated", path_role("Tests/TenaoshiEngineTests/OraclesGenerated.swift") == "oracle")
+    check("experiment fixture oracle", path_role("data/fixtures/experiments/x.experiment.json") == "oracle")
+    check("generated ignore", path_role("packages/spec-artifacts/src/ids.generated.ts") == "ignore")
+    check("scenario json oracle", path_role("data/fixtures/golden/foo.scenario.json") == "oracle")
+
+    print(f"selftest: {passed} passed, {fails} failed")
+    return 0 if fails == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+HELP = f"""twain {VERSION} — a unified diff is two patches (oracle vs production)
+
+Usage:
+  twain [rev]                     occupy rev vs its parent (default HEAD)
+  twain A...B                     occupy a range (merge-base)
+  twain --patch FILE              occupy a unified diff
+  git show | twain --patch -      stdin
+  twain --emit oracle|prod [rev]  print that half as a unified diff
+  twain --selftest
+
+Occupies each half against --against (default HEAD, or :worktree with --worktree).
+
+Statuses:
+  LOCKED        both halves occupy the tree and the oracle binds production
+  LOOSE         both occupy, bind empty (tests that do not mention the change)
+  MUTE          production occupies, no oracle half
+  HOLLOW        oracle occupies, no production half
+  PROD_AHEAD    production occupies, oracle still PENDING
+  ORACLE_AHEAD  oracle occupies, production still PENDING
+  PENDING       neither half occupies
+  SEAM          a hunk mixes oracle and production regions (not separable)
+  SPLIT         mixed occupancy inside a half
+  EMPTY         docs/ignore only
+
+Exit: 0 LOCKED/EMPTY, 1 unlocked, 2 SEAM/SPLIT, 3 error.
+      --report-only forces 0. --check is default exit.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="twain", add_help=False)
+    p.add_argument("rev", nargs="?", default=None)
+    p.add_argument("-C", "--repo", default=".")
+    p.add_argument("--against", default=None)
+    p.add_argument("--worktree", action="store_true")
+    p.add_argument("--patch", default=None)
+    p.add_argument("--emit", choices=("oracle", "prod", "ignore"))
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--explain", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--help", "-h", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ns = parse_args(argv if argv is not None else sys.argv[1:])
+    if ns.help:
+        sys.stdout.write(HELP)
+        return 0
+    if ns.version:
+        print(VERSION)
+        return 0
+    if ns.selftest:
+        return selftest()
+
+    root = Path(ns.repo).resolve()
+    try:
+        if ns.patch == "-":
+            text = sys.stdin.read()
+            rev = None
+        elif ns.patch:
+            text = Path(ns.patch).read_text(encoding="utf-8")
+            rev = None
+        else:
+            if not is_git_repo(root):
+                print("twain: not a git repository (pass --patch)", file=sys.stderr)
+                return EXIT_ERROR
+            rev = ns.rev or "HEAD"
+            text = patch_of_rev(root, rev)
+    except Exception as e:
+        print(f"twain: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+    hunks = parse_patch(text)
+    against: str | None
+    if ns.worktree:
+        against = None
+    elif ns.against:
+        against = ns.against
+    elif is_git_repo(root):
+        against = "HEAD"
+    else:
+        against = None
+
+    try:
+        rep, tagged = analyze(hunks, root, against, rev)
+    except Exception as e:
+        print(f"twain: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if ns.emit:
+        keep = [h for h, r, _ in tagged if r == ns.emit]
+        sys.stdout.write(emit_patch(keep))
+        code = 0 if keep or ns.report_only else EXIT_UNLOCKED
+        return 0 if ns.report_only else code
+
+    if ns.json:
+        sys.stdout.write(json.dumps(rep.as_dict(), indent=2, ensure_ascii=False) + "\n")
+    elif ns.tsv:
+        sys.stdout.write(format_tsv(rep))
+    elif ns.porcelain:
+        sys.stdout.write(format_porcelain(rep))
+    else:
+        sys.stdout.write(format_human(rep, ns.explain))
+
+    if ns.report_only:
+        return 0
+    return status_exit(rep.status)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

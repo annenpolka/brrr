@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""inlay — rewrite stale locators inside a JSON diagnostic stream.
+
+A pure Unix filter. Never talks to git. stdin is cargo
+--message-format=json, rustc --error-format=json, or any JSON log
+stream. Locators live in values (span objects, file+line pairs,
+strings). stdout is valid JSON with those addresses rewritten from
+--from-dir onto --to-dir by content fingerprint.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PY_TB_RE = re.compile(
+    r"""File\s+(?P<q>["'])(?P<path>.*?)(?P=q),\s+line\s+(?P<line>\d+)""",
+    re.IGNORECASE,
+)
+ARROW_RE = re.compile(
+    r"""-->\s+(?P<path>\S+?):(?P<line>\d+)(?::(?P<col>\d+))?"""
+)
+COLON_NUM_RE = re.compile(r":(\d+)(?::(\d+))?(?!\d)")
+GUTTER_RE = re.compile(r"^([ \t]*)(\d+)([ \t]*\|)(.*)$")
+GUTTER_TTL = 16
+GUTTER_SPAN = 24
+STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "class", "const", "crate",
+    "def", "else", "enum", "false", "fn", "for", "from", "func", "function",
+    "i", "if", "impl", "import", "in", "int", "let", "mod", "mut", "n",
+    "none", "not", "of", "or", "pub", "return", "self", "static", "str",
+    "struct", "t", "the", "this", "to", "true", "type", "use", "var",
+    "void", "where", "with", "guard", "async", "await", "throws", "some",
+    "nil", "func",
+}
+TRIVIAL_NORMS = {
+    "", "{", "}", "};", "[", "]", "(", ")", "else", "else:", "pass",
+    "break", "continue", "end", "end;", "//", "#", "*/", "/*", "try",
+    "catch", "do", "then",
+}
+BASENAME_DENY = {
+    "error", "warning", "note", "info", "debug", "fatal", "help", "line",
+    "file", "http", "https", "http", "tcp", "udp", "ws", "wss", "ftp",
+    "version", "port", "host", "time", "date", "pid", "exit", "code",
+    "status", "thread", "frame", "stack", "trace", "column", "row",
+    "test", "ok", "fail", "failed", "passed", "skip", "skipping",
+    "expected", "actual", "cause", "reason", "module", "package",
+}
+BARE_ALLOW = {
+    "Makefile", "makefile", "GNUmakefile", "Dockerfile", "justfile",
+    "Justfile", "LICENSE", "LICENCE", "COPYING", "Gemfile", "Rakefile",
+    "Cargo.toml", "Package.swift", "go.mod", "go.sum", "pyproject.toml",
+    "CMakeLists.txt", "README", "NOTICE", "AUTHORS", "CHANGELOG",
+}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+MAX_FILE_BYTES = 1_000_000
+SOURCE_EXTS = {
+    ".py", ".rs", ".swift", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".rb", ".java",
+    ".kt", ".kts", ".cs", ".fs", ".scala", ".php", ".sh", ".bash", ".zsh",
+    ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".html", ".css",
+    ".sql", ".r", ".lua", ".zig", ".nim", ".ex", ".exs", ".erl", ".hs",
+    ".ml", ".mli", ".vue", ".svelte", ".gradle", ".kts", ".plist",
+}
+
+# Structured JSON locator fields. A dict is a locator object only when
+# a file-like string binds against --from-dir *and* a sibling line field
+# is a positive integer. Path-only cargo keys (src_path, manifest_path)
+# stay put unless they have that sibling.
+FILE_KEYS = (
+    "file_name",
+    "filename",
+    "fileName",
+    "file",
+    "path",
+    "source_file",
+    "sourceFile",
+    "filepath",
+    "filePath",
+    "source_path",
+    "sourcePath",
+)
+LINE_KEYS = (
+    "line_start",
+    "lineStart",
+    "start_line",
+    "startLine",
+    "lineno",
+    "line_no",
+    "lineNumber",
+    "line_number",
+    "line",
+)
+END_LINE_KEYS = (
+    "line_end",
+    "lineEnd",
+    "end_line",
+    "endLine",
+    "end_lineno",
+    "endLineno",
+)
+COL_KEYS = (
+    "column_start",
+    "columnStart",
+    "start_column",
+    "startColumn",
+    "column",
+    "col",
+)
+COL_END_KEYS = (
+    "column_end",
+    "columnEnd",
+    "end_column",
+    "endColumn",
+)
+BYTE_START_KEYS = ("byte_start", "byteStart")
+BYTE_END_KEYS = ("byte_end", "byteEnd")
+
+
+@dataclass
+class Hit:
+    path: str
+    line: int
+    col: Optional[int] = None
+    span: tuple[int, int] = (0, 0)
+    form: str = "colon"  # python | colon | arrow | basename
+    quote: str = '"'
+    raw_path: str = ""
+
+
+@dataclass
+class Resolution:
+    hit: Hit
+    status: str  # same | shifted | moved | edited | deleted | unresolved
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+
+
+@dataclass
+class Carry:
+    """Last rewritten locator, so rustc/clang `NNN |` gutters can follow it."""
+    old_line: int
+    dest_line: int
+    ttl: int
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+    by_basename: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    path_set: frozenset[str] = field(default_factory=frozenset)
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        self.by_basename.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        for path, lines in self.files.items():
+            self.by_basename[os.path.basename(path)].append(path)
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+        self.path_set = frozenset(self.files.keys())
+
+
+@dataclass
+class Ctx:
+    src: Snapshot
+    dst: Snapshot
+    context: int
+    debug: bool
+    trace: bool
+    cache: dict[tuple[str, int], Resolution] = field(default_factory=dict)
+    traced: set[tuple[str, int, str, Optional[str], Optional[int]]] = field(default_factory=set)
+    unresolved: bool = False
+
+    def resolve(self, hit: Hit) -> Resolution:
+        key = (hit.path, hit.line)
+        base = self.cache.get(key)
+        if base is None:
+            base = resolve_hit(hit, self.src, self.dst, self.context, self.debug)
+            self.cache[key] = base
+        res = Resolution(
+            hit=Hit(
+                path=base.hit.path,
+                line=base.hit.line,
+                col=hit.col,
+                span=hit.span,
+                form=hit.form,
+                quote=hit.quote,
+                raw_path=hit.raw_path,
+            ),
+            status=base.status,
+            dest_path=base.dest_path,
+            dest_line=base.dest_line,
+            score=base.score,
+            note=base.note,
+            dest_text=base.dest_text,
+        )
+        if res.status == "unresolved":
+            self.unresolved = True
+        if self.trace:
+            tkey = (res.hit.path, res.hit.line, res.status, res.dest_path, res.dest_line)
+            if tkey not in self.traced:
+                self.traced.add(tkey)
+                print_trace(res)
+        return res
+
+
+def posix_rel(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/") if p.startswith("/") and not os.path.isabs(path) else p
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS or (part.startswith(".") and part not in (".", "..")) for part in parts[:-1]):
+        return True
+    name = parts[-1] if parts else ""
+    if name.startswith(".") and name not in BARE_ALLOW:
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def decode_bytes(data: bytes) -> Optional[str]:
+    if b"\x00" in data[:4096]:
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def walk_dir_files(root: Path) -> Iterator[str]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield rel
+
+
+def read_dir_file(root: Path, path: str) -> Optional[list[str]]:
+    fp = root / path
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        return None
+    text = decode_bytes(data)
+    if text is None:
+        return None
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def load_snapshot(directory: Path, label: str) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    for path in walk_dir_files(directory):
+        lines = read_dir_file(directory, path)
+        if lines is not None:
+            files[path] = lines
+    snap = Snapshot(label=label, files=files)
+    snap.index()
+    return snap
+
+
+def bind_path(raw: str, snap: Snapshot) -> Optional[str]:
+    p = posix_rel(raw.replace("\\", "/"))
+    while p.startswith("./"):
+        p = p[2:]
+    if p in snap.path_set:
+        return p
+    best = None
+    for kp in snap.path_set:
+        if p.endswith("/" + kp) or p.endswith("\\" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    if best:
+        return best
+    base = os.path.basename(p)
+    hits = snap.by_basename.get(base, [])
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _boundary_ok(text: str, start: int, end: int) -> bool:
+    if start > 0:
+        prev = text[start - 1]
+        if prev.isalnum() or prev in "._-":
+            return False
+    if end < len(text):
+        nxt = text[end]
+        if nxt.isalnum() or nxt in "._-":
+            return False
+    return True
+
+
+def _in_url(text: str, start: int) -> bool:
+    proto = text.rfind("://", 0, start)
+    if proto < 0:
+        return False
+    chunk = text[proto:start]
+    return all(c not in " \t\"'" for c in chunk)
+
+
+def _basename_ok(name: str) -> bool:
+    if not name or name in BASENAME_DENY:
+        return False
+    if name.lower() in BASENAME_DENY:
+        return False
+    if name in BARE_ALLOW:
+        return True
+    stem, ext = os.path.splitext(name)
+    if ext.lower() in SOURCE_EXTS:
+        return True
+    return False
+
+
+def _span_path_start(appeared: str, bound: str, path_start: int, path_end: int) -> tuple[int, str]:
+    """Where the rewrite span should start, and the form of the original path."""
+    appeared_n = appeared.replace("\\", "/")
+    bound_n = bound.replace("\\", "/")
+    if appeared_n == bound_n:
+        return path_start, "colon"
+    if appeared_n.endswith("/" + bound_n):
+        return path_end - len(bound), "colon"
+    base = os.path.basename(bound_n)
+    if appeared_n == base:
+        return path_start, "basename"
+    if appeared_n.endswith("/" + base) and bound_n.endswith("/" + base):
+        return path_end - len(base), "basename"
+    return path_start, "colon"
+
+
+def _take(span: tuple[int, int], occupied: list[tuple[int, int]]) -> bool:
+    s, e = span
+    if s < 0 or e <= s:
+        return False
+    for os_, oe in occupied:
+        if not (e <= os_ or s >= oe):
+            return False
+    occupied.append(span)
+    return True
+
+
+def find_hits(text: str, src: Snapshot) -> list[Hit]:
+    """Pull locators out of one string value. Noise is whatever we do not take."""
+    occupied: list[tuple[int, int]] = []
+    found: list[Hit] = []
+
+    for m in PY_TB_RE.finditer(text):
+        if _in_url(text, m.start()):
+            continue
+        bound = bind_path(m.group("path"), src)
+        if not bound:
+            continue
+        span = (m.start(), m.end())
+        if not _take(span, occupied):
+            continue
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group("line")),
+                span=span,
+                form="python",
+                quote=m.group("q"),
+                raw_path=m.group("path"),
+            )
+        )
+
+    for m in ARROW_RE.finditer(text):
+        if _in_url(text, m.start()):
+            continue
+        appeared = m.group("path")
+        bound = bind_path(appeared, src)
+        if not bound:
+            continue
+        path_start, path_end = m.start("path"), m.end("path")
+        span_start, form = _span_path_start(appeared, bound, path_start, path_end)
+        span = (span_start, m.end())
+        if not _take(span, occupied):
+            continue
+        col = int(m.group("col")) if m.group("col") else None
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group("line")),
+                col=col,
+                span=span,
+                form="arrow" if form != "basename" else "basename",
+                raw_path=text[span_start:path_end],
+            )
+        )
+
+    for m in COLON_NUM_RE.finditer(text):
+        span_end = m.end()
+        prefix = text[: m.start()]
+        if not prefix:
+            continue
+        if _in_url(text, m.start()):
+            continue
+        bound = None
+        appeared = None
+        form = "colon"
+        span_start = None
+        for path in src.paths:
+            if not path:
+                continue
+            if prefix.endswith(path) and _boundary_ok(text, m.start() - len(path), m.start()):
+                bound = path
+                appeared = path
+                span_start = m.start() - len(path)
+                form = "colon"
+                break
+        if bound is None:
+            uniques = [
+                (base, paths[0])
+                for base, paths in src.by_basename.items()
+                if len(paths) == 1 and _basename_ok(base)
+            ]
+            uniques.sort(key=lambda x: len(x[0]), reverse=True)
+            for base, path in uniques:
+                if prefix.endswith(base) and _boundary_ok(text, m.start() - len(base), m.start()):
+                    bound = path
+                    appeared = base
+                    span_start = m.start() - len(base)
+                    form = "basename"
+                    break
+        if bound is None or span_start is None:
+            continue
+        span = (span_start, span_end)
+        if not _take(span, occupied):
+            continue
+        col = int(m.group(2)) if m.group(2) else None
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group(1)),
+                col=col,
+                span=span,
+                form=form,
+                raw_path=appeared or bound,
+            )
+        )
+
+    found.sort(key=lambda h: h.span[0])
+    return found
+
+
+def path_score(src: str, dst: str) -> float:
+    if src == dst:
+        return 1.0
+    s_parts = src.replace("\\", "/").split("/")
+    d_parts = dst.replace("\\", "/").split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    score = 0.0
+    if s_base == d_base:
+        score += 0.55
+    s_stem, s_ext = os.path.splitext(src)
+    d_stem = os.path.splitext(dst)[0]
+    if dst.startswith(s_stem + "/") or f"/{os.path.basename(s_stem)}/" in f"/{dst}":
+        score += 0.35
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.05
+    if os.path.basename(s_stem) and os.path.basename(s_stem) in d_stem:
+        score += 0.08
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.15 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def neighbor_score(
+    src_lines: list[str], src_i: int, dst_lines: list[str], dst_i: int, ctx: int
+) -> float:
+    if ctx <= 0:
+        return 0.0
+    hits = 0
+    total = 0
+    for delta in range(-ctx, ctx + 1):
+        if delta == 0:
+            continue
+        sj = src_i + delta
+        if sj < 1 or sj > len(src_lines):
+            continue
+        sn = normalize(src_lines[sj - 1])
+        if sn in TRIVIAL_NORMS:
+            continue
+        total += 1
+        lo = max(1, dst_i - ctx)
+        hi = min(len(dst_lines), dst_i + ctx)
+        window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+        if sn in window:
+            hits += 1
+    if total == 0:
+        return 0.0
+    return hits / total
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def score_pair(
+    src_path: str,
+    src_lines: list[str],
+    src_i: int,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+) -> float:
+    sraw = src_lines[src_i - 1]
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_score(src_lines, src_i, dst_lines, dst_i, ctx)
+    ps = path_score(src_path, dst_path)
+    if sraw == draw:
+        return min(1.0, 0.75 + 0.25 * ps + 0.05 * ns)
+    if normalize(sraw) == normalize(draw):
+        return min(1.0, 0.68 + 0.25 * ps + 0.07 * ns)
+    lr = line_ratio(sraw, draw)
+    ts = token_score(sraw, draw)
+    return W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps
+
+
+def candidates_for(
+    src_path: str, src_lines: list[str], src_i: int, dst: Snapshot
+) -> list[tuple[str, int]]:
+    raw = src_lines[src_i - 1]
+    n = normalize(raw)
+    toks = tokens(raw)
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(path, line)] = None
+
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    ranked = sorted(set(toks), key=lambda t: (dst.token_df.get(t, 10**9), -len(t)))
+    for tok in ranked[:4]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred_paths = []
+    if src_path in dst.files:
+        preferred_paths.append(src_path)
+    stem = os.path.splitext(src_path)[0]
+    base = os.path.basename(src_path)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base) or os.path.basename(p) == base:
+            preferred_paths.append(p)
+    for p in preferred_paths:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(
+    src_path: str, src_line: int, src_raw: str, dst_path: Optional[str], dst_line: Optional[int], dst_raw: str, score: float
+) -> str:
+    if dst_path is None or dst_line is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    same_text = normalize(src_raw) == normalize(dst_raw) or line_ratio(src_raw, dst_raw) >= 0.96
+    if src_path == dst_path and same_text:
+        return "same" if src_line == dst_line else "shifted"
+    if same_text:
+        return "moved" if src_path != dst_path else "shifted"
+    return "edited"
+
+
+def describe_hole(src_lines: list[str], src_i: int, dst: Snapshot, ctx: int) -> str:
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    reach = max(ctx * 4, 10)
+    for d in range(1, reach + 1):
+        if prev_hit is None:
+            j = src_i - d
+            if j >= 1:
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        prev_hit = locs[0]
+        if next_hit is None:
+            j = src_i + d
+            if j <= len(src_lines):
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        next_hit = locs[0]
+        if prev_hit and next_hit:
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}"
+    if prev_hit:
+        return f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return f"next context at {next_hit[0]}:{next_hit[1]}"
+    return "no candidates"
+
+
+def resolve_hit(hit: Hit, src: Snapshot, dst: Snapshot, ctx: int, debug: bool) -> Resolution:
+    src_lines = src.files.get(hit.path)
+    if src_lines is None:
+        hits = [p for p in src.files if p == hit.path or p.endswith("/" + hit.path)]
+        if len(hits) == 1:
+            hit.path = hits[0]
+            src_lines = src.files[hit.path]
+        elif not hits:
+            return Resolution(hit=hit, status="unresolved", note="source path not in from-dir")
+        else:
+            return Resolution(hit=hit, status="unresolved", note="source path ambiguous")
+    if hit.line < 1 or hit.line > len(src_lines):
+        return Resolution(
+            hit=hit,
+            status="unresolved",
+            note=f"line {hit.line} out of range (file has {len(src_lines)} lines)",
+        )
+    src_raw = src_lines[hit.line - 1]
+    if normalize(src_raw) in TRIVIAL_NORMS:
+        return Resolution(hit=hit, status="unresolved", note="line is too trivial to fingerprint")
+
+    cands = candidates_for(hit.path, src_lines, hit.line, dst)
+    best: Optional[tuple[float, str, int, str]] = None
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc = score_pair(hit.path, src_lines, hit.line, dpath, dlines, dline, ctx)
+        if best is None or sc > best[0]:
+            best = (sc, dpath, dline, dlines[dline - 1])
+    if debug and best:
+        print(
+            f"# debug {hit.path}:{hit.line} -> {best[1]}:{best[2]} score={best[0]:.3f} cands={len(cands)}",
+            file=sys.stderr,
+        )
+    if best is None:
+        return Resolution(
+            hit=hit,
+            status="deleted",
+            score=0.0,
+            note=describe_hole(src_lines, hit.line, dst, ctx),
+        )
+    sc, dpath, dline, draw = best
+    status = classify(hit.path, hit.line, src_raw, dpath, dline, draw, sc)
+    if status == "deleted":
+        note = describe_hole(src_lines, hit.line, dst, ctx)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        return Resolution(
+            hit=hit,
+            status="deleted",
+            dest_path=dpath,
+            dest_line=dline,
+            score=sc,
+            note=note,
+            dest_text=draw,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "shifted":
+        note = "same file, line number drifted"
+    return Resolution(
+        hit=hit,
+        status=status,
+        dest_path=dpath,
+        dest_line=dline,
+        score=sc,
+        note=note,
+        dest_text=draw,
+    )
+
+
+def format_from(hit: Hit) -> str:
+    col = f":{hit.col}" if hit.col is not None else ""
+    return f"{hit.path}:{hit.line}{col}"
+
+
+def format_to(res: Resolution) -> str:
+    if res.dest_path is None or res.dest_line is None or res.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{res.hit.col}" if res.hit.col is not None else ""
+    return f"{res.dest_path}:{res.dest_line}{col}"
+
+
+def emit_path(res: Resolution) -> Optional[str]:
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    hit = res.hit
+    if res.dest_path == hit.path:
+        return hit.raw_path or hit.path
+    if hit.form == "basename":
+        dest_base = os.path.basename(res.dest_path)
+        if dest_base == os.path.basename(hit.path) and dest_base == (hit.raw_path or dest_base):
+            return dest_base
+        return res.dest_path
+    return res.dest_path
+
+
+def replacement_text(res: Resolution) -> Optional[str]:
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    hit = res.hit
+    if hit.form == "python":
+        q = hit.quote or '"'
+        return f"File {q}{res.dest_path}{q}, line {res.dest_line}"
+    path = emit_path(res)
+    if path is None:
+        return None
+    col = f":{hit.col}" if hit.col is not None else ""
+    return f"{path}:{res.dest_line}{col}"
+
+
+def apply_gutter(body: str, carry: Carry) -> Optional[str]:
+    m = GUTTER_RE.match(body)
+    if not m:
+        return None
+    n = int(m.group(2))
+    delta = n - carry.old_line
+    if delta < 0 or delta > GUTTER_SPAN:
+        return None
+    new_n = carry.dest_line + delta
+    num = str(new_n).rjust(len(m.group(2)))
+    return m.group(1) + num + m.group(3) + m.group(4)
+
+
+def should_carry(res: Resolution, body: str) -> bool:
+    if res.status not in {"same", "shifted", "moved", "edited"} or res.dest_line is None:
+        return False
+    if res.hit.form == "arrow" or "-->" in body:
+        return True
+    if re.search(r":\s*(error|warning|note|fatal)\b", body, re.I):
+        return True
+    if res.hit.col is not None and res.hit.form in {"colon", "basename"}:
+        return True
+    return False
+
+
+def rewrite_line(text: str, resolutions: list[Resolution]) -> str:
+    items = [res for res in resolutions if res.hit.span is not None]
+    items.sort(key=lambda r: r.hit.span[0], reverse=True)
+    out = text
+    for res in items:
+        start, end = res.hit.span
+        new = replacement_text(res)
+        if not new:
+            continue
+        out = out[:start] + new + out[end:]
+    return out
+
+
+def print_trace(res: Resolution) -> None:
+    note = res.note.replace("\t", " ").replace("\n", " ")
+    print(
+        f"{res.status}\t{format_from(res.hit)}\t{format_to(res)}\t{res.score:.3f}\t{note}",
+        file=sys.stderr,
+    )
+
+
+def pick_key(obj: dict, names: tuple[str, ...]) -> Optional[str]:
+    for n in names:
+        if n in obj:
+            return n
+    lower = {k.lower(): k for k in obj if isinstance(k, str)}
+    for n in names:
+        got = lower.get(n.lower())
+        if got is not None:
+            return got
+    return None
+
+
+def as_lineno(val: Any) -> Optional[int]:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val > 0 else None
+    if isinstance(val, float) and val.is_integer() and val > 0:
+        return int(val)
+    if isinstance(val, str) and val.isdigit():
+        n = int(val)
+        return n if n > 0 else None
+    return None
+
+
+def emit_file_field(appeared: str, bound: str, dest: str) -> str:
+    """Rewrite a JSON file field, keeping CI prefixes / basename style."""
+    appeared_n = appeared.replace("\\", "/")
+    bound_n = bound.replace("\\", "/")
+    dest_n = dest.replace("\\", "/")
+    if appeared_n == bound_n:
+        return dest_n
+    if appeared_n.endswith("/" + bound_n):
+        return appeared_n[: -len(bound_n)] + dest_n
+    base = os.path.basename(bound_n)
+    dest_base = os.path.basename(dest_n)
+    if appeared_n == base:
+        return dest_base if dest_base == base else dest_n
+    if appeared_n.endswith("/" + base):
+        prefix = appeared_n[: -len(base)]
+        if dest_base == base:
+            return prefix + dest_base
+        return prefix + dest_n
+    return dest_n
+
+
+def keep_line_type(original: Any, dest_line: int) -> Any:
+    if isinstance(original, str):
+        return str(dest_line)
+    return dest_line
+
+
+def split_keep(text: str) -> list[tuple[str, str]]:
+    """Split a JSON string value into (body, ending) lines."""
+    if text == "":
+        return [("", "")]
+    parts: list[tuple[str, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        nl = text.find("\n", i)
+        if nl < 0:
+            parts.append((text[i:], ""))
+            break
+        if nl > i and text[nl - 1] == "\r":
+            parts.append((text[i : nl - 1], "\r\n"))
+        else:
+            parts.append((text[i:nl], "\n"))
+        i = nl + 1
+    return parts
+
+
+def byte_offset(lines: list[str], line: int, col: int) -> int:
+    """UTF-8 byte offset of a 1-based line/column in dest file text."""
+    if line < 1 or line > len(lines):
+        return 0
+    total = 0
+    for i in range(line - 1):
+        total += len((lines[i] + "\n").encode("utf-8"))
+    raw = lines[line - 1]
+    if col <= 1:
+        return total
+    cut = min(len(raw), col - 1)
+    return total + len(raw[:cut].encode("utf-8"))
+
+
+def rewrite_string(text: str, ctx: Ctx) -> str:
+    """Rewrite locators inside a JSON string, carrying rustc gutters with them."""
+    pieces = split_keep(text)
+    carry: Optional[Carry] = None
+    out: list[str] = []
+    for body, nl in pieces:
+        gutter_applied = False
+        if carry is not None:
+            rewritten = apply_gutter(body, carry)
+            if rewritten is not None:
+                body = rewritten
+                gutter_applied = True
+        hits = [] if gutter_applied else find_hits(body, ctx.src)
+        line_res = [ctx.resolve(hit) for hit in hits]
+        refreshed: Optional[Carry] = None
+        for r in line_res:
+            if should_carry(r, body) and r.dest_line is not None:
+                refreshed = Carry(old_line=r.hit.line, dest_line=r.dest_line, ttl=GUTTER_TTL)
+        if refreshed is not None:
+            carry = refreshed
+        elif carry is not None:
+            carry.ttl -= 1
+            if carry.ttl <= 0:
+                carry = None
+        out.append(rewrite_line(body, line_res) + nl)
+    return "".join(out)
+
+
+def rewrite_object(obj: dict, ctx: Ctx) -> dict:
+    out: dict[Any, Any] = {}
+    handled: set[str] = set()
+
+    file_key = pick_key(obj, FILE_KEYS)
+    line_key = pick_key(obj, LINE_KEYS)
+    appeared = obj.get(file_key) if file_key else None
+    lineno = as_lineno(obj.get(line_key)) if line_key else None
+    bound = bind_path(appeared, ctx.src) if isinstance(appeared, str) else None
+
+    if file_key and line_key and bound and lineno is not None:
+        col_key = pick_key(obj, COL_KEYS)
+        col = as_lineno(obj.get(col_key)) if col_key else None
+        hit = Hit(
+            path=bound,
+            line=lineno,
+            col=col,
+            span=(0, 0),
+            form="colon",
+            raw_path=appeared,
+        )
+        res = ctx.resolve(hit)
+        if res.status not in {"deleted", "unresolved"} and res.dest_path and res.dest_line:
+            out[file_key] = emit_file_field(appeared, bound, res.dest_path)
+            out[line_key] = keep_line_type(obj[line_key], res.dest_line)
+            handled.add(file_key)
+            handled.add(line_key)
+            dest_line = res.dest_line
+            dest_end = dest_line
+            dest_lines = ctx.dst.files.get(res.dest_path) or []
+            end_key = pick_key(obj, END_LINE_KEYS)
+            if end_key and end_key not in handled:
+                end_no = as_lineno(obj.get(end_key))
+                if end_no is not None and end_no >= lineno:
+                    dest_end = dest_line + (end_no - lineno)
+                    out[end_key] = keep_line_type(obj[end_key], dest_end)
+                    handled.add(end_key)
+            if "text" in obj and isinstance(obj["text"], list) and dest_lines:
+                new_text = []
+                for i, item in enumerate(obj["text"]):
+                    li = dest_line + i
+                    if isinstance(item, dict) and 1 <= li <= len(dest_lines):
+                        new_item = {}
+                        for tk, tv in item.items():
+                            new_item[tk] = dest_lines[li - 1] if tk == "text" else rewrite_value(tv, ctx)
+                        new_item["text"] = dest_lines[li - 1]
+                        new_text.append(new_item)
+                    else:
+                        new_text.append(rewrite_value(item, ctx))
+                out["text"] = new_text
+                handled.add("text")
+            col_key = pick_key(obj, COL_KEYS)
+            col_start = as_lineno(obj.get(col_key)) if col_key else 1
+            col_end_key = pick_key(obj, COL_END_KEYS)
+            col_end = as_lineno(obj.get(col_end_key)) if col_end_key else col_start
+            if dest_lines and 1 <= dest_line <= len(dest_lines):
+                bs_key = pick_key(obj, BYTE_START_KEYS)
+                be_key = pick_key(obj, BYTE_END_KEYS)
+                if bs_key:
+                    out[bs_key] = byte_offset(dest_lines, dest_line, col_start or 1)
+                    handled.add(bs_key)
+                if be_key:
+                    end_line = dest_end if 1 <= dest_end <= len(dest_lines) else dest_line
+                    out[be_key] = byte_offset(dest_lines, end_line, col_end or 1)
+                    handled.add(be_key)
+
+    for k, v in obj.items():
+        if k in handled:
+            continue
+        out[k] = rewrite_value(v, ctx)
+    # Preserve original key order: handled keys were inserted first.
+    # Rebuild in input order.
+    ordered = {}
+    for k in obj:
+        ordered[k] = out[k]
+    for k, v in out.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered
+
+
+def rewrite_value(val: Any, ctx: Ctx) -> Any:
+    if isinstance(val, dict):
+        return rewrite_object(val, ctx)
+    if isinstance(val, list):
+        return [rewrite_value(x, ctx) for x in val]
+    if isinstance(val, str):
+        return rewrite_string(val, ctx)
+    return val
+
+
+def dumps_json(val: Any, indent: Optional[int]) -> str:
+    if indent is None:
+        return json.dumps(val, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(val, ensure_ascii=False, indent=indent)
+
+
+def scan_stream(raw: str) -> Iterator[tuple[str, Any, str]]:
+    """Yield ('json', value, nl) or ('raw', body, nl) from a JSON log stream.
+
+    Concatenated JSON values (NDJSON, pretty objects, one array) are the
+    object. Non-JSON chatter (cargo 'Compiling', timestamps) passes through.
+    """
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] in "{[":
+            try:
+                val, end = dec.raw_decode(raw, i)
+            except json.JSONDecodeError:
+                nl = raw.find("\n", i)
+                if nl < 0:
+                    yield ("raw", raw[i:], "")
+                    return
+                yield ("raw", raw[i:nl], "\n")
+                i = nl + 1
+                continue
+            nl = "\n"
+            j = end
+            if j < n and raw[j] == "\r":
+                j += 1
+                nl = "\r\n" if j < n and raw[j] == "\n" else "\r"
+            if j < n and raw[j] == "\n":
+                j += 1
+                if nl != "\r\n":
+                    nl = "\n"
+            elif j == end:
+                nl = "\n" if end < n else ""
+            yield ("json", val, nl)
+            i = j
+            continue
+        nl_at = raw.find("\n", i)
+        if nl_at < 0:
+            yield ("raw", raw[i:], "")
+            return
+        body = raw[i:nl_at]
+        if body.endswith("\r"):
+            yield ("raw", body[:-1], "\r\n")
+        else:
+            yield ("raw", body, "\n")
+        i = nl_at + 1
+
+
+def read_inputs(names: list[str]) -> str:
+    if not names:
+        names = ["-"]
+    chunks: list[str] = []
+    for name in names:
+        if name == "-":
+            chunks.append(sys.stdin.read())
+        else:
+            with open(name, encoding="utf-8", errors="surrogateescape", newline="") as fp:
+                chunks.append(fp.read())
+    return "".join(chunks)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="inlay",
+        description=(
+            "Rewrite locators inside a JSON compiler/test stream from one "
+            "directory snapshot onto another. Values move; the JSON stays valid. "
+            "No git, no locator arguments."
+        ),
+        epilog="cargo test --message-format=json | inlay --from-dir old --to-dir new",
+    )
+    p.add_argument(
+        "logs",
+        nargs="*",
+        help="JSON streams to rewrite (default: stdin). '-' is stdin.",
+    )
+    p.add_argument("--from-dir", type=Path, required=True, help="source snapshot directory")
+    p.add_argument("--to-dir", type=Path, required=True, help="destination snapshot directory")
+    p.add_argument("--trace", action="store_true", help="print mapping TSV on stderr")
+    p.add_argument("--strict", action="store_true", help="exit 1 if any locator is unresolved")
+    p.add_argument("--context", type=int, default=3, help="neighbor window (default 3)")
+    p.add_argument("--debug", action="store_true", help="scorer traces on stderr")
+    p.add_argument("--indent", type=int, default=None, help="pretty-print JSON with this indent")
+    p.add_argument("--version", action="version", version=f"inlay {VERSION}")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if not args.from_dir.is_dir():
+        print(f"inlay: --from-dir is not a directory: {args.from_dir}", file=sys.stderr)
+        return 2
+    if not args.to_dir.is_dir():
+        print(f"inlay: --to-dir is not a directory: {args.to_dir}", file=sys.stderr)
+        return 2
+    if not args.logs and sys.stdin.isatty():
+        build_parser().print_help()
+        return 2
+
+    src = load_snapshot(args.from_dir, str(args.from_dir))
+    dst = load_snapshot(args.to_dir, str(args.to_dir))
+    ctx = Ctx(
+        src=src,
+        dst=dst,
+        context=args.context,
+        debug=args.debug,
+        trace=args.trace,
+    )
+
+    raw = read_inputs(args.logs)
+    for kind, payload, nl in scan_stream(raw):
+        if kind == "raw":
+            print(payload + nl, end="")
+            continue
+        rewritten = rewrite_value(payload, ctx)
+        print(dumps_json(rewritten, args.indent) + (nl or "\n"), end="")
+
+    if args.strict and ctx.unresolved:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

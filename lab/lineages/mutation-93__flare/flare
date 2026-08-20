@@ -1,0 +1,1226 @@
+#!/usr/bin/env python3
+"""flare — emit LSP publishDiagnostics from 1-based locators.
+
+A pure Unix filter. Never talks to git. stdin is cargo / rustc JSON,
+SARIF, clang/Swift diagnostic JSON, or compiler text. Those locators
+are 1-based (`line_start`, `region.startLine`, `--> file:529:5`).
+stdout is a textDocument/publishDiagnostics stream whose
+`range.start.line` is 0-based, grouped by uri (one document per file),
+with dest-owned Content-Length (UTF-8 byte length of the JSON-RPC
+body) and dest-owned `character` (UTF-16, clamped to the snippet).
+
+This is the inverse of gist/blot: they rewrite nested 0-based LSP
+locators and refuse to shift SARIF. flare *creates* the LSP document
+from the 1-based schemas those filters will not touch. It does not
+rewrite already-0-based `range.start.line` (that would be a gist
+clone). It does not walk git. It does not mint pins. Off-by-one is
+the object: SARIF 529 becomes LSP 528, never 529 and never 17.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Iterator, Optional
+
+VERSION = "0.2.0"
+PUBLISH_METHOD = "textDocument/publishDiagnostics"
+
+CARGO_FILE_KEYS = ("file_name", "fileName")
+CARGO_LINE_KEYS = ("line_start", "lineStart")
+CARGO_END_LINE_KEYS = ("line_end", "lineEnd")
+CARGO_COL_KEYS = ("column_start", "columnStart", "col_start")
+CARGO_END_COL_KEYS = ("column_end", "columnEnd", "col_end")
+
+ANSI_RE = re.compile(
+    r"(?:\x1b\[[0-9;:]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
+)
+PY_TB_RE = re.compile(
+    r"""File\s+(?P<q>["'])(?P<path>.*?)(?P=q),\s+line\s+(?P<line>\d+)""",
+    re.IGNORECASE,
+)
+ARROW_RE = re.compile(
+    r"""-->\s+(?P<path>\S+?):(?P<line>\d+)(?::(?P<col>\d+))?"""
+)
+# Compiler diagnostics: path.ext:line:col: error:
+COLON_DIAG_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:)?(?:/|\./|\.\./)?(?:[^:\s]+/)*[^:\s]+?\."
+    r"(?:rs|py|swift|ts|tsx|js|jsx|mjs|cjs|go|c|h|cc|cpp|hpp|m|mm|rb|"
+    r"java|kt|kts|cs|fs|scala|php|sh|toml|md))"
+    r":(?P<line>\d+)(?::(?P<col>\d+))?"
+)
+URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+HEADER_LINE_RE = re.compile(br"^([A-Za-z0-9-]+):\s*(.*?)\s*$")
+CONTENT_HEADER_RE = re.compile(br"(?i)^content-(length|type)\s*:")
+
+SEVERITY = {
+    "error": 1,
+    "err": 1,
+    "fatal": 1,
+    "fail": 1,
+    "failed": 1,
+    "warning": 2,
+    "warn": 2,
+    "note": 3,
+    "info": 3,
+    "information": 3,
+    "remark": 3,
+    "none": 3,
+    "help": 4,
+    "hint": 4,
+    "suggestion": 4,
+}
+
+SOURCE_EXTS = {
+    ".py", ".rs", ".swift", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".rb", ".java",
+    ".kt", ".kts", ".cs", ".fs", ".scala", ".php", ".sh", ".toml", ".md",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Locator:
+    uri: str
+    line_1: int
+    col_1: Optional[int] = None
+    end_line_1: Optional[int] = None
+    end_col_1: Optional[int] = None
+    end_col_exclusive_1: bool = True
+    message: str = ""
+    severity: Optional[int] = None
+    code: Any = None
+    source: str = "flare"
+    schema: str = "text"
+    snippet: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    related: list["Locator"] = field(default_factory=list)
+
+
+@dataclass
+class Chunk:
+    kind: str  # json | lsp | raw
+    payload: Any
+    original: str = ""
+    raw_bytes: Optional[bytes] = None
+
+
+# ---------------------------------------------------------------------------
+# Numbers / URI
+# ---------------------------------------------------------------------------
+
+
+def as_int(v: Any) -> Optional[int]:
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v == int(v):
+        return int(v)
+    if isinstance(v, str) and v.strip().lstrip("+-").isdigit():
+        try:
+            return int(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def as_lineno_1(v: Any) -> Optional[int]:
+    n = as_int(v)
+    if n is None or n < 1:
+        return None
+    return n
+
+
+def as_col_1(v: Any) -> Optional[int]:
+    n = as_int(v)
+    if n is None or n < 1:
+        return None
+    return n
+
+
+def to_lsp_line(n_1: int) -> int:
+    return n_1 - 1
+
+
+def utf16_len(text: str) -> int:
+    n = 0
+    for ch in text:
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return n
+
+
+def to_lsp_char(col_1: Optional[int], snippet: str = "", *, clamp: bool = False) -> int:
+    if col_1 is None or col_1 < 1:
+        return 0
+    ch = col_1 - 1
+    if clamp and snippet:
+        cap = utf16_len(snippet)
+        if ch > cap:
+            ch = cap
+    return ch
+
+
+def end_lsp_char(
+    start_1: Optional[int],
+    end_1: Optional[int],
+    snippet: str,
+    exclusive_1: bool,
+    *,
+    clamp: bool = False,
+) -> int:
+    start_0 = to_lsp_char(start_1, snippet, clamp=clamp)
+    if end_1 is None:
+        if snippet and start_1 is not None:
+            # If the snippet is the whole line, a missing end is zero-width.
+            return start_0
+        return start_0
+    if exclusive_1:
+        ch = to_lsp_char(end_1, snippet, clamp=False)
+    else:
+        # Inclusive 1-based last column → exclusive 0-based character.
+        ch = end_1
+        if ch < 0:
+            ch = 0
+    if clamp and snippet:
+        cap = utf16_len(snippet)
+        if ch > cap:
+            ch = cap
+    if ch < start_0:
+        ch = start_0
+    return ch
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def first_present(obj: dict, keys: tuple[str, ...]) -> Any:
+    for k in keys:
+        if k in obj:
+            return obj[k]
+    return None
+
+
+def to_uri(path: str, prefix: Optional[str] = None) -> str:
+    if not path:
+        return path
+    if path.startswith("file:"):
+        return path
+    if URL_RE.match(path) and "://" in path:
+        return path
+    norm = path.replace("\\", "/")
+    if prefix and not norm.startswith("/"):
+        return prefix.rstrip("/") + "/" + norm.lstrip("./")
+    if norm.startswith("/"):
+        return "file://" + norm
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Schema classifiers
+# ---------------------------------------------------------------------------
+
+
+def is_cargo_span(obj: dict) -> bool:
+    keys = set(obj)
+    return bool(keys & set(CARGO_FILE_KEYS)) and bool(keys & set(CARGO_LINE_KEYS))
+
+
+def is_rustc_diagnostic(obj: dict) -> bool:
+    if not isinstance(obj.get("spans"), list):
+        return False
+    if obj.get("$message_type") == "diagnostic":
+        return True
+    if isinstance(obj.get("level"), str) and isinstance(obj.get("message"), (str, dict)):
+        return True
+    return False
+
+
+def is_cargo_wrapper(obj: dict) -> bool:
+    if obj.get("reason") != "compiler-message":
+        return False
+    return isinstance(obj.get("message"), dict)
+
+
+def is_physical_location(obj: dict) -> bool:
+    art = obj.get("artifactLocation") or obj.get("artifact_location")
+    region = obj.get("region")
+    if not isinstance(art, dict):
+        return False
+    if not isinstance(region, dict) and not isinstance(obj.get("contextRegion"), dict):
+        return False
+    uri = art.get("uri")
+    has_uri = isinstance(uri, str) and uri != ""
+    has_index = isinstance(art.get("index"), int)
+    if not has_uri and not has_index:
+        return False
+    if isinstance(region, dict) and (
+        "startLine" in region or "start_line" in region or "charOffset" in region or "byteOffset" in region
+    ):
+        return True
+    ctxr = obj.get("contextRegion")
+    return isinstance(ctxr, dict) and ("startLine" in ctxr or "start_line" in ctxr)
+
+
+def is_sarif_log(obj: dict) -> bool:
+    if not isinstance(obj.get("runs"), list):
+        return False
+    schema = obj.get("$schema")
+    if isinstance(schema, str) and "sarif" in schema.lower():
+        return True
+    if obj.get("version") in {"2.1.0", "2.1.0-rtm.5", "2.0.0"}:
+        return True
+    runs = obj.get("runs") or []
+    if runs and isinstance(runs[0], dict) and isinstance(runs[0].get("results"), list):
+        return True
+    return False
+
+
+def is_lsp_range(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    start = obj.get("start")
+    if not isinstance(start, dict):
+        return False
+    return as_int(start.get("line")) is not None
+
+
+def is_publish_params(obj: dict) -> bool:
+    if not isinstance(obj.get("uri"), str) or not obj.get("uri"):
+        return False
+    return isinstance(obj.get("diagnostics"), list)
+
+
+def is_jsonrpc_publish(obj: dict) -> bool:
+    if obj.get("method") != PUBLISH_METHOD:
+        return False
+    return isinstance(obj.get("params"), dict)
+
+
+def is_lsp_location(obj: dict) -> bool:
+    uri = obj.get("uri")
+    return isinstance(uri, str) and uri != "" and is_lsp_range(obj.get("range"))
+
+
+def is_lsp_object(obj: dict) -> bool:
+    if is_jsonrpc_publish(obj) or is_publish_params(obj) or is_lsp_location(obj):
+        return True
+    if is_lsp_range(obj.get("range")) and any(
+        k in obj for k in ("message", "severity", "source", "code", "tags", "relatedInformation", "data")
+    ):
+        return True
+    return False
+
+
+def is_clang_loc(obj: dict) -> bool:
+    if is_cargo_span(obj) or is_lsp_object(obj):
+        return False
+    caret = obj.get("caret")
+    if isinstance(caret, dict):
+        has_file = isinstance(caret.get("file"), str) or isinstance(caret.get("filename"), str)
+        return has_file and as_lineno_1(caret.get("line")) is not None
+    has_file = isinstance(obj.get("file"), str) or isinstance(obj.get("filename"), str)
+    if not has_file or as_lineno_1(obj.get("line")) is None:
+        return False
+    return "column" in obj or "offset" in obj or "col" in obj or "kind" in obj
+
+
+def is_swift_key_diag(obj: dict) -> bool:
+    has_file = isinstance(obj.get("key.filepath"), str) or isinstance(obj.get("key.file_path"), str)
+    if not has_file:
+        return False
+    return as_lineno_1(obj.get("key.line")) is not None or isinstance(obj.get("key.offset"), int)
+
+
+def is_generic_pair(obj: dict) -> bool:
+    if is_lsp_object(obj) or is_cargo_span(obj) or is_physical_location(obj):
+        return False
+    if is_clang_loc(obj) or is_swift_key_diag(obj) or is_rustc_diagnostic(obj):
+        return False
+    file_v = first_present(obj, ("file", "filename", "path", "src_path"))
+    line_v = first_present(obj, ("line", "lineno", "line_number", "Line"))
+    if not isinstance(file_v, str) or not file_v:
+        return False
+    if as_lineno_1(line_v) is None:
+        return False
+    # Path-only cargo keys with no diagnostic payload are not locators.
+    if "manifest_path" in obj and "reason" in obj:
+        return False
+    return True
+
+
+def severity_of(v: Any) -> Optional[int]:
+    if isinstance(v, bool):
+        return None
+    n = as_int(v)
+    if n in (1, 2, 3, 4):
+        return n
+    if isinstance(v, str):
+        return SEVERITY.get(v.strip().lower())
+    return None
+
+
+def code_of(v: Any) -> Any:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (str, int)):
+        return v
+    if isinstance(v, dict):
+        if isinstance(v.get("code"), (str, int)):
+            return v["code"]
+        if isinstance(v.get("value"), (str, int)):
+            return v["value"]
+    return None
+
+
+def message_of(v: Any) -> str:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        for k in ("text", "message", "rendered", "markdown"):
+            if isinstance(v.get(k), str):
+                return v[k]
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Harvest: 1-based schemas
+# ---------------------------------------------------------------------------
+
+
+def flare_data(schema: str, line_1: int, col_1: Optional[int], extra: Optional[dict] = None) -> dict:
+    d: dict[str, Any] = {"flare": {"schema": schema, "line_1": line_1}}
+    if col_1 is not None:
+        d["flare"]["column_1"] = col_1
+    if extra:
+        d.update(extra)
+    return d
+
+
+def snippet_from_span(span: dict) -> str:
+    text = span.get("text")
+    if isinstance(text, list) and text:
+        first = text[0]
+        if isinstance(first, dict) and isinstance(first.get("text"), str):
+            return first["text"]
+        if isinstance(first, str):
+            return first
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def locator_from_cargo_span(
+    span: dict,
+    *,
+    message: str,
+    severity: Optional[int],
+    code: Any,
+    source: str,
+    schema: str,
+    extra: Optional[dict] = None,
+) -> Optional[Locator]:
+    path = first_present(span, CARGO_FILE_KEYS)
+    line_1 = as_lineno_1(first_present(span, CARGO_LINE_KEYS))
+    if not isinstance(path, str) or not path or line_1 is None:
+        return None
+    col_1 = as_col_1(first_present(span, CARGO_COL_KEYS))
+    end_line_1 = as_lineno_1(first_present(span, CARGO_END_LINE_KEYS)) or line_1
+    end_col_1 = as_col_1(first_present(span, CARGO_END_COL_KEYS))
+    snip = snippet_from_span(span)
+    label = span.get("label")
+    msg = message
+    if isinstance(label, str) and label and label not in msg:
+        msg = msg + "\n" + label if msg else label
+    return Locator(
+        uri=path,
+        line_1=line_1,
+        col_1=col_1,
+        end_line_1=end_line_1,
+        end_col_1=end_col_1,
+        end_col_exclusive_1=True,
+        message=msg,
+        severity=severity,
+        code=code,
+        source=source,
+        schema=schema,
+        snippet=snip,
+        data=flare_data(schema, line_1, col_1, extra),
+    )
+
+
+def harvest_rustc(obj: dict) -> list[Locator]:
+    spans = obj.get("spans")
+    if not isinstance(spans, list):
+        return []
+    message = message_of(obj.get("rendered")) or message_of(obj.get("message")) or str(obj.get("message") or "")
+    severity = severity_of(obj.get("level"))
+    code = code_of(obj.get("code"))
+    source = "rustc"
+    extra = {}
+    if isinstance(obj.get("code"), dict) and obj["code"].get("explanation"):
+        extra["explanation"] = obj["code"]["explanation"]
+    primaries: list[Locator] = []
+    related: list[Locator] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        loc = locator_from_cargo_span(
+            span,
+            message=message,
+            severity=severity,
+            code=code,
+            source=source,
+            schema="cargo" if is_cargo_span(span) else "rustc",
+            extra=extra or None,
+        )
+        if loc is None:
+            continue
+        if span.get("is_primary") is False:
+            if isinstance(span.get("label"), str) and span["label"]:
+                loc.message = span["label"]
+            related.append(loc)
+        else:
+            primaries.append(loc)
+    if not primaries and related:
+        primaries = related
+        related = []
+    children = obj.get("children")
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, dict):
+                related.extend(harvest_rustc(child))
+    if not primaries:
+        return related
+    if related:
+        primaries[0].related.extend(related)
+        for extra_p in primaries[1:]:
+            extra_p.related.extend(related)
+    return primaries
+
+
+def harvest_cargo_wrapper(obj: dict) -> list[Locator]:
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return []
+    found = harvest_rustc(msg)
+    for loc in found:
+        loc.schema = "cargo"
+        loc.source = loc.source or "rustc"
+        loc.data.setdefault("flare", {})["schema"] = "cargo"
+    return found
+
+
+def sarif_uri(art: dict, artifacts: Optional[list]) -> Optional[str]:
+    uri = art.get("uri")
+    if isinstance(uri, str) and uri:
+        return uri
+    idx = art.get("index")
+    if isinstance(idx, int) and artifacts and 0 <= idx < len(artifacts):
+        loc = artifacts[idx].get("location") if isinstance(artifacts[idx], dict) else None
+        if isinstance(loc, dict):
+            u = loc.get("uri")
+            if isinstance(u, str) and u:
+                return u
+    return None
+
+
+def locator_from_region(
+    uri: str,
+    region: dict,
+    *,
+    message: str,
+    severity: Optional[int],
+    code: Any,
+    source: str,
+    extra: Optional[dict] = None,
+) -> Optional[Locator]:
+    line_1 = as_lineno_1(region.get("startLine") or region.get("start_line"))
+    if line_1 is None:
+        return None
+    col_1 = as_col_1(region.get("startColumn") or region.get("start_column"))
+    end_line_1 = as_lineno_1(region.get("endLine") or region.get("end_line")) or line_1
+    end_col_1 = as_col_1(region.get("endColumn") or region.get("end_column"))
+    snip = ""
+    snippet = region.get("snippet")
+    if isinstance(snippet, dict) and isinstance(snippet.get("text"), str):
+        snip = snippet["text"]
+    elif isinstance(snippet, str):
+        snip = snippet
+    return Locator(
+        uri=uri,
+        line_1=line_1,
+        col_1=col_1,
+        end_line_1=end_line_1,
+        end_col_1=end_col_1,
+        end_col_exclusive_1=False,  # SARIF endColumn is inclusive
+        message=message,
+        severity=severity,
+        code=code,
+        source=source,
+        schema="sarif",
+        snippet=snip,
+        data=flare_data("sarif", line_1, col_1, extra),
+    )
+
+
+def harvest_physical(obj: dict, artifacts: Optional[list], **kw: Any) -> list[Locator]:
+    art = obj.get("artifactLocation") or obj.get("artifact_location") or {}
+    if not isinstance(art, dict):
+        return []
+    uri = sarif_uri(art, artifacts)
+    if not uri:
+        return []
+    region = obj.get("region") if isinstance(obj.get("region"), dict) else None
+    if region is None:
+        region = obj.get("contextRegion") if isinstance(obj.get("contextRegion"), dict) else None
+    if region is None:
+        return []
+    loc = locator_from_region(uri, region, **kw)
+    return [loc] if loc else []
+
+
+def harvest_sarif_result(result: dict, artifacts: Optional[list], source: str) -> list[Locator]:
+    message = message_of(result.get("message")) or ""
+    severity = severity_of(result.get("level"))
+    code = code_of(result.get("ruleId") or result.get("ruleID") or result.get("rule"))
+    extra: dict[str, Any] = {}
+    if isinstance(result.get("properties"), dict):
+        extra["properties"] = result["properties"]
+    found: list[Locator] = []
+    related: list[Locator] = []
+    locs = result.get("locations")
+    if isinstance(locs, list):
+        for item in locs:
+            if not isinstance(item, dict):
+                continue
+            phys = item.get("physicalLocation") or item.get("physical_location")
+            if isinstance(phys, dict):
+                found.extend(
+                    harvest_physical(
+                        phys,
+                        artifacts,
+                        message=message,
+                        severity=severity,
+                        code=code,
+                        source=source,
+                        extra=extra or None,
+                    )
+                )
+    rels = result.get("relatedLocations") or result.get("related_locations")
+    if isinstance(rels, list):
+        for item in rels:
+            if not isinstance(item, dict):
+                continue
+            phys = item.get("physicalLocation") or item.get("physical_location")
+            rel_msg = message_of(item.get("message")) or "related"
+            if isinstance(phys, dict):
+                related.extend(
+                    harvest_physical(
+                        phys,
+                        artifacts,
+                        message=rel_msg,
+                        severity=severity,
+                        code=code,
+                        source=source,
+                    )
+                )
+    if found and related:
+        found[0].related.extend(related)
+    elif not found:
+        found = related
+    return found
+
+
+def harvest_sarif(obj: dict) -> list[Locator]:
+    out: list[Locator] = []
+    for run in obj.get("runs") or []:
+        if not isinstance(run, dict):
+            continue
+        artifacts = run.get("artifacts") if isinstance(run.get("artifacts"), list) else None
+        source = "sarif"
+        tool = run.get("tool")
+        if isinstance(tool, dict):
+            driver = tool.get("driver")
+            if isinstance(driver, dict) and isinstance(driver.get("name"), str):
+                source = driver["name"]
+        for result in run.get("results") or []:
+            if isinstance(result, dict):
+                out.extend(harvest_sarif_result(result, artifacts, source))
+    return out
+
+
+def harvest_clang(obj: dict) -> list[Locator]:
+    message = message_of(obj.get("message")) or message_of(obj.get("description")) or ""
+    severity = severity_of(obj.get("kind") or obj.get("severity") or obj.get("level"))
+    code = code_of(obj.get("option") or obj.get("code"))
+    caret = obj.get("caret") if isinstance(obj.get("caret"), dict) else obj
+    path = caret.get("file") or caret.get("filename")
+    line_1 = as_lineno_1(caret.get("line"))
+    if not isinstance(path, str) or not path or line_1 is None:
+        return []
+    col_1 = as_col_1(caret.get("col") or caret.get("column") or caret.get("offset"))
+    return [
+        Locator(
+            uri=path,
+            line_1=line_1,
+            col_1=col_1,
+            end_line_1=line_1,
+            message=message,
+            severity=severity,
+            code=code,
+            source="clang",
+            schema="clang",
+            data=flare_data("clang", line_1, col_1),
+        )
+    ]
+
+
+def harvest_swift(obj: dict) -> list[Locator]:
+    path = obj.get("key.filepath") or obj.get("key.file_path") or obj.get("filename")
+    line_1 = as_lineno_1(obj.get("key.line") or obj.get("line"))
+    if not isinstance(path, str) or not path or line_1 is None:
+        return []
+    col_1 = as_col_1(obj.get("key.column") or obj.get("key.col") or obj.get("column"))
+    message = message_of(obj.get("key.description") or obj.get("description") or obj.get("message")) or ""
+    severity = severity_of(obj.get("key.severity") or obj.get("severity"))
+    return [
+        Locator(
+            uri=path,
+            line_1=line_1,
+            col_1=col_1,
+            end_line_1=line_1,
+            message=message,
+            severity=severity,
+            source="sourcekit",
+            schema="swift",
+            data=flare_data("swift", line_1, col_1),
+        )
+    ]
+
+
+def harvest_generic(obj: dict) -> list[Locator]:
+    path = first_present(obj, ("file", "filename", "path"))
+    line_1 = as_lineno_1(first_present(obj, ("line", "lineno", "line_number", "Line")))
+    if not isinstance(path, str) or not path or line_1 is None:
+        return []
+    col_1 = as_col_1(first_present(obj, ("col", "column", "lineno_col")))
+    message = message_of(obj.get("msg") or obj.get("message") or obj.get("text") or "")
+    severity = severity_of(obj.get("level") or obj.get("severity") or obj.get("kind"))
+    source = obj.get("tool") if isinstance(obj.get("tool"), str) else "flare"
+    return [
+        Locator(
+            uri=path,
+            line_1=line_1,
+            col_1=col_1,
+            end_line_1=line_1,
+            message=message or f"{path}:{line_1}",
+            severity=severity,
+            source=str(source),
+            schema="generic",
+            data=flare_data("generic", line_1, col_1),
+        )
+    ]
+
+
+def looks_like_path(path: str) -> bool:
+    if not path or URL_RE.match(path):
+        return False
+    low = path.lower()
+    if low.startswith("http://") or low.startswith("https://") or low.startswith("ftp://"):
+        return False
+    base = path.rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    if dot and ("." + ext.lower()) in SOURCE_EXTS:
+        return True
+    if "/" in path or path.startswith("./"):
+        return True
+    return False
+
+
+def text_hits(line: str) -> list[Locator]:
+    visible = strip_ansi(line)
+    found: list[Locator] = []
+    seen: set[tuple[str, int, Optional[int]]] = set()
+
+    def add(path: str, line_1: int, col_1: Optional[int], schema: str, source: str) -> None:
+        if not looks_like_path(path) and schema != "python":
+            return
+        key = (path, line_1, col_1)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(
+            Locator(
+                uri=path,
+                line_1=line_1,
+                col_1=col_1,
+                end_line_1=line_1,
+                message=line.rstrip("\n"),
+                source=source,
+                schema=schema,
+                data=flare_data(schema, line_1, col_1),
+            )
+        )
+
+    for m in ARROW_RE.finditer(visible):
+        line_1 = as_lineno_1(m.group("line"))
+        if line_1 is None:
+            continue
+        add(m.group("path"), line_1, as_col_1(m.group("col")), "rustc-text", "rustc")
+    for m in PY_TB_RE.finditer(visible):
+        line_1 = as_lineno_1(m.group("line"))
+        if line_1 is None:
+            continue
+        add(m.group("path"), line_1, None, "python", "python")
+    if found:
+        return found
+    for m in COLON_DIAG_RE.finditer(visible):
+        path = m.group("path")
+        if URL_RE.match(path):
+            continue
+        line_1 = as_lineno_1(m.group("line"))
+        if line_1 is None:
+            continue
+        add(path, line_1, as_col_1(m.group("col")), "text", "flare")
+    return found
+
+
+def harvest_value(val: Any, acc: list[Locator], ignored: list[tuple[str, str]]) -> None:
+    if isinstance(val, list):
+        for item in val:
+            harvest_value(item, acc, ignored)
+        return
+    if not isinstance(val, dict):
+        return
+    if is_lsp_object(val):
+        uri = ""
+        line = ""
+        if is_jsonrpc_publish(val) and isinstance(val.get("params"), dict):
+            uri = str(val["params"].get("uri") or "")
+            diags = val["params"].get("diagnostics") or []
+            if diags and isinstance(diags[0], dict) and is_lsp_range(diags[0].get("range")):
+                line = str(diags[0]["range"]["start"].get("line"))
+        elif is_publish_params(val):
+            uri = str(val.get("uri") or "")
+        ignored.append(("lsp", uri or line or "range.start.line"))
+        return
+    if is_sarif_log(val):
+        acc.extend(harvest_sarif(val))
+        return
+    if is_cargo_wrapper(val):
+        acc.extend(harvest_cargo_wrapper(val))
+        return
+    if is_rustc_diagnostic(val):
+        acc.extend(harvest_rustc(val))
+        return
+    if is_physical_location(val):
+        acc.extend(
+            harvest_physical(
+                val,
+                None,
+                message="",
+                severity=None,
+                code=None,
+                source="sarif",
+            )
+        )
+        return
+    if is_swift_key_diag(val) or (
+        isinstance(val.get("filename"), str) and as_lineno_1(val.get("line")) is not None and "key." in ",".join(val)
+    ):
+        acc.extend(harvest_swift(val))
+        return
+    if isinstance(val.get("key.diagnostics"), list):
+        harvest_value(val["key.diagnostics"], acc, ignored)
+        return
+    if is_clang_loc(val):
+        acc.extend(harvest_clang(val))
+        return
+    if is_generic_pair(val):
+        acc.extend(harvest_generic(val))
+        return
+    for v in val.values():
+        harvest_value(v, acc, ignored)
+
+
+# ---------------------------------------------------------------------------
+# LSP emit
+# ---------------------------------------------------------------------------
+
+
+def make_range(loc: Locator, *, clamp: bool = False) -> dict[str, Any]:
+    start_line = to_lsp_line(loc.line_1)
+    end_line = to_lsp_line(loc.end_line_1 or loc.line_1)
+    start_ch = to_lsp_char(loc.col_1, loc.snippet, clamp=clamp)
+    end_ch = end_lsp_char(
+        loc.col_1, loc.end_col_1, loc.snippet, loc.end_col_exclusive_1, clamp=clamp
+    )
+    return {
+        "start": {"line": start_line, "character": start_ch},
+        "end": {"line": end_line, "character": end_ch},
+    }
+
+
+def make_diagnostic(loc: Locator, uri_prefix: Optional[str], *, clamp: bool = False) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "range": make_range(loc, clamp=clamp),
+        "message": loc.message or loc.uri,
+    }
+    if loc.severity is not None:
+        d["severity"] = loc.severity
+    if loc.code is not None:
+        d["code"] = loc.code
+    if loc.source:
+        d["source"] = loc.source
+    if loc.data:
+        d["data"] = loc.data
+    if loc.related:
+        related = []
+        for rel in loc.related:
+            related.append(
+                {
+                    "location": {
+                        "uri": to_uri(rel.uri, uri_prefix),
+                        "range": make_range(rel, clamp=clamp),
+                    },
+                    "message": rel.message or rel.uri,
+                }
+            )
+        d["relatedInformation"] = related
+    return d
+
+
+def make_notification(uri: str, diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": PUBLISH_METHOD,
+        "params": {
+            "uri": uri,
+            "diagnostics": diagnostics,
+        },
+    }
+
+
+def dumps_json(obj: Any, indent: Optional[int] = None) -> str:
+    if indent is None:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(obj, ensure_ascii=False, indent=indent) + "\n"
+
+
+def emit_lsp_frame(body: bytes, content_type: bool = True) -> None:
+    clen = str(len(body)).encode("ascii")
+    parts = [b"Content-Length: ", clen, b"\r\n"]
+    if content_type:
+        parts.append(b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n")
+    parts.append(b"\r\n")
+    parts.append(body)
+    sys.stdout.buffer.write(b"".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Stream scan
+# ---------------------------------------------------------------------------
+
+
+def _nbytes(s: str) -> int:
+    return len(s.encode("utf-8", "surrogateescape"))
+
+
+def _decode_slice(raw: bytes) -> str:
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def try_lsp_frame(raw: bytes, i: int) -> Optional[tuple[bytes, int]]:
+    n = len(raw)
+    if i >= n or raw[i] not in (ord("C"), ord("c")):
+        return None
+    nl_pos = raw.find(b"\n", i)
+    if nl_pos < 0:
+        return None
+    first = raw[i:nl_pos]
+    if first.endswith(b"\r"):
+        first = first[:-1]
+    if not CONTENT_HEADER_RE.match(first):
+        return None
+    pos = i
+    clen: Optional[int] = None
+    while pos < n:
+        crlf = raw.find(b"\r\n", pos)
+        lf = raw.find(b"\n", pos)
+        if crlf >= 0 and (lf < 0 or crlf <= lf):
+            line = raw[pos:crlf]
+            next_pos = crlf + 2
+        elif lf >= 0:
+            line = raw[pos:lf]
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            next_pos = lf + 1
+        else:
+            return None
+        if line == b"":
+            pos = next_pos
+            break
+        m = HEADER_LINE_RE.match(line)
+        if not m:
+            return None
+        if m.group(1).lower() == b"content-length":
+            try:
+                clen = int(m.group(2))
+            except ValueError:
+                return None
+        pos = next_pos
+    else:
+        return None
+    if clen is None or clen < 0:
+        return None
+    body_end = pos + clen
+    if body_end > n:
+        return None
+    return raw[pos:body_end], body_end
+
+
+def scan_stream(raw: bytes) -> Iterator[Chunk]:
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(raw)
+    while i < n:
+        framed = try_lsp_frame(raw, i)
+        if framed is not None:
+            body, end = framed
+            original = _decode_slice(body)
+            try:
+                val, _ = dec.raw_decode(original.lstrip("\ufeff"))
+            except json.JSONDecodeError:
+                yield Chunk(kind="raw", payload=_decode_slice(raw[i:end]), raw_bytes=raw[i:end])
+                i = end
+                continue
+            yield Chunk(kind="lsp", payload=val, original=original)
+            i = end
+            continue
+        text = _decode_slice(raw[i:])
+        if text[:1] in "{[":
+            try:
+                val, end = dec.raw_decode(text)
+            except json.JSONDecodeError:
+                nl = text.find("\n")
+                if nl < 0:
+                    yield Chunk(kind="raw", payload=text, raw_bytes=raw[i:])
+                    return
+                line = text[:nl]
+                consumed = text[: nl + 1]
+                yield Chunk(kind="raw", payload=line, raw_bytes=consumed.encode("utf-8", "surrogateescape"))
+                i += _nbytes(consumed)
+                continue
+            original = text[:end]
+            j = end
+            if j < len(text) and text[j] == "\r":
+                j += 1
+            if j < len(text) and text[j] == "\n":
+                j += 1
+            consumed = text[:j]
+            yield Chunk(kind="json", payload=val, original=original)
+            i += _nbytes(consumed)
+            continue
+        nl_at = text.find("\n")
+        if nl_at < 0:
+            yield Chunk(kind="raw", payload=text, raw_bytes=raw[i:])
+            return
+        line = text[:nl_at]
+        if line.endswith("\r"):
+            line = line[:-1]
+        consumed = text[: nl_at + 1]
+        yield Chunk(kind="raw", payload=line, raw_bytes=consumed.encode("utf-8", "surrogateescape"))
+        i += _nbytes(consumed)
+
+
+def read_inputs(names: list[str]) -> bytes:
+    if not names:
+        names = ["-"]
+    chunks: list[bytes] = []
+    for name in names:
+        if name == "-":
+            chunks.append(sys.stdin.buffer.read())
+        else:
+            with open(name, "rb") as fp:
+                chunks.append(fp.read())
+    return b"".join(chunks)
+
+
+def trace_line(kind: str, schema: str, uri: str, src: str, dest: str, note: str) -> None:
+    sys.stderr.write(f"{kind}\t{schema}\t{uri}\t{src}\t{dest}\t{note}\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="flare",
+        description=(
+            "Emit LSP textDocument/publishDiagnostics from cargo/rustc/SARIF/"
+            "text locators. Input lines are 1-based; output range.start.line "
+            "is 0-based. Content-Length is dest-owned. Does not rewrite LSP "
+            "(use gist/blot). Does not walk git. Does not mint pins."
+        ),
+        epilog="cat rustc.jsonl | flare     cat results.sarif | flare --ndjson --trace",
+    )
+    p.add_argument(
+        "logs",
+        nargs="*",
+        help="locator streams to convert (default: stdin). '-' is stdin.",
+    )
+    p.add_argument("--trace", action="store_true", help="print conversion TSV on stderr")
+    p.add_argument(
+        "--frame",
+        action="store_true",
+        help="emit dest-owned Content-Length frames (default in v0.2)",
+    )
+    p.add_argument(
+        "--ndjson",
+        action="store_true",
+        help="emit compact JSON-RPC objects, one per line (no Content-Length frames)",
+    )
+    p.add_argument(
+        "--per-span",
+        action="store_true",
+        help="one notification per locator (v0.1). default groups by uri",
+    )
+    p.add_argument(
+        "--uri-prefix",
+        default=None,
+        help="prefix relative paths (e.g. file:///home/runner/work/kizu/kizu)",
+    )
+    p.add_argument("--source", default=None, help="override Diagnostic.source")
+    p.add_argument("--indent", type=int, default=None, help="pretty-print JSON-RPC bodies")
+    p.add_argument("--version", action="version", version=f"flare {VERSION}")
+    return p
+
+
+def notifications_from_locators(
+    locators: list[Locator],
+    args: argparse.Namespace,
+    *,
+    group: bool,
+    clamp: bool,
+) -> list[dict[str, Any]]:
+    if args.source:
+        for loc in locators:
+            loc.source = args.source
+    if not group:
+        notes: list[dict[str, Any]] = []
+        for loc in locators:
+            uri = to_uri(loc.uri, args.uri_prefix)
+            diag = make_diagnostic(loc, args.uri_prefix, clamp=clamp)
+            notes.append(make_notification(uri, [diag]))
+        return notes
+    buckets: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for loc in locators:
+        uri = to_uri(loc.uri, args.uri_prefix)
+        buckets.setdefault(uri, []).append(make_diagnostic(loc, args.uri_prefix, clamp=clamp))
+    return [make_notification(uri, diags) for uri, diags in buckets.items()]
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        code = e.code
+        if code in (0, 2):
+            return int(code) if isinstance(code, int) else 2
+        return 2
+    if not args.logs and sys.stdin.isatty():
+        parser.print_help()
+        return 2
+
+    raw = read_inputs(args.logs)
+    locators: list[Locator] = []
+    ignored: list[tuple[str, str]] = []
+    prev_raw = ""
+    for chunk in scan_stream(raw):
+        if chunk.kind == "lsp":
+            harvest_value(chunk.payload, locators, ignored)
+            continue
+        if chunk.kind == "json":
+            harvest_value(chunk.payload, locators, ignored)
+            continue
+        line = str(chunk.payload)
+        hits = text_hits(line)
+        if hits:
+            title = prev_raw.strip()
+            if title and not text_hits(title):
+                for h in hits:
+                    if title not in h.message:
+                        h.message = title + "\n" + h.message
+                    if h.severity is None:
+                        low = title.lower()
+                        if "error" in low:
+                            h.severity = 1
+                        elif "warning" in low or "warn" in low:
+                            h.severity = 2
+                        elif "note" in low:
+                            h.severity = 3
+            locators.extend(hits)
+        elif line.strip() and args.trace:
+            ignored.append(("chatter", line[:80]))
+        prev_raw = line
+
+    if args.trace:
+        for kind, detail in ignored:
+            if kind == "lsp":
+                note = "already 0-based range.start.line; not converted (use gist/blot)"
+            else:
+                note = "not a 1-based locator"
+            trace_line("ignored", kind, detail, "-", "-", note)
+        for loc in locators:
+            lsp_line = to_lsp_line(loc.line_1)
+            trace_line(
+                "converted",
+                loc.schema,
+                loc.uri,
+                str(loc.line_1),
+                str(lsp_line),
+                "1-based locator → 0-based range.start.line",
+            )
+
+    notes = notifications_from_locators(
+        locators,
+        args,
+        group=not args.per_span,
+        clamp=True,
+    )
+    indent = args.indent
+    use_frame = not args.ndjson
+    if args.frame:
+        use_frame = True
+    for note in notes:
+        body = dumps_json(note, indent)
+        payload = body.encode("utf-8")
+        if use_frame:
+            # dest-owned: length of the converted body, not any input header.
+            emit_lsp_frame(payload.rstrip(b"\n") if indent is None else payload)
+        else:
+            if not body.endswith("\n"):
+                body += "\n"
+            sys.stdout.buffer.write(body.encode("utf-8"))
+
+    try:
+        sys.stdout.buffer.flush()
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

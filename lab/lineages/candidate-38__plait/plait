@@ -1,0 +1,1672 @@
+#!/usr/bin/env python3
+"""plait — composition algebra of review-suggestion strands.
+
+A review comment with a suggestion is a strand: a span plus a before→after
+image. GitHub "outdated" and `git apply --check` are booleans per comment.
+plea/sate occupy each claim against a tree. plait asks a different question:
+
+    Do these strands compose with each other?
+
+Verdicts: COMMUTE, STACK, ECHO, SPLIT, SUBSUME, JAM, COVER, DISJOINT.
+A file's plait is PARALLEL / SERIES / ECHO / SUBSUME / SPLIT / JAMMED.
+Apply schedules (line / time / topo) are witnesses, not the object.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from itertools import combinations
+from typing import Any, Iterable, Iterator
+
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+HUNK_RE = re.compile(
+    r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@"
+)
+PATH_HEADER_RE = re.compile(
+    r"^(?:#+\s*)?(?:file:\s*)?(\S+):(\d+)(?:-(\d+))?\s*$",
+    re.I,
+)
+MD_PATH_RE = re.compile(r"^(?:#+\s*|<!--\s*)(?:path|file)\s*[:\s]\s*(\S+)", re.I)
+
+VERDICTS = (
+    "COMMUTE",
+    "DISJOINT",
+    "ECHO",
+    "STACK",
+    "SUBSUME",
+    "SPLIT",
+    "JAM",
+    "COVER",
+    "THREAD",
+)
+# Composition edges. COMMUTE joins same-path edits into one PARALLEL plait.
+# THREAD joins a reply chain. DISJOINT does not join.
+CONNECTING = frozenset(
+    {"ECHO", "STACK", "SUBSUME", "SPLIT", "JAM", "COVER", "COMMUTE", "THREAD"}
+)
+APPLY_CONNECT = frozenset({"ECHO", "STACK", "SUBSUME", "SPLIT", "JAM"})
+# Default pair listing hides the Cartesian miss; --all-pairs restores it.
+QUIET_PAIRS = frozenset({"DISJOINT"})
+
+
+def _strip_cr(s: str) -> str:
+    return s.replace("\r", "")
+
+
+def _as_int(v: Any) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(*vals: Any) -> Any:
+    for v in vals:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _as_lines(val: Any) -> list[str] | None:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [_strip_cr(str(x)).rstrip("\n") for x in val]
+    if isinstance(val, str):
+        return _strip_cr(val).splitlines()
+    return None
+
+
+def _norm(lines: list[str] | None, ignore_space: bool) -> list[str] | None:
+    if lines is None:
+        return None
+    if not ignore_space:
+        return list(lines)
+    return [re.sub(r"[ \t]+", " ", ln).strip() for ln in lines]
+
+
+@dataclass
+class Span:
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start > self.end:
+            self.start, self.end = self.end, self.start
+
+    def overlaps(self, other: Span) -> bool:
+        return self.start <= other.end and other.start <= self.end
+
+    def contains(self, other: Span) -> bool:
+        return self.start <= other.start and self.end >= other.end
+
+    def strictly_contains(self, other: Span) -> bool:
+        return self.contains(other) and (self.start, self.end) != (other.start, other.end)
+
+    def nlines(self) -> int:
+        return self.end - self.start + 1
+
+    def __str__(self) -> str:
+        if self.start == self.end:
+            return str(self.start)
+        return f"{self.start}-{self.end}"
+
+
+@dataclass
+class Strand:
+    id: str
+    path: str
+    span: Span
+    before: list[str]
+    after: list[str] | None
+    kind: str = "suggestion"  # suggestion | remark
+    commit: str | None = None
+    original_commit: str | None = None
+    created_at: str | None = None
+    author: str | None = None
+    in_reply_to: str | None = None
+    recon: str = "explicit"
+    source: str = "json"
+    body: str = ""
+
+    @property
+    def coord_key(self) -> str:
+        return self.original_commit or self.commit or ""
+
+    @property
+    def when(self) -> str:
+        return self.created_at or ""
+
+    def has_edit(self) -> bool:
+        return self.after is not None
+
+    def real_edit(self) -> bool:
+        return self.after is not None and self.after != self.before
+
+
+@dataclass
+class Pair:
+    a: str
+    b: str
+    path: str
+    verdict: str
+    reason: str
+    a_span: str
+    b_span: str
+    order: str | None = None  # "a>b" when STACK/SUBSUME has a direction
+
+
+@dataclass
+class ApplyResult:
+    name: str
+    ok: bool
+    digest: str | None
+    error: str | None
+    order: list[str] = field(default_factory=list)
+    result: list[str] | None = None
+
+
+@dataclass
+class Component:
+    id: int
+    path: str
+    strand_ids: list[str]
+    verdict: str
+    pair_counts: dict[str, int]
+    schedules: dict[str, dict[str, Any]]
+    same_tree: bool | None
+    note: str = ""
+
+
+def parse_diff_hunk(diff_hunk: str) -> tuple[int, int, list[tuple[str, str]]] | None:
+    text = _strip_cr(diff_hunk)
+    lines = text.splitlines()
+    if not lines:
+        return None
+    header_i = 0
+    while header_i < len(lines) and not lines[header_i].startswith("@@"):
+        header_i += 1
+    if header_i >= len(lines):
+        return None
+    m = HUNK_RE.match(lines[header_i])
+    if not m:
+        return None
+    old_start = int(m.group(1))
+    new_start = int(m.group(3))
+    tagged: list[tuple[str, str]] = []
+    for L in lines[header_i + 1 :]:
+        if L.startswith("\\"):
+            continue
+        if not L:
+            tagged.append((" ", ""))
+            continue
+        tag = L[0]
+        if tag in " +-":
+            tagged.append((tag, L[1:]))
+        else:
+            tagged.append((" ", L))
+    return old_start, new_start, tagged
+
+
+def _in_range(loc: int, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+    return lo <= loc <= hi
+
+
+def lines_in_range(
+    tagged: list[tuple[str, str]],
+    old_start: int,
+    new_start: int,
+    side: str,
+    start: int,
+    end: int,
+) -> list[str]:
+    old_ln, new_ln = old_start, new_start
+    out: list[str] = []
+    right = side in ("RIGHT", "NEW", "+")
+    for tag, text in tagged:
+        if tag == "+":
+            if right and _in_range(new_ln, start, end):
+                out.append(text)
+            new_ln += 1
+        elif tag == "-":
+            if not right and _in_range(old_ln, start, end):
+                out.append(text)
+            old_ln += 1
+        else:
+            loc = new_ln if right else old_ln
+            if _in_range(loc, start, end):
+                out.append(text)
+            old_ln += 1
+            new_ln += 1
+    return out
+
+
+def side_new_lines(tagged: list[tuple[str, str]], side: str) -> list[str]:
+    if side in ("LEFT", "OLD", "-"):
+        return [t for tag, t in tagged if tag in " -"]
+    return [t for tag, t in tagged if tag in " +"]
+
+
+def extract_suggestions(body: str) -> list[list[str]]:
+    if not body:
+        return []
+    body = _strip_cr(body)
+    out: list[list[str]] = []
+    for m in SUGGEST_RE.finditer(body):
+        raw = m.group(1)
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        out.append(raw.splitlines())
+    return out
+
+
+def reconstruct_before(obj: dict) -> tuple[list[str], str, int | None, int | None]:
+    explicit = _as_lines(obj.get("before"))
+    end = _as_int(
+        _first(obj.get("line"), obj.get("original_line"), obj.get("originalLine"))
+    )
+    start = _as_int(
+        _first(
+            obj.get("start_line"),
+            obj.get("original_start_line"),
+            obj.get("startLine"),
+            obj.get("originalStartLine"),
+            end,
+        )
+    )
+    if explicit is not None:
+        return explicit, "explicit", start, end
+    side = str(obj.get("side") or obj.get("start_side") or "RIGHT").upper()
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    parsed = parse_diff_hunk(diff_hunk) if diff_hunk else None
+    if parsed and start is not None and end is not None:
+        old_start, new_start, tagged = parsed
+        got = lines_in_range(tagged, old_start, new_start, side, start, end)
+        if got:
+            return got, "range", start, end
+        n = max(1, abs(end - start) + 1)
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return side_lines[-n:], "hunk-tail", start, end
+    if parsed:
+        old_start, new_start, tagged = parsed
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return [side_lines[-1]], "hunk-last", start, end
+    return [], "none", start, end
+
+
+def _author_of(obj: dict) -> str | None:
+    user = obj.get("user") or obj.get("author")
+    if isinstance(user, dict):
+        return user.get("login") or user.get("name")
+    if isinstance(user, str):
+        return user
+    return None
+
+
+def obj_to_strands(obj: dict, source: str, remarks: bool) -> list[Strand]:
+    path = obj.get("path") or obj.get("filename") or obj.get("file") or ""
+    if not path:
+        return []
+    cid = str(_first(obj.get("id"), obj.get("html_url"), obj.get("url"), path) or path)
+    afters = _as_lines(obj.get("after"))
+    body = obj.get("body") or obj.get("comment") or obj.get("suggestion") or ""
+    sug = extract_suggestions(body) if isinstance(body, str) else []
+    kind = "suggestion"
+    images: list[list[str] | None]
+    if afters is not None:
+        images = [afters]
+    elif sug:
+        images = list(sug)
+    elif remarks:
+        images = [None]
+        kind = "remark"
+    else:
+        return []
+    before, recon, start, end = reconstruct_before(obj)
+    if start is None:
+        start = 1
+    if end is None:
+        end = start + max(0, len(before) - 1) if before else start
+    commit = obj.get("commit_id") or obj.get("commitId")
+    orig = obj.get("original_commit_id") or obj.get("originalCommitId")
+    in_reply = obj.get("in_reply_to_id") or obj.get("in_reply_to")
+    created = obj.get("created_at") or obj.get("createdAt") or obj.get("submitted_at")
+    out: list[Strand] = []
+    for i, after in enumerate(images):
+        ident = cid if len(images) == 1 else f"{cid}#{i + 1}"
+        out.append(
+            Strand(
+                id=str(ident),
+                path=str(path),
+                span=Span(int(start), int(end)),
+                before=list(before),
+                after=None if after is None else list(after),
+                kind=kind if after is not None else "remark",
+                commit=str(commit) if commit else None,
+                original_commit=str(orig) if orig else None,
+                created_at=str(created) if created else None,
+                author=_author_of(obj),
+                in_reply_to=str(in_reply) if in_reply else None,
+                recon=recon,
+                source=source,
+                body=_strip_cr(body) if isinstance(body, str) else "",
+            )
+        )
+    return out
+
+
+def parse_markdown(text: str, source: str, remarks: bool) -> list[Strand]:
+    text = _strip_cr(text)
+    lines = text.splitlines()
+    path = ""
+    start = end = 1
+    buf: list[str] = []
+    mode: str | None = None  # suggestion | quote
+    pending_quote: list[str] = []
+    strands: list[Strand] = []
+    n = 0
+
+    def flush_suggestion(after: list[str]) -> None:
+        nonlocal n
+        if not path:
+            return
+        n += 1
+        before = list(pending_quote) if pending_quote else []
+        strands.append(
+            Strand(
+                id=f"{source}:{n}:{path}",
+                path=path,
+                span=Span(start, end),
+                before=before,
+                after=list(after),
+                kind="suggestion",
+                recon="markdown",
+                source=source,
+            )
+        )
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        mh = PATH_HEADER_RE.match(stripped)
+        ph = MD_PATH_RE.match(stripped)
+        if mh:
+            path = mh.group(1)
+            start = int(mh.group(2))
+            end = int(mh.group(3) or mh.group(2))
+            pending_quote = []
+            i += 1
+            continue
+        if ph:
+            path = ph.group(1).rstrip("-->").strip()
+            pending_quote = []
+            i += 1
+            continue
+        if stripped.startswith("```suggestion"):
+            mode = "suggestion"
+            buf = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            flush_suggestion(buf)
+            mode = None
+            pending_quote = []
+            if i < len(lines):
+                i += 1
+            continue
+        if stripped.startswith("```"):
+            buf = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            pending_quote = buf
+            if i < len(lines):
+                i += 1
+            continue
+        i += 1
+    if remarks and path and not strands:
+        strands.append(
+            Strand(
+                id=f"{source}:remark:{path}",
+                path=path,
+                span=Span(start, end),
+                before=list(pending_quote),
+                after=None,
+                kind="remark",
+                recon="markdown",
+                source=source,
+            )
+        )
+    return strands
+
+
+def _iter_json_docs(text: str) -> Iterator[Any]:
+    text = text.strip()
+    if not text:
+        return
+    try:
+        yield json.loads(text)
+        return
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    idx = 0
+    n = len(text)
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            # last resort: jsonl line
+            nl = text.find("\n", idx)
+            if nl < 0:
+                raise
+            line = text[idx:nl].strip()
+            if line:
+                yield json.loads(line)
+            idx = nl + 1
+            continue
+        yield obj
+        idx = end
+
+
+def docs_to_objects(docs: Iterable[Any]) -> list[dict]:
+    out: list[dict] = []
+    for doc in docs:
+        if isinstance(doc, list):
+            out.extend(x for x in doc if isinstance(x, dict))
+        elif isinstance(doc, dict):
+            if isinstance(doc.get("comments"), list):
+                out.extend(x for x in doc["comments"] if isinstance(x, dict))
+            elif isinstance(doc.get("review_comments"), list):
+                out.extend(x for x in doc["review_comments"] if isinstance(x, dict))
+            else:
+                out.append(doc)
+    return out
+
+
+def ingest(text: str, source: str, remarks: bool) -> list[Strand]:
+    stripped = text.lstrip()
+    if not stripped:
+        return []
+    if stripped[0] in "[{":
+        try:
+            objs = docs_to_objects(_iter_json_docs(text))
+            strands: list[Strand] = []
+            for obj in objs:
+                strands.extend(obj_to_strands(obj, source, remarks))
+            return strands
+        except json.JSONDecodeError:
+            pass
+    return parse_markdown(text, source, remarks)
+
+
+def read_source(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def same_coord_frame(a: Strand, b: Strand) -> bool:
+    ka, kb = a.coord_key, b.coord_key
+    if not ka or not kb:
+        # fixtures without commits share a frame if both missing
+        return ka == kb
+    return ka == kb
+
+
+def _contiguous_slice(inner: list[str], outer: list[str]) -> bool:
+    if not inner:
+        return True
+    n = len(inner)
+    if n > len(outer):
+        return False
+    for i in range(len(outer) - n + 1):
+        if outer[i : i + n] == inner:
+            return True
+    return False
+
+
+def pair_verdict(a: Strand, b: Strand, ignore_space: bool = False) -> Pair:
+    """Algebra of two strands. Spans are comparable only in one commit frame."""
+    if a.path != b.path:
+        return Pair(a.id, b.id, a.path, "DISJOINT", "cross-file", str(a.span), str(b.span))
+
+    a_before = _norm(a.before, ignore_space) or []
+    b_before = _norm(b.before, ignore_space) or []
+    a_after = _norm(a.after, ignore_space)
+    b_after = _norm(b.after, ignore_space)
+
+    if a.kind == "remark" or b.kind == "remark":
+        reply = _reply_linked(a, b)
+        one_edit = (a.has_edit() and not b.has_edit()) or (b.has_edit() and not a.has_edit())
+        if one_edit and same_coord_frame(a, b) and a.span.overlaps(b.span):
+            return Pair(
+                a.id, b.id, a.path, "COVER", "remark sits on a suggestion", str(a.span), str(b.span)
+            )
+        if (not a.has_edit()) and (not b.has_edit()):
+            if reply:
+                return Pair(
+                    a.id, b.id, a.path, "THREAD", "in_reply_to", str(a.span), str(b.span)
+                )
+            if same_coord_frame(a, b) and a.span.overlaps(b.span):
+                return Pair(
+                    a.id, b.id, a.path, "THREAD", "same locus", str(a.span), str(b.span)
+                )
+        return Pair(a.id, b.id, a.path, "DISJOINT", "remark", str(a.span), str(b.span))
+
+    # image relations (commit-independent)
+    if a_after is not None and b_after is not None and a_before == b_before:
+        if a_after == b_after:
+            return Pair(a.id, b.id, a.path, "ECHO", "same before→after", str(a.span), str(b.span))
+        return Pair(
+            a.id, b.id, a.path, "SPLIT", "same before, two afters", str(a.span), str(b.span)
+        )
+
+    # STACK: one strand's after *is* the other's before (a real edit)
+    if (
+        a.real_edit()
+        and a_after is not None
+        and a_after == b_before
+        and a_after != a_before
+    ):
+        return Pair(
+            a.id,
+            b.id,
+            a.path,
+            "STACK",
+            "after(a)==before(b)",
+            str(a.span),
+            str(b.span),
+            order="a>b",
+        )
+    if (
+        b.real_edit()
+        and b_after is not None
+        and b_after == a_before
+        and b_after != b_before
+    ):
+        return Pair(
+            a.id,
+            b.id,
+            a.path,
+            "STACK",
+            "after(b)==before(a)",
+            str(a.span),
+            str(b.span),
+            order="b>a",
+        )
+
+    same = same_coord_frame(a, b)
+    if not same:
+        return Pair(
+            a.id,
+            b.id,
+            a.path,
+            "COMMUTE",
+            "distinct commits; images independent",
+            str(a.span),
+            str(b.span),
+        )
+
+    # same snapshot: spans are the object
+    if a.span.strictly_contains(b.span) and a_after is not None and b_after is not None:
+        if _contiguous_slice(b_after, a_after):
+            return Pair(
+                a.id,
+                b.id,
+                a.path,
+                "SUBSUME",
+                "a contains b; b.after ⊂ a.after",
+                str(a.span),
+                str(b.span),
+                order="a>b",
+            )
+        return Pair(
+            a.id, b.id, a.path, "JAM", "a contains b; afters disagree", str(a.span), str(b.span)
+        )
+    if b.span.strictly_contains(a.span) and a_after is not None and b_after is not None:
+        if _contiguous_slice(a_after, b_after):
+            return Pair(
+                a.id,
+                b.id,
+                a.path,
+                "SUBSUME",
+                "b contains a; a.after ⊂ b.after",
+                str(a.span),
+                str(b.span),
+                order="b>a",
+            )
+        return Pair(
+            a.id, b.id, a.path, "JAM", "b contains a; afters disagree", str(a.span), str(b.span)
+        )
+
+    if a.span.overlaps(b.span):
+        if a_after == b_after and a_after is not None:
+            return Pair(a.id, b.id, a.path, "ECHO", "overlap, same after", str(a.span), str(b.span))
+        return Pair(
+            a.id, b.id, a.path, "JAM", "overlapping spans, incompatible", str(a.span), str(b.span)
+        )
+
+    return Pair(a.id, b.id, a.path, "COMMUTE", "disjoint spans", str(a.span), str(b.span))
+
+
+def _reply_linked(a: Strand, b: Strand) -> bool:
+    if a.in_reply_to and a.in_reply_to == b.id:
+        return True
+    if b.in_reply_to and b.in_reply_to == a.id:
+        return True
+    # reply-to-reply: same parent
+    if a.in_reply_to and b.in_reply_to and a.in_reply_to == b.in_reply_to:
+        return True
+    return False
+
+
+def all_pairs(strands: list[Strand], ignore_space: bool) -> list[Pair]:
+    pairs: list[Pair] = []
+    for a, b in combinations(strands, 2):
+        pairs.append(pair_verdict(a, b, ignore_space))
+    pairs.sort(key=lambda p: (p.path, p.verdict, p.a, p.b))
+    return pairs
+
+
+class UnionFind:
+    def __init__(self, ids: Iterable[str]) -> None:
+        self.p = {i: i for i in ids}
+
+    def find(self, x: str) -> str:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def connected_groups(strands: list[Strand], pairs: list[Pair]) -> list[list[Strand]]:
+    by_id = {s.id: s for s in strands}
+    uf = UnionFind(by_id)
+    for p in pairs:
+        if p.verdict in CONNECTING and p.a in by_id and p.b in by_id:
+            uf.union(p.a, p.b)
+    groups: dict[str, list[Strand]] = defaultdict(list)
+    for s in strands:
+        groups[uf.find(s.id)].append(s)
+    out = list(groups.values())
+    out.sort(key=lambda g: (g[0].path, min(x.id for x in g)))
+    return out
+
+
+def component_verdict(group: list[Strand], pairs: list[Pair]) -> tuple[str, dict[str, int], str]:
+    ids = {s.id for s in group}
+    rel = [p for p in pairs if p.a in ids and p.b in ids]
+    counts: dict[str, int] = defaultdict(int)
+    for p in rel:
+        counts[p.verdict] += 1
+    if any(p.verdict == "JAM" for p in rel):
+        return "JAMMED", dict(counts), "incompatible overlap"
+    if any(p.verdict == "SPLIT" for p in rel):
+        return "SPLIT", dict(counts), "reviewers disagree"
+    stacks = [p for p in rel if p.verdict == "STACK"]
+    if stacks:
+        # cycle?
+        succ: dict[str, set[str]] = defaultdict(set)
+        for p in stacks:
+            if p.order == "a>b":
+                succ[p.a].add(p.b)
+            elif p.order == "b>a":
+                succ[p.b].add(p.a)
+        if _has_cycle(succ):
+            return "JAMMED", dict(counts), "stack cycle"
+        return "SERIES", dict(counts), "unique apply order"
+    if any(p.verdict == "SUBSUME" for p in rel):
+        return "SUBSUME", dict(counts), "outer consumes inner"
+    if any(p.verdict == "ECHO" for p in rel) and len(group) > 1:
+        return "ECHO", dict(counts), "duplicate strands"
+    if any(p.verdict == "COVER" for p in rel):
+        return "COVER", dict(counts), "remark sits on a suggestion"
+    if any(p.verdict == "THREAD" for p in rel):
+        return "THREAD", dict(counts), "reply chain"
+    n_edits = sum(1 for s in group if s.has_edit())
+    if n_edits > 1:
+        return "PARALLEL", dict(counts), "independent; compose in any order"
+    return "PARALLEL", dict(counts), "independent"
+
+
+def _has_cycle(succ: dict[str, set[str]]) -> bool:
+    seen: set[str] = set()
+    stack: set[str] = set()
+
+    def dfs(n: str) -> bool:
+        if n in stack:
+            return True
+        if n in seen:
+            return False
+        stack.add(n)
+        for m in succ.get(n, ()):
+            if dfs(m):
+                return True
+        stack.remove(n)
+        seen.add(n)
+        return False
+
+    return any(dfs(n) for n in list(succ))
+
+
+def topo_order(group: list[Strand], pairs: list[Pair]) -> list[Strand] | None:
+    ids = {s.id for s in group}
+    succ: dict[str, set[str]] = defaultdict(set)
+    indeg: dict[str, int] = {s.id: 0 for s in group}
+    for p in pairs:
+        if p.a not in ids or p.b not in ids:
+            continue
+        src = dst = None
+        if p.verdict == "STACK":
+            if p.order == "a>b":
+                src, dst = p.a, p.b
+            elif p.order == "b>a":
+                src, dst = p.b, p.a
+        elif p.verdict == "SUBSUME":
+            # apply outer only; skip inner later. Keep outer first.
+            if p.order == "a>b":
+                src, dst = p.a, p.b
+            elif p.order == "b>a":
+                src, dst = p.b, p.a
+        if src and dst and dst not in succ[src]:
+            succ[src].add(dst)
+            indeg[dst] += 1
+    by_id = {s.id: s for s in group}
+    ready = sorted([i for i, d in indeg.items() if d == 0], key=lambda i: (by_id[i].span.start, i))
+    out: list[Strand] = []
+    while ready:
+        n = ready.pop(0)
+        out.append(by_id[n])
+        for m in sorted(succ.get(n, ()), key=lambda i: (by_id[i].span.start, i)):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+                ready.sort(key=lambda i: (by_id[i].span.start, i))
+    if len(out) != len(group):
+        return None
+    return out
+
+
+def collapse_echo(group: list[Strand], pairs: list[Pair]) -> list[Strand]:
+    """Keep one strand per ECHO clique; drop subsumed inners."""
+    ids = {s.id for s in group}
+    uf = UnionFind(ids)
+    drop: set[str] = set()
+    for p in pairs:
+        if p.a not in ids or p.b not in ids:
+            continue
+        if p.verdict == "ECHO":
+            uf.union(p.a, p.b)
+        elif p.verdict == "SUBSUME":
+            if p.order == "a>b":
+                drop.add(p.b)
+            elif p.order == "b>a":
+                drop.add(p.a)
+    kept: dict[str, Strand] = {}
+    by_id = {s.id: s for s in group}
+    for s in group:
+        if s.id in drop:
+            continue
+        root = uf.find(s.id)
+        if root not in kept or s.id < kept[root].id:
+            kept[root] = s
+    return [kept[k] for k in sorted(kept)]
+
+
+def find_image(lines: list[str], image: list[str]) -> list[int]:
+    """Return 0-based start indices where image occurs as a contiguous block."""
+    if not image:
+        return []
+    n = len(image)
+    hits: list[int] = []
+    for i in range(0, len(lines) - n + 1):
+        if lines[i : i + n] == image:
+            hits.append(i)
+    return hits
+
+
+def apply_at(lines: list[str], start: int, end: int, after: list[str]) -> list[str] | None:
+    """Replace 1-indexed inclusive [start,end] with after. No image check."""
+    if start < 1 or end < start:
+        return None
+    if end > len(lines):
+        return None
+    return lines[: start - 1] + list(after) + lines[end:]
+
+
+def apply_one(
+    lines: list[str],
+    s: Strand,
+    require_before: bool,
+) -> tuple[list[str] | None, str]:
+    """Apply one strand. Prefer span if before matches; else unique image."""
+    if s.after is None:
+        return lines, "remark"
+    # 1. span + optional before check
+    if 1 <= s.span.start <= s.span.end <= len(lines):
+        window = lines[s.span.start - 1 : s.span.end]
+        if not require_before or window == s.before or not s.before:
+            return apply_at(lines, s.span.start, s.span.end, s.after), "span"
+        # span points at the after-image already (already applied)
+        if window == s.after:
+            return lines, "already"
+    # 2. unique before-image anywhere
+    if s.before:
+        hits = find_image(lines, s.before)
+        if len(hits) == 1:
+            i = hits[0]
+            return (
+                lines[:i] + list(s.after) + lines[i + len(s.before) :],
+                "image",
+            )
+        if len(hits) > 1:
+            return None, f"ambiguous-before x{len(hits)}"
+    # 3. after already present uniquely and before gone
+    if s.after and find_image(lines, s.after) and (not s.before or not find_image(lines, s.before)):
+        return lines, "already"
+    return None, "no-before"
+
+
+def shift_span(span: Span, applied: Span, new_len: int) -> Span | None:
+    old_len = applied.nlines()
+    delta = new_len - old_len
+    if span.end < applied.start:
+        return span
+    if span.start > applied.end:
+        return Span(span.start + delta, span.end + delta)
+    return None
+
+
+def apply_sequence(
+    base: list[str],
+    seq: list[Strand],
+    shift_coords: bool,
+    require_before: bool,
+) -> tuple[list[str] | None, str, list[str]]:
+    lines = list(base)
+    used: list[str] = []
+    live: dict[str, Span] = {s.id: Span(s.span.start, s.span.end) for s in seq}
+    for s in seq:
+        cur = Strand(**{**asdict(s), "span": live[s.id]})
+        # asdict nested Span becomes dict
+        if isinstance(cur.span, dict):
+            cur.span = Span(cur.span["start"], cur.span["end"])
+        nxt, how = apply_one(lines, cur, require_before=require_before)
+        if nxt is None:
+            return None, f"{s.id}:{how}", used
+        if how != "already" and how != "remark" and shift_coords:
+            new_len = len(cur.after or [])
+            applied = live[s.id]
+            for oid in list(live):
+                if oid == s.id:
+                    continue
+                shifted = shift_span(live[oid], applied, new_len)
+                if shifted is None:
+                    # overlapping leftover — remaining strand must use image apply
+                    continue
+                live[oid] = shifted
+        lines = nxt
+        used.append(f"{s.id}:{how}")
+    return lines, "ok", used
+
+
+def digest_lines(lines: list[str]) -> str:
+    h = hashlib.sha256()
+    for ln in lines:
+        h.update(ln.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()[:12]
+
+
+def load_tree_file(root: str, path: str, against: str | None, worktree: bool) -> list[str] | None:
+    if worktree or not against:
+        fp = os.path.join(root, path)
+        if not os.path.isfile(fp):
+            return None
+        with open(fp, encoding="utf-8") as f:
+            return _strip_cr(f.read()).splitlines()
+    import subprocess
+
+    r = subprocess.run(
+        ["git", "-C", root, "show", f"{against}:{path}"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return _strip_cr(r.stdout).splitlines()
+
+
+def time_key(s: Strand) -> tuple:
+    if s.created_at:
+        try:
+            dt = datetime.fromisoformat(s.created_at.replace("Z", "+00:00"))
+            return (dt, s.id)
+        except ValueError:
+            return (s.created_at, s.id)
+    return ("", s.id)
+
+
+def run_schedules(
+    group: list[Strand],
+    pairs: list[Pair],
+    base: list[str] | None,
+) -> dict[str, ApplyResult]:
+    collapsed = collapse_echo(group, pairs)
+    # split verdicts cannot apply all
+    ids = {s.id for s in group}
+    if any(p.verdict == "SPLIT" and p.a in ids and p.b in ids for p in pairs):
+        return {
+            "line": ApplyResult("line", False, None, "split", []),
+            "time": ApplyResult("time", False, None, "split", []),
+            "topo": ApplyResult("topo", False, None, "split", []),
+        }
+    if base is None:
+        return {}
+    line_seq = sorted(collapsed, key=lambda s: (-s.span.start, -s.span.end, s.id))
+    time_seq = sorted(collapsed, key=time_key)
+    topo = topo_order(collapsed, pairs) or list(collapsed)
+
+    def go(name: str, seq: list[Strand], shift: bool) -> ApplyResult:
+        # For line schedule, original coords stay valid iff no overlap:
+        # apply bottom-up without shift. For time/topo, shift + image fallback.
+        require = True
+        out, err, used = apply_sequence(base, seq, shift_coords=shift, require_before=require)
+        if out is None:
+            return ApplyResult(name, False, None, err, [s.id for s in seq])
+        return ApplyResult(name, True, digest_lines(out), None, [s.id for s in seq], out)
+
+    return {
+        "line": go("line", line_seq, shift=False),
+        "time": go("time", time_seq, shift=True),
+        "topo": go("topo", topo, shift=True),
+    }
+
+
+def build_components(
+    strands: list[Strand],
+    pairs: list[Pair],
+    tree_root: str | None,
+    against: str | None,
+    worktree: bool,
+) -> list[Component]:
+    comps: list[Component] = []
+    for i, group in enumerate(connected_groups(strands, pairs), 1):
+        verdict, counts, note = component_verdict(group, pairs)
+        base = None
+        if tree_root:
+            base = load_tree_file(tree_root, group[0].path, against, worktree)
+        schedules = run_schedules(group, pairs, base)
+        digests = {k: v.digest for k, v in schedules.items() if v.ok and v.digest}
+        same: bool | None
+        if not schedules:
+            same = None
+        elif not digests:
+            same = False
+        else:
+            same = len(set(digests.values())) == 1 and len(digests) == len(schedules)
+        comps.append(
+            Component(
+                id=i,
+                path=group[0].path,
+                strand_ids=[s.id for s in sorted(group, key=lambda x: (x.span.start, x.id))],
+                verdict=verdict,
+                pair_counts=counts,
+                schedules={
+                    k: {
+                        "ok": v.ok,
+                        "digest": v.digest,
+                        "error": v.error,
+                        "order": v.order,
+                    }
+                    for k, v in schedules.items()
+                },
+                same_tree=same,
+                note=note,
+            )
+        )
+    return comps
+
+
+def file_apply_report(
+    strands: list[Strand],
+    pairs: list[Pair],
+    tree_root: str | None,
+    against: str | None,
+    worktree: bool,
+) -> list[dict[str, Any]]:
+    by_path: dict[str, list[Strand]] = defaultdict(list)
+    for s in strands:
+        if s.has_edit():
+            by_path[s.path].append(s)
+    out = []
+    for path, group in sorted(by_path.items()):
+        base = load_tree_file(tree_root, path, against, worktree) if tree_root else None
+        schedules = run_schedules(group, pairs, base)
+        out.append(
+            {
+                "path": path,
+                "n": len(group),
+                "schedules": {
+                    k: {
+                        "ok": v.ok,
+                        "digest": v.digest,
+                        "error": v.error,
+                        "order": v.order,
+                    }
+                    for k, v in schedules.items()
+                },
+            }
+        )
+    return out
+
+
+def worst_exit(comps: list[Component]) -> int:
+    if any(c.verdict == "JAMMED" for c in comps):
+        return 2
+    if any(c.verdict == "SPLIT" for c in comps):
+        return 1
+    return 0
+
+
+def format_pretty(
+    strands: list[Strand],
+    pairs: list[Pair],
+    comps: list[Component],
+    hide_disjoint: bool = True,
+) -> str:
+    n = len(strands)
+    files = len({s.path for s in strands})
+    cc: dict[str, int] = defaultdict(int)
+    for c in comps:
+        cc[c.verdict] += 1
+    head = f"plait  n={n}  files={files}  components={len(comps)}"
+    if cc:
+        head += "  " + " ".join(f"{k}={v}" for k, v in sorted(cc.items()))
+    lines = [head, ""]
+    quiet = QUIET_PAIRS if hide_disjoint else frozenset()
+    shown = [p for p in pairs if p.verdict not in quiet]
+    hidden = len(pairs) - len(shown)
+    if shown:
+        lines.append("pairs")
+        for p in shown:
+            extra = f"  {p.reason}"
+            if p.order:
+                extra += f"  {p.order}"
+            lines.append(
+                f"  {p.verdict:<8} {p.path}  #{p.a}@{p.a_span}  #{p.b}@{p.b_span}{extra}"
+            )
+        if hidden:
+            lines.append(f"  ({hidden} DISJOINT hidden; --all-pairs to show)")
+        lines.append("")
+    elif hidden:
+        lines.append(f"pairs  ({hidden} DISJOINT hidden; --all-pairs to show)")
+        lines.append("")
+    if comps:
+        lines.append("plaits")
+        for c in comps:
+            ids = ",".join(f"#{i}" for i in c.strand_ids)
+            sched = ""
+            if c.schedules:
+                bits = []
+                for name, info in c.schedules.items():
+                    bits.append(f"{name}={'ok' if info['ok'] else 'fail'}")
+                same = ""
+                if c.same_tree is True:
+                    same = " same-tree"
+                elif c.same_tree is False and any(s.get("ok") for s in c.schedules.values()):
+                    same = " different-trees"
+                sched = "  apply:" + ",".join(bits) + same
+            lines.append(f"  {c.verdict:<8} {c.path}  {ids}  {c.note}{sched}")
+    if not pairs and not comps:
+        lines.append("(no strands)")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def format_tsv(pairs: list[Pair], comps: list[Component], hide_disjoint: bool = True) -> str:
+    rows = ["kind\tverdict\tpath\ta\tb\treason"]
+    for p in pairs:
+        if hide_disjoint and p.verdict == "DISJOINT":
+            continue
+        rows.append(f"pair\t{p.verdict}\t{p.path}\t{p.a}\t{p.b}\t{p.reason}")
+    for c in comps:
+        rows.append(
+            f"plait\t{c.verdict}\t{c.path}\t{','.join(c.strand_ids)}\t\t{c.note}"
+        )
+    return "\n".join(rows) + "\n"
+
+
+def to_json(
+    strands: list[Strand],
+    pairs: list[Pair],
+    comps: list[Component],
+    files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    cc: dict[str, int] = defaultdict(int)
+    for c in comps:
+        cc[c.verdict] += 1
+    pc: dict[str, int] = defaultdict(int)
+    for p in pairs:
+        pc[p.verdict] += 1
+    return {
+        "n": len(strands),
+        "files": len({s.path for s in strands}),
+        "strands": [
+            {
+                "id": s.id,
+                "path": s.path,
+                "span": str(s.span),
+                "start": s.span.start,
+                "end": s.span.end,
+                "kind": s.kind,
+                "before": s.before,
+                "after": s.after,
+                "commit": s.commit,
+                "original_commit": s.original_commit,
+                "created_at": s.created_at,
+                "author": s.author,
+                "recon": s.recon,
+            }
+            for s in strands
+        ],
+        "pairs": [asdict(p) for p in pairs],
+        "components": [
+            {
+                "id": c.id,
+                "path": c.path,
+                "strands": c.strand_ids,
+                "verdict": c.verdict,
+                "pair_counts": c.pair_counts,
+                "schedules": c.schedules,
+                "same_tree": c.same_tree,
+                "note": c.note,
+            }
+            for c in comps
+        ],
+        "file_apply": files,
+        "component_counts": dict(cc),
+        "pair_counts": dict(pc),
+        "unanimous": (
+            next(iter(cc)) if len(cc) == 1 else ("EMPTY" if not cc else "MIXED")
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+
+class Fail(Exception):
+    pass
+
+
+def _t(name: str, fn) -> None:
+    fn()
+    print(f"  PASS  {name}")
+
+
+def _strand(
+    i: str,
+    path: str,
+    start: int,
+    end: int,
+    before: list[str],
+    after: list[str] | None,
+    **kw: Any,
+) -> Strand:
+    return Strand(
+        id=i,
+        path=path,
+        span=Span(start, end),
+        before=before,
+        after=after,
+        **kw,
+    )
+
+
+def run_selftest() -> int:
+    n = 0
+
+    def t(name: str, fn) -> None:
+        nonlocal n
+        try:
+            _t(name, fn)
+            n += 1
+        except Exception as e:
+            print(f"  FAIL  {name}: {e}", file=sys.stderr)
+            raise
+
+    def commute_disjoint():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["x2"])
+        b = _strand("b", "f.py", 3, 3, ["z"], ["z2"])
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE":
+            raise Fail(p)
+
+    def echo_same_image():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("b", "f.py", 1, 1, ["x"], ["y"])
+        p = pair_verdict(a, b)
+        if p.verdict != "ECHO":
+            raise Fail(p)
+
+    def split_same_before():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("b", "f.py", 1, 1, ["x"], ["z"])
+        p = pair_verdict(a, b)
+        if p.verdict != "SPLIT":
+            raise Fail(p)
+
+    def jam_overlap():
+        a = _strand("a", "f.py", 1, 3, ["a", "b", "c"], ["A", "B", "C"])
+        b = _strand("b", "f.py", 3, 5, ["c", "d", "e"], ["C", "D", "E"])
+        p = pair_verdict(a, b)
+        if p.verdict != "JAM":
+            raise Fail(p)
+
+    def stack_images():
+        a = _strand("a", "f.py", 2, 2, ["beta"], ["beta2"], original_commit="c1")
+        b = _strand("b", "f.py", 2, 2, ["beta2"], ["beta3"], original_commit="c2")
+        p = pair_verdict(a, b)
+        if p.verdict != "STACK" or p.order != "a>b":
+            raise Fail(p)
+
+    def stack_reverse():
+        a = _strand("a", "f.py", 2, 2, ["beta2"], ["beta3"], original_commit="c2")
+        b = _strand("b", "f.py", 2, 2, ["beta"], ["beta2"], original_commit="c1")
+        p = pair_verdict(a, b)
+        if p.verdict != "STACK" or p.order != "b>a":
+            raise Fail(p)
+
+    def cross_commit_not_jam():
+        a = _strand("a", "f.py", 10, 12, ["old"], ["newA"], original_commit="c1")
+        b = _strand("b", "f.py", 10, 12, ["other"], ["newB"], original_commit="c2")
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE":
+            raise Fail(p)
+
+    def subsume_consistent():
+        a = _strand("a", "f.py", 1, 5, list("abcde"), list("abXde"))
+        b = _strand("b", "f.py", 3, 3, ["c"], ["X"])
+        p = pair_verdict(a, b)
+        if p.verdict != "SUBSUME" or p.order != "a>b":
+            raise Fail(p)
+
+    def subsume_jam():
+        a = _strand("a", "f.py", 1, 5, list("abcde"), list("abXde"))
+        b = _strand("b", "f.py", 3, 3, ["c"], ["Y"])
+        p = pair_verdict(a, b)
+        if p.verdict != "JAM":
+            raise Fail(p)
+
+    def remark_cover():
+        a = _strand("a", "f.py", 1, 3, ["a"], ["A"])
+        b = _strand("b", "f.py", 2, 2, ["q"], None, kind="remark")
+        p = pair_verdict(a, b)
+        if p.verdict != "COVER":
+            raise Fail(p)
+
+    def apply_commute_same_tree():
+        base = ["alpha", "beta", "gamma"]
+        a = _strand("a", "f.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("b", "f.py", 3, 3, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        sch = run_schedules([a, b], pairs, base)
+        if not sch["line"].ok or not sch["time"].ok:
+            raise Fail(sch)
+        if sch["line"].digest != sch["time"].digest:
+            raise Fail((sch["line"].digest, sch["time"].digest))
+        if sch["line"].result != ["ALPHA", "beta", "GAMMA"]:
+            raise Fail(sch["line"].result)
+
+    def apply_time_shifts():
+        # later comment is lower in the file; time-order applies top first
+        # and must shift the lower span.
+        base = ["a", "b", "c", "d"]
+        early = _strand(
+            "early",
+            "f.py",
+            1,
+            1,
+            ["a"],
+            ["a", "a2"],
+            created_at="2020-01-01T00:00:00Z",
+        )
+        late = _strand(
+            "late",
+            "f.py",
+            4,
+            4,
+            ["d"],
+            ["D"],
+            created_at="2020-01-02T00:00:00Z",
+        )
+        pairs = [pair_verdict(early, late)]
+        if pairs[0].verdict != "COMMUTE":
+            raise Fail(pairs[0])
+        sch = run_schedules([early, late], pairs, base)
+        if not sch["time"].ok:
+            raise Fail(sch["time"])
+        if sch["time"].result != ["a", "a2", "b", "c", "D"]:
+            raise Fail(sch["time"].result)
+        if not sch["line"].ok or sch["line"].result != sch["time"].result:
+            raise Fail(sch["line"])
+
+    def apply_stack_topo_only():
+        base = ["alpha", "beta", "gamma"]
+        a = _strand(
+            "a",
+            "f.py",
+            2,
+            2,
+            ["beta"],
+            ["beta2"],
+            original_commit="c1",
+            created_at="2020-01-02T00:00:00Z",
+        )
+        b = _strand(
+            "b",
+            "f.py",
+            2,
+            2,
+            ["beta2"],
+            ["beta3"],
+            original_commit="c2",
+            created_at="2020-01-01T00:00:00Z",  # B written "earlier" in clock? inverted
+        )
+        pairs = [pair_verdict(a, b)]
+        if pairs[0].verdict != "STACK":
+            raise Fail(pairs[0])
+        sch = run_schedules([a, b], pairs, base)
+        if not sch["topo"].ok or sch["topo"].result != ["alpha", "beta3", "gamma"]:
+            raise Fail(sch["topo"])
+        # time order is b then a: b's before (beta2) is missing; a then leaves beta2
+        if sch["time"].ok and sch["time"].result == ["alpha", "beta3", "gamma"]:
+            # image-apply of a after failed b? a applies (beta→beta2). b already tried.
+            # time is b first: should fail or not reach beta3 if we don't retry
+            pass
+        if sch["time"].ok and sch["time"].result == ["alpha", "beta3", "gamma"]:
+            # acceptable if image retry after... we apply sequentially, b first fails
+            raise Fail("time should not invent beta3 when b is first")
+        if sch["time"].ok:
+            # b first fails → whole schedule fail
+            raise Fail(("time unexpectedly ok", sch["time"]))
+
+    def apply_jam_fails():
+        base = ["a", "b", "c", "d"]
+        x = _strand("x", "f.py", 1, 3, ["a", "b", "c"], ["A", "B", "C"])
+        y = _strand("y", "f.py", 3, 4, ["c", "d"], ["C", "D"])
+        pairs = [pair_verdict(x, y)]
+        if pairs[0].verdict != "JAM":
+            raise Fail(pairs[0])
+        sch = run_schedules([x, y], pairs, base)
+        if sch["line"].ok or sch["time"].ok:
+            raise Fail(sch)
+
+    def recon_github_range():
+        # Real cli/cli PR #7 comment 333030758: GitHub truncates the hunk
+        # at the commented line. original_line=347 is the last '+' line.
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "original_line": 347,
+            "line": None,
+            "diff_hunk": (
+                "@@ -339,7 +342,11 @@ func show(number ...string) error {\n"
+                " func pullRequestForCurrentBranch() (*github.PullRequest, error) {\n"
+                " \tproject := project()\n"
+                " \tclient := github.NewClient(project.Host)\n"
+                "-\theadWithOwner := fmt.Sprintf(\"%s:%s\", project.Owner, currentBranch())\n"
+                "+\tcurrentBranch, err := context.CurrentBranch()\n"
+                "+\tif err != nil {\n"
+                "+\t\treturn &github.PullRequest{}, err"
+            ),
+            "body": (
+                "It's fine to return nil in place of pointers when an error occurs:\n"
+                "```suggestion\n"
+                "\t\treturn nil, err\n"
+                "```"
+            ),
+        }
+        ss = obj_to_strands(obj, "t", remarks=False)
+        if len(ss) != 1:
+            raise Fail(ss)
+        if ss[0].after != ["\t\treturn nil, err"]:
+            raise Fail(ss[0].after)
+        if ss[0].before != ["\t\treturn &github.PullRequest{}, err"]:
+            raise Fail(("before", ss[0].before))
+        if ss[0].span.start != 347:
+            raise Fail(ss[0].span)
+
+    def ingest_jsonl():
+        text = (
+            '{"path":"a.py","id":"1","start_line":1,"line":1,'
+            '"before":["x"],"after":["y"]}\n'
+            '{"path":"a.py","id":"2","start_line":3,"line":3,'
+            '"before":["z"],"after":["w"]}\n'
+        )
+        ss = ingest(text, "j", remarks=False)
+        if [s.id for s in ss] != ["1", "2"]:
+            raise Fail(ss)
+
+    def ingest_md():
+        text = "a.py:1-1\n```suggestion\nY\n```\n"
+        ss = ingest(text, "m", remarks=False)
+        if len(ss) != 1 or ss[0].after != ["Y"] or ss[0].path != "a.py":
+            raise Fail(ss)
+
+    def component_series():
+        a = _strand("a", "f.py", 2, 2, ["beta"], ["beta2"], original_commit="1")
+        b = _strand("b", "f.py", 2, 2, ["beta2"], ["beta3"], original_commit="2")
+        pairs = all_pairs([a, b], False)
+        v, _, _ = component_verdict([a, b], pairs)
+        if v != "SERIES":
+            raise Fail(v)
+
+    def component_parallel():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["X"])
+        b = _strand("b", "f.py", 3, 3, ["z"], ["Z"])
+        pairs = all_pairs([a, b], False)
+        groups = connected_groups([a, b], pairs)
+        if len(groups) != 1:
+            raise Fail([len(groups), [s.id for g in groups for s in g]])
+        v, _, note = component_verdict(groups[0], pairs)
+        if v != "PARALLEL":
+            raise Fail((v, note))
+        if set(s.id for s in groups[0]) != {"a", "b"}:
+            raise Fail(groups[0])
+
+    def remark_thread_not_cover():
+        a = _strand("a", "f.py", 29, 29, ["q"], None, kind="remark")
+        b = _strand(
+            "b", "f.py", 29, 29, ["q"], None, kind="remark", in_reply_to="a"
+        )
+        p = pair_verdict(a, b)
+        if p.verdict != "THREAD":
+            raise Fail(p)
+
+    def cross_file_stays_apart():
+        a = _strand("a", "a.py", 1, 1, ["x"], ["X"])
+        b = _strand("b", "b.py", 1, 1, ["x"], ["X"])
+        pairs = all_pairs([a, b], False)
+        groups = connected_groups([a, b], pairs)
+        if len(groups) != 2:
+            raise Fail(groups)
+
+    def empty_after_is_delete():
+        obj = {
+            "id": "d",
+            "path": "f.py",
+            "line": 2,
+            "before": ["drop"],
+            "body": "```suggestion\n```",
+        }
+        ss = obj_to_strands(obj, "t", remarks=False)
+        if ss[0].after != []:
+            raise Fail(ss[0].after)
+        base = ["keep", "drop", "tail"]
+        out, how = apply_one(base, ss[0], require_before=True)
+        if out != ["keep", "tail"] or how != "span":
+            raise Fail((out, how))
+
+    def echo_collapse_apply_once():
+        base = ["x"]
+        a = _strand("a", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("b", "f.py", 1, 1, ["x"], ["y"])
+        pairs = [pair_verdict(a, b)]
+        sch = run_schedules([a, b], pairs, base)
+        if not sch["line"].ok or sch["line"].result != ["y"]:
+            raise Fail(sch["line"])
+
+    t("commute-disjoint", commute_disjoint)
+    t("echo-same-image", echo_same_image)
+    t("split-same-before", split_same_before)
+    t("jam-overlap", jam_overlap)
+    t("stack-images", stack_images)
+    t("stack-reverse", stack_reverse)
+    t("cross-commit-not-jam", cross_commit_not_jam)
+    t("subsume-consistent", subsume_consistent)
+    t("subsume-jam", subsume_jam)
+    t("remark-cover", remark_cover)
+    t("apply-commute-same-tree", apply_commute_same_tree)
+    t("apply-time-shifts", apply_time_shifts)
+    t("apply-stack-topo-only", apply_stack_topo_only)
+    t("apply-jam-fails", apply_jam_fails)
+    t("recon-github-range", recon_github_range)
+    t("ingest-jsonl", ingest_jsonl)
+    t("ingest-md", ingest_md)
+    t("component-series", component_series)
+    t("component-parallel", component_parallel)
+    t("remark-thread-not-cover", remark_thread_not_cover)
+    t("cross-file-stays-apart", cross_file_stays_apart)
+    t("empty-after-is-delete", empty_after_is_delete)
+    t("echo-collapse-apply-once", echo_collapse_apply_once)
+    print(f"selftest {n}/{n} passed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="plait",
+        description=(
+            "Composition algebra of review-suggestion strands. "
+            "Not occupancy (plea/sate) and not GitHub outdated."
+        ),
+    )
+    p.add_argument("inputs", nargs="*", help="JSON / JSONL / markdown review streams; - for stdin")
+    p.add_argument("-C", "--root", dest="root", default=None, help="tree for apply witnesses")
+    p.add_argument("--against", default=None, help="git ref to read files from (default: worktree files)")
+    p.add_argument("--worktree", action="store_true", help="force reading worktree files")
+    p.add_argument("--remarks", action="store_true", help="include non-suggestion comments as COVER strands")
+    p.add_argument("--ignore-space", action="store_true", help="collapse horizontal whitespace in images")
+    p.add_argument("--json", action="store_true", help="JSON report")
+    p.add_argument("--tsv", action="store_true", help="TSV pairs + plaits")
+    p.add_argument("--pretty", action="store_true", help="human report (default)")
+    p.add_argument("--report-only", action="store_true", help="always exit 0 on success")
+    p.add_argument("--pick", default=None, help="only emit these pair/plait verdicts (comma)")
+    p.add_argument(
+        "--all-pairs",
+        action="store_true",
+        help="include DISJOINT pairs (default hides the Cartesian miss)",
+    )
+    p.add_argument("--selftest", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.selftest:
+        try:
+            return run_selftest()
+        except Exception:
+            return 3
+    inputs = list(args.inputs)
+    if not inputs:
+        if sys.stdin.isatty():
+            print("plait: pass a review stream or '-' for stdin", file=sys.stderr)
+            return 3
+        inputs = ["-"]
+    strands: list[Strand] = []
+    for src in inputs:
+        label = "stdin" if src == "-" else src
+        try:
+            text = read_source(src)
+        except OSError as e:
+            print(f"plait: {src}: {e}", file=sys.stderr)
+            return 3
+        strands.extend(ingest(text, label, remarks=args.remarks))
+    # stable unique ids if duplicates
+    seen: dict[str, int] = {}
+    for s in strands:
+        n = seen.get(s.id, 0) + 1
+        seen[s.id] = n
+        if n > 1:
+            s.id = f"{s.id}~{n}"
+
+    pairs = all_pairs(strands, args.ignore_space)
+    worktree = args.worktree or (args.root is not None and not args.against)
+    against = args.against
+    comps = build_components(strands, pairs, args.root, against, worktree)
+    files = file_apply_report(strands, pairs, args.root, against, worktree)
+
+    emit_pairs = list(pairs)
+    emit_comps = list(comps)
+    if args.pick:
+        pick = {x.strip().upper() for x in args.pick.split(",") if x.strip()}
+        emit_pairs = [p for p in pairs if p.verdict in pick]
+        emit_comps = [c for c in comps if c.verdict in pick]
+    hide = not args.all_pairs
+    payload = to_json(strands, emit_pairs, emit_comps, files)
+    if not args.all_pairs:
+        payload["pairs"] = [p for p in payload["pairs"] if p["verdict"] != "DISJOINT"]
+
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    elif args.tsv:
+        sys.stdout.write(format_tsv(emit_pairs, emit_comps, hide_disjoint=hide))
+    else:
+        sys.stdout.write(
+            format_pretty(strands, emit_pairs, emit_comps, hide_disjoint=hide)
+        )
+
+    if args.report_only:
+        return 0
+    return worst_exit(comps)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

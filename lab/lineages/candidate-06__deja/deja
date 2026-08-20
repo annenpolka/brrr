@@ -1,0 +1,1019 @@
+#!/usr/bin/env python3
+"""deja — historical déjà vu for a git diff.
+
+Compare a change (working tree, staged, stdin patch, or a commit) against
+repository history. Report when the change:
+
+  RELAPSE    puts back a line that was deleted on purpose
+  UNDOFIX    removes a defensive line that landed in a fix commit
+  RESURRECT  brings back a file path that history deleted
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from typing import Callable, Iterable, Sequence
+
+VERSION = "0.2.0"
+
+COMMIT_RE = re.compile(
+    r"^COMMIT (?P<sha>[0-9a-f]{7,40}) (?P<date>\S+) (?P<subject>.*)$"
+)
+HUNK_RE = re.compile(r"^@@ -(?P<ls>\d+)(?:,(?P<lc>\d+))? \+(?P<rs>\d+)(?:,(?P<rc>\d+))? @@")
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+CAMEL_RE = re.compile(r"[A-Z][a-z]+[A-Z]|[a-z]+[A-Z][a-zA-Z0-9]+")
+
+# Conventional / subject-initial fixes only. Do NOT match "fixed pellet",
+# "prefix", or mid-sentence "fixing tests" as if they were incident commits.
+CONV_FIX_RE = re.compile(
+    r"^(fix|fixes|fixed|hotfix|bugfix|security|revert)\b",
+    re.I,
+)
+WEAK_FIX_RE = re.compile(
+    r"\b(typo|lint|format|fmt|style|whitespace|clippy|prettier|eslint|"
+    r"import order|nits?|comment|docs?|readme|changelog|wording|layout|"
+    r"animation|dropdown|padding|spacing)\b",
+    re.I,
+)
+INCIDENT_RE = re.compile(
+    r"\b(cve-\d|xss|rce|sql injection|auth bypass|vulnerab|exploit|"
+    r"backdoor|privilege|leak|race condition)\b",
+    re.I,
+)
+
+GUARD_RE = re.compile(
+    r"("
+    r"\b(assert|panic|precondition|fatalError|unreachable|guard)\b"
+    r"|raise |throw |throws "
+    r"|ValueError|TypeError|RulesError|unwrap_or|expect\("
+    r"|is_none|is_empty|isEmpty|isNoneOrEmpty"
+    r'|==\s*[\'"]{2}|!=\s*[\'"]{2}'
+    r"|is None|== None|=== null|== null"
+    r"|\breject\b|\bforbid\b|\bdeny\b|\bsanitize\b|\bbypass\b"
+    r"|\bvalidate\b|\brequire\("
+    r"|return Err|return error"
+    r")",
+    re.I,
+)
+
+IMPORT_RE = re.compile(
+    r"^((pub(\s+\([^)]+\))?|crate|super)\s+)?(use |import |from |#include |package |require\(|export )"
+)
+
+BOILER_RE = re.compile(
+    r"^("
+    r"#!/"
+    r"|var body: some View"
+    r"|@ObservedObject |@StateObject |@State |@Binding |@EnvironmentObject |@Environment\("
+    r"|\.(padding|frame|font|foregroundStyle|foregroundColor|background|"
+    r"fill|clipShape|overlay|opacity|animation|transition|shadow|"
+    r"cornerRadius|ignoresSafeArea|buttonStyle|listStyle)\b"
+    r"|VStack\(|HStack\(|ZStack\(|LazyVStack\(|LazyHStack\("
+    r"|UnevenRoundedRectangle\("
+    r")",
+    re.I,
+)
+
+HASHISH_RE = re.compile(r"(sha256:)?[a-f0-9]{32,}", re.I)
+
+SKIP_FILE_RE = re.compile(
+    r"(^|/)("
+    r"package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|"
+    r"uv\.lock|composer\.lock|poetry\.lock|Gemfile\.lock|"
+    r".*\.min\.(js|css)|.*\.map|.*\.(png|jpg|jpeg|gif|webp|ico|pdf|woff2?|ttf|zip|gz)|"
+    r".*\.svg|.*\.lock|"
+    r".*\.generated\.[^/]+|.*generated\.(ts|js|json|swift)|OraclesGenerated\.swift|"
+    r"docs/generated/.*"
+    r"|target/.*|node_modules/.*|\.git/.*"
+    r")$",
+    re.I,
+)
+
+KEYWORDS = {
+    "and", "await", "bool", "break", "case", "catch", "class", "const",
+    "continue", "crate", "def", "default", "dyn", "elif", "else", "enum",
+    "except", "export", "extends", "false", "finally", "fn", "for", "from",
+    "func", "function", "if", "impl", "import", "in", "int", "interface",
+    "let", "match", "mod", "mut", "none", "not", "null", "or", "override",
+    "pass", "private", "pub", "public", "return", "self", "static", "str",
+    "string", "struct", "super", "switch", "this", "throw", "true", "try",
+    "type", "typeof", "undefined", "use", "var", "void", "where", "while",
+    "with", "yield", "async", "nil", "guard", "some", "any",
+    "optional", "throws", "package", "final", "open",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class Sighting:
+    sha: str
+    date: str
+    subject: str
+    path: str
+    raw: str
+    norm: str
+    idents: tuple[str, ...]
+    kind: str  # add | del
+    fix_weight: int
+
+
+@dataclasses.dataclass(frozen=True)
+class FileSighting:
+    sha: str
+    date: str
+    subject: str
+    path: str
+    kind: str  # add | del
+    fix_weight: int
+
+
+@dataclasses.dataclass
+class HunkLine:
+    path: str
+    lineno: int
+    raw: str
+    norm: str
+    idents: tuple[str, ...]
+    kind: str  # add | del
+
+
+@dataclasses.dataclass
+class FileDelta:
+    path: str
+    kind: str  # add | del | mod
+
+
+@dataclasses.dataclass
+class Finding:
+    kind: str
+    severity: str
+    path: str
+    lineno: int
+    query_line: str
+    sha: str
+    date: str
+    subject: str
+    hist_path: str
+    hist_line: str
+    match: str
+    reason: str
+    extra: int = 0
+
+    def porcelain(self) -> str:
+        return "\t".join(
+            [
+                self.kind,
+                self.severity,
+                self.path,
+                str(self.lineno),
+                self.sha[:12],
+                self.match,
+                self.reason,
+                compact(self.subject),
+                compact(self.query_line),
+                compact(self.hist_line),
+                self.hist_path,
+            ]
+        )
+
+
+def compact(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run_git(repo: str, args: Sequence[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    # quotepath=false: spaces and non-ASCII paths stay literal in diffs
+    # and ls-files, so resurrection can match the working tree.
+    return subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        check=check,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+
+
+def git_ok(repo: str) -> bool:
+    r = run_git(repo, ["rev-parse", "--is-inside-work-tree"], check=False)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def unquote_git_path(path: str) -> str:
+    """Decode git's C-quoted path (`"foo\\343\\203\\220.py"`)."""
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        raw = path[1:-1]
+        buf = bytearray()
+        i = 0
+        escapes = {"n": 10, "t": 9, "r": 13, '"': 34, "\\": 92, "a": 7, "b": 8}
+        while i < len(raw):
+            if raw[i] == "\\" and i + 1 < len(raw):
+                nxt = raw[i + 1]
+                if nxt in "01234567":
+                    j = i + 1
+                    n = 0
+                    count = 0
+                    while j < len(raw) and count < 3 and raw[j] in "01234567":
+                        n = n * 8 + int(raw[j])
+                        j += 1
+                        count += 1
+                    buf.append(n)
+                    i = j
+                    continue
+                if nxt in escapes:
+                    buf.append(escapes[nxt])
+                    i += 2
+                    continue
+            buf.extend(raw[i].encode("utf-8"))
+            i += 1
+        return buf.decode("utf-8", errors="replace")
+    return path
+
+
+def strip_ab_prefix(path: str) -> str:
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def parse_diff_git_line(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git ") :]
+    if rest.startswith('"'):
+        m = re.match(r'^("(?:\\.|[^"])*") (".*")$', rest)
+        if not m:
+            return None
+        a = strip_ab_prefix(unquote_git_path(m.group(1)))
+        b = strip_ab_prefix(unquote_git_path(m.group(2)))
+        return a, b
+    idx = rest.find(" b/")
+    if idx == -1:
+        return None
+    left = rest[:idx]
+    right = rest[idx + 1 :]
+    a = strip_ab_prefix(unquote_git_path(left[2:] if left.startswith("a/") else left))
+    b = strip_ab_prefix(unquote_git_path(right[2:] if right.startswith("b/") else right))
+    return a, b
+
+
+def parse_plusplus_path(line: str) -> str | None:
+    """Return the path from a ---/+++ header, or '/dev/null'."""
+    if not (line.startswith("+++ ") or line.startswith("--- ")):
+        return None
+    rhs = unquote_git_path(line[4:])
+    if rhs.startswith("a/") or rhs.startswith("b/"):
+        rhs = rhs[2:]
+    return rhs
+
+
+def skip_file(path: str) -> bool:
+    path = path.replace("\\", "/")
+    if path in {"/dev/null", "dev/null"}:
+        return True
+    return bool(SKIP_FILE_RE.search(path))
+
+
+def normalize(line: str) -> str:
+    s = line.replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.rstrip(",;")
+    return s
+
+
+def idents_of(line: str) -> tuple[str, ...]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in IDENT_RE.finditer(line):
+        tok = m.group(0)
+        key = tok.lower()
+        if key in KEYWORDS or len(key) < 3:
+            continue
+        if key not in seen:
+            seen.add(key)
+            found.append(tok)
+    return tuple(found)
+
+
+def significant(idents: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(tok for tok in idents if is_significant_ident(tok))
+
+
+def is_significant_ident(tok: str) -> bool:
+    if tok.lower() in KEYWORDS:
+        return False
+    if CAMEL_RE.search(tok):
+        return True
+    if "_" in tok and len(tok) >= 6:
+        return True
+    if len(tok) >= 8:
+        return True
+    if tok[:1].isupper() and len(tok) >= 4:
+        return True
+    return False
+
+
+DECL_ONLY_RE = re.compile(
+    r"^[A-Za-z_][\w.]*\s*[=:]\s*("
+    r"\d+(\.\d+)?"
+    r"|[A-Za-z_][\w.]*"
+    r")$"
+)
+
+
+def line_eligible(norm: str, idents: tuple[str, ...]) -> bool:
+    if not norm or len(norm) < 12:
+        return False
+    if not idents:
+        return False
+    if BOILER_RE.match(norm):
+        return False
+    if HASHISH_RE.search(norm):
+        return False
+    if DECL_ONLY_RE.match(norm) and not looks_like_guard(norm):
+        return False
+    if IMPORT_RE.match(norm) and len(idents) <= 1:
+        return False
+    return True
+
+
+def fix_weight(subject: str) -> int:
+    if INCIDENT_RE.search(subject):
+        return 2
+    if not CONV_FIX_RE.search(subject):
+        return 0
+    if WEAK_FIX_RE.search(subject):
+        return 1
+    return 2
+
+
+def looks_like_guard(line: str) -> bool:
+    return bool(GUARD_RE.search(line))
+
+
+def scan_unified(
+    text: str,
+    with_commits: bool,
+) -> tuple[list[HunkLine] | list[Sighting], list[FileDelta] | list[FileSighting]]:
+    """Walk a `git log -p` or `git diff` stream."""
+    lines_out: list = []
+    files_out: list = []
+    sha = date = subject = ""
+    path = ""
+    in_hunk = False
+    pending_file_kind: str | None = None
+    fw = 0
+
+    def emit_file(kind: str, pth: str) -> None:
+        if not pth or skip_file(pth):
+            return
+        if with_commits:
+            if not sha:
+                return
+            files_out.append(FileSighting(sha, date, subject, pth, kind, fw))
+        else:
+            files_out.append(FileDelta(pth, kind))
+
+    for line in text.splitlines():
+        if with_commits:
+            cm = COMMIT_RE.match(line)
+            if cm:
+                sha = cm.group("sha")
+                date = cm.group("date")
+                subject = cm.group("subject")
+                fw = fix_weight(subject)
+                in_hunk = False
+                path = ""
+                pending_file_kind = None
+                continue
+        parsed = parse_diff_git_line(line)
+        if parsed:
+            a, b = parsed
+            path = b if b not in {"/dev/null", "dev/null"} else a
+            in_hunk = False
+            pending_file_kind = None
+            continue
+        if line.startswith("deleted file mode"):
+            pending_file_kind = "del"
+            continue
+        if line.startswith("new file mode"):
+            pending_file_kind = "add"
+            continue
+        if line.startswith("+++ "):
+            rhs = parse_plusplus_path(line) or ""
+            if rhs in {"/dev/null", "dev/null"}:
+                emit_file("del", path)
+            else:
+                if rhs:
+                    path = rhs
+                if pending_file_kind:
+                    emit_file(pending_file_kind, path)
+                elif not with_commits:
+                    emit_file("mod", path)
+            continue
+        hm = HUNK_RE.match(line)
+        if hm:
+            old_ln = int(hm.group("ls"))
+            new_ln = int(hm.group("rs"))
+            in_hunk = True
+            continue
+        if not in_hunk or not path or skip_file(path):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            kind = "add"
+            raw = line[1:]
+            lineno = new_ln
+            new_ln += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            kind = "del"
+            raw = line[1:]
+            lineno = old_ln
+            old_ln += 1
+        elif line.startswith("\\"):
+            continue
+        else:
+            old_ln += 1
+            new_ln += 1
+            continue
+        norm = normalize(raw)
+        ids = idents_of(norm)
+        if not line_eligible(norm, ids):
+            continue
+        if with_commits:
+            if not sha:
+                continue
+            lines_out.append(
+                Sighting(sha, date, subject, path, raw, norm, ids, kind, fw)
+            )
+        else:
+            lines_out.append(HunkLine(path, lineno, raw, norm, ids, kind))
+    return lines_out, files_out
+
+
+def parse_patch(text: str) -> tuple[list[HunkLine], list[FileDelta]]:
+    lines, files = scan_unified(text, with_commits=False)
+    return lines, files  # type: ignore[return-value]
+
+
+def parse_history(text: str) -> tuple[list[Sighting], list[FileSighting]]:
+    lines, files = scan_unified(text, with_commits=True)
+    return lines, files  # type: ignore[return-value]
+
+
+def collect_query_diff(
+    repo: str,
+    source: str,
+    commit: str | None,
+    paths: list[str],
+    stdin_text: str | None,
+) -> str:
+    if source == "stdin":
+        return stdin_text or ""
+    path_args = ["--", *paths] if paths else []
+    if source == "commit":
+        if not commit:
+            raise SystemExit("deja: --commit requires a revision")
+        r = run_git(repo, ["rev-parse", "--verify", f"{commit}^{{commit}}"], check=False)
+        if r.returncode != 0:
+            raise SystemExit(f"deja: unknown revision {commit}")
+        parent = run_git(repo, ["rev-parse", "--verify", f"{commit}^"], check=False)
+        if parent.returncode != 0:
+            return run_git(repo, ["show", "--format=", "--binary", commit, *path_args]).stdout
+        # First-parent for merges: the landed delta, not the inner branch noise.
+        return run_git(repo, ["diff", "--binary", f"{commit}^", commit, *path_args]).stdout
+    if source == "staged":
+        return run_git(repo, ["diff", "--binary", "--cached", *path_args]).stdout
+    return run_git(repo, ["diff", "--binary", "HEAD", *path_args]).stdout
+
+
+def list_untracked(repo: str, paths: list[str]) -> list[str]:
+    r = run_git(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    files = [f for f in r.stdout.split("\0") if f]
+    if not paths:
+        return files
+    wanted = []
+    for f in files:
+        for p in paths:
+            if f == p or f.startswith(p.rstrip("/") + "/"):
+                wanted.append(f)
+                break
+    return wanted
+
+
+def synthesize_new_file_diff(path: str, content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    body = "\n".join("+" + ln for ln in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"new file mode 100644\n"
+        f"--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}\n"
+    )
+
+
+def collect_untracked_patch(
+    repo: str,
+    paths: list[str],
+    deleted_paths: set[str] | None,
+) -> str:
+    chunks: list[str] = []
+    for rel in list_untracked(repo, paths):
+        if skip_file(rel):
+            continue
+        if deleted_paths is not None and rel not in deleted_paths:
+            continue
+        abs_path = os.path.join(repo, rel)
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        if "\0" in content:
+            continue
+        chunk = synthesize_new_file_diff(rel, content)
+        if chunk:
+            chunks.append(chunk)
+    return "".join(chunks)
+
+
+def collect_history(repo: str, max_commits: int, since: str | None, exclude: set[str]) -> str:
+    args = [
+        "log",
+        "--no-merges",
+        "-p",
+        "--format=COMMIT %H %aI %s",
+        "-n",
+        str(max_commits),
+    ]
+    if since:
+        args.append(f"--since={since}")
+    text = run_git(repo, args).stdout
+    if not exclude:
+        return text
+    keep = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        cm = COMMIT_RE.match(line.rstrip("\n"))
+        if cm:
+            skipping = cm.group("sha") in exclude or cm.group("sha")[:12] in exclude
+        if not skipping:
+            keep.append(line)
+    return "".join(keep)
+
+
+def ident_fp(idents: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(t.lower() for t in significant(idents))
+
+
+def query_moves(query: list[HunkLine]) -> tuple[set[str], set[frozenset[str]]]:
+    added = [q for q in query if q.kind == "add"]
+    deleted = [q for q in query if q.kind == "del"]
+    moved_norm = {q.norm for q in added} & {q.norm for q in deleted}
+    add_fps = [ident_fp(q.idents) for q in added]
+    del_fps = [ident_fp(q.idents) for q in deleted]
+    moved_fp: set[frozenset[str]] = set()
+    for dfp in del_fps:
+        if len(dfp) < 2:
+            continue
+        for afp in add_fps:
+            if len(afp) < 2:
+                continue
+            inter = len(dfp & afp)
+            union = len(dfp | afp)
+            if inter >= 2 and union and inter / union >= 0.6:
+                moved_fp.add(dfp)
+                moved_fp.add(afp)
+    return moved_norm, moved_fp
+
+
+def df_map(sights: list[Sighting]) -> dict[str, int]:
+    df: dict[str, int] = defaultdict(int)
+    seen_per_tok: dict[str, set[str]] = defaultdict(set)
+    for s in sights:
+        for tok in s.idents:
+            key = tok.lower()
+            if s.norm not in seen_per_tok[key]:
+                seen_per_tok[key].add(s.norm)
+                df[key] += 1
+    return df
+
+
+def churn_map(sights: list[Sighting]) -> dict[str, int]:
+    commits: dict[str, set[str]] = defaultdict(set)
+    for s in sights:
+        commits[s.norm].add(s.sha)
+    return {norm: len(shas) for norm, shas in commits.items()}
+
+
+def rarest_df(idents: tuple[str, ...], df: dict[str, int]) -> int:
+    if not idents:
+        return 10**9
+    return min(df.get(t.lower(), 0) for t in idents)
+
+
+def ident_jaccard(a: tuple[str, ...], b: tuple[str, ...]) -> float:
+    sa = {x.lower() for x in a}
+    sb = {x.lower() for x in b}
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def index_by_norm(sights: Iterable[Sighting], kind: str) -> dict[str, list[Sighting]]:
+    idx: dict[str, list[Sighting]] = defaultdict(list)
+    for s in sights:
+        if s.kind == kind:
+            bucket = idx[s.norm]
+            if len(bucket) < 8:
+                bucket.append(s)
+    return idx
+
+
+def index_by_sig_idents(sights: Iterable[Sighting], kind: str) -> dict[frozenset[str], list[Sighting]]:
+    idx: dict[frozenset[str], list[Sighting]] = defaultdict(list)
+    for s in sights:
+        if s.kind != kind:
+            continue
+        sig = ident_fp(s.idents)
+        if len(sig) < 2:
+            continue
+        bucket = idx[sig]
+        if len(bucket) < 8:
+            bucket.append(s)
+    return idx
+
+
+def pick_best(cands: list[Sighting], query: HunkLine) -> Sighting:
+    def key(s: Sighting) -> tuple:
+        same_path = 0 if s.path == query.path else 1
+        return (same_path, -s.fix_weight, s.date)
+
+    return sorted(cands, key=key)[0]
+
+
+def match_findings(
+    query: list[HunkLine],
+    qfiles: list[FileDelta],
+    history: list[Sighting],
+    hfiles: list[FileSighting],
+    exclude_shas: set[str],
+) -> list[Finding]:
+    hist = [s for s in history if s.sha not in exclude_shas and s.sha[:12] not in exclude_shas]
+    hfiles = [f for f in hfiles if f.sha not in exclude_shas and f.sha[:12] not in exclude_shas]
+    df = df_map(hist)
+    churn = churn_map(hist)
+    del_exact = index_by_norm(hist, "del")
+    add_exact = index_by_norm(hist, "add")
+    del_ident = index_by_sig_idents(hist, "del")
+    moved_norm, moved_fp = query_moves(query)
+    findings: list[Finding] = []
+    seen_keys: set[tuple] = set()
+    resurrected: set[str] = set()
+
+    def emit(f: Finding) -> None:
+        key = (f.kind, f.path, f.lineno, f.sha, f.query_line)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        findings.append(f)
+
+    deleted_files: dict[str, list[FileSighting]] = defaultdict(list)
+    for f in hfiles:
+        if f.kind == "del":
+            deleted_files[f.path].append(f)
+
+    for qf in qfiles:
+        if qf.kind != "add":
+            continue
+        cands = deleted_files.get(qf.path, [])
+        if not cands:
+            continue
+        cands = sorted(cands, key=lambda s: (-s.fix_weight, s.date))
+        s = cands[0]
+        resurrected.add(qf.path)
+        severity = "high" if s.fix_weight >= 1 or INCIDENT_RE.search(s.subject) else "medium"
+        emit(
+            Finding(
+                kind="RESURRECT",
+                severity=severity,
+                path=qf.path,
+                lineno=0,
+                query_line="(file recreated)",
+                sha=s.sha,
+                date=s.date,
+                subject=s.subject,
+                hist_path=s.path,
+                hist_line="(deleted file)",
+                match="file",
+                reason="recreates-deleted-path",
+            )
+        )
+
+    for q in query:
+        if q.path in resurrected and q.kind == "add":
+            continue
+        if q.norm in moved_norm:
+            continue
+        fp = ident_fp(q.idents)
+        if fp in moved_fp:
+            continue
+        if q.kind == "add":
+            emit_relapse(q, del_exact, del_ident, df, churn, emit)
+        elif q.kind == "del":
+            emit_undofix(q, add_exact, df, churn, emit)
+
+    findings.sort(
+        key=lambda f: ({"high": 0, "medium": 1, "low": 2}[f.severity], f.kind, f.path, f.lineno)
+    )
+    return findings
+
+
+def too_common(q: HunkLine, df: dict[str, int], churn: dict[str, int], same_path_fix: bool) -> bool:
+    if churn.get(q.norm, 0) >= 3 and not same_path_fix:
+        return True
+    if rarest_df(q.idents, df) > 10 and not significant(q.idents):
+        return True
+    if IMPORT_RE.match(q.norm) and rarest_df(q.idents, df) > 2:
+        return True
+    return False
+
+
+def emit_relapse(
+    q: HunkLine,
+    del_exact: dict[str, list[Sighting]],
+    del_ident: dict[frozenset[str], list[Sighting]],
+    df: dict[str, int],
+    churn: dict[str, int],
+    emit: Callable[[Finding], None],
+) -> None:
+    cands = list(del_exact.get(q.norm, []))
+    match = "exact"
+    if not cands:
+        sig = ident_fp(q.idents)
+        if len(sig) >= 2 and rarest_df(tuple(sig), df) <= 4:
+            raw = del_ident.get(sig, [])
+            cands = [s for s in raw if ident_jaccard(q.idents, s.idents) >= 0.85]
+            match = "idents"
+    if not cands:
+        return
+    s = pick_best(cands, q)
+    same_path_fix = s.path == q.path and s.fix_weight == 2
+    if too_common(q, df, churn, same_path_fix):
+        return
+    # Cross-file exact match of a type-shaped declaration is almost always
+    # "this view also has an engine", not a relapse of deleted behavior.
+    if s.path != q.path and not looks_like_guard(q.norm) and rarest_df(significant(q.idents) or q.idents, df) > 3:
+        return
+    if s.fix_weight == 2:
+        severity = "high"
+        reason = "reintroduces-line-deleted-in-fix"
+    elif s.fix_weight == 1:
+        severity = "low"
+        reason = "reintroduces-line-deleted-in-weak-fix"
+    else:
+        severity = "medium"
+        reason = "reintroduces-deleted-line"
+    emit(
+        Finding(
+            kind="RELAPSE",
+            severity=severity,
+            path=q.path,
+            lineno=q.lineno,
+            query_line=q.raw,
+            sha=s.sha,
+            date=s.date,
+            subject=s.subject,
+            hist_path=s.path,
+            hist_line=s.raw,
+            match=match,
+            reason=reason,
+        )
+    )
+
+
+def emit_undofix(
+    q: HunkLine,
+    add_exact: dict[str, list[Sighting]],
+    df: dict[str, int],
+    churn: dict[str, int],
+    emit: Callable[[Finding], None],
+) -> None:
+    if IMPORT_RE.match(q.norm):
+        return
+    if not looks_like_guard(q.norm):
+        return
+    cands = [s for s in add_exact.get(q.norm, []) if s.fix_weight >= 2]
+    if not cands:
+        return
+    s = pick_best(cands, q)
+    if too_common(q, df, churn, same_path_fix=True):
+        return
+    emit(
+        Finding(
+            kind="UNDOFIX",
+            severity="high",
+            path=q.path,
+            lineno=q.lineno,
+            query_line=q.raw,
+            sha=s.sha,
+            date=s.date,
+            subject=s.subject,
+            hist_path=s.path,
+            hist_line=s.raw,
+            match="exact",
+            reason="deletes-line-introduced-as-fix",
+        )
+    )
+
+
+def format_human(findings: list[Finding], expand: bool) -> str:
+    if not findings:
+        return "deja: clean — no historical déjà vu in this diff\n"
+    if expand:
+        blocks = [format_one(f) for f in findings]
+        return "\n\n".join(blocks) + f"\n\n{len(findings)} finding(s)\n"
+
+    groups: dict[tuple, list[Finding]] = {}
+    order: list[tuple] = []
+    for f in findings:
+        key = (f.kind, f.sha, f.hist_path, f.reason)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+
+    blocks = []
+    for key in order:
+        items = groups[key]
+        if items[0].kind == "RESURRECT" or len(items) == 1:
+            blocks.append(format_one(items[0]))
+            continue
+        head = items[0]
+        extra = len(items) - 1
+        body = [
+            f"{head.kind:<9} {head.severity:<6} {head.path}:{head.lineno}  (+{extra} more)",
+            f"          {head.reason} × {len(items)} ({head.match})",
+            f"          now   {compact(head.query_line)}",
+            f"          then  {head.sha[:12]} {head.date[:10]} {compact(head.subject)}",
+            f"          was   {head.hist_path}: {compact(head.hist_line)}",
+        ]
+        blocks.append("\n".join(body))
+    clustered = len(order)
+    return "\n\n".join(blocks) + f"\n\n{len(findings)} finding(s) in {clustered} cluster(s)\n"
+
+
+def format_one(f: Finding) -> str:
+    loc = f.path if f.lineno == 0 else f"{f.path}:{f.lineno}"
+    return "\n".join(
+        [
+            f"{f.kind:<9} {f.severity:<6} {loc}",
+            f"          {f.reason} ({f.match})",
+            f"          now   {compact(f.query_line)}",
+            f"          then  {f.sha[:12]} {f.date[:10]} {compact(f.subject)}",
+            f"          was   {f.hist_path}: {compact(f.hist_line)}",
+        ]
+    )
+
+
+def format_json(findings: list[Finding]) -> str:
+    return json.dumps([dataclasses.asdict(f) for f in findings], indent=2) + "\n"
+
+
+def resolve_repo(explicit: str | None) -> str:
+    if explicit:
+        repo = os.path.abspath(explicit)
+        if not git_ok(repo):
+            raise SystemExit(f"deja: not a git repository: {repo}")
+        return repo
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if r.returncode != 0:
+        raise SystemExit("deja: not a git repository (run inside a repo or pass --repo)")
+    return r.stdout.strip()
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="deja",
+        description="Report when a git diff reintroduces deleted code, recreates a deleted path, or removes a historical bugfix.",
+    )
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--staged", action="store_true", help="inspect staged diff only")
+    src.add_argument("-c", "--commit", metavar="REV", help="inspect REV against its first parent")
+    src.add_argument("--stdin", action="store_true", help="read a unified diff from stdin")
+    p.add_argument("--repo", help="git repository (default: current)")
+    p.add_argument("-n", "--max-commits", type=int, default=400, help="history window in commits (default 400)")
+    p.add_argument("--since", help="git --since, e.g. 2.years or 2023-01-01")
+    p.add_argument("--porcelain", action="store_true", help="stable tab-separated output")
+    p.add_argument("--json", action="store_true", dest="json_out", help="JSON output")
+    p.add_argument("--expand", action="store_true", help="do not cluster human output")
+    p.add_argument(
+        "--untracked",
+        nargs="?",
+        const="all",
+        choices=("all", "resurrect", "off"),
+        default="resurrect",
+        help="include untracked files: resurrect (default; only historically deleted paths), all, or off",
+    )
+    p.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    p.add_argument("--ok-low", action="store_true", help="exit 0 when only low-severity findings remain")
+    p.add_argument("--version", action="version", version=f"deja {VERSION}")
+    p.add_argument("paths", nargs="*", help="limit the *query* diff to these paths")
+    return p.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    repo = resolve_repo(args.repo)
+    if args.stdin:
+        source = "stdin"
+        stdin_text = sys.stdin.read()
+        commit = None
+    elif args.commit:
+        source = "commit"
+        stdin_text = None
+        commit = args.commit
+    elif args.staged:
+        source = "staged"
+        stdin_text = None
+        commit = None
+    else:
+        source = "worktree"
+        stdin_text = None
+        commit = None
+
+    try:
+        diff_text = collect_query_diff(repo, source, commit, args.paths, stdin_text)
+    except subprocess.CalledProcessError as e:
+        eprint(e.stderr.strip() or str(e))
+        return 2
+
+    query, qfiles = parse_patch(diff_text)
+    exclude: set[str] = set()
+    if source == "commit" and commit:
+        sha = run_git(repo, ["rev-parse", commit]).stdout.strip()
+        exclude.add(sha)
+        # A merge's first-parent diff is the landed branch. Matching it
+        # against that same branch's intermediate commits is self-noise.
+        listed = run_git(
+            repo, ["rev-list", "--no-merges", f"{commit}^..{commit}"], check=False
+        )
+        if listed.returncode == 0:
+            exclude.update(s for s in listed.stdout.split() if s)
+
+    try:
+        hist_text = collect_history(repo, args.max_commits, args.since, exclude)
+    except subprocess.CalledProcessError as e:
+        eprint(e.stderr.strip() or str(e))
+        return 2
+    history, hfiles = parse_history(hist_text)
+
+    if source == "worktree" and args.untracked != "off":
+        deleted_paths = {f.path for f in hfiles if f.kind == "del"} if args.untracked == "resurrect" else None
+        extra = collect_untracked_patch(repo, args.paths, deleted_paths)
+        if extra:
+            more_q, more_f = parse_patch(extra)
+            query.extend(more_q)
+            qfiles.extend(more_f)
+
+    findings = match_findings(query, qfiles, history, hfiles, exclude)
+
+    if not args.quiet:
+        if args.json_out:
+            sys.stdout.write(format_json(findings))
+        elif args.porcelain:
+            for f in findings:
+                sys.stdout.write(f.porcelain() + "\n")
+        else:
+            sys.stdout.write(format_human(findings, expand=args.expand))
+
+    if not findings:
+        return 0
+    if args.ok_low and all(f.severity == "low" for f in findings):
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

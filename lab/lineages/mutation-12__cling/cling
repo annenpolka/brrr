@@ -1,0 +1,1661 @@
+#!/usr/bin/env python3
+"""cling — attach to a pid that is already running; the wake is the object.
+
+You did not start this command. cling latches onto a pid or process group
+and waits until that world goes still — or until SIGINT — then reports
+late writes, leaked children, leftover paths, and files the process
+still had open.
+
+Exit status of a process you do not parent is usually unavailable.
+SIGINT never kills the subject.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+VERSION = "0.2.0"
+
+PRUNE_DIR_NAMES = {
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "Pods",
+    ".next",
+    "DerivedData",
+    ".moon",
+    "_build",
+    "coverage",
+    ".cargo",
+    ".cache",
+    ".turbo",
+    "zig-cache",
+    "zig-out",
+    ".pnpm-store",
+    "pnpm-store",
+    ".git-scratch",
+    ".githooks",
+    ".claude",
+    ".codex",
+    "vendor",
+    ".idea",
+    ".vscode",
+}
+
+IGNORE_FILE_NAMES = {".DS_Store", "Thumbs.db", ".directory"}
+
+SYSTEM_PREFIXES = (
+    "/usr/",
+    "/bin/",
+    "/sbin/",
+    "/System/",
+    "/Library/",
+    "/opt/homebrew/",
+    "/opt/local/",
+    "/Applications/",
+    "/private/var/db/",
+    "/private/var/run/",
+    "/var/run/",
+    "/dev/",
+    "/etc/",
+)
+
+ROOT_PATHS = {
+    "/",
+    "/Users",
+    "/tmp",
+    "/private",
+    "/private/tmp",
+    "/var",
+    "/private/var",
+    "/var/folders",
+    "/private/var/folders",
+}
+
+ENV_KV_RE = re.compile(r"\b([A-Z_][A-Z0-9_]*)=([^\s]*)")
+
+
+def monotonic() -> float:
+    return time.monotonic()
+
+
+def wallclock() -> float:
+    return time.time()
+
+
+def iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) + f".{int((ts % 1) * 1000):03d}"
+
+
+def normpath(p: str | Path) -> str:
+    path = os.path.abspath(os.path.expanduser(str(p)))
+    try:
+        path = os.path.realpath(path)
+    except OSError:
+        pass
+    return path
+
+
+def is_under(path: str, root: str) -> bool:
+    path = normpath(path)
+    root = normpath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def path_parts(path: str) -> set[str]:
+    return set(Path(path).parts)
+
+
+def is_system_path(path: str) -> bool:
+    n = normpath(path)
+    if n in ROOT_PATHS:
+        return True
+    return n.startswith(SYSTEM_PREFIXES)
+
+
+def looks_tmp(path: str, tmp_roots: Iterable[str]) -> bool:
+    n = normpath(path)
+    if n.startswith("/tmp/") or n.startswith("/private/tmp/"):
+        return True
+    if "/var/folders/" in n or "/private/var/folders/" in n:
+        return True
+    for root in tmp_roots:
+        if root and is_under(n, root):
+            return True
+    return False
+
+
+def classify_path(path: str, tmp_roots: Iterable[str] | None = None) -> str:
+    parts = path_parts(path)
+    if parts & {".git"}:
+        return "vcs"
+    if parts & (PRUNE_DIR_NAMES - {".git"}):
+        return "cache"
+    if looks_tmp(path, tmp_roots or []):
+        return "tmp"
+    return "source"
+
+
+def pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def snapshot_processes() -> dict[int, dict[str, Any]]:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-ax", "-o", "pid=,ppid=,pgid=,stat=,command="],
+            text=True,
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    procs: dict[int, dict[str, Any]] = {}
+    for line in out.splitlines():
+        line = line.lstrip()
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+        except ValueError:
+            continue
+        procs[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "stat": parts[3],
+            "command": parts[4],
+        }
+    return procs
+
+
+def descendants_of(root_pid: int, procs: dict[int, dict[str, Any]]) -> set[int]:
+    by_ppid: dict[int, list[int]] = defaultdict(list)
+    for pid, info in procs.items():
+        by_ppid[info["ppid"]].append(pid)
+    out: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        p = stack.pop()
+        for c in by_ppid.get(p, []):
+            if c not in out:
+                out.add(c)
+                stack.append(c)
+    return out
+
+
+def ancestors_of(pid: int, procs: dict[int, dict[str, Any]]) -> set[int]:
+    out: set[int] = set()
+    cur = pid
+    for _ in range(64):
+        if not cur or cur in out:
+            break
+        out.add(cur)
+        info = procs.get(cur)
+        if not info:
+            break
+        cur = int(info["ppid"])
+    return out
+
+
+def group_members(pgid: int, procs: dict[int, dict[str, Any]] | None = None) -> set[int]:
+    procs = snapshot_processes() if procs is None else procs
+    return {pid for pid, info in procs.items() if info["pgid"] == pgid}
+
+
+def is_zombie(info: dict[str, Any]) -> bool:
+    return str(info.get("stat") or "").startswith("Z")
+
+
+def proc_info(pid: int) -> dict[str, Any] | None:
+    procs = snapshot_processes()
+    return procs.get(pid)
+
+
+def parse_lsof_f(text: str) -> list[dict[str, Any]]:
+    """Parse `lsof -F pftna` records."""
+    recs: list[dict[str, Any]] = []
+    cur: dict[str, Any] = {}
+    pid: int | None = None
+
+    def flush() -> None:
+        if cur.get("fd") is not None:
+            recs.append(dict(cur))
+
+    for raw in text.splitlines():
+        if not raw:
+            continue
+        tag, val = raw[0], raw[1:]
+        if tag == "p":
+            flush()
+            try:
+                pid = int(val)
+            except ValueError:
+                pid = None
+            cur = {"pid": pid}
+        elif tag == "f":
+            flush()
+            cur = {"pid": pid, "fd": val}
+        elif tag == "t":
+            cur["type"] = val
+        elif tag == "n":
+            cur["name"] = val
+        elif tag == "a":
+            cur["access"] = val
+    flush()
+    return recs
+
+
+def lsof_pids(pids: Iterable[int]) -> list[dict[str, Any]]:
+    wanted = [str(p) for p in sorted(set(pids)) if p and p > 0]
+    if not wanted:
+        return []
+    exe = shutil.which("lsof") or "/usr/sbin/lsof"
+    # Batch to keep one exec; cap so a fat process group cannot stall the wait.
+    wanted = wanted[:12]
+    try:
+        out = subprocess.check_output(
+            [exe, "-nP", "-p", ",".join(wanted), "-F", "pftna"],
+            text=True,
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return parse_lsof_f(out)
+
+
+def discover_cwd(pid: int, opens: list[dict[str, Any]] | None = None) -> str | None:
+    recs = opens if opens is not None else lsof_pids([pid])
+    for rec in recs:
+        if rec.get("pid") == pid and rec.get("fd") == "cwd" and rec.get("name"):
+            return normpath(rec["name"])
+    return None
+
+
+def proc_environ_ps(pid: int) -> dict[str, str]:
+    """Best-effort env via `ps eww`. Values stop at the first space."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid)],
+            text=True,
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    env: dict[str, str] = {}
+    for m in ENV_KV_RE.finditer(out):
+        env[m.group(1)] = m.group(2)
+    return env
+
+
+def is_held_file(rec: dict[str, Any]) -> bool:
+    fd = rec.get("fd") or ""
+    if fd in {"cwd", "txt", "rtd", "Ltxt"}:
+        return False
+    if rec.get("type") not in {"REG", "DIR"}:
+        return False
+    name = rec.get("name") or ""
+    if not name or name.startswith("->") or is_system_path(name):
+        return False
+    if os.path.basename(name) in IGNORE_FILE_NAMES:
+        return False
+    return True
+
+
+def infer_tmp_roots(env: dict[str, str], opens: list[dict[str, Any]]) -> list[str]:
+    roots: list[str] = []
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        val = env.get(key)
+        if val:
+            roots.append(normpath(val))
+    for rec in opens:
+        name = rec.get("name") or ""
+        if "/var/folders/" in name or "/private/var/folders/" in name:
+            # .../T/<random> or the file's parent under T
+            n = normpath(name)
+            parts = Path(n).parts
+            for i, part in enumerate(parts):
+                if part == "T" and i + 1 < len(parts):
+                    roots.append(str(Path(*parts[: i + 2])))
+                    break
+    if os.path.isdir("/tmp"):
+        roots.append(normpath("/tmp"))
+    if os.path.isdir("/private/tmp"):
+        roots.append(normpath("/private/tmp"))
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in roots:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def infer_watch_roots(
+    cwd: str | None,
+    opens: list[dict[str, Any]],
+    extra: list[str],
+    watch_cwd: bool,
+    cwd_file_cap: int = 400,
+) -> list[str]:
+    roots: list[str] = []
+    for p in extra:
+        if p:
+            roots.append(normpath(p))
+    for rec in opens:
+        if not is_held_file(rec):
+            continue
+        name = rec.get("name") or ""
+        parent = os.path.dirname(normpath(name))
+        if not parent or is_system_path(parent) or parent in ROOT_PATHS:
+            continue
+        # Never watch a whole user TMPDIR; the file's directory is the heap slot.
+        roots.append(parent)
+    if cwd and os.path.isdir(cwd) and not is_system_path(cwd):
+        if watch_cwd or tree_is_small(cwd, cwd_file_cap):
+            roots.append(normpath(cwd))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for r in roots:
+        if r in seen or not os.path.exists(r):
+            continue
+        # Drop a root that contains another already-chosen root? keep both;
+        # poll walk prunes caches. Cap count.
+        seen.add(r)
+        uniq.append(r)
+        if len(uniq) >= 12:
+            break
+    return uniq
+
+
+def tree_is_small(root: str, cap: int) -> bool:
+    n = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d not in PRUNE_DIR_NAMES]
+            n += len(filenames)
+            if n > cap:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def git_toplevel(cwd: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def git_porcelain(cwd: str) -> list[dict[str, str]]:
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "-uall"],
+            cwd=cwd,
+            text=True,
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        if not line:
+            continue
+        status = line[:2]
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        rows.append({"status": status, "path": path})
+    return rows
+
+
+def porcelain_set(rows: list[dict[str, str]]) -> set[tuple[str, str]]:
+    return {(r["status"], r["path"]) for r in rows}
+
+
+def should_prune_dir(name: str, include_caches: bool) -> bool:
+    if name == ".git":
+        return True
+    if include_caches:
+        return False
+    return name in PRUNE_DIR_NAMES
+
+
+def iter_files(root: str, include_caches: bool, max_files: int = 80_000):
+    root = normpath(root)
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not should_prune_dir(d, include_caches)]
+        for name in filenames:
+            if name in IGNORE_FILE_NAMES:
+                continue
+            n += 1
+            if n > max_files:
+                return
+            yield os.path.join(dirpath, name)
+
+
+def file_meta(path: str) -> dict[str, Any] | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not os.path.isfile(path) and not os.path.islink(path):
+        return None
+    digest = None
+    if st.st_size <= 65536 and os.path.isfile(path):
+        try:
+            h = hashlib.sha1()
+            with open(path, "rb") as fh:
+                h.update(fh.read())
+            digest = h.hexdigest()
+        except OSError:
+            digest = None
+    return {
+        "path": path,
+        "mtime": st.st_mtime,
+        "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+        "size": st.st_size,
+        "sha1": digest,
+    }
+
+
+def walk_snapshot(roots: list[str], include_caches: bool) -> dict[str, dict[str, Any]]:
+    snap: dict[str, dict[str, Any]] = {}
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for path in iter_files(root, include_caches):
+            meta = file_meta(path)
+            if meta:
+                snap[normpath(path)] = meta
+    return snap
+
+
+def diff_snapshots(
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    created = []
+    deleted = []
+    updated = []
+    for path, meta in after.items():
+        if path not in before:
+            created.append(meta)
+        else:
+            prev = before[path]
+            content_changed = (
+                prev.get("sha1") and meta.get("sha1") and prev["sha1"] != meta["sha1"]
+            )
+            time_changed = prev.get("mtime_ns") != meta.get("mtime_ns")
+            size_changed = prev["size"] != meta["size"]
+            if content_changed or time_changed or size_changed:
+                updated.append({**meta, "prev_mtime": prev["mtime"], "prev_size": prev["size"]})
+    for path, meta in before.items():
+        if path not in after:
+            deleted.append(meta)
+    return {"created": created, "updated": updated, "deleted": deleted}
+
+
+class Timeline:
+    def __init__(self, cap: int = 20000):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.events: list[dict[str, Any]] = []
+        self.dropped = 0
+
+    def add(self, event: dict[str, Any]) -> None:
+        with self.lock:
+            if len(self.events) >= self.cap:
+                self.dropped += 1
+                return
+            self.events.append(event)
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.events)
+
+
+def start_fswatch(paths: list[str], include_caches: bool) -> subprocess.Popen | None:
+    exe = shutil.which("fswatch")
+    if not exe:
+        return None
+    watch = [p for p in paths if p and os.path.exists(p)]
+    if not watch:
+        return None
+    cmd = [
+        exe,
+        "-0",
+        "-r",
+        "--latency",
+        "0.05",
+        "--format",
+        "%f\x1f%p",
+        "--event-flag-separator",
+        ",",
+        "--extended",
+    ]
+    if not include_caches:
+        for name in sorted(PRUNE_DIR_NAMES):
+            cmd.extend(["--prune", rf"(^|/){re.escape(name)}$"])
+    cmd.extend(watch)
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+
+
+def parse_fswatch_record(rec: bytes) -> tuple[str, str] | None:
+    try:
+        text = rec.decode("utf-8", "replace")
+    except Exception:
+        return None
+    if "\x1f" not in text:
+        flags, _, path = text.partition(" ")
+        path = path or flags
+        flags = flags if path != flags else ""
+        return flags, path
+    flags, path = text.split("\x1f", 1)
+    return flags, path
+
+
+def fswatch_reader(
+    proc: subprocess.Popen,
+    t0: float,
+    timeline: Timeline,
+    include_caches: bool,
+    tmp_roots: list[str],
+) -> None:
+    assert proc.stdout is not None
+    buf = b""
+    while True:
+        chunk = proc.stdout.read(8192)
+        if not chunk:
+            break
+        buf += chunk
+        *parts, buf = buf.split(b"\0")
+        receipt = monotonic() - t0
+        for rec in parts:
+            if not rec:
+                continue
+            parsed = parse_fswatch_record(rec)
+            if not parsed:
+                continue
+            flags, path = parsed
+            if not path:
+                continue
+            npath = normpath(path)
+            if os.path.basename(npath) in IGNORE_FILE_NAMES:
+                continue
+            parts_set = path_parts(npath)
+            if ".git" in parts_set:
+                continue
+            if not include_caches and (parts_set & (PRUNE_DIR_NAMES - {".git"})):
+                if not looks_tmp(npath, tmp_roots):
+                    continue
+            timeline.add(
+                {
+                    "t": round(receipt, 4),
+                    "kind": "fs",
+                    "flags": flags,
+                    "path": npath,
+                    "class": classify_path(npath, tmp_roots),
+                }
+            )
+
+
+def poll_walker(
+    stop: threading.Event,
+    roots: list[str],
+    include_caches: bool,
+    t0: float,
+    timeline: Timeline,
+    interval: float,
+    tmp_roots: list[str],
+) -> None:
+    prev = walk_snapshot(roots, include_caches)
+    while not stop.wait(interval):
+        cur = walk_snapshot(roots, include_caches)
+        t = monotonic() - t0
+        diff = diff_snapshots(prev, cur)
+        for meta in diff["created"]:
+            timeline.add(
+                {
+                    "t": round(t, 4),
+                    "kind": "fs",
+                    "flags": "Created",
+                    "path": meta["path"],
+                    "class": classify_path(meta["path"], tmp_roots),
+                    "size": meta["size"],
+                }
+            )
+        for meta in diff["updated"]:
+            timeline.add(
+                {
+                    "t": round(t, 4),
+                    "kind": "fs",
+                    "flags": "Updated",
+                    "path": meta["path"],
+                    "class": classify_path(meta["path"], tmp_roots),
+                    "size": meta["size"],
+                }
+            )
+        for meta in diff["deleted"]:
+            timeline.add(
+                {
+                    "t": round(t, 4),
+                    "kind": "fs",
+                    "flags": "Removed",
+                    "path": meta["path"],
+                    "class": classify_path(meta["path"], tmp_roots),
+                }
+            )
+        prev = cur
+
+
+def harvest_tracked(
+    subject: int,
+    tracked: set[int],
+    lock: threading.Lock,
+    ignore: set[int],
+    pgid: int | None,
+) -> None:
+    """Track descendants, plus same-pgid orphans/children of the subject.
+
+    Never swallow the clinger's own lineage. Non-interactive shells share a
+    pgid with `cmd &`, so "every pid in the subject's group" is the demo
+    script, the wrapper, and us.
+    """
+    procs = snapshot_processes()
+    with lock:
+        tracked.add(subject)
+        extra: set[int] = set()
+        for pid in list(tracked):
+            extra |= descendants_of(pid, procs)
+        extra.add(subject)
+        extra |= descendants_of(subject, procs)
+        if pgid is not None:
+            for pid, info in procs.items():
+                if pid in ignore or pid == subject:
+                    continue
+                if info["pgid"] != pgid:
+                    continue
+                ppid = info["ppid"]
+                if ppid == subject or ppid in extra or ppid <= 1:
+                    extra.add(pid)
+        extra -= ignore
+        tracked |= extra
+
+
+def proc_sampler(
+    stop: threading.Event,
+    subject: int,
+    tracked: set[int],
+    lock: threading.Lock,
+    interval: float,
+    ignore: set[int],
+    pgid: int | None,
+    commands: list[dict[str, Any]] | None = None,
+    commands_lock: threading.Lock | None = None,
+    timeline: Timeline | None = None,
+    t0: float = 0.0,
+) -> None:
+    last_cmd: str | None = None
+    harvest_tracked(subject, tracked, lock, ignore, pgid)
+    while True:
+        info = proc_info(subject)
+        if info and commands is not None:
+            cmd = info.get("command") or ""
+            if cmd and cmd != last_cmd:
+                rec = {"t": round(monotonic() - t0, 4), "command": cmd}
+                if commands_lock is not None:
+                    with commands_lock:
+                        commands.append(rec)
+                else:
+                    commands.append(rec)
+                if last_cmd is not None and timeline is not None:
+                    timeline.add({"t": rec["t"], "kind": "exec", "command": cmd})
+                last_cmd = cmd
+        if stop.wait(interval):
+            break
+        harvest_tracked(subject, tracked, lock, ignore, pgid)
+    harvest_tracked(subject, tracked, lock, ignore, pgid)
+
+
+def lsof_sampler(
+    stop: threading.Event,
+    subject: int,
+    tracked: set[int],
+    lock: threading.Lock,
+    interval: float,
+    samples: list[dict[str, Any]],
+    samples_lock: threading.Lock,
+    t0: float,
+) -> None:
+    while True:
+        with lock:
+            pids = set(tracked)
+        pids.add(subject)
+        recs = lsof_pids(pids)
+        held = [r for r in recs if is_held_file(r)]
+        # After the pid dies lsof is empty. Keep the last *live* heap.
+        subject_seen = any(r.get("pid") == subject for r in recs)
+        if recs and (subject_seen or held):
+            with samples_lock:
+                samples.append(
+                    {
+                        "t": round(monotonic() - t0, 4),
+                        "n": len(held),
+                        "files": held[:200],
+                    }
+                )
+        if stop.wait(interval):
+            break
+
+
+def wait_pid_still(
+    pid: int,
+    pgid: int | None,
+    wait_group: bool,
+    stop: threading.Event,
+    timeout: float | None,
+    poll_s: float,
+) -> tuple[str, float]:
+    """Block until the wait condition, interrupt, or timeout.
+
+    Returns (reason, monotonic_now). reason in
+    {exited, group-empty, interrupted, timeout, gone}.
+    """
+    t_start = monotonic()
+    if wait_group and pgid is not None:
+        me = os.getpid()
+        while True:
+            if stop.is_set():
+                return "interrupted", monotonic()
+            if timeout is not None and monotonic() - t_start >= timeout:
+                return "timeout", monotonic()
+            procs = snapshot_processes()
+            ignore_now = ancestors_of(me, procs) | descendants_of(me, procs) | {me}
+            live = [
+                p
+                for p, info in procs.items()
+                if info["pgid"] == pgid
+                and not is_zombie(info)
+                and p not in ignore_now
+            ]
+            if not live:
+                return "group-empty", monotonic()
+            stop.wait(poll_s)
+        # unreachable
+
+    # Single pid: kqueue NOTE_EXIT when available, plus poll (zombies, races).
+    kq = None
+    if hasattr(select, "kqueue") and pid_exists(pid):
+        try:
+            kq = select.kqueue()
+            ev = select.kevent(
+                pid,
+                select.KQ_FILTER_PROC,
+                select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                select.KQ_NOTE_EXIT | getattr(select, "KQ_NOTE_EXEC", 0),
+            )
+            kq.control([ev], 0)
+        except OSError:
+            if kq is not None:
+                try:
+                    kq.close()
+                except OSError:
+                    pass
+            kq = None
+
+    try:
+        while True:
+            if stop.is_set():
+                return "interrupted", monotonic()
+            if timeout is not None and monotonic() - t_start >= timeout:
+                return "timeout", monotonic()
+            info = proc_info(pid)
+            if info is None or is_zombie(info):
+                return "exited" if info is None or is_zombie(info) else "gone", monotonic()
+            if not pid_exists(pid):
+                return "exited", monotonic()
+            wait = poll_s
+            if timeout is not None:
+                wait = min(wait, max(0.01, timeout - (monotonic() - t_start)))
+            if kq is not None:
+                try:
+                    recs = kq.control(None, 1, wait)
+                except InterruptedError:
+                    recs = []
+                except OSError:
+                    recs = []
+                    try:
+                        kq.close()
+                    except OSError:
+                        pass
+                    kq = None
+                if recs:
+                    fflags = int(getattr(recs[0], "fflags", 0) or 0)
+                    if fflags & select.KQ_NOTE_EXIT:
+                        return "exited", monotonic()
+                    # NOTE_EXEC (or other PROC notes): pid still alive.
+            else:
+                stop.wait(wait)
+    finally:
+        if kq is not None:
+            try:
+                kq.close()
+            except OSError:
+                pass
+
+
+def late_writes_from_timeline(events: list[dict[str, Any]], exit_t: float) -> list[dict[str, Any]]:
+    out = []
+    seen: set[str] = set()
+    for ev in events:
+        if ev.get("kind") != "fs":
+            continue
+        if ev.get("t", 0) + 1e-9 < exit_t:
+            continue
+        path = ev.get("path")
+        if not path or path in seen:
+            continue
+        flags = ev.get("flags") or ""
+        if "Removed" in flags:
+            continue
+        seen.add(path)
+        out.append(
+            {
+                "t_after_exit": round(ev["t"] - exit_t, 4),
+                "path": path,
+                "flags": flags,
+                "class": ev.get("class"),
+                "via": "watch",
+            }
+        )
+    out.sort(key=lambda r: r["t_after_exit"])
+    return out
+
+
+def late_writes_from_mtimes(
+    paths: Iterable[str],
+    waitpid_wall: float,
+    tmp_roots: list[str],
+    slop: float = 0.02,
+) -> list[dict[str, Any]]:
+    out = []
+    for path in paths:
+        npath = normpath(path)
+        try:
+            mtime = os.path.getmtime(npath)
+        except OSError:
+            continue
+        if mtime + slop < waitpid_wall:
+            continue
+        out.append(
+            {
+                "t_after_exit": round(mtime - waitpid_wall, 4),
+                "path": npath,
+                "flags": "Updated",
+                "class": classify_path(npath, tmp_roots),
+                "via": "mtime",
+            }
+        )
+    out.sort(key=lambda r: r["t_after_exit"])
+    return out
+
+
+def merge_late_writes(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for rec in group:
+            path = rec["path"]
+            prev = by.get(path)
+            if prev is None or rec["t_after_exit"] < prev["t_after_exit"]:
+                if prev and prev.get("via") != rec.get("via"):
+                    rec = {**rec, "via": f"{rec.get('via')}+{prev.get('via')}"}
+                by[path] = rec
+    return sorted(by.values(), key=lambda r: r["t_after_exit"])
+
+
+def aggregate_by_class(paths: Iterable[str], tmp_roots: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for p in paths:
+        counts[classify_path(p, tmp_roots)] += 1
+    return dict(counts)
+
+
+def open_file_summary(recs: list[dict[str, Any]], tmp_roots: list[str]) -> dict[str, Any]:
+    by_dir: dict[str, int] = defaultdict(int)
+    files = []
+    for rec in recs:
+        name = rec.get("name")
+        if not name:
+            continue
+        n = normpath(name)
+        by_dir[os.path.dirname(n)] += 1
+        files.append(
+            {
+                "pid": rec.get("pid"),
+                "fd": rec.get("fd"),
+                "access": rec.get("access"),
+                "path": n,
+                "class": classify_path(n, tmp_roots),
+            }
+        )
+    top_dirs = sorted(by_dir.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+    return {
+        "count": len(files),
+        "files": files[:80],
+        "by_dir": [{"path": p, "count": n} for p, n in top_dirs],
+    }
+
+
+def surviving_open_files(
+    last_held: list[dict[str, Any]], tmp_roots: list[str]
+) -> list[dict[str, Any]]:
+    out = []
+    seen: set[str] = set()
+    for rec in last_held:
+        name = rec.get("name")
+        if not name:
+            continue
+        n = normpath(name)
+        if n in seen:
+            continue
+        seen.add(n)
+        if not os.path.isfile(n):
+            continue
+        out.append(
+            {
+                "path": n,
+                "pid": rec.get("pid"),
+                "fd": rec.get("fd"),
+                "access": rec.get("access"),
+                "class": classify_path(n, tmp_roots),
+                "size": file_meta(n)["size"] if file_meta(n) else None,
+            }
+        )
+    return out
+
+
+def kill_pids(pids: Iterable[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.05)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _die(msg: str, code: int = 2) -> None:
+    print(f"cling: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def resolve_subject(args: argparse.Namespace) -> tuple[int, int, bool, dict[str, Any]]:
+    wait_group = bool(args.group or args.pgid)
+    pid = args.pid
+    if pid is None and args.pgid is None:
+        _die("need a PID or --pgid")
+    if pid is not None and not pid_exists(pid):
+        _die(f"no such pid {pid}")
+    if pid is None:
+        members = group_members(args.pgid)
+        live = []
+        procs = snapshot_processes()
+        for p in members:
+            info = procs.get(p)
+            if info and not is_zombie(info):
+                live.append(p)
+        if not live:
+            _die(f"no live pids in pgid {args.pgid}")
+        pid = args.pgid if args.pgid in live else min(live)
+    info = proc_info(pid)
+    if info is None:
+        _die(f"no such pid {pid}")
+    pgid = args.pgid if args.pgid is not None else int(info["pgid"])
+    return pid, pgid, wait_group, info
+
+
+def attach(args: argparse.Namespace, stop: threading.Event) -> dict[str, Any]:
+    pid, pgid, wait_group, info0 = resolve_subject(args)
+    opens0 = lsof_pids([pid])
+    cwd = args.cwd or discover_cwd(pid, opens0) or os.getcwd()
+    cwd = normpath(cwd)
+    env = proc_environ_ps(pid)
+    tmp_roots = infer_tmp_roots(env, opens0)
+    watch_paths = infer_watch_roots(
+        cwd, opens0, list(args.watch or []), watch_cwd=args.watch_cwd
+    )
+    git_root = git_toplevel(args.cwd or cwd)
+    git_before = git_porcelain(git_root) if git_root else []
+
+    snap_roots = list(watch_paths)
+    before_snap = walk_snapshot(snap_roots, args.include_caches) if snap_roots else {}
+
+    timeline = Timeline(cap=args.max_events)
+    t0 = monotonic()
+    t0_wall = wallclock()
+    timeline.add(
+        {
+            "t": 0.0,
+            "kind": "attach",
+            "pid": pid,
+            "pgid": pgid,
+            "command": info0.get("command"),
+        }
+    )
+
+    fsw = None
+    if watch_paths and not args.poll:
+        fsw = start_fswatch(watch_paths, args.include_caches)
+    stop_poll = threading.Event()
+    watch_backend = "git-bookend"
+    reader_thread = None
+    if fsw is not None:
+        watch_backend = "fswatch"
+        reader_thread = threading.Thread(
+            target=fswatch_reader,
+            args=(fsw, t0, timeline, args.include_caches, tmp_roots),
+            daemon=True,
+        )
+        reader_thread.start()
+        time.sleep(0.05)
+    poll_thread = None
+    if watch_paths:
+        watch_backend = "poll" if fsw is None else "fswatch+poll"
+        poll_thread = threading.Thread(
+            target=poll_walker,
+            args=(
+                stop_poll,
+                watch_paths,
+                args.include_caches,
+                t0,
+                timeline,
+                max(args.poll_ms, 20) / 1000.0,
+                tmp_roots,
+            ),
+            daemon=True,
+        )
+        poll_thread.start()
+
+    ignore_pids = ancestors_of(os.getpid(), snapshot_processes()) | {os.getpid()}
+    if fsw is not None:
+        ignore_pids.add(fsw.pid)
+
+    tracked: set[int] = {pid}
+    tracked_lock = threading.Lock()
+    commands_seen: list[dict[str, Any]] = []
+    commands_lock = threading.Lock()
+    if info0.get("command"):
+        commands_seen.append({"t": 0.0, "command": info0["command"]})
+    stop_ps = threading.Event()
+    ps_thread = threading.Thread(
+        target=proc_sampler,
+        args=(
+            stop_ps,
+            pid,
+            tracked,
+            tracked_lock,
+            max(args.poll_ms, 20) / 1000.0,
+            ignore_pids,
+            pgid,  # always; --group only changes the wait, not who we track
+            commands_seen,
+            commands_lock,
+            timeline,
+            t0,
+        ),
+        daemon=True,
+    )
+    ps_thread.start()
+
+    lsof_samples: list[dict[str, Any]] = []
+    lsof_lock = threading.Lock()
+    stop_lsof = threading.Event()
+    lsof_thread = threading.Thread(
+        target=lsof_sampler,
+        args=(
+            stop_lsof,
+            pid,
+            tracked,
+            tracked_lock,
+            max(args.lsof_ms, 150) / 1000.0,
+            lsof_samples,
+            lsof_lock,
+            t0,
+        ),
+        daemon=True,
+    )
+    lsof_thread.start()
+
+    reason, _abs = wait_pid_still(
+        pid,
+        pgid,
+        wait_group,
+        stop,
+        args.timeout,
+        max(args.poll_ms, 20) / 1000.0,
+    )
+    waitpid_t = monotonic() - t0
+    waitpid_wall = wallclock()
+    timeline.add({"t": round(waitpid_t, 4), "kind": "end", "reason": reason, "pid": pid})
+
+    settle_s = args.settle_ms / 1000.0
+    settle_timeout = args.settle_timeout_ms / 1000.0
+    # settle_loop uses absolute monotonic in its first draft — keep it relative
+    # by wrapping: pass relative end_t and convert internally via t0.
+    last_fs = waitpid_t
+    settle_deadline = waitpid_t + settle_timeout
+    while True:
+        now = monotonic() - t0
+        if now >= settle_deadline or stop.is_set():
+            break
+        events = timeline.snapshot()
+        fs_after = [e for e in events if e.get("kind") == "fs" and e.get("t", 0) >= waitpid_t]
+        if fs_after:
+            last_fs = max(last_fs, max(e["t"] for e in fs_after))
+        if now - last_fs >= settle_s:
+            break
+        stop.wait(max(args.poll_ms, 20) / 1000.0)
+
+    t_end = monotonic() - t0
+    stop_ps.set()
+    stop_poll.set()
+    stop_lsof.set()
+    if fsw is not None:
+        try:
+            fsw.terminate()
+            fsw.wait(timeout=1)
+        except Exception:
+            try:
+                fsw.kill()
+            except OSError:
+                pass
+    if reader_thread is not None:
+        reader_thread.join(timeout=1.5)
+    if poll_thread is not None:
+        poll_thread.join(timeout=1.5)
+    ps_thread.join(timeout=1)
+    lsof_thread.join(timeout=1.5)
+
+    after_snap = walk_snapshot(snap_roots, args.include_caches) if snap_roots else {}
+    git_after = git_porcelain(git_root) if git_root else []
+    fs_diff = (
+        diff_snapshots(before_snap, after_snap)
+        if snap_roots
+        else {"created": [], "updated": [], "deleted": []}
+    )
+
+    procs_now = snapshot_processes()
+    ignore_now = ignore_pids | ancestors_of(os.getpid(), procs_now)
+    with tracked_lock:
+        tracked_copy = set(tracked)
+    live_children = []
+    leaked = []
+    for child in sorted(tracked_copy):
+        if child in ignore_now or child == pid:
+            continue
+        inf = procs_now.get(child)
+        if not inf or is_zombie(inf):
+            continue
+        live_children.append(inf)
+    # Leaks exist only once the wait condition says the subject world ended.
+    if reason in {"exited", "gone", "group-empty"}:
+        leaked = list(live_children)
+
+    events = timeline.snapshot()
+    before_set = porcelain_set(git_before)
+    after_set = porcelain_set(git_after)
+    introduced = [{"status": s, "path": p} for (s, p) in sorted(after_set - before_set)]
+    cleared = [{"status": s, "path": p} for (s, p) in sorted(before_set - after_set)]
+
+    tmp_residue = []
+    for op, items in fs_diff.items():
+        for meta in items:
+            if looks_tmp(meta["path"], tmp_roots):
+                tmp_residue.append({"op": op, "path": meta["path"], "size": meta.get("size")})
+
+    late_watch = late_writes_from_timeline(events, waitpid_t)
+    mtime_paths = []
+    if git_root:
+        for row in introduced:
+            mtime_paths.append(os.path.join(git_root, row["path"]))
+    for op in ("created", "updated"):
+        for meta in fs_diff.get(op, []):
+            mtime_paths.append(meta["path"])
+    for row in tmp_residue:
+        mtime_paths.append(row["path"])
+    late_mtime = late_writes_from_mtimes(mtime_paths, waitpid_wall, tmp_roots)
+    late = merge_late_writes(late_watch, late_mtime)
+
+    with lsof_lock:
+        samples_copy = list(lsof_samples)
+    first_held = (
+        samples_copy[0]["files"]
+        if samples_copy
+        else [r for r in opens0 if is_held_file(r)]
+    )
+    last_held = first_held
+    for sample in reversed(samples_copy):
+        if sample.get("files"):
+            last_held = sample["files"]
+            break
+    leftovers = surviving_open_files(last_held, tmp_roots)
+
+    with commands_lock:
+        execs = list(commands_seen)
+    last_cmd = execs[-1]["command"] if execs else (info0.get("command") if info0 else None)
+    info_end = proc_info(pid)
+    report = {
+        "tool": "cling",
+        "version": VERSION,
+        "mode": "attach",
+        "pid": pid,
+        "pgid": pgid,
+        "wait": "group" if wait_group else "pid",
+        "command": last_cmd,
+        "subject": {
+            "pid": pid,
+            "ppid": info0.get("ppid"),
+            "pgid": pgid,
+            "stat_at_attach": info0.get("stat"),
+            "command": info0.get("command"),
+            "cwd": cwd,
+        },
+        "cwd": cwd,
+        "started_at": iso(t0_wall),
+        "end_reason": reason,
+        "interrupted": reason == "interrupted",
+        "timed_out": reason == "timeout",
+        "target_alive": bool(pid_exists(pid) and (proc_info(pid) and not is_zombie(proc_info(pid)))),
+        "exit_code": None,
+        "duration_ms": int(round(t_end * 1000)),
+        "waitpid_ms": int(round(waitpid_t * 1000)),
+        "settle_ms": int(round((t_end - waitpid_t) * 1000)),
+        "watch_backend": watch_backend if watch_paths else "git-bookend",
+        "waitpid_wall": waitpid_wall,
+        "tmp_roots": tmp_roots,
+        "watch_paths": watch_paths,
+        "inferred_watch": [p for p in watch_paths if p not in {normpath(x) for x in (args.watch or [])}],
+        "late_writes": late,
+        "leaked_processes": leaked,
+        "live_children": live_children if reason in {"interrupted", "timeout"} else [],
+        "git_residue": {
+            "introduced": introduced,
+            "cleared": cleared,
+            "before_count": len(git_before),
+            "after_count": len(git_after),
+            "root": git_root,
+        },
+        "tmp_residue": tmp_residue[:200],
+        "fs_diff": {
+            "created": fs_diff.get("created", [])[:200],
+            "updated": fs_diff.get("updated", [])[:200],
+            "deleted": fs_diff.get("deleted", [])[:200],
+        },
+        "open_at_attach": open_file_summary([r for r in opens0 if is_held_file(r)], tmp_roots),
+        "open_last": open_file_summary(last_held, tmp_roots),
+        "open_leftovers": leftovers[:80],
+        "execs": execs,
+        "lsof_samples": len(samples_copy),
+        "timeline_events": len(events),
+        "timeline_dropped": timeline.dropped,
+        "timeline": events if args.include_timeline else None,
+    }
+
+    if args.kill_leaked and leaked and reason in {"exited", "gone", "group-empty"}:
+        kill_pids([p["pid"] for p in leaked])
+        report["killed_leaked"] = [p["pid"] for p in leaked]
+
+    return report
+
+
+def snapshot_pid(args: argparse.Namespace) -> dict[str, Any]:
+    pid = args.pid
+    if pid is None:
+        _die("snapshot needs a PID")
+    if not pid_exists(pid):
+        _die(f"no such pid {pid}")
+    info = proc_info(pid)
+    if info is None:
+        _die(f"no such pid {pid}")
+    procs = snapshot_processes()
+    kids = descendants_of(pid, procs)
+    group = group_members(info["pgid"], procs)
+    lsof_targets = [pid, *sorted(kids)]
+    opens = lsof_pids(lsof_targets)
+    cwd = args.cwd or discover_cwd(pid, opens) or None
+    env = proc_environ_ps(pid)
+    tmp_roots = infer_tmp_roots(env, opens)
+    held = [r for r in opens if is_held_file(r)]
+    watch = infer_watch_roots(cwd, opens, list(args.watch or []), watch_cwd=args.watch_cwd)
+    children = [procs[p] for p in sorted(kids) if p in procs]
+    return {
+        "tool": "cling",
+        "version": VERSION,
+        "mode": "snapshot",
+        "pid": pid,
+        "pgid": info["pgid"],
+        "ppid": info["ppid"],
+        "stat": info["stat"],
+        "command": info["command"],
+        "cwd": cwd,
+        "alive": True,
+        "children": children,
+        "group_size": len(group),
+        "group": sorted(group)[:40],
+        "tmp_roots": tmp_roots,
+        "watch_would": watch,
+        "open": open_file_summary(held, tmp_roots),
+        "started_at": iso(wallclock()),
+    }
+
+
+def human_attach(report: dict[str, Any]) -> str:
+    sub = report.get("subject") or {}
+    cmd = report.get("command") or sub.get("command") or "?"
+    if len(cmd) > 120:
+        cmd = cmd[:117] + "..."
+    end = report.get("end_reason")
+    alive = report.get("target_alive")
+    lines = [
+        "=== cling ===",
+        f"subject: pid {report['pid']}  pgid {report['pgid']}  wait={report['wait']}",
+        f"command: {cmd}",
+        f"cwd: {report.get('cwd')}",
+        f"end: {end}"
+        + ("  TARGET STILL ALIVE" if alive else "")
+        + ("  (timeout)" if report.get("timed_out") else "")
+        + ("  (interrupted)" if report.get("interrupted") else ""),
+        f"duration: {report['duration_ms']}ms",
+        f"waitpid_at: {report['waitpid_ms']}ms",
+        f"quiesce: {report['settle_ms']}ms after end"
+        + ("  LATE ACTIVITY" if report.get("late_writes") else "  (world already still)"),
+        f"watch: {report.get('watch_backend')}",
+    ]
+    execs = report.get("execs") or []
+    if len(execs) > 1:
+        lines.append(f"execs: {len(execs) - 1} (same pid, image changed)")
+        for ev in execs[1:4]:
+            c = ev.get("command") or ""
+            if len(c) > 100:
+                c = c[:97] + "..."
+            lines.append(f"  +{ev.get('t', 0):.3f}s  {c}")
+    lines.append("")
+    if report.get("late_writes"):
+        lines.append(f"late writes ({len(report['late_writes'])}):")
+        for w in report["late_writes"][:20]:
+            lines.append(f"  +{w['t_after_exit']:.3f}s  {w.get('class') or '':<9} {w['path']}")
+        if len(report["late_writes"]) > 20:
+            lines.append(f"  ... {len(report['late_writes']) - 20} more")
+        lines.append("")
+    leaked = report.get("leaked_processes") or []
+    live = report.get("live_children") or []
+    if leaked:
+        lines.append(f"leaked processes ({len(leaked)}):")
+        for p in leaked[:15]:
+            c = p["command"]
+            if len(c) > 100:
+                c = c[:97] + "..."
+            lines.append(f"  pid {p['pid']:<6} {p['stat']:<4} {c}")
+        lines.append("")
+    elif report.get("end_reason") in {"exited", "gone", "group-empty"}:
+        lines.append("leaked processes: none")
+        lines.append("")
+    if live:
+        lines.append(f"live children at interrupt ({len(live)}):")
+        for p in live[:10]:
+            c = p["command"]
+            if len(c) > 100:
+                c = c[:97] + "..."
+            lines.append(f"  pid {p['pid']:<6} {p['stat']:<4} {c}")
+        lines.append("")
+    leftover = report.get("open_leftovers") or []
+    if leftover:
+        lines.append(f"open-file leftovers ({len(leftover)}):")
+        for p in leftover[:15]:
+            lines.append(f"  {p.get('class') or '':<9} {p['path']}")
+        lines.append("")
+    git_res = report.get("git_residue") or {}
+    intro = git_res.get("introduced") or []
+    if intro:
+        lines.append("git residue (introduced):")
+        for row in intro[:30]:
+            lines.append(f"  {row['status']} {row['path']}")
+        if len(intro) > 30:
+            lines.append(f"  ... {len(intro) - 30} more")
+        lines.append("")
+    else:
+        lines.append("git residue: none")
+        lines.append("")
+    tmp = report.get("tmp_residue") or []
+    if tmp:
+        lines.append(f"tmp residue ({len(tmp)}):")
+        for p in tmp[:20]:
+            lines.append(f"  {p['op']:<7} {p['path']}")
+        if len(tmp) > 20:
+            lines.append(f"  ... {len(tmp) - 20} more")
+        lines.append("")
+    created = (report.get("fs_diff") or {}).get("created") or []
+    if created:
+        by_c = aggregate_by_class([c["path"] for c in created], report.get("tmp_roots") or [])
+        lines.append(f"created files: {len(created)}  {by_c}")
+        for c in created[:12]:
+            lines.append(
+                f"  + {classify_path(c['path'], report.get('tmp_roots') or []):<9} {c['path']}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def human_snapshot(report: dict[str, Any]) -> str:
+    cmd = report.get("command") or "?"
+    if len(cmd) > 120:
+        cmd = cmd[:117] + "..."
+    lines = [
+        "=== cling snapshot ===",
+        f"pid {report['pid']}  pgid {report['pgid']}  ppid {report['ppid']}  {report.get('stat')}",
+        f"command: {cmd}",
+        f"cwd: {report.get('cwd')}",
+        f"children: {len(report.get('children') or [])}  group: {report.get('group_size')}",
+        "",
+    ]
+    kids = report.get("children") or []
+    if kids:
+        lines.append("children:")
+        for p in kids[:15]:
+            c = p["command"]
+            if len(c) > 90:
+                c = c[:87] + "..."
+            lines.append(f"  pid {p['pid']:<6} {p['stat']:<4} {c}")
+        lines.append("")
+    op = report.get("open") or {}
+    files = op.get("files") or []
+    lines.append(f"open held files: {op.get('count', 0)}")
+    for f in files[:15]:
+        lines.append(f"  {f.get('class') or '':<9} fd={f.get('fd')}  {f['path']}")
+    if op.get("count", 0) > 15:
+        lines.append(f"  ... {op['count'] - 15} more")
+    if op.get("by_dir"):
+        lines.append("open by directory:")
+        for d in op["by_dir"][:8]:
+            lines.append(f"  {d['count']:>4}  {d['path']}")
+    would = report.get("watch_would") or []
+    if would:
+        lines.append("")
+        lines.append("watch roots if attached:")
+        for p in would:
+            lines.append(f"  {p}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def emit_report(report: dict[str, Any], args: argparse.Namespace, human_fn) -> None:
+    out_path = getattr(args, "out", None)
+    as_json = getattr(args, "json", False) or bool(out_path)
+    payload = {k: v for k, v in report.items() if v is not None}
+    text = json.dumps(payload, indent=2, default=str)
+    if out_path:
+        Path(out_path).write_text(text + "\n", encoding="utf-8")
+    if getattr(args, "json", False) and not out_path:
+        sys.stdout.write(text + "\n")
+    elif not getattr(args, "quiet", False):
+        sys.stderr.write(human_fn(report))
+
+
+def add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--json", action="store_true", help="JSON on stdout")
+    p.add_argument("--out", help="write JSON report to PATH")
+    p.add_argument("--quiet", action="store_true", help="no human report")
+    p.add_argument("--cwd", help="override subject cwd / git bookend root")
+    p.add_argument("--watch", action="append", default=[], help="extra path to watch (repeatable)")
+    p.add_argument("--watch-cwd", action="store_true", help="poll/fswatch subject cwd even if large")
+    p.add_argument("--include-caches", action="store_true")
+    p.add_argument("--poll", action="store_true", help="force poll backend even if fswatch exists")
+
+
+def add_attach_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("pid", nargs="?", type=int, help="already-running pid")
+    p.add_argument("--pgid", type=int, help="attach to this process group (implies --group)")
+    p.add_argument("--group", action="store_true", help="wait until the subject's pgid is empty")
+    p.add_argument("--settle-ms", type=int, default=350, help="stillness window after last fs event")
+    p.add_argument("--settle-timeout-ms", type=int, default=2500, help="max wait after end")
+    p.add_argument("--poll-ms", type=int, default=50)
+    p.add_argument("--lsof-ms", type=int, default=250, help="how often to resample open files")
+    p.add_argument("--timeout", type=float, default=None, help="stop waiting after SEC (do not kill subject)")
+    p.add_argument("--kill-leaked", action="store_true", help="SIGTERM descendants after the subject ends")
+    p.add_argument("--include-timeline", action="store_true")
+    p.add_argument("--max-events", type=int, default=20000)
+    add_common(p)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cling",
+        description="Attach to an already-running pid/pgid. Wait until it is still (or SIGINT), then report the wake.",
+    )
+    p.add_argument("--version", action="version", version=f"cling {VERSION}")
+    sub = p.add_subparsers(dest="mode")
+    att = sub.add_parser("attach", help="latch onto a pid and wait for stillness")
+    add_attach_args(att)
+    snap = sub.add_parser("snapshot", help="one-shot heap of a running pid (do not wait)")
+    snap.add_argument("pid", type=int)
+    add_common(snap)
+    return p
+
+
+def parse_stdin_pid() -> int | None:
+    if sys.stdin.isatty():
+        return None
+    text = sys.stdin.read()
+    for tok in re.findall(r"\d+", text):
+        return int(tok)
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] not in {"attach", "snapshot", "-h", "--help", "--version"}:
+        argv = ["attach", *argv]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.mode:
+        parser.print_help()
+        return 2
+
+    if args.mode == "snapshot":
+        report = snapshot_pid(args)
+        emit_report(report, args, human_snapshot)
+        return 0
+
+    if getattr(args, "pid", None) is None and getattr(args, "pgid", None) is None:
+        piped = parse_stdin_pid()
+        if piped is not None:
+            args.pid = piped
+        else:
+            print("usage: cling [attach] [options] PID\n       cling snapshot PID", file=sys.stderr)
+            return 2
+
+    stop = threading.Event()
+    nint = {"n": 0}
+
+    def on_int(_signum, _frame) -> None:
+        nint["n"] += 1
+        if nint["n"] == 1:
+            stop.set()
+        else:
+            raise KeyboardInterrupt
+
+    old = signal.signal(signal.SIGINT, on_int)
+    try:
+        report = attach(args, stop)
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+    emit_report(report, args, human_attach)
+    if report.get("timed_out"):
+        return 124
+    if report.get("interrupted"):
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

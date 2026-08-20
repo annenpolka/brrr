@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+"""skew — callee diffs for caller files whose clock is behind.
+
+Clock is file mtime when the worktree differs from HEAD, otherwise the
+last commit that touched the *file*. No git blame. The question is:
+has this callee changed since this caller file was last saved/committed?
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+VERSION = "0.2.0"
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+AT_RE = re.compile(r"^(?P<path>.+):(?P<line>\d+)$")
+COMMIT_HEAD_RE = re.compile(r"^([0-9a-f]{40})\t(\d+)\t(.*)$")
+
+DEF_EXTS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+REF_EXTS = DEF_EXTS | {
+    ".bash",
+    ".json",
+    ".just",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
+REF_FILENAMES = {
+    "dockerfile",
+    "justfile",
+    "makefile",
+    "cmakelists.txt",
+    "gemfile",
+    "rakefile",
+}
+
+DEF_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])"
+    r"(?:(?:pub(?:\([^)]*\))?|public|private|internal|fileprivate|open|"
+    r"protected|static|override|final|async|export|default|abstract|"
+    r"mutating|convenience|required|indirect|unowned|lazy|weak|"
+    r"constexpr|inline|virtual|friend)\s+)*"
+    r"(?:def|fn|func|function|class|struct|enum|trait|interface|protocol|"
+    r"actor|typealias|type|namespace|union)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+BIND_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])"
+    r"(?:(?:pub(?:\([^)]*\))?|public|private|internal|export|static|const|"
+    r"let|var)\s+)+\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\(|<|\[)"
+)
+
+STOP = {
+    "abstract", "actor", "and", "args", "async", "await", "beta", "bool",
+    "boolean", "break", "case", "catch", "class", "colors", "const", "continue",
+    "data",
+    "debug", "def", "default", "display", "elif", "else", "enum", "err",
+    "error", "except", "export", "extends", "false", "file", "final",
+    "finally", "float", "fn", "for", "from", "func", "function", "get", "if",
+    "hunks", "impl", "implements", "import", "in", "index", "insert", "info",
+    "init", "int", "interface", "item", "key", "language", "len", "length",
+    "let", "list", "log", "main", "map", "match", "missing", "mod", "module",
+    "mut",
+    "name", "namespace", "new", "nil", "none", "not", "null", "object", "ok",
+    "open", "or", "override", "package", "path", "paths", "present",
+    "private", "prompt", "protected", "protocol", "pub", "public", "raise",
+    "result", "return", "self", "set", "size", "some", "static", "str",
+    "string", "struct", "super", "switch", "test", "text", "this", "throw",
+    "trait", "true", "try", "type", "undefined", "union", "use", "val",
+    "value", "var", "void", "where", "while", "with", "yield",
+}
+
+
+@dataclasses.dataclass
+class Clock:
+    ts: int
+    kind: str  # commit | mtime
+    rev: str
+    summary: str
+
+
+@dataclasses.dataclass
+class DefSite:
+    name: str
+    path: str
+    line: int
+    end_line: int
+    body: str
+    clock: Clock | None
+
+
+@dataclasses.dataclass
+class FileRef:
+    name: str
+    path: str
+    mentions: list[int]
+    clock: Clock | None
+
+
+@dataclasses.dataclass
+class Cohort:
+    name: str
+    defn: DefSite
+    refs: list[FileRef]
+    old_body: str | None
+    old_rev: str | None
+    status: str  # changed | missing-then
+    diff: str | None
+    lag_days: int
+    sig_changed: bool
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"skew: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git_ok(repo: str, *args: str) -> tuple[int, str, str]:
+    r = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return (
+        r.returncode,
+        r.stdout.decode("utf-8", "replace"),
+        r.stderr.decode("utf-8", "replace"),
+    )
+
+
+def git(repo: str, *args: str) -> str:
+    code, out, err = git_ok(repo, *args)
+    if code != 0:
+        raise RuntimeError(err.strip() or f"git {' '.join(args)} failed")
+    return out
+
+
+def toplevel(path: str) -> str:
+    code, out, err = git_ok(path, "rev-parse", "--show-toplevel")
+    if code != 0:
+        die(f"not a git repository: {path}")
+    return out.strip()
+
+
+def is_ref_file(path: str) -> bool:
+    base = os.path.basename(path).lower()
+    if base in REF_FILENAMES:
+        return True
+    return os.path.splitext(path)[1].lower() in REF_EXTS
+
+
+def is_def_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in DEF_EXTS
+
+
+def list_files(repo: str, pathspecs: list[str]) -> list[str]:
+    args = ["ls-files", "-z", "--"]
+    if pathspecs:
+        args.extend(pathspecs)
+    out = git(repo, *args)
+    return [p for p in out.split("\0") if p and is_ref_file(p)]
+
+
+def read_file(repo: str, path: str) -> str | None:
+    full = os.path.join(repo, path)
+    try:
+        if os.path.getsize(full) > 2_000_000:
+            return None
+        with open(full, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def keep_name(name: str, forced: set[str] | None = None) -> bool:
+    if forced and name in forced:
+        return True
+    if name.lower() in STOP:
+        return False
+    if len(name) < 3:
+        return False
+    if name.startswith("_") and len(name) < 5:
+        return False
+    return True
+
+
+def def_matches(text: str) -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for rx in (DEF_RE, BIND_RE):
+        for m in rx.finditer(text):
+            name = m.group(1)
+            if not keep_name(name):
+                continue
+            line = text.count("\n", 0, m.start(1)) + 1
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((name, line))
+    return found
+
+
+def header_kind(lines: list[str], start: int) -> tuple[int, str]:
+    i = start
+    n = len(lines)
+    while i < n and i - start <= 40:
+        stripped = lines[i].rstrip()
+        if "{" in lines[i]:
+            return i, "brace"
+        if stripped.endswith(";") and ":" not in stripped[-4:]:
+            return i, "decl"
+        if stripped.endswith(":") and not stripped.endswith(","):
+            return i, "indent"
+        i += 1
+    return start, "indent"
+
+
+def span_end(lines: list[str], start: int) -> int:
+    n = len(lines)
+    last, kind = header_kind(lines, start)
+    if kind == "decl":
+        return last
+    if kind == "brace":
+        depth = 0
+        started = False
+        i = start
+        while i < n:
+            depth += lines[i].count("{") - lines[i].count("}")
+            if "{" in lines[i]:
+                started = True
+            if started and depth <= 0:
+                return i
+            i += 1
+        return n - 1
+    base = len(lines[start]) - len(lines[start].lstrip(" \t"))
+    end = last
+    i = last + 1
+    while i < n:
+        if not lines[i].strip():
+            end = i
+            i += 1
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip(" \t"))
+        if indent <= base:
+            break
+        end = i
+        i += 1
+    return end
+
+
+def extract_named_span(
+    text: str, name: str, near_line: int | None = None
+) -> tuple[int, int, str] | None:
+    sites = [(n, ln) for n, ln in def_matches(text) if n == name]
+    if not sites:
+        return None
+    if near_line is None:
+        line = sites[0][1]
+    else:
+        line = min(sites, key=lambda s: abs(s[1] - near_line))[1]
+    lines = text.splitlines()
+    if line < 1 or line > len(lines):
+        return None
+    start = line - 1
+    end = span_end(lines, start)
+    body = "\n".join(lines[start : end + 1])
+    return line, end + 1, body
+
+
+def parse_file_log(text: str) -> dict[str, Clock]:
+    """Newest commit that touched each path (first sighting in git log)."""
+    clocks: dict[str, Clock] = {}
+    cur: Clock | None = None
+    for line in text.splitlines():
+        m = COMMIT_HEAD_RE.match(line)
+        if m:
+            cur = Clock(
+                ts=int(m.group(2)),
+                kind="commit",
+                rev=m.group(1),
+                summary=m.group(3),
+            )
+            continue
+        if not line or cur is None:
+            continue
+        if line not in clocks:
+            clocks[line] = cur
+    return clocks
+
+
+def dirty_paths(repo: str) -> set[str]:
+    """Tracked paths whose worktree (or index) differs from HEAD."""
+    code, out, _ = git_ok(repo, "diff", "--name-only", "-z", "HEAD")
+    if code != 0 or not out:
+        return set()
+    return {p for p in out.split("\0") if p}
+
+
+def load_clocks(repo: str, files: list[str]) -> dict[str, Clock]:
+    log = git(repo, "log", "--pretty=format:%H%x09%ct%x09%s", "--name-only")
+    clocks = parse_file_log(log)
+    dirty = dirty_paths(repo)
+    want = set(files)
+    for path in files:
+        if path not in dirty:
+            continue
+        full = os.path.join(repo, path)
+        try:
+            ts = int(os.path.getmtime(full))
+        except OSError:
+            continue
+        prev = clocks.get(path)
+        summary = "uncommitted"
+        if prev and prev.summary:
+            summary = f"uncommitted (was: {prev.summary})"
+        clocks[path] = Clock(ts=ts, kind="mtime", rev="WORKTREE", summary=summary)
+    # Staged-only new files may be absent from log.
+    for path in want:
+        if path in clocks:
+            continue
+        full = os.path.join(repo, path)
+        try:
+            ts = int(os.path.getmtime(full))
+        except OSError:
+            continue
+        clocks[path] = Clock(ts=ts, kind="mtime", rev="WORKTREE", summary="uncommitted")
+    return clocks
+
+
+def asof_rev(repo: str, clock: Clock, cache: dict[int, str]) -> str:
+    """Tree-ish the caller file was last saved against."""
+    if clock.kind == "commit" and clock.rev and clock.rev != "WORKTREE":
+        return clock.rev
+    if clock.ts in cache:
+        return cache[clock.ts]
+    when = dt.datetime.fromtimestamp(clock.ts, dt.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S +0000"
+    )
+    code, out, _ = git_ok(repo, "rev-list", "-1", f"--before={when}", "HEAD")
+    rev = out.strip() if code == 0 and out.strip() else "HEAD"
+    cache[clock.ts] = rev
+    return rev
+
+
+def show_at(
+    repo: str, rev: str, path: str, cache: dict[tuple[str, str], str | None]
+) -> str | None:
+    key = (rev, path)
+    if key in cache:
+        return cache[key]
+    if not rev or rev == "WORKTREE":
+        cache[key] = read_file(repo, path)
+        return cache[key]
+    code, out, _ = git_ok(repo, "show", f"{rev}:{path}")
+    cache[key] = out if code == 0 else None
+    return cache[key]
+
+
+def _norm(s: str) -> str:
+    return "\n".join(line.rstrip() for line in s.strip().splitlines())
+
+
+def header_has_name(body: str, name: str) -> bool:
+    sig = header_sig(body)
+    if not sig:
+        return False
+    return name in IDENT_RE.findall(sig)
+
+
+def header_sig(body: str) -> str:
+    if not body:
+        return ""
+    acc: list[str] = []
+    for line in body.splitlines()[:40]:
+        acc.append(line.rstrip())
+        if "{" in line or line.rstrip().endswith(":") or (
+            line.rstrip().endswith(";") and len(acc) == 1
+        ):
+            break
+    text = "\n".join(acc)
+    if "{" in text:
+        text = text.split("{", 1)[0]
+    return _norm(text)
+
+
+def unify(old: str, new: str, name: str, old_label: str, new_label: str) -> str:
+    diff = difflib.unified_diff(
+        (old or "").splitlines(),
+        (new or "").splitlines(),
+        fromfile=f"a/{name}@{old_label}",
+        tofile=f"b/{name}@{new_label}",
+        lineterm="",
+        n=2,
+    )
+    return "\n".join(diff)
+
+
+def short(rev: str) -> str:
+    if not rev or rev == "WORKTREE":
+        return "WORKTREE"
+    if rev.strip("0") == "":
+        return "WORKTREE"
+    return rev[:9]
+
+
+def ymd(ts: int) -> str:
+    if not ts:
+        return "unknown"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def days_between(newer: int, older: int) -> int:
+    if not newer or not older:
+        return 0
+    return max(0, int((newer - older) / 86400))
+
+
+def classify_query(repo: str, q: str) -> tuple[str, str, int | None]:
+    m = AT_RE.match(q)
+    if m:
+        return "at", m.group("path"), int(m.group("line"))
+    full = os.path.join(repo, q)
+    if os.path.exists(full) or "/" in q or q.startswith("."):
+        return "path", q, None
+    return "symbol", q, None
+
+
+def collect(
+    repo: str,
+    files: list[str],
+    forced: set[str],
+    clocks: dict[str, Clock],
+) -> tuple[list[DefSite], list[FileRef]]:
+    texts: dict[str, str] = {}
+    for path in files:
+        text = read_file(repo, path)
+        if text is None:
+            continue
+        texts[path] = text
+
+    defs: list[DefSite] = []
+    def_index: dict[str, list[DefSite]] = defaultdict(list)
+    def_spans: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+
+    for path, text in texts.items():
+        if not is_def_file(path):
+            continue
+        lines = text.splitlines()
+        for name, line in def_matches(text):
+            if not keep_name(name, forced):
+                continue
+            start = line - 1
+            if start >= len(lines):
+                continue
+            end = span_end(lines, start)
+            body = "\n".join(lines[start : end + 1])
+            site = DefSite(
+                name=name,
+                path=path,
+                line=line,
+                end_line=end + 1,
+                body=body,
+                clock=clocks.get(path),
+            )
+            defs.append(site)
+            def_index[name].append(site)
+            def_spans[name].append((path, line, end + 1))
+
+    if forced:
+        names = set(forced)
+    else:
+        names = set()
+        for name, sites in def_index.items():
+            paths = {s.path for s in sites}
+            if len(sites) > 12 or len(paths) > 8:
+                continue
+            names.add(name)
+    defs = [d for d in defs if d.name in names]
+    if not forced:
+        # Brace-counting can swallow a whole Rust/Swift file and call it
+        # a "signature change". Unscoped runs drop those fake callees.
+        defs = [
+            d
+            for d in defs
+            if (d.end_line - d.line) <= 160 and header_has_name(d.body, d.name)
+        ]
+        names = {d.name for d in defs}
+
+    # Mentions, collapsed per (name, file). Same-file mentions of a def
+    # are not a clock skew — the file cannot be behind itself.
+    mentions: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for path, text in texts.items():
+        for i, line in enumerate(text.splitlines(), 1):
+            for tok in IDENT_RE.findall(line):
+                if tok not in names:
+                    continue
+                if not keep_name(tok, forced):
+                    continue
+                skip = False
+                for dpath, start, end in def_spans.get(tok, []):
+                    if dpath == path and start <= i <= end:
+                        skip = True
+                        break
+                if skip:
+                    continue
+                key = (tok, path)
+                if i not in mentions[key]:
+                    mentions[key].append(i)
+
+    refs: list[FileRef] = []
+    for (name, path), lines in mentions.items():
+        # Drop refs that only live in a file that *defines* the name
+        # (intra-file sleep is a blame question; we killed that clock).
+        if all(d.path == path for d in def_index.get(name, [])):
+            only_here = def_index.get(name, [])
+            if only_here and all(d.path == path for d in only_here):
+                continue
+        refs.append(
+            FileRef(
+                name=name,
+                path=path,
+                mentions=sorted(lines),
+                clock=clocks.get(path),
+            )
+        )
+
+    if not forced:
+        file_occ: dict[str, set[str]] = defaultdict(set)
+        mention_n: dict[str, int] = defaultdict(int)
+        for r in refs:
+            file_occ[r.name].add(r.path)
+            mention_n[r.name] += len(r.mentions)
+        nfiles = max(1, len(texts))
+        rare = set()
+        for name in names:
+            if mention_n[name] > 80:
+                continue
+            if len(file_occ[name]) > max(12, int(nfiles * 0.35)):
+                continue
+            rare.add(name)
+        defs = [d for d in defs if d.name in rare]
+        refs = [r for r in refs if r.name in rare]
+
+    return defs, refs
+
+
+def pick_def(sites: list[DefSite], ref: FileRef) -> DefSite | None:
+    if not sites:
+        return None
+    other = [s for s in sites if s.path != ref.path]
+    pool = other or sites
+    return min(
+        pool,
+        key=lambda s: (s.path == ref.path, abs(s.line - (ref.mentions[0] if ref.mentions else 0)), s.path),
+    )
+
+
+def build_cohorts(
+    repo: str,
+    defs: list[DefSite],
+    refs: list[FileRef],
+    min_days: int,
+    at_filter: tuple[str, int] | None,
+    limit: int,
+    ghosts: bool,
+    sig_only: bool,
+    dirty_only: bool,
+) -> list[Cohort]:
+    by_name: dict[str, list[DefSite]] = defaultdict(list)
+    for d in defs:
+        if d.clock is None:
+            continue
+        by_name[d.name].append(d)
+
+    show_cache: dict[tuple[str, str], str | None] = {}
+    asof_cache: dict[int, str] = {}
+    groups: dict[tuple[str, str, str], Cohort] = {}
+
+    for r in refs:
+        if r.clock is None:
+            continue
+        if at_filter and r.path != at_filter[0]:
+            continue
+        if at_filter and at_filter[1] not in r.mentions:
+            continue
+        d = pick_def(by_name.get(r.name, []), r)
+        if d is None or d.clock is None:
+            continue
+        if d.path == r.path:
+            continue
+        if dirty_only and d.clock.kind != "mtime":
+            continue
+        cts, dts = r.clock.ts, d.clock.ts
+        if cts >= dts:
+            continue
+        if (
+            r.clock.kind == "commit"
+            and d.clock.kind == "commit"
+            and r.clock.rev == d.clock.rev
+        ):
+            continue
+        lag = days_between(dts, cts)
+        if lag < min_days and d.clock.kind != "mtime":
+            continue
+        # Same-session dirty-vs-dirty (both mtime, same calendar day) is
+        # two buffers in one sitting, not "hasn't been saved through".
+        if r.clock.kind == "mtime" and d.clock.kind == "mtime" and lag == 0:
+            continue
+
+        old_rev = asof_rev(repo, r.clock, asof_cache)
+        text = show_at(repo, old_rev, d.path, show_cache)
+        old_body = None
+        diff = None
+        if text is None:
+            status = "missing-then"
+        else:
+            got = extract_named_span(text, d.name, d.line)
+            if got is None:
+                status = "missing-then"
+            else:
+                old_body = got[2]
+                if _norm(old_body) == _norm(d.body):
+                    continue
+                status = "changed"
+                new_label = "WORKTREE" if d.clock.kind == "mtime" else "HEAD"
+                diff = unify(
+                    old_body,
+                    d.body,
+                    d.name,
+                    short(old_rev),
+                    new_label,
+                )
+        sig_changed = bool(old_body and header_sig(old_body) != header_sig(d.body))
+        key = (d.name, d.path, old_body if old_body is not None else f"#{status}")
+        if key not in groups:
+            groups[key] = Cohort(
+                name=d.name,
+                defn=d,
+                refs=[],
+                old_body=old_body,
+                old_rev=old_rev,
+                status=status,
+                diff=diff,
+                lag_days=lag,
+                sig_changed=sig_changed,
+            )
+        c = groups[key]
+        existing = next((x for x in c.refs if x.path == r.path), None)
+        if existing is None:
+            c.refs.append(r)
+        else:
+            for ln in r.mentions:
+                if ln not in existing.mentions:
+                    existing.mentions.append(ln)
+            existing.mentions.sort()
+        c.lag_days = max(c.lag_days, lag)
+
+    cohorts = list(groups.values())
+    if not ghosts:
+        cohorts = [c for c in cohorts if c.status == "changed"]
+    if sig_only:
+        cohorts = [c for c in cohorts if c.sig_changed]
+    cohorts.sort(
+        key=lambda c: (
+            0 if c.defn.clock and c.defn.clock.kind == "mtime" else 1,
+            0 if any(is_def_file(r.path) for r in c.refs) else 1,
+            0 if c.sig_changed else 1,
+            0 if c.status == "changed" else 1,
+            -sum(1 for r in c.refs if is_def_file(r.path)),
+            -c.lag_days,
+            c.name,
+        )
+    )
+    return cohorts[:limit]
+
+
+def mention_label(refs: FileRef) -> str:
+    if not refs.mentions:
+        return ""
+    shown = ",".join(f":{n}" for n in refs.mentions[:4])
+    extra = f"+{len(refs.mentions) - 4}" if len(refs.mentions) > 4 else ""
+    return shown + extra
+
+
+def format_human(cohorts: list[Cohort], show_diff: bool) -> str:
+    if not cohorts:
+        return "skew: no skewed caller files\n"
+    out: list[str] = []
+    for c in cohorts:
+        d = c.defn
+        ck = d.clock
+        head = (
+            f"{c.name}\n"
+            f"  def   {d.path}:{d.line}-{d.end_line}  {ymd(ck.ts if ck else 0)}  "
+            f"{short(ck.rev if ck else '')}  {ck.kind if ck else '?'}  "
+            f"{ck.summary if ck else ''}"
+        )
+        out.append(head)
+        shape = "sig" if c.sig_changed else "body"
+        n = len(c.refs)
+        out.append(
+            f"  {c.status}  {shape}  {n} file{'s' if n != 1 else ''}  "
+            f"lag {c.lag_days}d"
+        )
+        for r in c.refs[:12]:
+            bl = r.clock
+            out.append(
+                f"    {r.path}  {ymd(bl.ts if bl else 0)}  "
+                f"{short(bl.rev if bl else '')}  {bl.kind if bl else '?'}  "
+                f"{mention_label(r)}"
+            )
+        if len(c.refs) > 12:
+            out.append(f"    … {len(c.refs) - 12} more")
+        if show_diff and c.diff:
+            for line in c.diff.splitlines():
+                out.append(f"    {line}")
+        elif show_diff and c.status == "missing-then":
+            out.append("    (definition did not exist at caller file's last clock)")
+        out.append("")
+    return "\n".join(out)
+
+
+def format_tsv(cohorts: list[Cohort]) -> str:
+    rows = [
+        "name\tstatus\tsig_changed\tlag_days\tdef_path\tdef_line\tdef_rev\t"
+        "def_clock\tdef_date\tref_path\tref_rev\tref_clock\tref_date\tmention_line"
+    ]
+    for c in cohorts:
+        d = c.defn
+        for r in c.refs:
+            mentions = r.mentions or [0]
+            for ln in mentions:
+                rows.append(
+                    "\t".join(
+                        [
+                            c.name,
+                            c.status,
+                            "1" if c.sig_changed else "0",
+                            str(c.lag_days),
+                            d.path,
+                            str(d.line),
+                            short(d.clock.rev if d.clock else ""),
+                            d.clock.kind if d.clock else "",
+                            ymd(d.clock.ts if d.clock else 0),
+                            r.path,
+                            short(r.clock.rev if r.clock else ""),
+                            r.clock.kind if r.clock else "",
+                            ymd(r.clock.ts if r.clock else 0),
+                            str(ln),
+                        ]
+                    )
+                )
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def format_json(cohorts: list[Cohort], show_diff: bool) -> str:
+    payload = []
+    for c in cohorts:
+        d = c.defn
+        payload.append(
+            {
+                "name": c.name,
+                "status": c.status,
+                "sig_changed": c.sig_changed,
+                "lag_days": c.lag_days,
+                "def": {
+                    "path": d.path,
+                    "line": d.line,
+                    "end_line": d.end_line,
+                    "rev": d.clock.rev if d.clock else None,
+                    "clock": d.clock.kind if d.clock else None,
+                    "date": ymd(d.clock.ts if d.clock else 0),
+                    "summary": d.clock.summary if d.clock else None,
+                },
+                "refs": [
+                    {
+                        "path": r.path,
+                        "rev": r.clock.rev if r.clock else None,
+                        "clock": r.clock.kind if r.clock else None,
+                        "date": ymd(r.clock.ts if r.clock else 0),
+                        "mentions": r.mentions,
+                    }
+                    for r in c.refs
+                ],
+                "old_rev": c.old_rev,
+                "diff": c.diff if show_diff else None,
+            }
+        )
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="skew",
+        description=(
+            "Show callee definition-diffs for caller files whose save/commit "
+            "clock is behind the callee file. Clock is worktree mtime when "
+            "dirty, else the last commit that touched the file. No blame."
+        ),
+    )
+    p.add_argument("queries", nargs="*", help="symbol, path, or path:line")
+    p.add_argument("--repo", default=".", help="git repository (default: .)")
+    p.add_argument("--format", choices=("human", "json", "tsv"), default="human")
+    p.add_argument("--diff", action="store_true", help="print unified diffs")
+    p.add_argument(
+        "--ghosts",
+        action="store_true",
+        help="include files whose definition did not exist yet (default: hide)",
+    )
+    p.add_argument(
+        "--sig",
+        action="store_true",
+        help="only report cohorts whose header/signature changed",
+    )
+    p.add_argument(
+        "--dirty",
+        action="store_true",
+        help="only callees whose clock is worktree mtime (HEAD vs worktree)",
+    )
+    p.add_argument("--min-days", type=int, default=0, help="minimum lag in days")
+    p.add_argument("--limit", type=int, default=40, help="max cohorts to report")
+    p.add_argument("--check", action="store_true", help="exit 1 if any cohort found")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.version:
+        print(VERSION)
+        return 0
+    repo = toplevel(os.path.abspath(args.repo))
+    forced: set[str] = set()
+    pathspecs: list[str] = []
+    at_filter: tuple[str, int] | None = None
+    for q in args.queries:
+        kind, val, line = classify_query(repo, q)
+        if kind == "symbol":
+            forced.add(val)
+        elif kind == "at":
+            at_filter = (val, line or 0)
+        else:
+            pathspecs.append(val)
+
+    all_files = list_files(repo, [])
+    if not all_files:
+        die("no tracked source files match", 1)
+    allow: set[str] | None = None
+    if pathspecs:
+        allow = set(list_files(repo, pathspecs))
+    if at_filter:
+        allow = (allow or set()) | {at_filter[0]}
+
+    clocks = load_clocks(repo, all_files)
+    if args.verbose:
+        n_mtime = sum(1 for p in all_files if clocks.get(p) and clocks[p].kind == "mtime")
+        print(f"skew: {len(all_files)} files, {n_mtime} dirty-mtime clocks", file=sys.stderr)
+
+    defs, refs = collect(repo, all_files, forced, clocks)
+
+    if forced:
+        defs = [d for d in defs if d.name in forced]
+        refs = [r for r in refs if r.name in forced]
+    if allow is not None:
+        refs = [r for r in refs if r.path in allow]
+
+    if at_filter:
+        names_on_line = {
+            r.name
+            for r in refs
+            if r.path == at_filter[0] and at_filter[1] in r.mentions
+        }
+        # Clock stays file-level; the line only selects which tokens to join.
+        refs = [
+            FileRef(
+                name=r.name,
+                path=r.path,
+                mentions=[at_filter[1]],
+                clock=r.clock,
+            )
+            for r in refs
+            if r.path == at_filter[0] and at_filter[1] in r.mentions
+        ]
+        defs = [d for d in defs if d.name in names_on_line]
+        if not refs:
+            print(
+                f"skew: no tracked symbols on {at_filter[0]}:{at_filter[1]}",
+                file=sys.stderr,
+            )
+
+    ghosts = args.ghosts or bool(forced or at_filter)
+    cohorts = build_cohorts(
+        repo,
+        defs,
+        refs,
+        min_days=args.min_days,
+        at_filter=at_filter,
+        limit=max(1, args.limit),
+        ghosts=ghosts,
+        sig_only=args.sig,
+        dirty_only=args.dirty,
+    )
+
+    if args.format == "json":
+        sys.stdout.write(format_json(cohorts, show_diff=True))
+    elif args.format == "tsv":
+        sys.stdout.write(format_tsv(cohorts))
+    else:
+        sys.stdout.write(format_human(cohorts, show_diff=args.diff))
+
+    if args.check and cohorts:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

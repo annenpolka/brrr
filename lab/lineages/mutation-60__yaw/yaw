@@ -1,0 +1,1073 @@
+#!/usr/bin/env python3
+"""yaw — kernel slew between two clocks.
+
+Two clock names or two readings. Stdout is one of: SLEW  SLEEP  STEP  REST
+
+Never wraps a command. Never calls the gap NTP.
+
+Darwin first-class clocks:
+
+  CLOCK_MONOTONIC       POSIX name: includes sleep, adjtime-slewed
+  CLOCK_MONOTONIC_RAW   includes sleep, unslewed
+  CLOCK_UPTIME_RAW      pauses on sleep, unslewed
+  CLOCK_REALTIME        wall; can STEP; adjtime-slewed with MONOTONIC
+  python.monotonic      Darwin: CLOCK_UPTIME_RAW (Python never exposes RAW)
+  kern.boottime         wall origin for since-boot comparison
+
+The object is CLOCK_MONOTONIC − CLOCK_MONOTONIC_RAW (adjtime).
+scarp names that offset `ntp`. It is not.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import ctypes
+import json
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+VERSION = "0.2"
+
+EPS = 1e-3  # 1ms sampling floor
+SLEEP_MIN = 0.05
+SLEW_MIN = 1e-3
+STEP_MIN = 0.05
+ORIGIN_MIXED = 1e7
+
+USAGE = """yaw — kernel slew between two clocks
+
+Usage:
+  yaw [CLOCK_A CLOCK_B]          live pair (default: CLOCK_MONOTONIC vs RAW)
+  yaw clocks                     dump Darwin / POSIX clocks (no spawn)
+  yaw --all                      classify every canonical pair
+  yaw [--as A B]                 filter stdin (named readings, JSON, TSV)
+  yaw selftest
+
+Stdout is SLEW, SLEEP, STEP, or REST. No command wrapping. No NTP.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Clock kinds. Darwin CLOCK_MONOTONIC is first-class, not an alias of RAW.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Kind:
+    name: str
+    origin: str  # "epoch" | "boot"
+    sleep: bool  # keeps ticking across host suspend
+    slew: bool  # adjtime / ntp_adjtime frequency
+
+
+def _darwin_kinds() -> dict[str, Kind]:
+    return {
+        "CLOCK_REALTIME": Kind("CLOCK_REALTIME", "epoch", True, True),
+        "CLOCK_MONOTONIC": Kind("CLOCK_MONOTONIC", "boot", True, True),
+        "CLOCK_MONOTONIC_RAW": Kind("CLOCK_MONOTONIC_RAW", "boot", True, False),
+        "CLOCK_UPTIME_RAW": Kind("CLOCK_UPTIME_RAW", "boot", False, False),
+        "python.monotonic": Kind("python.monotonic", "boot", False, False),
+        "kern.boottime": Kind("kern.boottime", "epoch", True, True),
+        "kern.sleeptime": Kind("kern.sleeptime", "epoch", True, True),
+        "kern.waketime": Kind("kern.waketime", "epoch", True, True),
+        "CLOCK_MONOTONIC_RAW_APPROX": Kind(
+            "CLOCK_MONOTONIC_RAW_APPROX", "boot", True, False
+        ),
+        "CLOCK_UPTIME_RAW_APPROX": Kind(
+            "CLOCK_UPTIME_RAW_APPROX", "boot", False, False
+        ),
+    }
+
+
+def _linux_kinds() -> dict[str, Kind]:
+    # CLOCK_MONOTONIC: no suspend, adjtime-slewed (clock_gettime(2)).
+    # CLOCK_BOOTTIME: suspend + adjtime. Python monotonic is CLOCK_MONOTONIC.
+    return {
+        "CLOCK_REALTIME": Kind("CLOCK_REALTIME", "epoch", True, True),
+        "CLOCK_MONOTONIC": Kind("CLOCK_MONOTONIC", "boot", False, True),
+        "CLOCK_MONOTONIC_RAW": Kind("CLOCK_MONOTONIC_RAW", "boot", False, False),
+        "CLOCK_BOOTTIME": Kind("CLOCK_BOOTTIME", "boot", True, True),
+        "python.monotonic": Kind("python.monotonic", "boot", False, True),
+        "kern.boottime": Kind("kern.boottime", "epoch", True, True),
+    }
+
+
+def _fallback_kinds() -> dict[str, Kind]:
+    return {
+        "CLOCK_REALTIME": Kind("CLOCK_REALTIME", "epoch", True, True),
+        "CLOCK_MONOTONIC": Kind("CLOCK_MONOTONIC", "boot", True, True),
+        "python.monotonic": Kind("python.monotonic", "boot", True, True),
+        "kern.boottime": Kind("kern.boottime", "epoch", True, True),
+    }
+
+
+def platform_kind() -> str:
+    if sys.platform == "darwin" and hasattr(time, "CLOCK_MONOTONIC_RAW") and hasattr(
+        time, "CLOCK_UPTIME_RAW"
+    ):
+        return "darwin"
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        return "linux"
+    return "fallback"
+
+
+PLATFORM = platform_kind()
+KINDS: dict[str, Kind] = {
+    "darwin": _darwin_kinds,
+    "linux": _linux_kinds,
+    "fallback": _fallback_kinds,
+}[PLATFORM]()
+
+ALIASES: dict[str, str] = {
+    "wall": "CLOCK_REALTIME",
+    "realtime": "CLOCK_REALTIME",
+    "clock_realtime": "CLOCK_REALTIME",
+    "time": "CLOCK_REALTIME",
+    "monotonic": "CLOCK_MONOTONIC",
+    "posix": "CLOCK_MONOTONIC",
+    "posix_monotonic": "CLOCK_MONOTONIC",
+    "clock_monotonic": "CLOCK_MONOTONIC",
+    "raw": "CLOCK_MONOTONIC_RAW",
+    "monotonic_raw": "CLOCK_MONOTONIC_RAW",
+    "clock_monotonic_raw": "CLOCK_MONOTONIC_RAW",
+    "machine": "CLOCK_MONOTONIC_RAW",  # scarp's unslewed machine
+    "uptime": "CLOCK_UPTIME_RAW",
+    "uptime_raw": "CLOCK_UPTIME_RAW",
+    "clock_uptime_raw": "CLOCK_UPTIME_RAW",
+    "awake": "CLOCK_UPTIME_RAW",
+    "python.monotonic": "python.monotonic",
+    "python_monotonic": "python.monotonic",
+    "time.monotonic": "python.monotonic",
+    "boot": "kern.boottime",
+    "boottime": "kern.boottime",
+    "kern.boottime": "kern.boottime",
+    "kern_boottime": "kern.boottime",
+    "sleeptime": "kern.sleeptime",
+    "kern.sleeptime": "kern.sleeptime",
+    "waketime": "kern.waketime",
+    "kern.waketime": "kern.waketime",
+}
+
+DEFAULT_PAIR = ("CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW")
+
+CANONICAL_PAIRS: list[tuple[str, str]] = [
+    ("CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW"),
+    ("CLOCK_MONOTONIC_RAW", "CLOCK_UPTIME_RAW"),
+    ("CLOCK_REALTIME", "CLOCK_MONOTONIC"),
+    ("CLOCK_REALTIME", "CLOCK_MONOTONIC_RAW"),
+    ("CLOCK_REALTIME", "python.monotonic"),
+    ("python.monotonic", "CLOCK_UPTIME_RAW"),
+    ("python.monotonic", "CLOCK_MONOTONIC_RAW"),
+    ("CLOCK_MONOTONIC", "python.monotonic"),
+]
+
+
+def canon(name: str) -> str:
+    k = name.strip()
+    if k in KINDS:
+        return k
+    n = k.lower().replace("-", "_")
+    if n in ALIASES:
+        return ALIASES[n]
+    if n.startswith("clock_") and n.upper() in KINDS:
+        return n.upper()
+    raise SystemExit(f"yaw: unknown clock {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Read clocks. ctypes sysctl, never sysctl(8).
+# ---------------------------------------------------------------------------
+
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int64), ("tv_usec", ctypes.c_int32)]
+
+
+_LIBC: Any = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL(None)
+        except OSError:
+            _LIBC = False
+    return _LIBC or None
+
+
+def sysctl_timeval(name: str) -> float | None:
+    if sys.platform != "darwin":
+        return None
+    libc = _libc()
+    if libc is None:
+        return None
+    tv = _Timeval()
+    size = ctypes.c_size_t(ctypes.sizeof(tv))
+    libc.sysctlbyname.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    libc.sysctlbyname.restype = ctypes.c_int
+    rc = libc.sysctlbyname(name.encode(), ctypes.byref(tv), ctypes.byref(size), None, 0)
+    if rc != 0:
+        return None
+    return float(tv.tv_sec) + float(tv.tv_usec) / 1_000_000.0
+
+
+def linux_btime() -> float | None:
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+def boottime_now() -> float | None:
+    if PLATFORM == "darwin":
+        return sysctl_timeval("kern.boottime")
+    if PLATFORM == "linux":
+        return linux_btime()
+    return None
+
+
+def _gettime(attr: str) -> float | None:
+    clk = getattr(time, attr, None)
+    if clk is None:
+        return None
+    try:
+        return float(time.clock_gettime(clk))
+    except (OSError, ValueError):
+        return None
+
+
+def sample() -> dict[str, float]:
+    """One snapshot. POSIX CLOCK_MONOTONIC is kept distinct from RAW."""
+    out: dict[str, float] = {}
+    for attr in (
+        "CLOCK_REALTIME",
+        "CLOCK_MONOTONIC",
+        "CLOCK_MONOTONIC_RAW",
+        "CLOCK_UPTIME_RAW",
+        "CLOCK_BOOTTIME",
+        "CLOCK_MONOTONIC_RAW_APPROX",
+        "CLOCK_UPTIME_RAW_APPROX",
+    ):
+        v = _gettime(attr)
+        if v is not None:
+            out[attr] = v
+    out["python.monotonic"] = float(time.monotonic())
+    boot = boottime_now()
+    if boot is not None:
+        out["kern.boottime"] = boot
+    if PLATFORM == "darwin":
+        for n in ("kern.sleeptime", "kern.waketime"):
+            v = sysctl_timeval(n)
+            if v is not None:
+                out[n] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Parse stdin — a snapshot of named clocks, not two cuts (that is scarp).
+# ---------------------------------------------------------------------------
+
+NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+KV_RE = re.compile(
+    r"^\s*(?:clock\s+)?"
+    r"(?P<key>[A-Za-z_.][A-Za-z0-9_.]*)"
+    r"(?:\s*[=:]\s*|\s+)"
+    r"(?P<val>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    r"\s*$"
+)
+
+
+def parse_snapshot(text: str, as_pair: tuple[str, str] | None = None) -> dict[str, float]:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+
+    if stripped[0] in "{[":
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            return _from_json(data)
+
+    clocks: dict[str, float] = {}
+    bare: list[float] = []
+    jsonl_ok = True
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line[0] in "{[":
+            try:
+                clocks.update(_from_json(json.loads(line)))
+                continue
+            except json.JSONDecodeError:
+                jsonl_ok = False
+        m = KV_RE.match(line)
+        if m:
+            key = m.group("key")
+            # scarp cut uses python.monotonic as a reading, not a role tag
+            if key in ("backend", "machine_clock", "awake_clock", "python_monotonic_role", "pid"):
+                continue
+            try:
+                name = canon(key)
+            except SystemExit:
+                continue
+            clocks[name] = float(m.group("val"))
+            continue
+        nums = [float(x) for x in NUM_RE.findall(line)]
+        if nums:
+            bare.extend(nums)
+    if clocks:
+        return clocks
+    if bare:
+        if as_pair is None:
+            raise SystemExit(
+                "yaw: unlabeled numbers need --as CLOCK_A CLOCK_B"
+            )
+        if len(bare) < 2:
+            raise SystemExit("yaw: need two readings")
+        return {as_pair[0]: bare[0], as_pair[1]: bare[1]}
+    if not jsonl_ok:
+        raise SystemExit("yaw: could not parse stdin")
+    return clocks
+
+
+def _from_json(data: Any) -> dict[str, float]:
+    if isinstance(data, list):
+        out: dict[str, float] = {}
+        for el in data:
+            out.update(_from_json(el))
+        return out
+    if not isinstance(data, dict):
+        return {}
+    src = dict(data)
+    if isinstance(src.get("clock"), dict):
+        src.update(src["clock"])
+    out: dict[str, float] = {}
+    for k, v in src.items():
+        if k in (
+            "clock",
+            "backend",
+            "machine_clock",
+            "awake_clock",
+            "python_monotonic_role",
+            "pid",
+            "verdict",
+            "version",
+        ):
+            continue
+        try:
+            name = canon(str(k))
+            out[name] = float(v)
+        except (SystemExit, TypeError, ValueError):
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Classify a pair.
+# v0.1 named wall−RAW STEP (scarp's NTP). Live Darwin: that Δ equals
+# CLOCK_MONOTONIC−RAW and wall−boot tracks POSIX CLOCK_MONOTONIC to ~1µs.
+# STEP is only a wall jump vs the already-slewed POSIX clock.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Gap:
+    primary: str = "REST"
+    a: str = ""
+    b: str = ""
+    delta: float | None = None
+    slew: float | None = None
+    sleep: float | None = None
+    step: float | None = None
+    reason: str = ""
+    tags: list[str] = field(default_factory=list)
+    clocks: dict[str, float] = field(default_factory=dict)
+    owned: list[str] = field(default_factory=list)
+    kind: str = PLATFORM
+
+
+def as_boot(name: str, value: float, clocks: dict[str, float]) -> float:
+    kind = KINDS.get(name)
+    if kind is None:
+        return value
+    if kind.origin == "epoch" and name != "kern.boottime":
+        boot = clocks.get("kern.boottime")
+        if boot is None:
+            # already-since-boot wall (scarp durations, or wall << epoch)
+            if value < ORIGIN_MIXED:
+                return value
+            raise SystemExit(
+                "yaw: CLOCK_REALTIME needs kern.boottime to compare with since-boot clocks"
+            )
+        return value - boot
+    return value
+
+
+def pair_owns(a: str, b: str) -> list[str]:
+    ka, kb = KINDS[a], KINDS[b]
+    owns: list[str] = []
+    if ka.sleep != kb.sleep:
+        owns.append("sleep")
+    if ka.slew != kb.slew:
+        owns.append("slew")
+    wallish = (ka.origin == "epoch") != (kb.origin == "epoch")
+    if wallish:
+        owns.append("step")
+    return owns
+
+
+def _equivalent(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if {a, b} <= {"python.monotonic", "CLOCK_UPTIME_RAW", "CLOCK_UPTIME_RAW_APPROX"}:
+        return True
+    if {a, b} <= {"CLOCK_MONOTONIC_RAW", "CLOCK_MONOTONIC_RAW_APPROX"}:
+        return True
+    if PLATFORM == "linux" and {a, b} <= {"python.monotonic", "CLOCK_MONOTONIC"}:
+        return True
+    return False
+
+
+def _witness_slew_sleep_step(clocks: dict[str, float]) -> tuple[float | None, float | None, float | None]:
+    """Decompose a snapshot: slew = MONOTONIC−RAW, sleep = RAW−UPTIME, step = wall-boot−MONOTONIC."""
+    raw = clocks.get("CLOCK_MONOTONIC_RAW")
+    mono = clocks.get("CLOCK_MONOTONIC")
+    up = clocks.get("CLOCK_UPTIME_RAW")
+    if up is None:
+        up = clocks.get("python.monotonic") if PLATFORM == "darwin" else None
+    boot = clocks.get("kern.boottime")
+    wall = clocks.get("CLOCK_REALTIME")
+    slew = (mono - raw) if mono is not None and raw is not None else None
+    sleep = (raw - up) if raw is not None and up is not None else None
+    if PLATFORM == "linux":
+        bootc = clocks.get("CLOCK_BOOTTIME")
+        m = clocks.get("CLOCK_MONOTONIC")
+        if sleep is None and bootc is not None and m is not None:
+            sleep = bootc - m
+        if slew is None and m is not None and raw is not None:
+            slew = m - raw
+    step = None
+    if wall is not None and boot is not None and mono is not None:
+        step = (wall - boot) - mono
+    elif wall is not None and mono is not None and wall < ORIGIN_MIXED:
+        step = wall - mono
+    return slew, sleep, step
+
+
+def classify_pair(a: str, b: str, clocks: dict[str, float]) -> Gap:
+    if a not in clocks:
+        raise SystemExit(f"yaw: no reading for {a}")
+    if b not in clocks:
+        raise SystemExit(f"yaw: no reading for {b}")
+    xa = as_boot(a, clocks[a], clocks)
+    xb = as_boot(b, clocks[b], clocks)
+    d = xa - xb
+    owned = pair_owns(a, b)
+    g = Gap(
+        a=a,
+        b=b,
+        delta=d,
+        clocks=dict(clocks),
+        owned=owned,
+        tags=[],
+    )
+    w_slew, w_sleep, w_step = _witness_slew_sleep_step(clocks)
+    g.slew, g.sleep, g.step = w_slew, w_sleep, w_step
+
+    if _equivalent(a, b):
+        g.primary = "REST"
+        g.tags = ["REST"]
+        g.reason = _reason(g)
+        return g
+
+    # Pair-local: a singleton owned set *is* the pair delta.
+    # Mixed wall−RAW = slew+step; POSIX CLOCK_MONOTONIC is the witness.
+    # Without that witness we name the gap SLEW, never NTP.
+    if owned == ["slew"]:
+        g.slew = d
+    elif owned == ["sleep"]:
+        g.sleep = d
+    elif owned == ["step"]:
+        g.step = d
+    else:
+        if "slew" in owned and g.slew is None and "sleep" not in owned:
+            g.slew = d if g.step is None else (d - g.step)
+        if "step" in owned and g.step is None and "sleep" not in owned and g.slew is not None:
+            g.step = d - g.slew
+        if "slew" in owned and g.slew is None and g.step is None:
+            # wall vs RAW, no MONOTONIC in the snapshot: not NTP.
+            g.slew = d
+
+    tags: list[str] = []
+    if "step" in owned and g.step is not None and abs(g.step) >= STEP_MIN:
+        tags.append("STEP")
+    if "sleep" in owned and g.sleep is not None and abs(g.sleep) >= SLEEP_MIN:
+        tags.append("SLEEP")
+    elif "sleep" in owned and g.sleep is None and abs(d) >= SLEEP_MIN:
+        g.sleep = d
+        tags.append("SLEEP")
+    if "slew" in owned and g.slew is not None and abs(g.slew) >= SLEW_MIN:
+        tags.append("SLEW")
+
+    if not tags:
+        g.primary = "REST"
+        g.tags = ["REST"]
+    else:
+        g.tags = tags
+        g.primary = tags[0]
+    g.reason = _reason(g)
+    return g
+
+
+def _reason(g: Gap) -> str:
+    d = g.delta or 0.0
+    if g.primary == "SLEW":
+        slew = g.slew if g.slew is not None else d
+        bits = [
+            f"adjtime slewed POSIX CLOCK_MONOTONIC {fmt_secs(abs(slew))} "
+            f"{'behind' if slew < 0 else 'ahead of'} CLOCK_MONOTONIC_RAW"
+        ]
+        if g.step is not None and abs(g.step) < STEP_MIN:
+            bits.append("wall−boot tracks CLOCK_MONOTONIC (not a step)")
+        elif "CLOCK_MONOTONIC" not in g.clocks and (
+            KINDS[g.a].origin == "epoch" or KINDS[g.b].origin == "epoch"
+        ):
+            bits.append("no CLOCK_MONOTONIC witness, so a step cannot be named")
+        return "; ".join(bits)
+    if g.primary == "SLEEP":
+        slept = g.sleep if g.sleep is not None else d
+        extra = ""
+        if g.slew is not None and abs(g.slew) >= SLEW_MIN:
+            extra = f"; slew {fmt_secs(g.slew, signed=True)} also sits in this pair"
+        return f"host suspend sits between {g.a} and {g.b} ({fmt_secs(abs(slept))}){extra}"
+    if g.primary == "STEP":
+        step = g.step if g.step is not None else d
+        direction = "forward" if step > 0 else "backward"
+        return (
+            f"wall {direction}-stepped {fmt_secs(abs(step))} vs POSIX CLOCK_MONOTONIC"
+        )
+    if abs(d) < EPS:
+        return f"{g.a} and {g.b} agree"
+    return f"{g.a} − {g.b} is {fmt_secs(d, signed=True)}, below floor"
+
+
+def classify_default(clocks: dict[str, float], pair: tuple[str, str] | None = None) -> Gap:
+    if pair is not None:
+        a, b = pair
+        if a not in KINDS or b not in KINDS:
+            a, b = canon(a), canon(b)
+        return classify_pair(a, b, clocks)
+    a, b = DEFAULT_PAIR
+    if a in clocks and b in clocks:
+        return classify_pair(a, b, clocks)
+    # scarp cut: wall + machine (RAW), no POSIX CLOCK_MONOTONIC
+    if "CLOCK_REALTIME" in clocks and "CLOCK_MONOTONIC_RAW" in clocks:
+        return classify_pair("CLOCK_REALTIME", "CLOCK_MONOTONIC_RAW", clocks)
+    if "CLOCK_MONOTONIC_RAW" in clocks and "CLOCK_UPTIME_RAW" in clocks:
+        return classify_pair("CLOCK_MONOTONIC_RAW", "CLOCK_UPTIME_RAW", clocks)
+    names = [n for n in clocks if n in KINDS and n not in ("kern.boottime", "kern.sleeptime", "kern.waketime")]
+    if len(names) >= 2:
+        return classify_pair(names[0], names[1], clocks)
+    raise SystemExit("yaw: need two clocks")
+
+
+# ---------------------------------------------------------------------------
+# Format
+# ---------------------------------------------------------------------------
+
+def fmt_secs(x: float, signed: bool = False) -> str:
+    s = abs(x)
+    if s < 0.0005:
+        return "+0s" if signed else "0s"
+    sign = "-" if x < 0 else ("+" if signed else "")
+    if s < 60:
+        return f"{sign}{s:.3f}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{sign}{int(m)}m{sec:05.2f}s"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{sign}{int(h)}h{int(m):02d}m{sec:04.1f}s"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{sign}{int(d)}d{int(h):02d}h{int(m):02d}m"
+
+
+def _fmt_opt(x: float | None, signed: bool = False) -> str:
+    if x is None:
+        return f"{'—':>12}"
+    return f"{fmt_secs(x, signed=signed):>12}"
+
+
+def format_word(g: Gap) -> str:
+    return g.primary + "\n"
+
+
+def format_explain(g: Gap) -> str:
+    clocks = g.clocks
+    lines = [
+        f"{g.primary}  pair={g.a} − {g.b}  owned={'+'.join(g.owned) or 'none'}",
+        f"  CLOCK_MONOTONIC      {_fmt_opt(clocks.get('CLOCK_MONOTONIC'))}   POSIX; sleep+adjtime",
+        f"  CLOCK_MONOTONIC_RAW  {_fmt_opt(clocks.get('CLOCK_MONOTONIC_RAW'))}   unslewed; sleep",
+        f"  CLOCK_UPTIME_RAW     {_fmt_opt(clocks.get('CLOCK_UPTIME_RAW'))}   unslewed; pauses",
+        f"  python.monotonic     {_fmt_opt(clocks.get('python.monotonic'))}   Darwin: UPTIME_RAW",
+        f"  wall − boot          {_fmt_opt(_wall_boot(clocks))}   REALTIME − kern.boottime",
+        f"  slew                 {_fmt_opt(g.slew if g.slew is not None else (g.delta if g.primary == 'SLEW' else None), signed=True)}   MONOTONIC − RAW",
+        f"  sleep                {_fmt_opt(g.sleep)}   RAW − UPTIME_RAW",
+        f"  step                 {_fmt_opt(g.step, signed=True)}   wall−boot − MONOTONIC",
+        f"  pair Δ               {_fmt_opt(g.delta, signed=True)}   {g.a} − {g.b}",
+    ]
+    raw = clocks.get("CLOCK_MONOTONIC_RAW")
+    if g.slew is not None and raw and raw > 1:
+        ppm = g.slew / raw * 1e6
+        lines.append(f"  slew ppm             {ppm:+.2f} ppm   slew / RAW since boot")
+    lines.append(f"reason  {g.reason}")
+    if PLATFORM == "darwin":
+        lines.append(
+            "note    Python never exposes RAW; time.monotonic() is CLOCK_UPTIME_RAW"
+        )
+        lines.append(
+            "note    wall−boot−RAW is this slew, not NTP; STEP is wall vs CLOCK_MONOTONIC"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _wall_boot(clocks: dict[str, float]) -> float | None:
+    wall = clocks.get("CLOCK_REALTIME")
+    boot = clocks.get("kern.boottime")
+    if wall is None:
+        return None
+    if boot is None:
+        return wall if wall < ORIGIN_MIXED else None
+    return wall - boot
+
+
+def format_porcelain(g: Gap) -> str:
+    rows = [
+        ("verdict", "primary", g.primary),
+        ("verdict", "pair", f"{g.a} {g.b}"),
+        ("verdict", "owned", " ".join(g.owned)),
+        ("verdict", "tags", " ".join(g.tags)),
+        ("gap", "delta", f"{g.delta or 0:.9f}"),
+        ("gap", "slew", "" if g.slew is None else f"{g.slew:.9f}"),
+        ("gap", "sleep", "" if g.sleep is None else f"{g.sleep:.9f}"),
+        ("gap", "step", "" if g.step is None else f"{g.step:.9f}"),
+        ("meta", "backend", PLATFORM),
+        ("meta", "version", VERSION),
+        ("meta", "object", "kernel slew (adjtime), not NTP"),
+    ]
+    for k, v in g.clocks.items():
+        rows.append(("clock", k, f"{v:.9f}"))
+    return "".join(f"{a}\t{b}\t{c}\n" for a, b, c in rows)
+
+
+def format_json(g: Gap) -> str:
+    payload = {
+        "version": VERSION,
+        "backend": PLATFORM,
+        "object": "kernel slew",
+        "verdict": {
+            "primary": g.primary,
+            "pair": [g.a, g.b],
+            "owned": g.owned,
+            "tags": g.tags,
+            "reason": g.reason,
+        },
+        "gap": {
+            "delta": g.delta,
+            "slew": g.slew,
+            "sleep": g.sleep,
+            "step": g.step,
+        },
+        "clock": g.clocks,
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def format_clocks(clocks: dict[str, float], *, as_json: bool = False) -> str:
+    if as_json:
+        payload = {"backend": PLATFORM, "clock": clocks}
+        return json.dumps(payload, indent=2) + "\n"
+    lines = [f"backend\t{PLATFORM}"]
+    order = [
+        "CLOCK_REALTIME",
+        "CLOCK_MONOTONIC",
+        "CLOCK_MONOTONIC_RAW",
+        "CLOCK_UPTIME_RAW",
+        "CLOCK_BOOTTIME",
+        "python.monotonic",
+        "kern.boottime",
+        "kern.sleeptime",
+        "kern.waketime",
+        "CLOCK_MONOTONIC_RAW_APPROX",
+        "CLOCK_UPTIME_RAW_APPROX",
+    ]
+    seen = set()
+    for k in order:
+        if k in clocks:
+            lines.append(f"{k}\t{clocks[k]:.9f}")
+            seen.add(k)
+    for k, v in clocks.items():
+        if k not in seen:
+            lines.append(f"{k}\t{v:.9f}")
+    return "\n".join(lines) + "\n"
+
+
+def format_all(clocks: dict[str, float]) -> str:
+    lines = []
+    for a, b in CANONICAL_PAIRS:
+        if a not in clocks or b not in clocks:
+            continue
+        try:
+            g = classify_pair(a, b, clocks)
+        except SystemExit:
+            continue
+        lines.append(f"{g.primary:5}  {a} − {b}  Δ={fmt_secs(g.delta or 0, signed=True)}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+class Fail(Exception):
+    pass
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise Fail(msg)
+
+
+def selftest() -> int:
+    n = 0
+
+    def check(name: str, fn) -> None:
+        nonlocal n
+        fn()
+        n += 1
+        print(f"PASS  {name}")
+
+    def test_no_spawn() -> None:
+        _assert("subprocess" not in sys.modules, "subprocess imported")
+        src = open(__file__, encoding="utf-8").read()
+        tree = ast.parse(src)
+        imported: set[str] = set()
+        called: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Name):
+                    called.add(fn.id)
+                elif isinstance(fn, ast.Attribute):
+                    called.add(fn.attr)
+                    if isinstance(fn.value, ast.Name):
+                        called.add(f"{fn.value.id}.{fn.attr}")
+        _assert("subprocess" not in imported, f"imports {imported}")
+        _assert("Popen" not in called, f"called {called}")
+        _assert("os.system" not in called and "system" not in called, f"called {called}")
+        _assert("posix_spawn" not in called, f"called {called}")
+
+    def test_aliases() -> None:
+        _assert(canon("monotonic") == "CLOCK_MONOTONIC", "monotonic is POSIX, not python")
+        _assert(canon("time.monotonic") == "python.monotonic", "time.monotonic is python")
+        _assert(canon("raw") == "CLOCK_MONOTONIC_RAW", "raw")
+        _assert(canon("machine") == "CLOCK_MONOTONIC_RAW", "scarp machine = RAW")
+        _assert(canon("awake") == "CLOCK_UPTIME_RAW", "scarp awake = UPTIME_RAW")
+
+    def test_synthetic() -> None:
+        slew = classify_pair(
+            "CLOCK_MONOTONIC",
+            "CLOCK_MONOTONIC_RAW",
+            {
+                "CLOCK_MONOTONIC": 92.5,
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_UPTIME_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_092.5,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(slew.primary == "SLEW", f"slew got {slew.primary}")
+        _assert(abs((slew.delta or 0) - (-7.5)) < 1e-9, f"slew Δ {slew.delta}")
+
+        sleep = classify_pair(
+            "CLOCK_MONOTONIC_RAW",
+            "CLOCK_UPTIME_RAW",
+            {
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_UPTIME_RAW": 10.0,
+                "CLOCK_MONOTONIC": 100.0,
+            },
+        )
+        _assert(sleep.primary == "SLEEP", f"sleep got {sleep.primary}")
+        _assert(abs((sleep.delta or 0) - 90) < 1e-9, f"sleep Δ {sleep.delta}")
+
+        rest = classify_pair(
+            "CLOCK_MONOTONIC",
+            "CLOCK_MONOTONIC_RAW",
+            {"CLOCK_MONOTONIC": 100.0, "CLOCK_MONOTONIC_RAW": 100.0000004},
+        )
+        _assert(rest.primary == "REST", f"tiny slew {rest.primary} Δ={rest.delta}")
+
+        py = classify_pair(
+            "python.monotonic",
+            "CLOCK_UPTIME_RAW",
+            {"python.monotonic": 50.0, "CLOCK_UPTIME_RAW": 50.0},
+        )
+        _assert(py.primary == "REST", f"python vs UPTIME {py.primary}")
+
+        # v0.2: wall vs RAW with MONOTONIC witness is SLEW (same 7.5s).
+        wall_raw = classify_pair(
+            "CLOCK_REALTIME",
+            "CLOCK_MONOTONIC_RAW",
+            {
+                "CLOCK_MONOTONIC": 92.5,
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_UPTIME_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_092.5,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(
+            wall_raw.primary == "SLEW",
+            f"wall−RAW should be SLEW, got {wall_raw.primary} Δ={wall_raw.delta} step={wall_raw.step}",
+        )
+        _assert("STEP" not in wall_raw.tags, f"tags {wall_raw.tags}")
+
+        # scarp cut: no CLOCK_MONOTONIC. Still SLEW, not NTP STEP.
+        scarp_ntp = classify_pair(
+            "CLOCK_REALTIME",
+            "CLOCK_MONOTONIC_RAW",
+            {
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_UPTIME_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_092.5,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(
+            scarp_ntp.primary == "SLEW",
+            f"scarp-shaped wall−RAW {scarp_ntp.primary} (must not be STEP/NTP)",
+        )
+
+        wall_mono = classify_pair(
+            "CLOCK_REALTIME",
+            "CLOCK_MONOTONIC",
+            {
+                "CLOCK_MONOTONIC": 92.5,
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_092.5,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(wall_mono.primary == "REST", f"wall−MONOTONIC {wall_mono.primary} Δ={wall_mono.delta}")
+
+        jumped = classify_pair(
+            "CLOCK_REALTIME",
+            "CLOCK_MONOTONIC",
+            {
+                "CLOCK_MONOTONIC": 100.0,
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_104.0,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(jumped.primary == "STEP", f"true jump {jumped.primary} Δ={jumped.delta}")
+        _assert(abs((jumped.delta or 0) - 4) < 1e-9, f"jump 4s {jumped.delta}")
+
+        # jump vs RAW still STEP: MONOTONIC witness shows the 4s is not slew.
+        jumped_raw = classify_pair(
+            "CLOCK_REALTIME",
+            "CLOCK_MONOTONIC_RAW",
+            {
+                "CLOCK_MONOTONIC": 100.0,
+                "CLOCK_MONOTONIC_RAW": 100.0,
+                "CLOCK_REALTIME": 1_000_000_104.0,
+                "kern.boottime": 1_000_000_000.0,
+            },
+        )
+        _assert(
+            jumped_raw.primary == "STEP",
+            f"jump vs RAW {jumped_raw.primary} step={jumped_raw.step} slew={jumped_raw.slew}",
+        )
+
+    def test_parse_scarp_cut() -> None:
+        text = (
+            "wall\t1000000092.5\n"
+            "machine\t100.0\n"
+            "awake\t100.0\n"
+            "python.monotonic\t100.0\n"
+            "boottime\t1000000000.0\n"
+        )
+        clocks = parse_snapshot(text)
+        _assert(clocks["CLOCK_REALTIME"] == 1000000092.5, clocks)
+        _assert(clocks["CLOCK_MONOTONIC_RAW"] == 100.0, clocks)
+        _assert("CLOCK_MONOTONIC" not in clocks, "scarp cut hides POSIX MONOTONIC")
+        g = classify_default(clocks)
+        _assert(g.primary == "SLEW", f"scarp-shaped cut {g.primary} pair={g.a} {g.b}")
+        _assert("STEP" not in g.tags, f"scarp ntp must not become STEP: {g.tags}")
+
+    def test_live() -> None:
+        c = sample()
+        _assert("CLOCK_REALTIME" in c and c["CLOCK_REALTIME"] > 1e9, "wall epoch")
+        if PLATFORM != "darwin":
+            return
+        _assert("CLOCK_MONOTONIC" in c and "CLOCK_MONOTONIC_RAW" in c, "darwin clocks")
+        _assert("CLOCK_UPTIME_RAW" in c, "uptime")
+        _assert("kern.boottime" in c, "boottime")
+        py = c["python.monotonic"]
+        up = c["CLOCK_UPTIME_RAW"]
+        _assert(abs(py - up) < 0.05, f"python.monotonic is UPTIME_RAW {py-up}")
+        raw, mono = c["CLOCK_MONOTONIC_RAW"], c["CLOCK_MONOTONIC"]
+        _assert(abs((c["CLOCK_REALTIME"] - c["kern.boottime"]) - mono) < 0.05, "wall-boot ≈ MONOTONIC")
+        g = classify_pair("CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW", c)
+        _assert(g.primary == "SLEW", f"live POSIX vs RAW {g.primary} Δ={g.delta}")
+        sleep = classify_pair("CLOCK_MONOTONIC_RAW", "CLOCK_UPTIME_RAW", c)
+        _assert(sleep.primary == "SLEEP", f"live RAW vs UPTIME {sleep.primary}")
+        rest = classify_pair("CLOCK_REALTIME", "CLOCK_MONOTONIC", c)
+        _assert(rest.primary == "REST", f"live wall vs POSIX MONOTONIC {rest.primary} Δ={rest.delta}")
+        wall_raw = classify_pair("CLOCK_REALTIME", "CLOCK_MONOTONIC_RAW", c)
+        _assert(
+            wall_raw.primary == "SLEW",
+            f"live wall vs RAW {wall_raw.primary} (v0.1 called this STEP) Δ={wall_raw.delta} step={wall_raw.step}",
+        )
+        _assert("STEP" not in wall_raw.tags, f"live wall−RAW tags {wall_raw.tags}")
+        _assert(
+            abs((wall_raw.slew or 0) - (g.slew or 0)) < 0.05,
+            f"wall−RAW slew {wall_raw.slew} vs MONOTONIC−RAW {g.slew}",
+        )
+
+    check("no spawn", test_no_spawn)
+    check("aliases: monotonic is POSIX", test_aliases)
+    check("synthetic SLEW/SLEEP/STEP/REST", test_synthetic)
+    check("scarp cut has no CLOCK_MONOTONIC", test_parse_scarp_cut)
+    check("live Darwin snapshot", test_live)
+    print(f"selftest {n}/{n} passed  backend={PLATFORM}  yaw {VERSION}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="yaw", add_help=False, usage=USAGE)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--explain", action="store_true")
+    p.add_argument("--require", metavar="NAME")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--as", nargs=2, metavar=("A", "B"), dest="as_pair")
+    p.add_argument("cmd", nargs="?", default="")
+    p.add_argument("cmd_args", nargs="*")
+    return p.parse_args(argv)
+
+
+def emit_gap(g: Gap, ns: argparse.Namespace, stream) -> None:
+    if ns.json:
+        stream.write(format_json(g))
+    elif ns.porcelain:
+        stream.write(format_porcelain(g))
+    elif ns.explain:
+        stream.write(format_explain(g))
+    else:
+        stream.write(format_word(g))
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ns = parse_args(argv)
+    if ns.help:
+        print(USAGE)
+        return 0
+    if ns.version:
+        print(f"yaw {VERSION} backend={PLATFORM}")
+        return 0
+
+    cmd = ns.cmd or ""
+    rest = list(ns.cmd_args)
+
+    if cmd == "selftest":
+        try:
+            return selftest()
+        except Fail as e:
+            print(f"FAIL  {e}", file=sys.stderr)
+            return 1
+
+    if cmd == "clocks":
+        sys.stdout.write(format_clocks(sample(), as_json=ns.json))
+        return 0
+
+    pair: tuple[str, str] | None = None
+    if ns.as_pair:
+        pair = (canon(ns.as_pair[0]), canon(ns.as_pair[1]))
+
+    # yaw CLOCK_A CLOCK_B
+    if cmd and cmd not in ("selftest", "clocks") and cmd != "--":
+        try:
+            a = canon(cmd)
+            if not rest:
+                print("yaw: need two clock names", file=sys.stderr)
+                print(USAGE, file=sys.stderr)
+                return 2
+            b = canon(rest[0])
+            pair = (a, b)
+            cmd = ""
+        except SystemExit as e:
+            print(str(e), file=sys.stderr)
+            return 2
+
+    stdin_text = ""
+    if not sys.stdin.isatty():
+        stdin_text = sys.stdin.read()
+
+    try:
+        if stdin_text.strip():
+            clocks = parse_snapshot(stdin_text, as_pair=pair)
+            if ns.all:
+                sys.stdout.write(format_all(clocks))
+                return 0
+            g = classify_default(clocks, pair=pair)
+        else:
+            clocks = sample()
+            if ns.all:
+                sys.stdout.write(format_all(clocks))
+                return 0
+            g = classify_default(clocks, pair=pair)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    emit_gap(g, ns, sys.stdout)
+    if ns.require:
+        want = ns.require.strip().upper()
+        if g.primary != want:
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

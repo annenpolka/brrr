@@ -1,0 +1,2877 @@
+#!/usr/bin/env python3
+"""tinder — leftover claim in, fact-falsifying commit out, dest-file identity follows.
+
+Smolder inverts leftover: dest locus in, falsifying commit/hunk out
+(ash = regenerate). Hole: a leftover that *moved with a dest-file rename*
+still names the rename (path-limited pickaxe / dest recency), not the
+commit that falsified the fact.
+
+tinder --follow (default) walks dest-file identity (berth/slip): query
+the old name or the new name, read the leftover at the live holder, then
+name the commit that mutated the *fact*. A dest-only rename is not a
+falsifier. Copy is not follow.
+
+A *fact* is a typed bound name/value, rename, or polarity flip (ember).
+Regenerated dest is *ash*: leftover *build*. Ash answers **regenerate**,
+never "edit this line". October is not timeout 10.
+
+Not leftover names (haunt/wraith). FILE:LINE is legal input.
+
+Exit: 0 found (falsifier or regenerate), 1 none, 2 usage/error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Sequence, TextIO
+
+NAME = "tinder"
+VERSION = "0.2.0"
+
+KEYWORDS = frozenset(
+    """
+    a an the and or not if else elif for while do done then in of on at to from
+    as is was are were be been being this that these those it its they them their
+    we you he she i true false none null nil some ok err error result value data
+    item items type types name names key keys id ids file files path paths line
+    lines self this super crate pub use mod fn let mut const var val def class
+    struct enum trait impl interface return yield break continue pass try catch
+    except finally throw raise with import export default async await new delete
+    int str bool string list dict map vec option result void null undefined
+    public private protected static final override where select insert update
+    func function method module package namespace object switch case match when
+    end begin out ref ptr box rc arc dyn mut self cls argc argv main init
+    get set add put has len size count index min max abs fmt print log
+    info warn warning error fatal panic todo fixme xxx
+    int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 usize isize f32 f64
+    float double char byte bytes string str bool boolean
+    ns swift rust python java kotlin go ts js
+    """.split()
+)
+
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".build",
+        "vendor",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".idea",
+        ".vscode",
+        "Pods",
+        "DerivedData",
+        ".next",
+        "coverage",
+        ".cache",
+        "zig-out",
+        ".moon",
+        ".direnv",
+        "zig-cache",
+        ".cargo",
+        "site-packages",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".turbo",
+        "xcuserdata",
+    }
+)
+
+DOC_SUFFIXES = frozenset(
+    {".md", ".mdx", ".rst", ".txt", ".adoc", ".org", ".html"}
+)
+CONFIG_SUFFIXES = frozenset(
+    {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".plist", ".pkl"}
+)
+TEST_HINTS = ("test", "spec", "specs", "fixtures", "golden", "contract")
+
+CINDER_DIR_NAMES = frozenset(
+    {
+        "generated",
+        "__generated__",
+        "_generated",
+        ".generated",
+        "codegen",
+        "oracle",
+        "oracles",
+        "__snapshots__",
+    }
+)
+CINDER_FILENAMES = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pnpm-lock.yml",
+        "bun.lock",
+        "bun.lockb",
+        "cargo.lock",
+        "poetry.lock",
+        "pipfile.lock",
+        "uv.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "go.work.sum",
+        "flake.lock",
+        "pdm.lock",
+        "gopkg.lock",
+        "mix.lock",
+        "pubspec.lock",
+        "podfile.lock",
+        "package.resolved",
+    }
+)
+LOCKFILE_GENERATORS = {
+    "package-lock.json": "npm",
+    "npm-shrinkwrap.json": "npm",
+    "yarn.lock": "yarn",
+    "pnpm-lock.yaml": "pnpm",
+    "pnpm-lock.yml": "pnpm",
+    "bun.lock": "bun",
+    "bun.lockb": "bun",
+    "cargo.lock": "cargo",
+    "poetry.lock": "poetry",
+    "pipfile.lock": "pipenv",
+    "uv.lock": "uv",
+    "composer.lock": "composer",
+    "gemfile.lock": "bundler",
+    "go.sum": "go",
+    "go.work.sum": "go",
+    "flake.lock": "nix",
+    "pdm.lock": "pdm",
+    "gopkg.lock": "godep",
+    "mix.lock": "mix",
+    "pubspec.lock": "pub",
+    "podfile.lock": "cocoapods",
+    "package.resolved": "swiftpm",
+}
+CINDER_BANNER_RE = re.compile(
+    r"(?i)@generated\b"
+    r"|code generated\b"
+    r"|auto[- ]generated\b"
+    r"|this file (?:was |is )?generated\b"
+    r"|generated from \S+"
+    r"|generated by \S+"
+    r"|generated — do not edit"
+    r"|generated -- do not edit"
+    r"|do not edit[^\n]{0,60}generated"
+    r"|generated[^\n]{0,60}do not edit"
+)
+# Capture the generator token from a banner when present.
+BANNER_GENERATOR_RE = re.compile(
+    r"(?i)(?:@generated|auto[- ]generated|code generated|this file (?:was |is )?generated|generated)"
+    r"\s+(?:by|from)\s+"
+    r"(?P<gen>[^\s,;]+)"
+)
+
+IDENT_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*")
+KEBAB_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b")
+VERSION_RE = re.compile(r"\bv?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?\b")
+NUMBER_RE = re.compile(r"\b\d+(?:\.\d+){2,}(?:-[A-Za-z0-9.]+)?\b|\b\d+\.\d+\b|\b\d+\b")
+STRING_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
+PAIR_RE = re.compile(
+    r"""(?x)
+    (?P<qkey>["'])?
+    (?P<key>
+        [A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*
+        |
+        [A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+
+    )
+    (?(qkey)(?P=qkey))
+    (?:
+        \s*:\s*[A-Za-z_][A-Za-z0-9_\[\]<>.,\s]*
+        (?==)
+    )?
+    \s*
+    (?P<op>=|:|:=)
+    \s*
+    (?:
+        Some\(\s*(?P<someint>\d+)\s*\)
+        |
+        (?P<q>["'])(?P<str>(?:\\.|[^\\])*?)(?P=q)
+        |
+        (?P<ver>v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)
+        |
+        (?P<float>\d+\.\d+)
+        |
+        (?P<int>\d+)
+        |
+        (?P<bool>true|false|True|False|YES|NO|nil|null|None)
+    )
+    """
+)
+CALENDAR_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?\b"
+    r"|\b\d{4}/\d{2}/\d{2}\b"
+)
+BARE_NUM_RE = re.compile(r"\b(\d+\.\d+|\d+)\b")
+CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+")
+POLARITY = {
+    "true": "false",
+    "false": "true",
+    "True": "False",
+    "False": "True",
+    "yes": "no",
+    "no": "yes",
+    "on": "off",
+    "off": "on",
+    "enable": "disable",
+    "disable": "enable",
+    "enabled": "disabled",
+    "disabled": "enabled",
+    "allow": "deny",
+    "deny": "allow",
+    "present": "absent",
+    "absent": "present",
+    "start": "stop",
+    "stop": "start",
+    "open": "close",
+    "close": "open",
+    "include": "exclude",
+    "exclude": "include",
+}
+COMMON_NUMBERS = frozenset({str(i) for i in range(0, 11)} | {"100"})
+GENERIC_NAMES = frozenset(
+    {
+        "threshold",
+        "value",
+        "status",
+        "result",
+        "error",
+        "index",
+        "count",
+        "size",
+        "length",
+        "offset",
+        "limit",
+        "flag",
+        "mode",
+        "type",
+        "kind",
+        "name",
+        "path",
+        "file",
+        "line",
+        "item",
+        "data",
+        "config",
+        "option",
+        "param",
+        "args",
+        "state",
+        "event",
+        "patch",
+        "exit",
+        "request",
+        "response",
+        "message",
+        "output",
+        "input",
+        "slice",
+        "point",
+        "points",
+        "version",
+        "revision",
+        "scenario",
+        "experiment",
+        "validation",
+        "allocation",
+        "timeout",
+    }
+)
+VALUE_NAMES = frozenset({"version", "timeout", "retries", "threshold", "intent"})
+STEM_ALIASES = {
+    "timeout": ("タイムアウト", "time-out"),
+    "retries": ("リトライ", "retry"),
+    "retry": ("リトライ",),
+    "threshold": ("閾値", "しきい値"),
+    "version": ("バージョン",),
+    "intent": ("意図",),
+}
+
+# git pathspecs: leftover *build* is not a falsifying origin.
+LOG_EXCLUDES = (
+    ":(glob,exclude)**/generated/**",
+    ":(glob,exclude)**/__generated__/**",
+    ":(glob,exclude)**/_generated/**",
+    ":(glob,exclude)**/.generated/**",
+    ":(glob,exclude)**/codegen/**",
+    ":(glob,exclude)**/oracle/**",
+    ":(glob,exclude)**/oracles/**",
+    ":(glob,exclude)**/__snapshots__/**",
+    ":(glob,exclude)**/*.generated.*",
+    ":(glob,exclude)**/*.generated",
+    ":(glob,exclude)**/*Generated.*",
+    ":(glob,exclude)**/*.gen.go",
+    ":(glob,exclude)**/*.gen.ts",
+    ":(glob,exclude)**/*.gen.js",
+    ":(glob,exclude)**/*.pb.go",
+    ":(glob,exclude)**/*.pb.ts",
+    ":(glob,exclude)**/*_pb2.py",
+    ":(glob,exclude)**/*.snap",
+    ":(glob,exclude)**/*.lock",
+    ":(glob,exclude)**/*.lockb",
+    ":(exclude)package-lock.json",
+    ":(exclude)npm-shrinkwrap.json",
+    ":(exclude)yarn.lock",
+    ":(exclude)pnpm-lock.yaml",
+    ":(exclude)go.sum",
+    ":(exclude)flake.lock",
+    ":(exclude)Cargo.lock",
+    ":(exclude)poetry.lock",
+    ":(exclude)uv.lock",
+    ":(exclude)composer.lock",
+    ":(exclude)Gemfile.lock",
+    ":(exclude)package.resolved",
+)
+
+
+@dataclass(frozen=True)
+class Origin:
+    path: str
+    line: int
+    excerpt: str
+
+
+@dataclass(frozen=True)
+class Fact:
+    kind: str
+    name: str
+    old: str
+    new: str
+    origin: Origin
+
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.kind, self.name, self.old, self.new)
+
+
+@dataclass
+class Hunk:
+    old_start: int
+    new_start: int
+    deleted: list[tuple[int, str]] = field(default_factory=list)
+    added: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    status: str
+    hunks: list[Hunk] = field(default_factory=list)
+    old_path: str | None = None
+
+
+@dataclass(frozen=True)
+class Locator:
+    path: str
+    line: int
+    raw: str
+
+
+@dataclass(frozen=True)
+class Dest:
+    path: str
+    line: int
+    text: str
+    body: str
+    excerpt: str
+    nearby: str
+    ash: bool
+    generator: str | None
+    ash_reason: str
+    claim: str
+    asked_path: str = ""
+    asked_line: int = 0
+    identity: tuple[str, ...] = ()
+    dest_rename_shas: tuple[str, ...] = ()
+    followed: bool = False
+    slipped: bool = False
+
+
+@dataclass(frozen=True)
+class DestIdentity:
+    names: tuple[str, ...]
+    current: str
+    asked: str
+    rename_shas: tuple[str, ...]
+    followed: bool
+
+
+@dataclass(frozen=True)
+class Falsifier:
+    sha: str
+    subject: str
+    when: str
+    fact: Fact
+    score: int
+    why: tuple[str, ...]
+    hunk: str
+    source: str  # worktree | index | commit | diff
+    # Other leftover claims the same dest line still asserts from this change.
+    also: tuple[tuple[Fact, int, tuple[str, ...]], ...] = ()
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{NAME}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(
+    args: Sequence[str],
+    root: Path,
+    *,
+    check: bool = True,
+) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        die(f"git {' '.join(args[:6])} failed: {err or proc.returncode}")
+    return proc.stdout
+
+
+def git_ok(root: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == b"true"
+
+
+def dest_exists(root: Path, rel: str, rev: str | None) -> bool:
+    if not rel:
+        return False
+    if rev is None:
+        return (root / rel).is_file()
+    proc = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{rev}:{rel}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _parse_rename_records(text: str) -> list[tuple[str, str, str]]:
+    """Newest-first (sha, old, new) from `git log --name-status` COMMIT records."""
+    out: list[tuple[str, str, str]] = []
+    sha = ""
+    for raw in text.splitlines():
+        if raw.startswith("COMMIT "):
+            sha = raw.split(" ", 1)[1].strip()
+            continue
+        if not sha or not raw:
+            continue
+        parts = raw.split("\t")
+        code = parts[0] if parts else ""
+        if code.startswith("R") and len(parts) >= 3:
+            old = parts[1].replace("\\", "/")
+            new = parts[2].replace("\\", "/")
+            if old and new and old != new:
+                out.append((sha, old, new))
+    return out
+
+
+def identity_via_follow(root: Path, path: str, rev: str) -> DestIdentity:
+    """Live dest path → identity chain via R records only.
+
+    git log --follow walks *blob* identity and treats a copy as the same
+    roost (v0.1 lie: docs/copy.md still named docs/help.md). berth's
+    object is the file identity: R is a move, C is not.
+    """
+    cur = path.replace("\\", "/")
+    names = [cur]
+    shas: list[str] = []
+    seen = {cur}
+    for sha, old, new in _all_renames(root, rev):
+        if new == cur and old not in seen:
+            shas.append(sha)
+            names.append(old)
+            seen.add(old)
+            cur = old
+    birth_to_dest = list(reversed(names))
+    return DestIdentity(
+        names=tuple(birth_to_dest),
+        current=path.replace("\\", "/"),
+        asked=path.replace("\\", "/"),
+        rename_shas=tuple(dict.fromkeys(shas)),
+        followed=len(birth_to_dest) > 1,
+    )
+
+
+def _all_renames(root: Path, rev: str) -> list[tuple[str, str, str]]:
+    raw = git(
+        [
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--find-renames",
+            "--diff-filter=R",
+            "--name-status",
+            "--pretty=format:COMMIT %H",
+            rev,
+        ],
+        root,
+        check=False,
+    )
+    if not raw:
+        return []
+    return _parse_rename_records(raw.decode("utf-8", "replace"))
+
+
+def resolve_dest_identity(
+    root: Path, asked: str, rev: str | None, *, follow: bool
+) -> DestIdentity:
+    """Map a dest locator path onto the live holder of that file identity.
+
+    --follow (default): a dest-file rename is one leftover surface.
+    --no-follow: the path is the identity (dead old name stays missing).
+    Copy is not a rename: there is no R record, so the dest is a new file.
+    """
+    asked = asked.replace("\\", "/")
+    tip = rev or "HEAD"
+    if not follow:
+        return DestIdentity(
+            names=(asked,),
+            current=asked,
+            asked=asked,
+            rename_shas=(),
+            followed=False,
+        )
+    if dest_exists(root, asked, rev):
+        ident = identity_via_follow(root, asked, tip)
+        return DestIdentity(
+            names=ident.names,
+            current=asked,
+            asked=asked,
+            rename_shas=ident.rename_shas,
+            followed=ident.followed,
+        )
+    if not git_ok(root):
+        return DestIdentity(
+            names=(asked,), current=asked, asked=asked, rename_shas=(), followed=False
+        )
+    # Dead name: walk R records *forward* (old → new) until a live holder.
+    # Undirected union would join reincarnations; copies have no R record.
+    forward: dict[str, list[tuple[str, str]]] = {}
+    for sha, old, new in _all_renames(root, tip):
+        forward.setdefault(old, []).append((new, sha))
+    hop = asked
+    shas: list[str] = []
+    seen = {asked}
+    hops = 0
+    while hops < 12:
+        hops += 1
+        nxts = forward.get(hop, [])
+        live: list[tuple[str, str]] = []
+        dead: list[tuple[str, str]] = []
+        for new, sha in nxts:
+            if new in seen:
+                continue
+            if dest_exists(root, new, rev):
+                live.append((new, sha))
+            else:
+                dead.append((new, sha))
+        if live:
+            new, sha = live[0]
+            shas.append(sha)
+            ident = identity_via_follow(root, new, tip)
+            names = tuple(dict.fromkeys([*ident.names, asked, new]))
+            # Prefer git --follow's chain when it already names the asked path;
+            # merge-as-A dest still accepts the R walk (rove's first-parent hole).
+            return DestIdentity(
+                names=names,
+                current=new,
+                asked=asked,
+                rename_shas=tuple(dict.fromkeys([*ident.rename_shas, *shas])),
+                followed=True,
+            )
+        if not dead:
+            break
+        hop, sha = dead[0]
+        if hop in seen:
+            break
+        seen.add(hop)
+        shas.append(sha)
+    return DestIdentity(
+        names=(asked,), current=asked, asked=asked, rename_shas=(), followed=False
+    )
+
+
+def dest_identity_paths(ident: DestIdentity | None) -> set[str]:
+    if ident is None:
+        return set()
+    return {n.replace("\\", "/") for n in ident.names if n}
+
+
+def _line_tokens(line: str) -> set[str]:
+    toks = set(extract_idents(line))
+    toks.update(NUMBER_RE.findall(mask_calendar(line)))
+    toks.update(VERSION_RE.findall(line))
+    return {t for t in toks if t}
+
+
+def best_slip_line(hist: str, lines: Sequence[str]) -> int | None:
+    """Relocate a dest leftover line by dest-file text, not leftover-name search."""
+    want = hist.rstrip("\n")
+    if not want.strip():
+        return None
+    for i, body in enumerate(lines, 1):
+        if body == want:
+            return i
+    hist_tok = _line_tokens(want)
+    if not hist_tok:
+        return None
+    best_i: int | None = None
+    best = 0.0
+    for i, body in enumerate(lines, 1):
+        if want.strip() and want.strip() in body:
+            return i
+        tok = _line_tokens(body)
+        if not tok:
+            continue
+        score = len(hist_tok & tok) / len(hist_tok)
+        if score > best:
+            best = score
+            best_i = i
+    if best >= 0.7 and best_i is not None:
+        return best_i
+    return None
+
+
+def historical_asked_line(
+    root: Path,
+    asked: str,
+    line: int,
+    ident: DestIdentity,
+    rev: str | None,
+) -> str | None:
+    """Dest leftover text at the asked name just before it moved."""
+    tip = rev or "HEAD"
+    for sha, old, _new in _all_renames(root, tip):
+        if old != asked:
+            continue
+        text = read_dest_text(root, asked, f"{sha}^")
+        if text is None:
+            continue
+        lines = text.splitlines()
+        if 1 <= line <= len(lines):
+            return lines[line - 1]
+    if dest_exists(root, asked, rev):
+        text = read_dest_text(root, asked, rev)
+        if text is not None:
+            lines = text.splitlines()
+            if 1 <= line <= len(lines):
+                return lines[line - 1]
+    _ = ident
+    return None
+
+
+def parse_unified_diff(text: str) -> list[FileDiff]:
+    files: list[FileDiff] = []
+    current: FileDiff | None = None
+    hunk: Hunk | None = None
+    old_ln = 0
+    new_ln = 0
+    pending_old: str | None = None
+
+    def flush_hunk() -> None:
+        nonlocal hunk
+        if current is not None and hunk is not None:
+            if hunk.deleted or hunk.added:
+                current.hunks.append(hunk)
+        hunk = None
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            flush_hunk()
+            current = None
+            hunk = None
+            pending_old = None
+            parts = raw.split()
+            old_p = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else ""
+            new_p = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else old_p
+            current = FileDiff(path=new_p or old_p, status="modify", old_path=old_p or None)
+            files.append(current)
+            continue
+        if raw.startswith("rename from "):
+            if current is not None:
+                current.old_path = raw[len("rename from ") :]
+                current.status = "rename"
+            continue
+        if raw.startswith("rename to "):
+            if current is not None:
+                current.path = raw[len("rename to ") :]
+                current.status = "rename"
+            continue
+        if raw.startswith("deleted file"):
+            if current is not None:
+                current.status = "delete"
+            continue
+        if raw.startswith("new file"):
+            if current is not None:
+                current.status = "add"
+            continue
+        if raw.startswith("--- "):
+            rest = raw[4:]
+            if rest.startswith("a/"):
+                pending_old = rest[2:]
+            elif rest == "/dev/null":
+                pending_old = None
+            continue
+        if raw.startswith("+++ "):
+            rest = raw[4:]
+            if current is None:
+                path = rest[2:] if rest.startswith("b/") else rest
+                current = FileDiff(path=path, status="modify", old_path=pending_old)
+                files.append(current)
+            elif rest.startswith("b/"):
+                current.path = rest[2:]
+            elif rest == "/dev/null" and current is not None:
+                current.status = "delete"
+            continue
+        if raw.startswith("@@"):
+            flush_hunk()
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            if not m:
+                continue
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(2))
+            hunk = Hunk(old_start=old_ln, new_start=new_ln)
+            continue
+        if hunk is None or current is None:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            hunk.deleted.append((old_ln, raw[1:]))
+            old_ln += 1
+        elif raw.startswith("+"):
+            hunk.added.append((new_ln, raw[1:]))
+            new_ln += 1
+        elif raw.startswith(" ") or raw == "":
+            old_ln += 1
+            new_ln += 1
+    flush_hunk()
+    return [f for f in files if f.path and f.path != "/dev/null"]
+
+
+def pair_value(m: re.Match[str]) -> str:
+    if m.group("someint") is not None:
+        return m.group("someint")
+    if m.group("str") is not None:
+        return m.group("str")
+    if m.group("ver") is not None:
+        return m.group("ver")
+    if m.group("float") is not None:
+        return m.group("float")
+    if m.group("int") is not None:
+        return m.group("int")
+    if m.group("bool") is not None:
+        return m.group("bool")
+    return ""
+
+
+def looks_like_symbol(tok: str) -> bool:
+    if not tok or len(tok) < 2:
+        return False
+    if "_" in tok or "-" in tok or "/" in tok or "." in tok:
+        return True
+    if re.search(r"[a-z][A-Z]", tok):
+        return True
+    if re.fullmatch(r"[A-Z]{2,}[A-Z0-9]*", tok):
+        return True
+    if re.search(r"\d", tok) and re.search(r"[A-Za-z]", tok):
+        return True
+    if tok.startswith(("@", "--", "$")):
+        return True
+    return False
+
+
+def is_keyword_name(key: str) -> bool:
+    if key.lower() not in KEYWORDS:
+        return False
+    return not looks_like_symbol(key)
+
+
+def extract_pairs(line: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for m in PAIR_RE.finditer(line):
+        key = m.group("key")
+        val = pair_value(m)
+        if key and val != "" and not is_keyword_name(key):
+            out.append((key, val))
+    return out
+
+
+def extract_idents(line: str) -> list[str]:
+    found: list[str] = []
+    for m in IDENT_RE.finditer(line):
+        tok = m.group(0)
+        if m.start() > 0 and line[m.start() - 1].isalpha():
+            continue
+        if len(tok) < 3:
+            continue
+        if tok.lower() in KEYWORDS and not looks_like_symbol(tok):
+            continue
+        if tok.isnumeric():
+            continue
+        found.append(tok)
+    for m in KEBAB_RE.finditer(line):
+        tok = m.group(0)
+        if tok.lower() not in KEYWORDS:
+            found.append(tok)
+    return found
+
+
+def extract_strings(line: str) -> list[str]:
+    out: list[str] = []
+    for m in STRING_RE.finditer(line):
+        inner = m.group(0)[1:-1]
+        if len(inner) >= 6 and not inner.startswith("/"):
+            out.append(inner)
+    return out
+
+
+def stems(name: str) -> set[str]:
+    parts = re.split(r"[_\-./\s]+", name)
+    camel = CAMEL_RE.findall(name)
+    bits = {p.lower() for p in parts + camel if len(p) >= 4 and p.lower() not in KEYWORDS}
+    compact = name.lower()
+    if len(compact) >= 4 and " " not in compact:
+        bits.add(compact)
+    return bits
+
+
+def similar(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    al, bl = a.lower(), b.lower()
+    ratio = difflib.SequenceMatcher(None, al, bl).ratio()
+    tok_a = {t for t in re.split(r"[_\-./\s]+", al) if t}
+    tok_b = {t for t in re.split(r"[_\-./\s]+", bl) if t}
+    tok_a.update(x.lower() for x in CAMEL_RE.findall(a))
+    tok_b.update(x.lower() for x in CAMEL_RE.findall(b))
+    jacc = len(tok_a & tok_b) / (len(tok_a | tok_b) or 1)
+    return max(ratio, (ratio + jacc) / 2, jacc)
+
+
+def is_case_only(a: str, b: str) -> bool:
+    return a.lower() == b.lower() and a != b
+
+
+def is_plural_pair(a: str, b: str) -> bool:
+    al, bl = a.lower(), b.lower()
+    if bl == al + "s" or al == bl + "s":
+        return True
+    if bl == al + "es" or al == bl + "es":
+        return True
+    if al.endswith("y") and bl == al[:-1] + "ies":
+        return True
+    if bl.endswith("y") and al == bl[:-1] + "ies":
+        return True
+    return False
+
+
+def is_inflection_pair(a: str, b: str) -> bool:
+    if is_plural_pair(a, b) or is_case_only(a, b):
+        return True
+    al, bl = a.lower(), b.lower()
+    suffixes = ("ing", "ed", "er", "est", "ly", "tion", "ments")
+    for s in suffixes:
+        if al + s == bl or bl + s == al:
+            return True
+        if al.endswith(s) and bl == al[: -len(s)] and len(al) - len(s) >= 4:
+            return True
+        if bl.endswith(s) and al == bl[: -len(s)] and len(bl) - len(s) >= 4:
+            return True
+    return False
+
+
+def ident_tokens(tok: str) -> set[str]:
+    bits = {t.lower() for t in re.split(r"[_\-./]+", tok) if t}
+    bits.update(x.lower() for x in CAMEL_RE.findall(tok))
+    return {b for b in bits if len(b) >= 3}
+
+
+def should_emit_rename(old: str, new: str, *, pair_key: bool) -> bool:
+    if not old or not new or old == new:
+        return False
+    if is_inflection_pair(old, new):
+        return False
+    shared = ident_tokens(old) & ident_tokens(new)
+    if pair_key and similar(old, new) >= 0.45 and len(old) >= 4:
+        return True
+    if looks_like_symbol(old) and looks_like_symbol(new) and (shared or similar(old, new) >= 0.70):
+        return True
+    return False
+
+
+def leftover_pairs(line: str) -> dict[str, str]:
+    return dict(extract_pairs(line))
+
+
+def value_type(val: str) -> str:
+    if not val:
+        return "empty"
+    if val in POLARITY:
+        return "polarity"
+    if VERSION_RE.fullmatch(val) or re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?", val):
+        return "version"
+    if re.fullmatch(r"\d+", val):
+        return "integer"
+    if re.fullmatch(r"\d+\.\d+", val):
+        return "float"
+    return "other"
+
+
+def mask_calendar(text: str) -> str:
+    """Blank ISO/slash dates so month 10 is not integer 10."""
+    return CALENDAR_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def stem_in_text(stem: str, text: str) -> bool:
+    if not stem:
+        return False
+    if not stem.isascii():
+        return stem in text
+    return (
+        re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(stem) + r"(?![A-Za-z0-9_])",
+            text,
+            re.I,
+        )
+        is not None
+    )
+
+
+def is_homonym_binding(fact: Fact, line: str) -> bool:
+    pairs = leftover_pairs(line)
+    if fact.name in pairs:
+        bound = pairs[fact.name]
+        if bound != fact.old and bound != fact.new:
+            return True
+    if fact.kind == "rename" and fact.old in pairs:
+        bound = pairs[fact.old]
+        if fact.new and bound != fact.new:
+            return True
+    return False
+
+
+def align_lines(
+    deleted: Sequence[tuple[int, str]], added: Sequence[tuple[int, str]]
+) -> list[tuple[tuple[int, str] | None, tuple[int, str] | None]]:
+    used_add = [False] * len(added)
+    pairs: list[tuple[tuple[int, str] | None, tuple[int, str] | None]] = []
+
+    add_by_body: dict[str, list[int]] = {}
+    for i, (_, body) in enumerate(added):
+        add_by_body.setdefault(body, []).append(i)
+
+    matched_del = [False] * len(deleted)
+    for di, (dln, dbody) in enumerate(deleted):
+        bucket = add_by_body.get(dbody)
+        if bucket:
+            ai = bucket.pop(0)
+            used_add[ai] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[ai]))
+            if not bucket:
+                add_by_body.pop(dbody, None)
+
+    for di, (dln, dbody) in enumerate(deleted):
+        if matched_del[di]:
+            continue
+        best_i = -1
+        best = 0.45
+        dstrip = dbody.strip()
+        for ai, (aln, abody) in enumerate(added):
+            if used_add[ai]:
+                continue
+            score = similar(dstrip, abody.strip())
+            dkeys = {k for k, _ in extract_pairs(dbody)}
+            akeys = {k for k, _ in extract_pairs(abody)}
+            if dkeys & akeys:
+                score += 0.25
+            if score > best:
+                best = score
+                best_i = ai
+        if best_i >= 0:
+            used_add[best_i] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[best_i]))
+        else:
+            pairs.append((deleted[di], None))
+
+    for ai, a in enumerate(added):
+        if not used_add[ai]:
+            pairs.append((None, a))
+    return pairs
+
+
+def is_distinctive_value(val: str) -> bool:
+    if not val:
+        return False
+    if VERSION_RE.fullmatch(val):
+        return True
+    if re.fullmatch(r"\d+\.\d+", val):
+        return True
+    if val in POLARITY:
+        return True
+    if len(val) >= 4 and not val.isdigit():
+        return True
+    if val.isdigit() and val not in COMMON_NUMBERS:
+        return True
+    return False
+
+
+def extract_facts(
+    files: Sequence[FileDiff],
+    kinds: set[str],
+    dest_identity: set[str] | None = None,
+) -> list[Fact]:
+    added_idents: set[str] = set()
+    added_strings: set[str] = set()
+    added_pairs: set[tuple[str, str]] = set()
+    dest_id = {p.replace("\\", "/") for p in (dest_identity or set()) if p}
+    for fd in files:
+        for h in fd.hunks:
+            for _, line in h.added:
+                added_idents.update(extract_idents(line))
+                added_strings.update(extract_strings(line))
+                added_pairs.update(extract_pairs(line))
+
+    facts: list[Fact] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def emit(kind: str, name: str, old: str, new: str, origin: Origin) -> None:
+        if kind not in kinds:
+            return
+        if old == new:
+            return
+        if not old:
+            return
+        fact = Fact(kind=kind, name=name, old=old, new=new, origin=origin)
+        k = fact.key()
+        if k in seen:
+            return
+        seen.add(k)
+        facts.append(fact)
+
+    for fd in files:
+        if fd.status == "add":
+            continue
+        # Dest leftover surface is not a fact origin. A dest-file rename
+        # (or dest rewrite that rode along with the move) is not the
+        # falsifying change — that is smolder's dest-recency hole.
+        if dest_id:
+            p = (fd.path or "").replace("\\", "/")
+            op = (fd.old_path or "").replace("\\", "/")
+            if p in dest_id or op in dest_id:
+                continue
+        # Ash origin is leftover *build*, not a falsifying claim-change.
+        if is_cinder_path(fd.path) or (fd.old_path and is_cinder_path(fd.old_path)):
+            continue
+        if filediff_has_generated_banner(fd):
+            continue
+        for h in fd.hunks:
+            for d, a in align_lines(h.deleted, h.added):
+                if d is None:
+                    continue
+                dln, dbody = d
+                origin = Origin(fd.old_path or fd.path, dln, dbody.strip()[:200])
+                if a is None:
+                    if "removal" in kinds:
+                        for ident in extract_idents(dbody):
+                            if ident not in added_idents:
+                                emit("removal", ident, ident, "", origin)
+                    continue
+
+                _aln, abody = a
+                dpairs = extract_pairs(dbody)
+                apair_list = extract_pairs(abody)
+                apairs = dict(apair_list)
+
+                def emit_value(name: str, old: str, new: str) -> None:
+                    if len(old) > 80 or len(new) > 80:
+                        return
+                    if (
+                        old in COMMON_NUMBERS
+                        and not looks_like_symbol(name)
+                        and name.lower() not in VALUE_NAMES
+                    ):
+                        return
+                    kind = (
+                        "polarity"
+                        if old in POLARITY and POLARITY[old].lower() == new.lower()
+                        else "value"
+                    )
+                    if kind == "value" and not (
+                        is_distinctive_value(old)
+                        or is_distinctive_value(new)
+                        or name.lower() in VALUE_NAMES
+                    ):
+                        if not (old.isdigit() or re.fullmatch(r"\d+\.\d+", old)):
+                            return
+                    emit(kind, name, old, new, origin)
+
+                for key, old in dpairs:
+                    if key in apairs and apairs[key] != old:
+                        emit_value(key, old, apairs[key])
+
+                if len(dpairs) == 1 and len(apair_list) == 1:
+                    (dk, dv), (ak, av) = dpairs[0], apair_list[0]
+                    if dk != ak and similar(dk, ak) >= 0.45:
+                        if dk not in added_idents and should_emit_rename(dk, ak, pair_key=True):
+                            emit("rename", dk, dk, ak, origin)
+                        if dv != av:
+                            emit_value(dk, dv, av)
+
+                if not dpairs and not apair_list:
+                    dnums = BARE_NUM_RE.findall(dbody)
+                    anums = BARE_NUM_RE.findall(abody)
+                    if len(dnums) == 1 and len(anums) == 1 and dnums[0] != anums[0]:
+                        shared = stems(dbody) & stems(abody)
+                        shared = {s for s in shared if s.lower() not in KEYWORDS}
+                        if shared:
+                            emit_value(sorted(shared, key=len, reverse=True)[0], dnums[0], anums[0])
+
+                dkeys = {k for k, _ in dpairs}
+                akeys = set(apairs)
+                didents = [i for i in extract_idents(dbody) if i not in dkeys]
+                aidents = [i for i in extract_idents(abody) if i not in akeys]
+                removed = [i for i in didents if i not in aidents]
+                added = [i for i in aidents if i not in didents]
+                used_added: set[int] = set()
+                for r in removed:
+                    best_j = -1
+                    best = 0.62
+                    for j, n in enumerate(added):
+                        if j in used_added:
+                            continue
+                        s = similar(r, n)
+                        if stems(r) & stems(n):
+                            s += 0.15
+                        if s > best:
+                            best = s
+                            best_j = j
+                    if best_j >= 0:
+                        if r not in added_idents and should_emit_rename(
+                            r, added[best_j], pair_key=False
+                        ):
+                            emit("rename", r, r, added[best_j], origin)
+                        used_added.add(best_j)
+
+                dst = extract_strings(dbody)
+                ast = set(extract_strings(abody))
+                for s in dst:
+                    if (
+                        s not in ast
+                        and s not in added_strings
+                        and 6 <= len(s) <= 80
+                        and is_distinctive_value(s)
+                    ):
+                        new = next(iter(ast - set(dst)), "")
+                        if len(new) > 80:
+                            new = new[:80]
+                        emit("string", s[:40], s, new, origin)
+
+    return facts
+
+
+def classify_claim(path: str, line: str) -> str:
+    p = path.replace("\\", "/").lower()
+    stripped = line.lstrip()
+    name = Path(path).name.lower()
+    if name in CINDER_FILENAMES or name.endswith(".lock") or name.endswith(".lockb"):
+        return "config"
+    if any(part in p.split("/") for part in ("test", "tests", "spec", "specs")) or any(
+        h in p for h in TEST_HINTS
+    ):
+        if "assert" in stripped or "expect(" in stripped or "XCT" in stripped:
+            return "assert"
+        return "test"
+    suffix = Path(path).suffix.lower()
+    if suffix in DOC_SUFFIXES or "/docs/" in p or "/adr/" in p or p.endswith("readme"):
+        return "docs"
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+    if stripped.startswith(("//", "#", "///", "//!", "--", "*", "/*", "<!--")):
+        return "comment"
+    if "assert" in stripped or "expect(" in stripped:
+        return "assert"
+    if STRING_RE.search(line) and not PAIR_RE.search(line):
+        return "string"
+    return "code"
+
+
+def needle_in_line(
+    needle: str, line: str, *, ident: bool, vtype: str | None = None
+) -> bool:
+    if not needle:
+        return False
+    hay = line
+    if not ident and (
+        vtype == "integer" or (vtype is None and re.fullmatch(r"\d+", needle))
+    ):
+        hay = mask_calendar(line)
+    if ident:
+        pat = r"(?<![A-Za-z0-9_])" + re.escape(needle) + r"(?![A-Za-z0-9_])"
+        if re.search(pat, hay) is not None:
+            return True
+        if needle.lower() != needle and needle.lower() in hay.lower():
+            return re.search(pat, hay, re.I) is not None
+        return False
+    if re.fullmatch(r"v?\d+(?:\.\d+)+", needle) or re.fullmatch(r"\d+", needle):
+        pat = r"(?<![\d.])" + re.escape(needle) + r"(?![\d.])"
+        return re.search(pat, hay) is not None
+    if vtype == "polarity" or (vtype is None and needle in POLARITY):
+        return stem_in_text(needle, hay)
+    return needle in hay
+
+
+def name_mentioned(fact: Fact, text: str) -> tuple[bool, bool]:
+    if needle_in_line(fact.name, text, ident=True):
+        return True, False
+    for st in stems(fact.name):
+        if len(st) >= 4 and stem_in_text(st, text):
+            return False, True
+    for alias in STEM_ALIASES.get(fact.name.lower(), ()):
+        if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+            return False, True
+    for st in stems(fact.name):
+        for alias in STEM_ALIASES.get(st, ()):
+            if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+                return False, True
+    return False, False
+
+
+def score_finding(
+    fact: Fact,
+    path: str,
+    line: str,
+    claim: str,
+    *,
+    nearby: str = "",
+) -> tuple[int, list[str]]:
+    """Score dest line as leftover of fact. Locator is explicit: no file-has-new."""
+    why: list[str] = []
+    score = 0
+
+    same_file = path == fact.origin.path
+    if same_file:
+        score += 12
+        why.append("same-file")
+
+    has_name, has_stem = name_mentioned(fact, line)
+    same_line_name = has_name or has_stem
+    if not same_line_name and nearby:
+        n_name, n_stem = name_mentioned(fact, nearby)
+        if n_name or n_stem:
+            why.append("nearby-name")
+            score += 14
+            if fact.kind != "polarity":
+                has_stem = True
+    if has_name:
+        score += 40
+        why.append("same-line-name")
+    elif has_stem:
+        score += 18
+        why.append("name-stem")
+    if fact.kind == "polarity" and not same_line_name:
+        return 0, []
+
+    vt = value_type(fact.old)
+    if fact.kind == "polarity":
+        vt = "polarity"
+    if fact.kind in {"value", "polarity"}:
+        if needle_in_line(fact.old, line, ident=False, vtype=vt):
+            score += 28
+            why.append("old-value")
+        if fact.new and needle_in_line(
+            fact.new, line, ident=False, vtype=value_type(fact.new)
+        ):
+            score -= 20
+            why.append("also-new-value")
+    elif fact.kind in {"rename", "removal"}:
+        if needle_in_line(fact.old, line, ident=True):
+            score += 36
+            why.append("old-ident")
+        if fact.new and needle_in_line(fact.new, line, ident=True):
+            score -= 15
+            why.append("also-new-ident")
+        generic = fact.old.lower() in GENERIC_NAMES or fact.name.lower() in GENERIC_NAMES
+        backticked = f"`{fact.old}`" in line or f"`{fact.name}`" in line
+        if generic and claim in {"docs", "code", "comment", "string"} and not backticked:
+            score -= 28
+            why.append("generic-ident")
+    elif fact.kind == "string":
+        if value_type(fact.old) == "polarity" or fact.old in POLARITY:
+            hit = needle_in_line(fact.old, line, ident=False, vtype="polarity")
+        else:
+            hit = fact.old in line
+        if hit:
+            score += 40
+            why.append("old-string")
+
+    claim_boost = {
+        "comment": 18,
+        "docs": 16,
+        "assert": 22,
+        "test": 12,
+        "config": 20,
+        "string": 10,
+        "code": 4,
+    }
+    score += claim_boost.get(claim, 0)
+    why.append(f"claim:{claim}")
+
+    if (
+        fact.kind in {"rename", "removal"}
+        and not looks_like_symbol(fact.old)
+        and path != fact.origin.path
+    ):
+        score -= 40
+        why.append("off-file-prose-rename")
+
+    if fact.name.lower() == "version" and claim == "config":
+        score += 15
+        why.append("version-config")
+
+    return max(score, 0), why
+
+
+def filediff_has_generated_banner(fd: FileDiff) -> bool:
+    """Hunk text may carry a @generated banner even when the path looks human."""
+    lines: list[str] = []
+    for h in fd.hunks:
+        for _, body in h.deleted[:8]:
+            lines.append(body)
+        for _, body in h.added[:8]:
+            lines.append(body)
+        if len(lines) >= 8:
+            break
+    return is_cinder_banner("\n".join(lines[:8]))
+
+
+def is_cinder_path(rel: str) -> bool:
+    p = Path(rel)
+    parts = p.parts
+    if any(part.lower() in CINDER_DIR_NAMES for part in parts):
+        return True
+    name = p.name
+    lname = name.lower()
+    if lname in CINDER_FILENAMES:
+        return True
+    if lname.endswith(".lock") or lname.endswith(".lockb"):
+        return True
+    if ".generated." in lname or lname.endswith(".generated"):
+        return True
+    if lname.endswith(".gen.go") or lname.endswith(".gen.ts") or lname.endswith(".gen.js"):
+        return True
+    if lname.endswith(".pb.go") or lname.endswith(".pb.ts") or lname.endswith("_pb2.py"):
+        return True
+    if lname.endswith(".snap"):
+        return True
+    stem = p.stem.lower()
+    if stem.endswith("generated") or stem.startswith("generated"):
+        return True
+    return False
+
+
+def is_cinder_banner(text: str) -> bool:
+    if not text:
+        return False
+    head = "\n".join(text.splitlines()[:8])
+    return CINDER_BANNER_RE.search(head) is not None
+
+
+def dest_is_cinder(rel: str, text: str | None = None) -> bool:
+    return is_cinder_path(rel) or (text is not None and is_cinder_banner(text))
+
+
+def infer_generator(rel: str, text: str | None) -> tuple[str | None, str]:
+    """Name the regenerator when dest is ash. Never 'edit this line'."""
+    name = Path(rel).name.lower()
+    if name in LOCKFILE_GENERATORS:
+        return LOCKFILE_GENERATORS[name], "lockfile"
+    if name in CINDER_FILENAMES or name.endswith(".lock") or name.endswith(".lockb"):
+        return "lockfile", "lockfile"
+    lname = name
+    if lname.endswith(".pb.go") or lname.endswith(".pb.ts") or lname.endswith("_pb2.py"):
+        return "protoc", "protobuf"
+    if lname.endswith(".snap"):
+        return "snapshot", "snapshot"
+    if text:
+        head = "\n".join(text.splitlines()[:8])
+        m = BANNER_GENERATOR_RE.search(head)
+        if m:
+            gen = m.group("gen").strip().strip(".,;:)")
+            gen = gen.lstrip("`").rstrip("`")
+            if gen:
+                return gen, "banner"
+        if is_cinder_banner(text):
+            return None, "banner"
+    parts = [p.lower() for p in Path(rel).parts]
+    if any(p in {"oracle", "oracles"} for p in parts):
+        return None, "oracle"
+    if any(p in CINDER_DIR_NAMES for p in parts):
+        return None, "generated-path"
+    if is_cinder_path(rel):
+        return None, "generated-path"
+    return None, "generated"
+
+
+def parse_locator(raw: str) -> Locator | None:
+    """FILE:LINE, grep -n, and compiler path:line:col:rest. Invert input."""
+    s = raw.strip()
+    if not s:
+        return None
+    if s.startswith(("diff ", "+++ ", "--- ", "@@", "index ", "Binary ")):
+        return None
+    if re.match(r"^[+-]{3} ", s):
+        return None
+    if "://" in s and not re.search(r":\d+", s.split("://", 1)[1] if False else s):
+        return None
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        return None
+    m = re.search(r":(\d+)(?::\d+)?(?::(.*))?$", s)
+    if not m:
+        return None
+    path = s[: m.start()]
+    path = re.sub(r"^\./", "", path)
+    if not path:
+        return None
+    line = int(m.group(1))
+    if line < 1:
+        return None
+    return Locator(path=path, line=line, raw=s)
+
+
+def read_locators(args: argparse.Namespace) -> list[Locator]:
+    raws: list[str] = list(args.locators or [])
+    if not raws:
+        if sys.stdin.isatty() and args.diff != "-":
+            die("usage: tinder FILE:LINE [FILE:LINE ...]  (or locators on stdin)")
+        if args.diff == "-":
+            die("stdin is the diff (--diff -); pass FILE:LINE on argv")
+        for line in sys.stdin.read().splitlines():
+            if line.strip():
+                raws.append(line)
+    locators: list[Locator] = []
+    seen: set[tuple[str, int]] = set()
+    for raw in raws:
+        loc = parse_locator(raw)
+        if loc is None:
+            if args.locators:
+                die(f"not a FILE:LINE locator: {raw}")
+            continue
+        key = (loc.path, loc.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        locators.append(loc)
+    if not locators:
+        die("no FILE:LINE locators")
+    return locators
+
+
+def rel_path(root: Path, path: str) -> str:
+    p = Path(path)
+    if p.is_absolute():
+        try:
+            return str(p.resolve().relative_to(root.resolve()))
+        except ValueError:
+            return str(p)
+    return path.replace("\\", "/")
+
+
+def read_dest_text(root: Path, rel: str, rev: str | None) -> str | None:
+    if rev is None:
+        path = root / rel
+        if not path.is_file():
+            return None
+        try:
+            if path.stat().st_size > 1_500_000:
+                return None
+            data = path.read_bytes()
+        except OSError:
+            return None
+    else:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"{rev}:{rel}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        data = proc.stdout
+        if len(data) > 1_500_000:
+            return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def load_dest(
+    root: Path,
+    loc: Locator,
+    rev: str | None,
+    *,
+    follow: bool = True,
+) -> Dest | None:
+    asked = rel_path(root, loc.path)
+    ident = resolve_dest_identity(root, asked, rev, follow=follow)
+    rel = ident.current if follow else asked
+    text = read_dest_text(root, rel, rev)
+    if text is None:
+        return None
+    lines = text.splitlines()
+    line_no = loc.line
+    slipped = False
+    # Dead dest name: keep the leftover *line* across dest identity (slip),
+    # not just the path. A dest rewrite that rode with the move would
+    # otherwise point at the new heading.
+    if follow and asked != rel and git_ok(root):
+        hist = historical_asked_line(root, asked, loc.line, ident, rev)
+        if hist is not None:
+            current_body = lines[line_no - 1] if 1 <= line_no <= len(lines) else ""
+            if current_body != hist:
+                hit = best_slip_line(hist, lines)
+                if hit is not None:
+                    slipped = hit != loc.line
+                    line_no = hit
+    if line_no < 1 or line_no > len(lines):
+        return None
+    body = lines[line_no - 1]
+    nearby = "\n".join(
+        lines[max(0, line_no - 4) : line_no - 1] + lines[line_no : line_no + 2]
+    )
+    excerpt = body.strip()
+    if len(excerpt) > 220:
+        excerpt = excerpt[:217] + "..."
+    ash = dest_is_cinder(rel, text)
+    gen, reason = infer_generator(rel, text) if ash else (None, "")
+    names = ident.names if ident.names else (rel,)
+    return Dest(
+        path=rel,
+        line=line_no,
+        text=text,
+        body=body,
+        excerpt=excerpt,
+        nearby=nearby,
+        ash=ash,
+        generator=gen,
+        ash_reason=reason,
+        claim=classify_claim(rel, body),
+        asked_path=asked,
+        asked_line=loc.line,
+        identity=names,
+        dest_rename_shas=ident.rename_shas,
+        followed=ident.followed or asked != rel,
+        slipped=slipped,
+    )
+
+
+def line_has_value_name(line: str) -> bool:
+    """True when the dest line names a typed claim (timeout/version/… or alias)."""
+    for name in VALUE_NAMES:
+        if stem_in_text(name, line):
+            return True
+        for alias in STEM_ALIASES.get(name, ()):
+            if (alias in line) if not alias.isascii() else stem_in_text(alias, line):
+                return True
+    for key, _val in extract_pairs(line):
+        if key.lower() in VALUE_NAMES or looks_like_symbol(key):
+            return True
+    for ident in extract_idents(line):
+        if looks_like_symbol(ident) or ident.lower() in VALUE_NAMES:
+            return True
+    return False
+
+
+def pickaxe_seeds(dest: Dest) -> list[str]:
+    """Distinctive tokens from the dest *claim*. Calendar months are not integers."""
+    line = dest.body
+    masked = mask_calendar(line)
+    seeds: list[str] = []
+    seen: set[str] = set()
+    named = line_has_value_name(line)
+
+    def add(tok: str) -> None:
+        if not tok or tok in seen:
+            return
+        # Keep polarity / versions / numbers even if the token is a keyword (True).
+        if (
+            tok.lower() in KEYWORDS
+            and not looks_like_symbol(tok)
+            and tok not in POLARITY
+            and not is_distinctive_value(tok)
+            and not VERSION_RE.fullmatch(tok)
+            and not re.fullmatch(r"\d+(?:\.\d+)?", tok)
+        ):
+            return
+        seen.add(tok)
+        seeds.append(tok)
+
+    for key, val in extract_pairs(line):
+        if is_distinctive_value(val) or VERSION_RE.fullmatch(val) or val in POLARITY:
+            add(val)
+        elif named and val:
+            add(val)
+        if looks_like_symbol(key) or key.lower() in VALUE_NAMES:
+            add(key)
+    for ver in VERSION_RE.findall(line):
+        add(ver)
+    for num in NUMBER_RE.findall(masked):
+        if is_distinctive_value(num) or (named and num):
+            add(num)
+    for ident in extract_idents(line):
+        if looks_like_symbol(ident) or ident.lower() in VALUE_NAMES:
+            add(ident)
+    for alias_key, aliases in STEM_ALIASES.items():
+        if any((a in line) if not a.isascii() else stem_in_text(a, line) for a in aliases):
+            add(alias_key)
+        if stem_in_text(alias_key, line) and alias_key in VALUE_NAMES:
+            add(alias_key)
+    if not seeds:
+        for st in stems(masked):
+            if st in VALUE_NAMES:
+                add(st)
+    return seeds
+
+
+def slice_diff_for_path(diff_text: str, path: str) -> str:
+    if not diff_text or not path:
+        return ""
+    chunks: list[str] = []
+    current: list[str] = []
+    keep = False
+    want = path.replace("\\", "/")
+
+    def flush() -> None:
+        nonlocal current, keep
+        if keep and current:
+            chunks.append("\n".join(current).rstrip())
+        current = []
+        keep = False
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            flush()
+            current = [raw]
+            parts = raw.split()
+            old_p = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else ""
+            new_p = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else ""
+            keep = want in {old_p, new_p, Path(old_p).name, Path(new_p).name}
+            continue
+        if not current:
+            if raw.startswith("--- "):
+                rest = raw[4:]
+                p = rest[2:] if rest.startswith("a/") else rest
+                current = [raw]
+                keep = p == want or Path(p).name == Path(want).name
+            continue
+        current.append(raw)
+        if raw.startswith("--- "):
+            rest = raw[4:]
+            p = rest[2:] if rest.startswith("a/") else rest
+            if p == want:
+                keep = True
+        elif raw.startswith("+++ "):
+            rest = raw[4:]
+            p = rest[2:] if rest.startswith("b/") else rest
+            if p == want:
+                keep = True
+    flush()
+    return "\n".join(chunks)
+
+
+def fact_matches_dest(
+    fact: Fact,
+    dest: Dest,
+    min_score: int,
+) -> tuple[int, list[str]] | None:
+    if dest_is_cinder(fact.origin.path):
+        return None
+    if fact.origin.path == dest.path and fact.origin.excerpt.strip() == dest.body.strip():
+        # This line *is* the changed origin, not a leftover of it.
+        if fact.new and needle_in_line(
+            fact.new, dest.body, ident=fact.kind in {"rename", "removal"}, vtype=value_type(fact.new)
+        ):
+            return None
+    if is_homonym_binding(fact, dest.body):
+        return None
+    vt = "polarity" if fact.kind == "polarity" else value_type(fact.old)
+    if fact.kind in {"rename", "removal"}:
+        if not needle_in_line(fact.old, dest.body, ident=True):
+            return None
+    elif fact.kind == "string":
+        if not needle_in_line(fact.old, dest.body, ident=False, vtype=vt):
+            if fact.old not in dest.body:
+                return None
+    else:
+        if not needle_in_line(fact.old, dest.body, ident=False, vtype=vt):
+            return None
+    score, why = score_finding(
+        fact, dest.path, dest.body, dest.claim, nearby=dest.nearby
+    )
+    if score < min_score:
+        return None
+    return score, why
+
+
+def matching_facts(
+    facts: Sequence[Fact], dest: Dest, min_score: int
+) -> list[tuple[Fact, int, tuple[str, ...]]]:
+    """Every leftover claim this dest line still asserts, best score first."""
+    out: list[tuple[Fact, int, tuple[str, ...]]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for fact in facts:
+        hit = fact_matches_dest(fact, dest, min_score)
+        if hit is None:
+            continue
+        k = fact.key()
+        if k in seen:
+            continue
+        seen.add(k)
+        score, why = hit
+        out.append((fact, score, tuple(why)))
+    out.sort(key=lambda t: (-t[1], t[0].kind, t[0].name, t[0].origin.path))
+    return out
+
+
+def best_fact(
+    facts: Sequence[Fact], dest: Dest, min_score: int
+) -> tuple[Fact, int, tuple[str, ...]] | None:
+    hits = matching_facts(facts, dest, min_score)
+    return hits[0] if hits else None
+
+
+def decode_diff(raw: bytes, src: str) -> str:
+    if b"\0" in raw[:8192]:
+        die(f"binary diff ({src})")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        die(f"binary diff ({src}): {e}")
+    return ""
+
+
+def read_given_diff(args: argparse.Namespace) -> str:
+    assert args.diff is not None
+    if args.diff == "-":
+        raw = sys.stdin.buffer.read()
+        src = "stdin"
+    else:
+        p = Path(args.diff)
+        try:
+            raw = p.read_bytes()
+        except OSError as e:
+            die(f"cannot read {p}: {e}")
+        src = str(p)
+    return decode_diff(raw, src)
+
+
+def commit_meta(root: Path, sha: str) -> tuple[str, str, str]:
+    out = git(["log", "-1", "--format=%H%x09%s%x09%cI", sha], root)
+    line = out.decode("utf-8", "replace").strip()
+    parts = line.split("\t", 2)
+    if len(parts) < 3:
+        return sha, "", ""
+    return parts[0], parts[1], parts[2]
+
+
+def commit_patch(root: Path, sha: str) -> str:
+    raw = git(
+        ["show", "--pretty=format:", "--no-color", "--no-ext-diff", "--first-parent", sha],
+        root,
+        check=False,
+    )
+    return decode_diff(raw, sha) if raw else ""
+
+
+def worktree_patch(root: Path, staged: bool) -> str:
+    args = ["diff", "--cached" if staged else "HEAD", "--no-color", "--no-ext-diff"]
+    raw = git(args, root, check=False)
+    return decode_diff(raw, "worktree") if raw else ""
+
+
+def log_shas_for_seeds(
+    root: Path,
+    seeds: Sequence[str],
+    *,
+    max_commits: int,
+    since: str | None,
+    until: str | None,
+) -> list[str]:
+    if not seeds:
+        return []
+    seen: set[str] = set()
+    order: list[str] = []
+    extra: list[str] = []
+    if since:
+        extra += [f"--since={since}"]
+    if until:
+        extra += [f"--until={until}"]
+    # Prefer distinctive seeds first; names are noisier.
+    ranked = sorted(
+        seeds,
+        key=lambda s: (
+            0 if VERSION_RE.fullmatch(s) else 1 if is_distinctive_value(s) else 2,
+            -len(s),
+        ),
+    )
+    for seed in ranked:
+        # -i: dest prose `timeout` must still see HOOK_TIMEOUT 10→30.
+        cmd = [
+            "log",
+            "--pretty=format:%H",
+            f"-n{max_commits}",
+            "-i",
+            "-S",
+            seed,
+            *extra,
+            "--",
+            ".",
+            *LOG_EXCLUDES,
+        ]
+        raw = git(cmd, root, check=False)
+        if not raw:
+            continue
+        for sha in raw.decode("utf-8", "replace").splitlines():
+            sha = sha.strip()
+            if len(sha) >= 7 and sha not in seen:
+                seen.add(sha)
+                order.append(sha)
+        if len(order) >= max_commits:
+            break
+    if not order:
+        return []
+    # Newest first among the union.
+    walk = git(["rev-list", "--date-order", "--no-walk", *order], root, check=False)
+    if not walk:
+        return order[:max_commits]
+    out = [s.strip() for s in walk.decode("utf-8").splitlines() if s.strip()]
+    return out[:max_commits]
+
+
+def _clip_hunk(hunk: str) -> str:
+    if hunk and len(hunk.splitlines()) > 80:
+        return "\n".join(hunk.splitlines()[:80]) + "\n..."
+    return hunk
+
+
+def make_falsifier(
+    *,
+    sha: str,
+    subject: str,
+    when: str,
+    fact: Fact,
+    score: int,
+    why: tuple[str, ...],
+    diff_text: str,
+    source: str,
+    also: tuple[tuple[Fact, int, tuple[str, ...]], ...] = (),
+) -> Falsifier:
+    paths: list[str] = []
+    for fa in (fact, *(t[0] for t in also)):
+        if fa.origin.path not in paths:
+            paths.append(fa.origin.path)
+    hunks = [_clip_hunk(slice_diff_for_path(diff_text, p)) for p in paths]
+    hunk = "\n\n".join(h for h in hunks if h)
+    return Falsifier(
+        sha=sha,
+        subject=subject,
+        when=when,
+        fact=fact,
+        score=score,
+        why=why,
+        hunk=hunk,
+        source=source,
+        also=also,
+    )
+
+
+def search_diff(
+    dest: Dest,
+    diff_text: str,
+    kinds: set[str],
+    min_score: int,
+    *,
+    sha: str,
+    subject: str,
+    when: str,
+    source: str,
+) -> Falsifier | None:
+    if not diff_text.strip():
+        return None
+    files = parse_unified_diff(diff_text)
+    dest_id = set(dest.identity) | {dest.path, dest.asked_path}
+    dest_id.discard("")
+    facts = extract_facts(files, kinds, dest_identity=dest_id)
+    hits = matching_facts(facts, dest, min_score)
+    if not hits:
+        return None
+    fact, score, why = hits[0]
+    return make_falsifier(
+        sha=sha,
+        subject=subject,
+        when=when,
+        fact=fact,
+        score=score,
+        why=why,
+        diff_text=diff_text,
+        source=source,
+        also=tuple(hits[1:]),
+    )
+
+
+def find_falsifiers(
+    root: Path,
+    dest: Dest,
+    args: argparse.Namespace,
+    kinds: set[str],
+) -> list[Falsifier]:
+    limit = 10**9 if args.all else max(1, args.limit)
+    found: list[Falsifier] = []
+
+    if args.diff is not None:
+        diff_text = read_given_diff(args)
+        hit = search_diff(
+            dest,
+            diff_text,
+            kinds,
+            args.min_score,
+            sha="DIFF",
+            subject="supplied diff",
+            when="",
+            source="diff",
+        )
+        return [hit] if hit else []
+
+    if not git_ok(root):
+        die(f"not a git repository: {root} (pass --diff or run inside a repo)")
+
+    # Uncommitted change is the most recent possible falsifier.
+    wt = worktree_patch(root, staged=False)
+    hit = search_diff(
+        dest,
+        wt,
+        kinds,
+        args.min_score,
+        sha="WORKTREE",
+        subject="uncommitted worktree",
+        when="",
+        source="worktree",
+    )
+    if hit:
+        found.append(hit)
+        if len(found) >= limit:
+            return found
+
+    idx = worktree_patch(root, staged=True)
+    if idx.strip() and idx != wt:
+        hit = search_diff(
+            dest,
+            idx,
+            kinds,
+            args.min_score,
+            sha="INDEX",
+            subject="staged index",
+            when="",
+            source="index",
+        )
+        if hit:
+            found.append(hit)
+            if len(found) >= limit:
+                return found
+
+    seeds = pickaxe_seeds(dest)
+    shas = log_shas_for_seeds(
+        root,
+        seeds,
+        max_commits=args.max_commits,
+        since=args.since,
+        until=args.until,
+    )
+    for sha in shas:
+        patch = commit_patch(root, sha)
+        if not patch.strip():
+            continue
+        full, subject, when = commit_meta(root, sha)
+        hit = search_diff(
+            dest,
+            patch,
+            kinds,
+            args.min_score,
+            sha=full[:12],
+            subject=subject,
+            when=when,
+            source="commit",
+        )
+        if hit:
+            # keep full sha in structured output
+            hit = Falsifier(
+                sha=full,
+                subject=hit.subject,
+                when=hit.when,
+                fact=hit.fact,
+                score=hit.score,
+                why=hit.why,
+                hunk=hit.hunk,
+                source=hit.source,
+                also=hit.also,
+            )
+            found.append(hit)
+            if len(found) >= limit:
+                break
+    return found
+
+
+def color_enabled(args: argparse.Namespace, stream: TextIO) -> bool:
+    if args.no_color:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return stream.isatty()
+
+
+def paint(text: str, code: str, on: bool) -> str:
+    if not on:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def fact_title(fact: Fact) -> str:
+    if fact.kind == "rename":
+        return f"{fact.old} → {fact.new}"
+    if fact.kind == "polarity":
+        return f"{fact.name}: {fact.old} → {fact.new}"
+    if fact.kind == "removal":
+        return f"{fact.old} (removed)"
+    if fact.kind == "string":
+        return f'"{fact.old}" → "{fact.new}"'
+    return f"{fact.name}: {fact.old} → {fact.new}"
+
+
+def fact_kind_label(fact: Fact) -> str:
+    return {
+        "rename": "RENAME",
+        "polarity": "FLIP",
+        "removal": "GONE",
+        "string": "STR",
+    }.get(fact.kind, "FACT")
+
+
+def print_ash(dest: Dest, *, color: bool) -> None:
+    loc = f"{dest.path}:{dest.line}"
+    via = dest_via_label(dest)
+    head = f"{NAME}: ash  {loc}"
+    if via:
+        head += f"  dest {via}"
+    print(paint(head, "1", color))
+    print()
+    print(paint("ASH", "33;1", color), paint("leftover build, not leftover claim", "2", color))
+    print(f"  {paint(loc, '32', color):<42} {dest.excerpt}")
+    gen = dest.generator or ""
+    reason = dest.ash_reason
+    if gen and reason == "lockfile":
+        print(paint(f"regenerate  {gen}", "36;1", color), paint(f"({Path(dest.path).name} — lockfile)", "2", color))
+    elif gen:
+        print(paint(f"regenerate  {gen}", "36;1", color), paint(f"({reason})", "2", color))
+    else:
+        hint = {
+            "oracle": "oracle dest — regenerate from spec",
+            "generated-path": "generated dest — leftover build",
+            "banner": "generated banner — leftover build",
+            "lockfile": "lockfile — leftover build",
+        }.get(reason, "leftover build, not a leftover claim")
+        print(paint("regenerate", "36;1", color), paint(f"({hint})", "2", color))
+
+
+def dest_via_label(dest: Dest) -> str:
+    names = [n for n in dest.identity if n]
+    chain = ""
+    if len(names) >= 2:
+        chain = " → ".join(names)
+    elif dest.asked_path and dest.asked_path != dest.path:
+        chain = f"{dest.asked_path} → {dest.path}"
+    if dest.slipped and dest.asked_path:
+        al = dest.asked_line or dest.line
+        slip = f"{dest.asked_path}:{al} → {dest.path}:{dest.line}"
+        if chain:
+            return f"{chain}; slip {slip}"
+        return f"slip {slip}"
+    return chain
+
+
+def print_none(dest: Dest, *, color: bool) -> None:
+    loc = f"{dest.path}:{dest.line}"
+    via = dest_via_label(dest)
+    head = f"{NAME}: none  {loc}"
+    if via:
+        head += f"  dest {via}"
+    print(paint(head, "1", color))
+    print(f"  {dest.excerpt}")
+    print(paint("  no falsifying fact mutation found for this leftover claim.", "2", color))
+
+
+def print_falsifiers(
+    dest: Dest, hits: Sequence[Falsifier], *, explain: bool, color: bool, show_hunk: bool
+) -> None:
+    loc = f"{dest.path}:{dest.line}"
+    via = dest_via_label(dest)
+    head = f"{NAME}: leftover  {loc}"
+    if via:
+        head += f"  dest {via}"
+    print(paint(head, "1", color))
+    print()
+    print(paint("CLAIM", "33;1", color), paint(dest.excerpt, "1", color))
+    print(f"  {paint(loc, '32', color)}")
+    if via:
+        print(paint("DEST", "36;1", color), paint(via, "2", color), paint("(file identity, not leftover-name)", "2", color))
+    for hit in hits:
+        fact = hit.fact
+        print()
+        who = hit.sha if hit.source == "commit" else hit.sha
+        meta = hit.subject
+        extra = f"  {hit.when}" if hit.when else ""
+        print(
+            paint("FALSIFIED", "32;1", color),
+            paint(who[:12] if hit.source == "commit" else who, "32", color),
+            paint(meta, "1", color) + paint(extra, "2", color),
+        )
+        print(
+            paint(fact_kind_label(fact), "33;1", color),
+            paint(fact_title(fact), "1", color),
+            paint(f"  {fact.origin.path}:{fact.origin.line}", "2", color),
+            paint(f"  score {hit.score}", "2", color),
+        )
+        if explain:
+            print(paint(f"         why: {', '.join(hit.why)}", "2", color))
+        for extra_fact, extra_score, extra_why in hit.also:
+            print(
+                paint(fact_kind_label(extra_fact), "33;1", color),
+                paint(fact_title(extra_fact), "1", color),
+                paint(f"  {extra_fact.origin.path}:{extra_fact.origin.line}", "2", color),
+                paint(f"  score {extra_score}", "2", color),
+            )
+            if explain:
+                print(paint(f"         why: {', '.join(extra_why)}", "2", color))
+        if show_hunk and hit.hunk:
+            print(paint(hit.hunk, "2", color))
+
+
+def print_tsv_ash(dest: Dest) -> None:
+    excerpt = dest.excerpt.replace("\t", " ").replace("\n", " ")
+    gen = dest.generator or ""
+    print(
+        f"ash\t{dest.path}\t{dest.line}\tregenerate\t\t{gen}\t\t\t\t\t{dest.ash_reason}\t{excerpt}"
+    )
+
+
+def print_tsv_hit(dest: Dest, hit: Falsifier) -> None:
+    excerpt = dest.excerpt.replace("\t", " ").replace("\n", " ")
+    rows = [(hit.fact, hit.score)] + [(fa, sc) for fa, sc, _why in hit.also]
+    for fa, score in rows:
+        print(
+            f"leftover\t{dest.path}\t{dest.line}\tfalsified\t{hit.sha}\t{fa.name}\t"
+            f"{fa.old}\t{fa.new}\t{fa.kind}\t{fa.origin.path}\t"
+            f"{fa.origin.line}\t{score}\t{excerpt}"
+        )
+
+
+def print_tsv_none(dest: Dest) -> None:
+    excerpt = dest.excerpt.replace("\t", " ").replace("\n", " ")
+    print(f"none\t{dest.path}\t{dest.line}\tnone\t\t\t\t\t\t\t\t\t{excerpt}")
+
+
+def dest_json(dest: Dest) -> dict[str, object]:
+    return {
+        "path": dest.path,
+        "line": dest.line,
+        "asked_path": dest.asked_path or dest.path,
+        "asked_line": dest.asked_line or dest.line,
+        "identity": list(dest.identity),
+        "followed": dest.followed or bool(dest_via_label(dest)),
+        "slipped": dest.slipped,
+        "excerpt": dest.excerpt,
+        "claim": dest.claim,
+        "ash": dest.ash,
+        "generator": dest.generator,
+        "ash_reason": dest.ash_reason,
+    }
+
+
+def fact_json(fa: Fact) -> dict[str, object]:
+    return {
+        "kind": fa.kind,
+        "name": fa.name,
+        "old": fa.old,
+        "new": fa.new,
+        "origin": {"path": fa.origin.path, "line": fa.origin.line, "excerpt": fa.origin.excerpt},
+    }
+
+
+def parse_kinds(s: str) -> set[str]:
+    allowed = {"value", "rename", "polarity", "string", "removal"}
+    parts = {p.strip() for p in s.split(",") if p.strip()}
+    if not parts:
+        die("empty --kinds")
+    unknown = parts - allowed
+    if unknown:
+        die(f"unknown kinds {sorted(unknown)}; allowed: {sorted(allowed)}")
+    return parts
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=NAME,
+        description=(
+            "Given a leftover dest locus (FILE:LINE), emit the commit that "
+            "falsified the fact. --follow walks dest-file identity so a leftover "
+            "that moved with a dest rename names the fact, not the rename. "
+            "Ash (generated/oracle/lockfile) answers regenerate."
+        ),
+    )
+    p.add_argument(
+        "locators",
+        nargs="*",
+        help="FILE:LINE leftover loci (grep -n lines also work). Stdin if omitted.",
+    )
+    p.add_argument("-C", "--root", default=".", help="repository root (default: cwd)")
+    p.add_argument(
+        "--follow",
+        dest="follow",
+        action="store_true",
+        default=True,
+        help="follow dest-file identity across renames (default)",
+    )
+    p.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        help="path is the identity; a dead dest name is missing",
+    )
+    p.add_argument(
+        "--rev",
+        default=None,
+        help="read dest from this revision instead of the worktree",
+    )
+    p.add_argument(
+        "--diff",
+        metavar="FILE",
+        help="score locators against this unified diff ('-' = stdin) instead of walking history",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--tsv", action="store_true", help="TSV output")
+    p.add_argument("--explain", action="store_true", help="show score reasons")
+    p.add_argument("--no-hunk", action="store_true", help="do not print the origin hunk")
+    p.add_argument("--min-score", type=int, default=55, help="minimum leftover score (default 55)")
+    p.add_argument(
+        "--kinds",
+        default="value,rename,polarity",
+        help="comma-separated fact kinds (value,rename,polarity,string,removal). "
+        "string is opt-in: dest leftover is not leftover-name search",
+    )
+    p.add_argument("--limit", type=int, default=1, help="falsifiers per locator (default 1, newest)")
+    p.add_argument("--all", action="store_true", help="print every matching falsifier (up to --max-commits)")
+    p.add_argument(
+        "--max-commits",
+        type=int,
+        default=80,
+        help="pickaxe candidate cap (default 80)",
+    )
+    p.add_argument("--since", default=None, help="git log --since")
+    p.add_argument("--until", default=None, help="git log --until")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def cmd_self_test() -> int:
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name} {detail}")
+            failures += 1
+
+    loc = parse_locator("plugin/plugin.json:4")
+    check("parse FILE:LINE", loc is not None and loc.path == "plugin/plugin.json" and loc.line == 4)
+    grep = parse_locator('plugin/plugin.json:4:    "version": "0.3.0",')
+    check("parse grep -n", grep is not None and grep.path == "plugin/plugin.json" and grep.line == 4)
+    spaced = parse_locator("file with spaces.md:3")
+    check("parse space in filename", spaced is not None and spaced.path == "file with spaces.md" and spaced.line == 3)
+    check("reject bare path", parse_locator("README.md") is None)
+    check("reject URL", parse_locator("https://example.com/foo") is None)
+
+    ver = """diff --git a/plugin.json b/plugin.json
+--- a/plugin.json
++++ b/plugin.json
+@@ -1,4 +1,4 @@
+ {
+-  "version": "0.3.0",
++  "version": "0.7.0",
+   "timeout": 10
+ }
+"""
+    jsf = extract_facts(parse_unified_diff(ver), {"value", "rename", "polarity", "string"})
+    check(
+        "json quoted version is a named fact",
+        any(f.kind == "value" and f.name == "version" and f.old == "0.3.0" and f.new == "0.7.0" for f in jsf),
+        str([(f.name, f.old, f.new) for f in jsf]),
+    )
+    check(
+        "json version is not truncated to 0.3",
+        not any(f.old == "0.3" or f.new == "0.3" for f in jsf),
+        str([(f.old, f.new) for f in jsf]),
+    )
+    prose_ver = Fact(
+        "value", "version", "0.3.0", "0.7.0", Origin("plugin.json", 2, '"version": "0.3.0"')
+    )
+    check(
+        "prose version 0.3.0 is not a homonym",
+        not is_homonym_binding(prose_ver, "plugin version 0.3.0, hook timeout 10 seconds."),
+    )
+    sc_prose, why_prose = score_finding(
+        prose_ver,
+        "README.md",
+        "plugin version 0.3.0, hook timeout 10 seconds.",
+        "docs",
+    )
+    check(
+        "JSON-only plugin version 0.3.0 still scores as a claim",
+        sc_prose >= 70 and "old-value" in why_prose,
+        f"{sc_prose} {why_prose}",
+    )
+
+    check(
+        "integer 10 is not October in ISO date",
+        not needle_in_line("10", "shipped 2024-10-01", ident=False, vtype="integer"),
+    )
+    check(
+        "integer 10 still matches timeout prose",
+        needle_in_line("10", "timeout default is 10", ident=False, vtype="integer"),
+    )
+    check(
+        "3 does not match a date-only line",
+        not needle_in_line("3", "landed 2024-03-01.", ident=False, vtype="integer"),
+    )
+
+    date_dest = Dest(
+        path="CHANGELOG.md",
+        line=2,
+        text="## timeout\nshipped 2024-10-01\n",
+        body="shipped 2024-10-01",
+        excerpt="shipped 2024-10-01",
+        nearby="## timeout",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+    )
+    timeout_fact = Fact(
+        "value", "HOOK_TIMEOUT", "10", "30", Origin("src/config.py", 1, "HOOK_TIMEOUT = 10")
+    )
+    check(
+        "date dest is not leftover of timeout 10",
+        fact_matches_dest(timeout_fact, date_dest, 55) is None,
+    )
+    seeds = pickaxe_seeds(date_dest)
+    check(
+        "date dest does not seed integer 10",
+        "10" not in seeds,
+        str(seeds),
+    )
+
+    check("generated/ dest is ash", is_cinder_path("generated/vendor_bundle.js"))
+    check("oracle/ dest is ash", is_cinder_path("oracle/timeout.json"))
+    check("Cargo.lock dest is ash", is_cinder_path("Cargo.lock"))
+    check("package-lock.json dest is ash", is_cinder_path("package-lock.json"))
+    check("OraclesGenerated.swift is ash", is_cinder_path("OraclesGenerated.swift"))
+    check("plugin.json is a believer", not is_cinder_path("plugin/plugin.json"))
+    check("CLAUDE.md is a believer", not is_cinder_path("CLAUDE.md"))
+    gen, reason = infer_generator(
+        "Cargo.lock",
+        '# This file is automatically @generated by Cargo.\nversion = 3\nversion = "0.3.0"\n',
+    )
+    check("Cargo.lock generator is cargo", gen == "cargo" and reason == "lockfile", f"{gen} {reason}")
+    gen2, reason2 = infer_generator(
+        "OraclesGenerated.swift",
+        "// @generated by tools/spec-gen.ts from specs/tenaoshi.pkl — DO NOT EDIT\nlet timeout = 10\n",
+    )
+    check(
+        "banner names spec-gen.ts",
+        gen2 is not None and "spec-gen.ts" in gen2,
+        f"{gen2} {reason2}",
+    )
+    check(
+        "banner outside generated/ is still ash",
+        dest_is_cinder("hook_bundle.js", "// generated — do not edit\nconst TIMEOUT = 10;\n"),
+    )
+    gen3, reason3 = infer_generator(
+        "hook_bundle.js", "// generated — do not edit\nconst TIMEOUT = 10;\n"
+    )
+    check("nameless banner still regenerate (not edit)", reason3 == "banner", f"{gen3} {reason3}")
+
+    polar_f = Fact(
+        "polarity", "ENABLE_CACHE", "True", "False", Origin("src/flags.py", 1, "ENABLE_CACHE = True")
+    )
+    sc_ghost, why_ghost = score_finding(
+        polar_f, "README.md", "DEBUG is True", "docs", nearby="the cache is enabled\n"
+    )
+    check("polarity leftover needs same-line name", sc_ghost < 55, f"{sc_ghost} {why_ghost}")
+
+    cafe = """diff --git a/src/x.py b/src/x.py
+--- a/src/x.py
++++ b/src/x.py
+@@ -1 +1 @@
+-café_timeout = 10
++café_timeout = 30
+"""
+    cf = extract_facts(parse_unified_diff(cafe), {"value", "rename", "polarity", "string"})
+    check(
+        "do not mint _timeout from café_timeout",
+        not any(f.name == "_timeout" or f.old == "_timeout" for f in cf),
+        str([(f.name, f.old, f.new) for f in cf]),
+    )
+    check(
+        "timeout stem is not settimeout",
+        not stem_in_text("timeout", "assert socket.settimeout(10) or True"),
+    )
+
+    # Mini invert: JSON-only hunk falsifies prose leftover.
+    prose_dest = Dest(
+        path="README.md",
+        line=1,
+        text="plugin version 0.3.0, hook timeout 10 seconds.\n",
+        body="plugin version 0.3.0, hook timeout 10 seconds.",
+        excerpt="plugin version 0.3.0, hook timeout 10 seconds.",
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+    )
+    hit = search_diff(
+        prose_dest,
+        ver,
+        {"value", "rename", "polarity", "string"},
+        55,
+        sha="DIFF",
+        subject="supplied diff",
+        when="",
+        source="diff",
+    )
+    check("JSON-only hunk falsifies plugin version 0.3.0 prose", hit is not None and hit.fact.old == "0.3.0")
+    ash_dest = Dest(
+        path="package-lock.json",
+        line=7,
+        text='{\n  "version": "0.3.0"\n}\n',
+        body='  "version": "0.3.0"',
+        excerpt='"version": "0.3.0"',
+        nearby="",
+        ash=True,
+        generator="npm",
+        ash_reason="lockfile",
+        claim="config",
+    )
+    check("lockfile dest is classified ash (regenerate, not blame)", ash_dest.ash and ash_dest.generator == "npm")
+
+    both = """diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,3 +1,3 @@
+ [[package]]
+ name = "kizu"
+-version = "0.3.0"
++version = "0.3.1"
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,3 @@
+ [package]
+ name = "kizu"
+-version = "0.3.0"
++version = "0.3.1"
+"""
+    both_facts = extract_facts(parse_unified_diff(both), {"value"})
+    check(
+        "lockfile hunk is not a falsifying origin when Cargo.toml also moved",
+        any(f.origin.path == "Cargo.toml" and f.old == "0.3.0" for f in both_facts)
+        and not any(f.origin.path.endswith(".lock") for f in both_facts),
+        str([(f.origin.path, f.old, f.new) for f in both_facts]),
+    )
+    lock_dest = Dest(
+        path="plugin/plugin.json",
+        line=4,
+        text='{\n  "version": "0.3.0"\n}\n',
+        body='  "version": "0.3.0",',
+        excerpt='"version": "0.3.0",',
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="config",
+    )
+    both_hit = search_diff(
+        lock_dest,
+        both,
+        {"value", "rename", "polarity", "string"},
+        55,
+        sha="DIFF",
+        subject="supplied diff",
+        when="",
+        source="diff",
+    )
+    check(
+        "kizu-shaped bump names Cargo.toml not Cargo.lock",
+        both_hit is not None and both_hit.fact.origin.path == "Cargo.toml",
+        str(both_hit.fact.origin.path if both_hit else None),
+    )
+
+    timeout_line = Dest(
+        path="docs/help.txt",
+        line=2,
+        text="--timeout N   hook timeout seconds (default 10)\n",
+        body="--timeout N   hook timeout seconds (default 10)",
+        excerpt="--timeout N   hook timeout seconds (default 10)",
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+    )
+    check(
+        "named timeout seeds integer 10 (not a calendar month)",
+        "10" in pickaxe_seeds(timeout_line),
+        str(pickaxe_seeds(timeout_line)),
+    )
+    polar_line = Dest(
+        path="README.md",
+        line=9,
+        text="Cache is enabled (`ENABLE_CACHE = True`).\n",
+        body="Cache is enabled (`ENABLE_CACHE = True`).",
+        excerpt="Cache is enabled (`ENABLE_CACHE = True`).",
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+    )
+    polar_seeds = pickaxe_seeds(polar_line)
+    check(
+        "polarity True is a pickaxe seed (not dropped as a keyword)",
+        "True" in polar_seeds or "true" in {s.lower() for s in polar_seeds},
+        str(polar_seeds),
+    )
+
+    dual = """diff --git a/src/retry.py b/src/retry.py
+--- a/src/retry.py
++++ b/src/retry.py
+@@ -1,4 +1,4 @@
+-MAX_RETRIES = 3
+-HOOK_TIMEOUT = 10
++MAX_ATTEMPTS = 8
++HOOK_TIMEOUT = 30
+"""
+    dual_dest = Dest(
+        path="docs/ja.md",
+        line=1,
+        text="タイムアウトは 10 秒です。MAX_RETRIES はまだ 3 のまま。\n",
+        body="タイムアウトは 10 秒です。MAX_RETRIES はまだ 3 のまま。",
+        excerpt="タイムアウトは 10 秒です。MAX_RETRIES はまだ 3 のまま。",
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+    )
+    dual_hit = search_diff(
+        dual_dest,
+        dual,
+        {"value", "rename", "polarity", "string"},
+        55,
+        sha="DIFF",
+        subject="supplied diff",
+        when="",
+        source="diff",
+    )
+    dual_names = set()
+    if dual_hit:
+        dual_names.add((dual_hit.fact.kind, dual_hit.fact.old, dual_hit.fact.new))
+        dual_names.update((fa.kind, fa.old, fa.new) for fa, _sc, _wh in dual_hit.also)
+    check(
+        "one dest line leftover-claims both rename and timeout",
+        dual_hit is not None
+        and ("rename", "MAX_RETRIES", "MAX_ATTEMPTS") in dual_names
+        and any(old == "10" and new == "30" for _k, old, new in dual_names),
+        str(dual_names),
+    )
+
+    # Dest leftover surface is not a fact origin: dest-file rename hunk
+    # must not leftover-match as the falsifier.
+    dest_mv = """diff --git a/docs/help.md b/docs/guide.md
+similarity index 100%
+rename from docs/help.md
+rename to docs/guide.md
+diff --git a/src/retry.py b/src/retry.py
+--- a/src/retry.py
++++ b/src/retry.py
+@@ -1 +1 @@
+-HOOK_TIMEOUT = 10
++HOOK_TIMEOUT = 30
+"""
+    dest_moved = Dest(
+        path="docs/guide.md",
+        line=1,
+        text="timeout default is 10\n",
+        body="timeout default is 10",
+        excerpt="timeout default is 10",
+        nearby="",
+        ash=False,
+        generator=None,
+        ash_reason="",
+        claim="docs",
+        asked_path="docs/help.md",
+        identity=("docs/help.md", "docs/guide.md"),
+        dest_rename_shas=("deadbeef",),
+        followed=True,
+    )
+    dest_mv_hit = search_diff(
+        dest_moved,
+        dest_mv,
+        {"value", "rename", "polarity", "string"},
+        55,
+        sha="DIFF",
+        subject="supplied diff",
+        when="",
+        source="diff",
+    )
+    check(
+        "dest-file rename hunk is not the falsifier; timeout fact is",
+        dest_mv_hit is not None
+        and dest_mv_hit.fact.old == "10"
+        and dest_mv_hit.fact.new == "30"
+        and dest_mv_hit.fact.origin.path == "src/retry.py",
+        str(
+            (dest_mv_hit.fact.origin.path, dest_mv_hit.fact.old, dest_mv_hit.fact.new)
+            if dest_mv_hit
+            else None
+        ),
+    )
+    rename_only = """diff --git a/docs/help.md b/docs/guide.md
+similarity index 100%
+rename from docs/help.md
+rename to docs/guide.md
+"""
+    rename_only_hit = search_diff(
+        dest_moved,
+        rename_only,
+        {"value", "rename", "polarity", "string"},
+        55,
+        sha="DIFF",
+        subject="supplied dest rename",
+        when="",
+        source="diff",
+    )
+    check(
+        "dest-only rename is not a falsifying fact",
+        rename_only_hit is None,
+        str(rename_only_hit.fact if rename_only_hit else None),
+    )
+    check(
+        "dest-line slip lands on the leftover sentence, not the new heading",
+        best_slip_line("timeout default is 10", ["# Guide", "", "timeout default is 10"]) == 3,
+    )
+    check(
+        "dest-line slip does not treat October as timeout 10",
+        best_slip_line("timeout default is 10", ["# Guide", "shipped 2024-10-01"]) is None,
+    )
+
+    return 1 if failures else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"self-test", "--self-test"}:
+        return cmd_self_test()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print(f"{NAME} {VERSION}")
+        return 0
+    if args.min_score < 0:
+        die("--min-score must be >= 0")
+    if args.limit < 1:
+        die("--limit must be >= 1")
+    if args.max_commits < 1:
+        die("--max-commits must be >= 1")
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        die(f"root not found: {root}")
+
+    kinds = parse_kinds(args.kinds)
+    locators = read_locators(args)
+    color = color_enabled(args, sys.stdout)
+    results: list[tuple[Locator, Dest | None, list[Falsifier]]] = []
+    json_rows: list[dict[str, object]] = []
+    found_any = False
+    tsv_header = False
+
+    for loc in locators:
+        dest = load_dest(root, loc, args.rev, follow=args.follow)
+        if dest is None:
+            if args.json:
+                json_rows.append(
+                    {
+                        "locator": loc.raw,
+                        "path": rel_path(root, loc.path),
+                        "line": loc.line,
+                        "status": "missing",
+                        "action": "none",
+                    }
+                )
+            elif args.tsv:
+                if not tsv_header:
+                    print(
+                        "status\tpath\tline\taction\tcommit\tname\told\tnew\tkind\torigin\torigin_line\tscore\texcerpt"
+                    )
+                    tsv_header = True
+                print(
+                    f"missing\t{rel_path(root, loc.path)}\t{loc.line}\tnone\t\t\t\t\t\t\t\t\t"
+                )
+            else:
+                print(f"{NAME}: missing  {rel_path(root, loc.path)}:{loc.line}", file=sys.stderr)
+            results.append((loc, None, []))
+            continue
+
+        if dest.ash:
+            found_any = True
+            if args.json:
+                json_rows.append(
+                    {
+                        **dest_json(dest),
+                        "status": "ash",
+                        "action": "regenerate",
+                        "falsifiers": [],
+                    }
+                )
+            elif args.tsv:
+                if not tsv_header:
+                    print(
+                        "status\tpath\tline\taction\tcommit\tname\told\tnew\tkind\torigin\torigin_line\tscore\texcerpt"
+                    )
+                    tsv_header = True
+                print_tsv_ash(dest)
+            else:
+                print_ash(dest, color=color)
+            results.append((loc, dest, []))
+            continue
+
+        hits = find_falsifiers(root, dest, args, kinds)
+        if hits:
+            found_any = True
+        if args.json:
+            json_rows.append(
+                {
+                    **dest_json(dest),
+                    "status": "leftover" if hits else "none",
+                    "action": "falsified" if hits else "none",
+                    "falsifiers": [
+                        {
+                            "sha": h.sha,
+                            "subject": h.subject,
+                            "when": h.when,
+                            "source": h.source,
+                            "score": h.score,
+                            "why": list(h.why),
+                            "fact": fact_json(h.fact),
+                            "also": [
+                                {
+                                    "score": sc,
+                                    "why": list(wh),
+                                    "fact": fact_json(fa),
+                                }
+                                for fa, sc, wh in h.also
+                            ],
+                            "hunk": h.hunk,
+                        }
+                        for h in hits
+                    ],
+                }
+            )
+        elif args.tsv:
+            if not tsv_header:
+                print(
+                    "status\tpath\tline\taction\tcommit\tname\told\tnew\tkind\torigin\torigin_line\tscore\texcerpt"
+                )
+                tsv_header = True
+            if not hits:
+                print_tsv_none(dest)
+            else:
+                for h in hits:
+                    print_tsv_hit(dest, h)
+        else:
+            if hits:
+                print_falsifiers(
+                    dest, hits, explain=args.explain, color=color, show_hunk=not args.no_hunk
+                )
+            else:
+                print_none(dest, color=color)
+        results.append((loc, dest, hits))
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "version": VERSION,
+                    "root": str(root),
+                    "results": json_rows,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    return 0 if found_any else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

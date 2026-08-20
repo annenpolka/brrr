@@ -1,0 +1,2455 @@
+#!/usr/bin/env python3
+"""knot — wait-for conversation of a command line.
+
+A command line is both a pipeline and a process tree. Meters time
+empty vs full pipes; the tree joins sleep to child-wait / fifo / tcp
+peers. One walk names the wait-source of the whole tree — the knot.
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+__version__ = "0.2.0"
+
+SKIP_FD_NAMES = {"cwd", "txt", "rtd", "mem", "NOFD", "DEL"}
+INSTRUMENT_COMMS = frozenset({"knot"})
+USER_WRAPPER_COMMS = frozenset({"bash", "sh", "dash", "zsh", "tee"})
+# Parents that are a hidden pipeline: even if they ran, the wait-source
+# is usually the child they waitpid on (pkl, rustc, vitest worker).
+INNER_WRAPPERS = frozenset(
+    {
+        "node",
+        "bun",
+        "deno",
+        "cargo",
+        "rustc",
+        "python",
+        "python3",
+        "Python",
+        "just",
+        "pnpm",
+        "npm",
+        "yarn",
+        "make",
+        "ninja",
+        "cmake",
+        "swift",
+        "java",
+        "ruby",
+        "perl",
+    }
+)
+WEAK_NAMES = frozenset(
+    {"", "Python", "(Python)", "<defunct>", "python", "python3", "python3.14", "bash", "sh"}
+)
+SPECIFIC_KINDS = frozenset(
+    {
+        "pipe-empty",
+        "pipe-full",
+        "pipe-read",
+        "pipe-write",
+        "fifo",
+        "fifo-orphan",
+        "pipe-orphan",
+        "tcp",
+        "tcp-orphan",
+        "tcp-external",
+        "file-handoff",
+    }
+)
+KIND_WEIGHT = {
+    "pipe-empty": 1.6,
+    "pipe-full": 1.6,
+    "pipe-read": 1.6,
+    "pipe-write": 1.6,
+    "fifo": 1.6,
+    "fifo-orphan": 1.5,
+    "pipe-orphan": 1.4,
+    "tcp": 1.5,
+    "tcp-orphan": 1.7,
+    "tcp-external": 1.3,
+    "file-handoff": 1.2,
+    "child-wait": 0.45,
+    "sleep": 0.3,
+    "wchan": 0.3,
+}
+DEFAULT_BUF = 65536
+DEFAULT_INTERVAL = 0.08
+_LSOF_LINE = re.compile(
+    r"^(?P<cmd>\S+)\s+(?P<pid>\d+)\s+(?P<user>\S+)\s+(?P<fd>\S+)\s+"
+    r"(?P<type>\S+)\s+(?P<device>\S+)\s+(?P<size>\S+)(?:\s+(?P<rest>.*))?$"
+)
+_SHELLY = (
+    "&&",
+    "||",
+    ";",
+    "\n",
+    "`",
+    "$(",
+    "${",
+    ">",
+    "<",
+    "2>",
+    "&>",
+    "if ",
+    "for ",
+    "while ",
+)
+_SHORTENERS = [
+    (re.compile(r"^/opt/homebrew/Cellar/python@[\d.]+/\S+?/(?:Python|python3[\d.]*)\s+"), "python3 "),
+    (re.compile(r"^/usr/local/Cellar/python@[\d.]+/\S+?/(?:Python|python3[\d.]*)\s+"), "python3 "),
+    (re.compile(r"^/usr/bin/python3\s+"), "python3 "),
+    (re.compile(r"^/Users/\S+?/\.rustup/toolchains/\S+?/bin/"), ""),
+    (re.compile(r"^/opt/homebrew/opt/node@?[\d]*/bin/"), ""),
+    (re.compile(r"^/opt/homebrew/bin/"), ""),
+    (re.compile(r"^/Users/\S+?/target/(debug|release)/deps/"), r"./target/\1/deps/"),
+]
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Fd:
+    fd: str = ""
+    type: str = ""
+    mode: str = ""
+    name: str = ""
+    local: str = ""
+    peer: str = ""
+    net_state: str = ""
+    inode: str = ""
+    path: str = ""
+    device: str = ""
+
+    def is_pipeish(self) -> bool:
+        t = self.type.upper()
+        return t in {"PIPE", "FIFO"} or self.name.startswith("pipe:") or t == "FIFO"
+
+    def is_net(self) -> bool:
+        t = self.type.upper()
+        return t in {"IPv4", "IPv6", "TCP", "UDP", "unix", "UNIX", "sock", "SOCKET"} or (
+            self.name.startswith("socket:") or self.name.startswith("TCP ")
+        )
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    pgid: int = 0
+    uid: int = 0
+    state: str = ""
+    wchan: str = ""
+    rss: int = 0
+    cpu: float = 0.0
+    cmd: str = ""
+    comm: str = ""
+    fds: list[Fd] = field(default_factory=list)
+
+    @property
+    def running(self) -> bool:
+        return bool(self.state) and self.state[0] in "R"
+
+    @property
+    def zombie(self) -> bool:
+        return bool(self.state) and self.state[0] in "Z"
+
+    @property
+    def sleeping(self) -> bool:
+        return bool(self.state) and self.state[0] in "SUIDT"
+
+
+@dataclass
+class Edge:
+    src: int
+    dst: int
+    kind: str
+    detail: str = ""
+    peer_cmd: str = ""
+    s: float = 0.0
+    source: str = "tree"
+
+
+@dataclass
+class Sample:
+    t: float
+    procs: list[Proc]
+    edges: list[Edge]
+
+
+# ---------------------------------------------------------------------------
+# ps / lsof / procfs
+# ---------------------------------------------------------------------------
+
+
+def _decode(blob: bytes) -> str:
+    return blob.decode("utf-8", "replace")
+
+
+def parse_ps_table(text: str) -> list[Proc]:
+    procs: list[Proc] = []
+    lines = text.splitlines()
+    if not lines:
+        return procs
+    start = 1 if "PID" in lines[0].upper() and "PPID" in lines[0].upper() else 0
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 8:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+            uid = int(parts[3])
+        except ValueError:
+            continue
+        state = parts[4]
+        wchan = parts[5]
+        try:
+            rss = int(float(parts[6]))
+        except ValueError:
+            rss = 0
+        try:
+            cpu = float(parts[7])
+        except ValueError:
+            cpu = 0.0
+        cmd = parts[8] if len(parts) > 8 else ""
+        comm = Path(cmd.split(None, 1)[0]).name if cmd.strip() else ""
+        if comm.endswith(":"):
+            comm = comm[:-1]
+        if comm.startswith("(") and comm.endswith(")") and len(comm) > 2:
+            comm = comm[1:-1]
+        procs.append(
+            Proc(
+                pid=pid,
+                ppid=ppid,
+                pgid=pgid,
+                uid=uid,
+                state=state,
+                wchan="" if wchan == "-" else wchan,
+                rss=rss,
+                cpu=cpu,
+                cmd=cmd,
+                comm=comm or f"pid{pid}",
+            )
+        )
+    return procs
+
+
+def run_ps() -> list[Proc]:
+    cmd = ["ps", "-axo", "pid=,ppid=,pgid=,uid=,state=,wchan=,rss=,%cpu=,command="]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=2.0, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    text = _decode(out.stdout)
+    if not text.strip():
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid,ppid,pgid,uid,state,wchan,rss,%cpu,command"],
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        text = _decode(out.stdout)
+    return parse_ps_table(text)
+
+
+def _fd_mode(fdname: str) -> tuple[str, str]:
+    if fdname[-1:] in "rwu" and fdname[:-1].isdigit():
+        return fdname[:-1], fdname[-1]
+    return fdname, ""
+
+
+def _split_node_name(rest: str) -> tuple[str, str]:
+    rest = (rest or "").strip()
+    if not rest:
+        return "", ""
+    parts = rest.split()
+    head = parts[0]
+    if head in {"TCP", "UDP"} or head.startswith("->") or head.startswith("*"):
+        return "", rest
+    if re.match(r"^\d+$", head) and len(parts) > 1:
+        return head, " ".join(parts[1:])
+    return "", rest
+
+
+def _col_starts(header: str, names: list[str]) -> list[int]:
+    starts: list[int] = []
+    pos = 0
+    for name in names:
+        i = header.find(name, pos)
+        if i < 0:
+            return []
+        starts.append(i)
+        pos = i + 1
+    return starts
+
+
+def _slice_cols(line: str, starts: list[int]) -> list[str]:
+    vals = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(line)
+        vals.append(line[s:e].strip())
+    return vals
+
+
+def _enrich_fd(fd: Fd) -> None:
+    name = fd.name.strip()
+    typ = fd.type.upper()
+    if typ in {"PIPE", "FIFO"} or name.startswith("pipe:"):
+        peer_m = re.search(r"->(0x[0-9a-fA-F]+)", name)
+        if peer_m:
+            fd.peer = peer_m.group(1).lower()
+        if fd.device.lower().startswith("0x"):
+            fd.local = fd.device.lower()
+        m_pipe = re.search(r"pipe:\[(\d+)\]", name)
+        if m_pipe:
+            fd.inode = m_pipe.group(1)
+            fd.local = fd.local or f"pipe:{fd.inode}"
+        if typ == "FIFO" or name.startswith("/"):
+            fd.path = name.split()[0] if name else ""
+        return
+    if typ in {"IPv4", "IPv6"} or name.startswith("TCP") or name.startswith("UDP"):
+        body = re.sub(r"^(?:TCP|UDP)\s+", "", name, flags=re.I).strip()
+        st = re.search(r"\(([^)]+)\)\s*$", body)
+        if st:
+            fd.net_state = st.group(1).upper()
+            body = body[: st.start()].strip()
+        if "->" in body:
+            a, b = body.split("->", 1)
+            fd.local, fd.peer = a.strip(), b.strip()
+        else:
+            fd.local = body
+        return
+    if typ in {"unix", "UNIX"} or "unix" in name.lower():
+        fd.local = name
+        return
+    if typ in {"REG", "DIR", "CHR", "VDIR", "VREG"}:
+        fd.path = name.split()[0] if name else ""
+
+
+def parse_lsof_text(text: str) -> dict[int, list[Fd]]:
+    by_pid: dict[int, list[Fd]] = defaultdict(list)
+    lines = [ln.rstrip("\n") for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    start = 1 if lines[0].lstrip().startswith("COMMAND") else 0
+    parsed_any = False
+    for line in lines[start:]:
+        m = _LSOF_LINE.match(line.strip())
+        if not m:
+            continue
+        pid = int(m.group("pid"))
+        fdname = m.group("fd")
+        bare, mode = _fd_mode(fdname)
+        if bare.lower() in SKIP_FD_NAMES or fdname.lower() in SKIP_FD_NAMES:
+            continue
+        inode, name = _split_node_name(m.group("rest") or "")
+        fd = Fd(
+            fd=fdname,
+            type=m.group("type"),
+            mode=mode,
+            name=name,
+            inode=inode,
+            device=m.group("device"),
+        )
+        _enrich_fd(fd)
+        by_pid[pid].append(fd)
+        parsed_any = True
+    if parsed_any:
+        return dict(by_pid)
+    return _parse_lsof_columns(lines)
+
+
+def _parse_lsof_columns(lines: list[str]) -> dict[int, list[Fd]]:
+    header = lines[0]
+    if "PID" not in header or "NAME" not in header:
+        return {}
+    names = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
+    starts = _col_starts(header, names)
+    if len(starts) != 9:
+        return {}
+    by_pid: dict[int, list[Fd]] = defaultdict(list)
+    for line in lines[1:]:
+        if len(line) < starts[1]:
+            continue
+        cols = _slice_cols(line, starts)
+        if len(cols) < 9:
+            continue
+        try:
+            pid = int(cols[1])
+        except ValueError:
+            continue
+        fdname = cols[3]
+        bare, mode = _fd_mode(fdname)
+        if bare.lower() in SKIP_FD_NAMES or fdname.lower() in SKIP_FD_NAMES:
+            continue
+        fd = Fd(
+            fd=fdname,
+            type=cols[4],
+            mode=mode,
+            name=cols[8],
+            inode=cols[7],
+            device=cols[5],
+        )
+        _enrich_fd(fd)
+        by_pid[pid].append(fd)
+    return dict(by_pid)
+
+
+def run_lsof(pids: list[int]) -> dict[int, list[Fd]]:
+    if not pids:
+        return {}
+    merged: dict[int, list[Fd]] = {}
+    for i in range(0, len(pids), 40):
+        group = pids[i : i + 40]
+        spec = ",".join(str(p) for p in group)
+        try:
+            out = subprocess.run(
+                ["lsof", "-nP", "-w", "-p", spec],
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        merged.update(parse_lsof_text(_decode(out.stdout)))
+    return merged
+
+
+def procfs_available() -> bool:
+    return os.path.exists("/proc/self/stat") and os.path.isdir("/proc/self/fd")
+
+
+def parse_proc_stat_line(pid: int, stat: str, cmdline: str, wchan: str) -> Optional[Proc]:
+    lpar = stat.find("(")
+    rpar = stat.rfind(")")
+    if lpar < 0 or rpar < 0:
+        return None
+    comm = stat[lpar + 1 : rpar]
+    rest = stat[rpar + 2 :].split()
+    if len(rest) < 5:
+        return None
+    state = rest[0]
+    try:
+        ppid = int(rest[1])
+        pgid = int(rest[2])
+        rss = int(rest[21]) * 4 if len(rest) > 21 else 0
+    except ValueError:
+        return None
+    cmd = cmdline.strip() or f"[{comm}]"
+    return Proc(pid=pid, ppid=ppid, pgid=pgid, state=state, wchan="" if wchan in {"0", ""} else wchan, rss=rss, cmd=cmd, comm=comm)
+
+
+def run_procfs_procs() -> list[Proc]:
+    procs: list[Proc] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for ent in entries:
+        if not ent.isdigit():
+            continue
+        pid = int(ent)
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+                stat = f.read()
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    raw = f.read()
+                cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+            except OSError:
+                cmdline = ""
+            try:
+                with open(f"/proc/{pid}/wchan", "r", encoding="utf-8", errors="replace") as f:
+                    wchan = f.read().strip()
+            except OSError:
+                wchan = ""
+        except OSError:
+            continue
+        p = parse_proc_stat_line(pid, stat, cmdline, wchan)
+        if p:
+            procs.append(p)
+    return procs
+
+
+def _linux_fd_mode(pid: int, fdname: str) -> str:
+    try:
+        with open(f"/proc/{pid}/fdinfo/{fdname}", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("flags:"):
+                    flags = int(line.split()[1], 8)
+                    acc = flags & 0x3
+                    if acc == 0:
+                        return "r"
+                    if acc == 1:
+                        return "w"
+                    return "u"
+    except OSError:
+        return ""
+    return ""
+
+
+def _is_fifo(path: str) -> bool:
+    try:
+        import stat as statmod
+
+        return statmod.S_ISFIFO(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def run_procfs_fds(pids: list[int]) -> dict[int, list[Fd]]:
+    by_pid: dict[int, list[Fd]] = {}
+    for pid in pids:
+        fds: list[Fd] = []
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            path = f"{fd_dir}/{name}"
+            try:
+                target = os.readlink(path)
+            except OSError:
+                continue
+            mode = _linux_fd_mode(pid, name)
+            fd = Fd(fd=name + mode, type="REG", mode=mode, name=target)
+            if target.startswith("pipe:"):
+                fd.type = "PIPE"
+                m = re.search(r"\[(\d+)\]", target)
+                if m:
+                    fd.inode = m.group(1)
+                    fd.local = f"pipe:{m.group(1)}"
+            elif target.startswith("socket:"):
+                fd.type = "sock"
+            elif target.startswith("anon_inode:"):
+                fd.type = "anon"
+            else:
+                fd.path = target
+                fd.type = "FIFO" if target.startswith("/") and _is_fifo(target) else "REG"
+            fds.append(fd)
+        by_pid[pid] = fds
+    return by_pid
+
+
+# ---------------------------------------------------------------------------
+# tree + edges
+# ---------------------------------------------------------------------------
+
+
+def expand_tree(all_procs: list[Proc], root_pid: int, known: set[int]) -> list[Proc]:
+    known.add(root_pid)
+    by_pid = {p.pid: p for p in all_procs}
+    root = by_pid.get(root_pid)
+    root_pgid = root.pgid if root and root.pgid == root_pid else 0
+    self_pid = os.getpid()
+    changed = True
+    while changed:
+        changed = False
+        for p in all_procs:
+            if p.pid in known or p.pid <= 1 or p.pid == self_pid:
+                continue
+            if p.ppid in known or (root_pgid and p.pgid == root_pgid):
+                known.add(p.pid)
+                changed = True
+    return [p for p in all_procs if p.pid in known]
+
+
+def infer_edges(procs: list[Proc]) -> list[Edge]:
+    by_pid = {p.pid: p for p in procs}
+    edges: list[Edge] = []
+    edges.extend(_pipe_edges(procs, by_pid))
+    edges.extend(_net_edges(procs, by_pid))
+    edges.extend(_fifo_file_edges(procs, by_pid))
+    edges.extend(_orphan_fd_edges(procs, edges))
+    edges.extend(_child_wait_edges(procs, edges))
+    for p in procs:
+        if not p.sleeping or p.zombie:
+            continue
+        if any(e.src == p.pid for e in edges):
+            continue
+        kind = "sleep"
+        detail = p.wchan or "timer"
+        if p.wchan and p.wchan.lower() not in {"-", "0"}:
+            kind = "wchan"
+            detail = p.wchan
+        edges.append(Edge(src=p.pid, dst=0, kind=kind, detail=detail, peer_cmd="kernel"))
+    return edges
+
+
+def _pipe_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    locals_: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    peers: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    inodes: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    items: list[tuple[Proc, Fd]] = []
+    for p in procs:
+        for fd in p.fds:
+            if not fd.is_pipeish():
+                continue
+            items.append((p, fd))
+            if fd.local:
+                locals_[fd.local].append((p, fd))
+            if fd.peer:
+                peers[fd.peer].append((p, fd))
+            if fd.inode:
+                inodes[fd.inode].append((p, fd))
+    seen: set[tuple[int, int]] = set()
+    edges: list[Edge] = []
+
+    def add(a: Proc, afd: Fd, b: Proc, bfd: Fd) -> None:
+        if a.pid == b.pid:
+            return
+        if afd.local and afd.local == bfd.local and afd.local.startswith("0x"):
+            return
+        key = (min(a.pid, b.pid), max(a.pid, b.pid))
+        if key in seen:
+            return
+        seen.add(key)
+        a_read, b_read = afd.mode == "r", bfd.mode == "r"
+        a_write, b_write = afd.mode == "w", bfd.mode == "w"
+        if a_read and not b_read:
+            src, dst, sfd, kind = a, b, afd, "pipe-read"
+        elif b_read and not a_read:
+            src, dst, sfd, kind = b, a, bfd, "pipe-read"
+        elif a_write and not b_write:
+            src, dst, sfd, kind = a, b, afd, "pipe-write"
+        elif b_write and not a_write:
+            src, dst, sfd, kind = b, a, bfd, "pipe-write"
+        else:
+            if a.pid == b.ppid:
+                src, dst, sfd = b, a, bfd
+            elif b.pid == a.ppid:
+                src, dst, sfd = a, b, afd
+            elif a.sleeping and not b.sleeping:
+                src, dst, sfd = a, b, afd
+            elif b.sleeping and not a.sleeping:
+                src, dst, sfd = b, a, bfd
+            else:
+                src, dst, sfd = a, b, afd
+            kind = "pipe-read"
+        edges.append(
+            Edge(
+                src=src.pid,
+                dst=dst.pid,
+                kind=kind,
+                detail=sfd.name or sfd.local or sfd.peer,
+                peer_cmd=short_cmd(dst.cmd),
+            )
+        )
+
+    for p, fd in items:
+        partners: list[tuple[Proc, Fd]] = []
+        if fd.peer:
+            partners.extend(locals_.get(fd.peer, []))
+        if fd.local:
+            partners.extend(peers.get(fd.local, []))
+        if fd.inode:
+            partners.extend(inodes.get(fd.inode, []))
+        for q, qfd in partners:
+            add(p, fd, q, qfd)
+    return edges
+
+
+def _port_of(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    if endpoint.startswith("["):
+        m = re.search(r"\]:(\d+)$", endpoint)
+        return m.group(1) if m else ""
+    if ":" in endpoint:
+        return endpoint.rsplit(":", 1)[-1]
+    return ""
+
+
+def _same_listen(listen_local: str, peer: str) -> bool:
+    if not listen_local or not peer:
+        return False
+    if listen_local == peer:
+        return True
+    lp, pp = _port_of(listen_local), _port_of(peer)
+    if not lp or lp != pp:
+        return False
+    host = listen_local.rsplit(":", 1)[0]
+    return host in {"*", "0.0.0.0", "::", "[::]", "127.0.0.1", "::1"}
+
+
+def _net_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    listens: dict[str, Proc] = {}
+    established: list[tuple[Proc, Fd]] = []
+    connecting: list[tuple[Proc, Fd]] = []
+    for p in procs:
+        for fd in p.fds:
+            if not fd.is_net():
+                continue
+            st = fd.net_state
+            if st == "LISTEN" and fd.local:
+                listens[fd.local] = p
+                port = _port_of(fd.local)
+                if port:
+                    listens[f"*:{port}"] = p
+                    listens[port] = p
+            elif st in {"SYN_SENT", "SYN_RECV"}:
+                connecting.append((p, fd))
+            elif fd.peer or st == "ESTABLISHED":
+                established.append((p, fd))
+    edges: list[Edge] = []
+    paired: set[tuple[int, int]] = set()
+
+    def match_peer(p: Proc, fd: Fd) -> Optional[Proc]:
+        if fd.peer:
+            for q in procs:
+                if q.pid == p.pid:
+                    continue
+                for qfd in q.fds:
+                    if not qfd.is_net():
+                        continue
+                    if qfd.local == fd.peer or (qfd.peer == fd.local and qfd.local == fd.peer):
+                        return q
+                    if qfd.net_state == "LISTEN" and _same_listen(qfd.local, fd.peer):
+                        return q
+        port = _port_of(fd.peer)
+        if port and (port in listens or f"*:{port}" in listens):
+            return listens.get(fd.peer) or listens.get(port) or listens.get(f"*:{port}")
+        return None
+
+    for p, fd in established + connecting:
+        peer = match_peer(p, fd)
+        if peer:
+            key = (min(p.pid, peer.pid), max(p.pid, peer.pid))
+            if key in paired:
+                continue
+            paired.add(key)
+            waiter = p if p.sleeping or not peer.sleeping else peer
+            other = peer if waiter is p else p
+            edges.append(Edge(src=waiter.pid, dst=other.pid, kind="tcp", detail=fd.name, peer_cmd=short_cmd(other.cmd)))
+        else:
+            kind = "tcp-orphan" if fd.net_state in {"SYN_SENT", ""} and not fd.peer else "tcp-external"
+            if fd.net_state == "SYN_SENT":
+                kind = "tcp-orphan"
+            if p.sleeping or kind == "tcp-orphan":
+                edges.append(Edge(src=p.pid, dst=0, kind=kind, detail=fd.name, peer_cmd=fd.peer or "no-listener"))
+    return edges
+
+
+def _orphan_fd_edges(procs: list[Proc], existing: list[Edge]) -> list[Edge]:
+    paired: set[int] = set()
+    for e in existing:
+        if e.kind.startswith(("pipe", "fifo", "tcp", "file")):
+            paired.add(e.src)
+            if e.dst:
+                paired.add(e.dst)
+    edges: list[Edge] = []
+    for p in procs:
+        if not p.sleeping or p.zombie or p.pid in paired:
+            continue
+        for fd in p.fds:
+            if not fd.is_pipeish():
+                continue
+            bare = fd.fd.rstrip("rwu")
+            if bare in {"0", "1", "2"}:
+                continue
+            if fd.mode == "w":
+                continue
+            is_fifo = fd.type.upper() == "FIFO" or (fd.path and "fifo" in fd.path.lower())
+            if not is_fifo and fd.mode != "r":
+                continue
+            kind = "fifo-orphan" if is_fifo else "pipe-orphan"
+            edges.append(Edge(src=p.pid, dst=0, kind=kind, detail=fd.path or fd.name or fd.local, peer_cmd="missing-peer"))
+            break
+    return edges
+
+
+def _child_wait_edges(procs: list[Proc], existing: list[Edge]) -> list[Edge]:
+    already = {e.src for e in existing}
+    kids_of: dict[int, list[Proc]] = defaultdict(list)
+    for p in procs:
+        if not p.zombie:
+            kids_of[p.ppid].append(p)
+    edges: list[Edge] = []
+    for p in procs:
+        if p.pid in already or not p.sleeping or p.zombie:
+            continue
+        kids = kids_of.get(p.pid) or []
+        if not kids:
+            continue
+        running = [k for k in kids if k.running]
+        target = running[0] if running else kids[0]
+        edges.append(
+            Edge(
+                src=p.pid,
+                dst=target.pid,
+                kind="child-wait",
+                detail=f"{len(kids)} child" + ("ren" if len(kids) != 1 else ""),
+                peer_cmd=short_cmd(target.cmd),
+            )
+        )
+    return edges
+
+
+def _fifo_file_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    by_path: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    for p in procs:
+        for fd in p.fds:
+            path = fd.path
+            if not path or path.startswith("/dev/") or path.startswith("/System/"):
+                continue
+            if fd.type.upper() in {"REG", "FIFO"} or path:
+                by_path[path].append((p, fd))
+    edges: list[Edge] = []
+    for path, holders in by_path.items():
+        writers = [(p, fd) for p, fd in holders if fd.mode in {"w", "u"}]
+        readers = [(p, fd) for p, fd in holders if fd.mode == "r"]
+        if not writers or not readers:
+            continue
+        fifo = any(fd.type.upper() == "FIFO" for _, fd in holders)
+        kind = "fifo" if fifo else "file-handoff"
+        for rp, rfd in readers:
+            if not rp.sleeping and not fifo:
+                continue
+            for wp, wfd in writers:
+                if rp.pid == wp.pid:
+                    continue
+                edges.append(Edge(src=rp.pid, dst=wp.pid, kind=kind, detail=path, peer_cmd=short_cmd(wp.cmd)))
+    return edges
+
+
+def short_cmd(cmd: str, n: int = 78) -> str:
+    cmd = " ".join((cmd or "").split())
+    cmd = re.sub(r"^\(([^)]+)\)\s*", r"\1 ", cmd)
+    for rx, repl in _SHORTENERS:
+        cmd = rx.sub(repl, cmd, count=1)
+    bits = cmd.split()
+    if bits and "rustc" in bits[0]:
+        m = re.search(r"--crate(?:-name)?\s+(\S+)", cmd)
+        if m:
+            cmd = f"rustc --crate {m.group(1)}"
+        else:
+            rs = re.findall(r"(\S+\.rs)", cmd)
+            if rs:
+                cmd = f"rustc {Path(rs[-1]).name}"
+        bits = cmd.split()
+    # Absolute args collapse to basename so a knot is "python3 hidden_producer.py"
+    # not a truncated worktree path that lost the script name.
+    out = []
+    for tok in bits:
+        if tok.startswith("/") and "/" in tok[1:]:
+            out.append(Path(tok).name)
+        else:
+            out.append(tok)
+    cmd = " ".join(out)
+    if len(cmd) <= n:
+        return cmd
+    return cmd[: n - 1] + "…"
+
+
+def is_instrument(proc: Proc) -> bool:
+    """True only for our meter/wrap processes, not for bash -c that embeds them."""
+    comm = proc.comm or ""
+    if comm in USER_WRAPPER_COMMS:
+        return False
+    if comm in INSTRUMENT_COMMS:
+        return True
+    if comm.startswith("(") and comm.endswith(")"):
+        return True
+    tokens = (proc.cmd or "").split()
+    return "--meter" in tokens or "--wrap" in tokens
+
+
+def weak_name(cmd: str) -> bool:
+    c = " ".join((cmd or "").split())
+    if c in WEAK_NAMES:
+        return True
+    bits = c.split()
+    if len(bits) == 1 and Path(bits[0]).name in WEAK_NAMES:
+        return True
+    return False
+
+
+def prefer_cmd(old: str, new: str) -> str:
+    if weak_name(new) and not weak_name(old):
+        return old
+    if weak_name(old) and not weak_name(new):
+        return new or old
+    if new and len(new) >= len(old or ""):
+        return new
+    return old or new
+
+
+def is_user_wrapper(proc: Proc) -> bool:
+    return (proc.comm or "") in USER_WRAPPER_COMMS
+
+
+# ---------------------------------------------------------------------------
+# meter / wrap
+# ---------------------------------------------------------------------------
+
+
+def run_meter(log_path: str, bufsize: int) -> int:
+    infd, outfd = 0, 1
+    os.set_blocking(infd, False)
+    os.set_blocking(outfd, False)
+    buf = bytearray()
+    stats = {
+        "bytes": 0,
+        "read_stall_ns": 0,
+        "write_stall_ns": 0,
+        "both_stall_ns": 0,
+        "copy_ns": 0,
+        "reads": 0,
+        "writes": 0,
+        "read_eof": False,
+        "epipe": False,
+        "meter_pid": os.getpid(),
+    }
+    t_start = time.monotonic_ns()
+
+    def _flush_log() -> None:
+        stats["wall_ns"] = time.monotonic_ns() - t_start
+        tmp = log_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(stats, separators=(",", ":")))
+        os.replace(tmp, log_path)
+
+    def _handle_stop(_signum: int, _frame: Any) -> None:
+        _flush_log()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+    try:
+        while True:
+            want_read = (not stats["read_eof"]) and (len(buf) < bufsize)
+            want_write = len(buf) > 0
+            if not want_read and not want_write:
+                break
+            poller = select.poll()
+            if want_read:
+                poller.register(infd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            if want_write:
+                poller.register(outfd, select.POLLOUT | select.POLLERR | select.POLLHUP)
+            t0 = time.monotonic_ns()
+            try:
+                evlist = poller.poll(1000)
+            except InterruptedError:
+                continue
+            waited = time.monotonic_ns() - t0
+            ev = {fd: flags for fd, flags in evlist}
+            in_ready = bool(ev.get(infd, 0) & (select.POLLIN | select.POLLHUP | select.POLLERR))
+            out_ready = bool(ev.get(outfd, 0) & (select.POLLOUT | select.POLLERR | select.POLLHUP))
+            if waited >= 50_000:
+                if want_read and want_write:
+                    stats["both_stall_ns"] += waited
+                elif want_write:
+                    stats["write_stall_ns"] += waited
+                elif want_read:
+                    stats["read_stall_ns"] += waited
+            if want_read and in_ready:
+                t2 = time.monotonic_ns()
+                try:
+                    chunk = os.read(infd, bufsize - len(buf) or bufsize)
+                except BlockingIOError:
+                    chunk = None
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        chunk = None
+                    else:
+                        raise
+                stats["copy_ns"] += time.monotonic_ns() - t2
+                if chunk is None:
+                    pass
+                elif chunk == b"":
+                    stats["read_eof"] = True
+                else:
+                    buf.extend(chunk)
+                    stats["reads"] += 1
+            if want_write and (out_ready or ev.get(outfd, 0) & select.POLLERR):
+                t2 = time.monotonic_ns()
+                try:
+                    n = os.write(outfd, buf)
+                except BlockingIOError:
+                    n = 0
+                except OSError as exc:
+                    if exc.errno == errno.EPIPE:
+                        stats["epipe"] = True
+                        stats["copy_ns"] += time.monotonic_ns() - t2
+                        break
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        n = 0
+                    else:
+                        raise
+                stats["copy_ns"] += time.monotonic_ns() - t2
+                if n:
+                    del buf[:n]
+                    stats["bytes"] += n
+                    stats["writes"] += 1
+    finally:
+        try:
+            _flush_log()
+        except OSError:
+            pass
+    return 0
+
+
+def run_wrap(log_path: str, argv: list[str]) -> int:
+    if not argv:
+        print("knot --wrap: missing command", file=sys.stderr)
+        return 2
+    t0 = time.monotonic_ns()
+    try:
+        proc = subprocess.Popen(argv)
+    except OSError as exc:
+        with open(log_path, "w", encoding="utf-8") as fh:
+            json.dump({"error": str(exc), "argv": argv, "exit": 127}, fh)
+        return 127
+    pid = proc.pid
+    _pid, status, ru = os.wait4(pid, 0)
+    if os.WIFSIGNALED(status):
+        exit_code = 128 + os.WTERMSIG(status)
+        term_sig = os.WTERMSIG(status)
+    else:
+        exit_code = os.WEXITSTATUS(status)
+        term_sig = None
+    wall_ns = time.monotonic_ns() - t0
+    payload = {
+        "argv": argv,
+        "pid": pid,
+        "wrap_pid": os.getpid(),
+        "exit": exit_code,
+        "term_sig": term_sig,
+        "wall_ns": wall_ns,
+        "ru_utime": ru.ru_utime,
+        "ru_stime": ru.ru_stime,
+        "ru_maxrss": ru.ru_maxrss,
+        "ru_nvcsw": getattr(ru, "ru_nvcsw", 0),
+        "ru_nivcsw": getattr(ru, "ru_nivcsw", 0),
+    }
+    tmp = log_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    os.replace(tmp, log_path)
+    return exit_code
+
+
+def split_pipeline(script: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    i = 0
+    n = len(script)
+    while i < n:
+        c = script[i]
+        if quote:
+            buf.append(c)
+            if c == quote:
+                if quote == "'" or (i > 0 and script[i - 1] != "\\"):
+                    quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "|" and i + 1 < n and script[i + 1] in "|":
+            buf.append(c)
+            buf.append(script[i + 1])
+            i += 2
+            continue
+        if c == "|":
+            if i + 1 < n and script[i + 1] == "&":
+                i += 1
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return [p for p in parts if p]
+
+
+def shell_quote(arg: str) -> str:
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
+def stage_from_sh(part: str) -> list[str]:
+    if any(tok in part for tok in _SHELLY):
+        return ["bash", "-lc", part]
+    try:
+        argv = shlex.split(part)
+    except ValueError:
+        return ["bash", "-lc", part]
+    return argv or ["bash", "-lc", part]
+
+
+def knot_self() -> list[str]:
+    return [sys.executable, os.path.realpath(__file__)]
+
+
+def shorten_argv(argv: list[str], limit: int = 56) -> str:
+    if not argv:
+        return "?"
+    bits = [os.path.basename(argv[0])] + argv[1:]
+    text = " ".join(bits)
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def default_label(argv: list[str]) -> str:
+    if len(argv) >= 3 and os.path.basename(argv[0]) in {"bash", "sh", "zsh"} and argv[1] in {"-c", "-lc"}:
+        return shorten_argv(["sh", argv[2]])
+    return shorten_argv(argv)
+
+
+def split_stages_from_argv(rest: list[str]) -> list[list[str]]:
+    stages: list[list[str]] = []
+    cur: list[str] = []
+    for tok in rest:
+        if tok == "+":
+            if cur:
+                stages.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        stages.append(cur)
+    return stages
+
+
+def ns_to_s(ns: int | float | None) -> float:
+    if not ns:
+        return 0.0
+    return float(ns) / 1e9
+
+
+# ---------------------------------------------------------------------------
+# sampling
+# ---------------------------------------------------------------------------
+
+
+class Backend:
+    def __init__(self, kind: str, use_fds: bool) -> None:
+        self.kind = kind
+        self.use_fds = use_fds
+
+    def procs(self) -> list[Proc]:
+        if self.kind == "proc":
+            return run_procfs_procs()
+        return run_ps()
+
+    def fds(self, pids: list[int]) -> dict[int, list[Fd]]:
+        if not self.use_fds or not pids:
+            return {}
+        if self.kind == "proc":
+            got = run_procfs_fds(pids)
+            extra = run_lsof(pids)
+            for pid, fds in extra.items():
+                if pid in got:
+                    nets = [fd for fd in fds if fd.is_net()]
+                    got[pid].extend(nets)
+                else:
+                    got[pid] = fds
+            return got
+        return run_lsof(pids)
+
+
+def pick_backend(name: str, use_fds: bool) -> Backend:
+    if name == "auto":
+        name = "proc" if procfs_available() else "ps"
+    return Backend(name, use_fds)
+
+
+def take_sample(backend: Backend, root_pid: int, known: set[int], t0: float, want_fds: bool) -> Optional[Sample]:
+    all_procs = backend.procs()
+    if not all_procs:
+        return None
+    tree = expand_tree(all_procs, root_pid, known)
+    if not tree:
+        return None
+    if want_fds:
+        fdmap = backend.fds([p.pid for p in tree])
+        for p in tree:
+            p.fds = fdmap.get(p.pid, [])
+    return Sample(t=time.monotonic() - t0, procs=tree, edges=infer_edges(tree))
+
+
+def sample_loop(
+    backend: Backend,
+    root_pid: int,
+    interval: float,
+    known: set[int],
+    sink: list[Sample],
+    stop: list[bool],
+) -> None:
+    t0 = time.monotonic()
+    last_lsof = -1.0
+    lsof_every = max(0.28, interval)
+    while not stop[0]:
+        now = time.monotonic() - t0
+        idle_guess = bool(sink) and sink[-1].procs and not any(p.running for p in sink[-1].procs)
+        prev_n = len(sink[-1].procs) if sink else 0
+        want_fds = prev_n <= 12 or idle_guess or not sink or (now - last_lsof >= lsof_every)
+        s = take_sample(backend, root_pid, known, t0, want_fds)
+        if s:
+            if want_fds:
+                last_lsof = now
+            sink.append(s)
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# fold + merge + knot walk  (the synthesis)
+# ---------------------------------------------------------------------------
+
+
+def fold_tree(samples: list[Sample]) -> tuple[list[Edge], dict[int, dict[str, Any]]]:
+    per: dict[int, dict[str, Any]] = {}
+    edge_w: dict[tuple[int, int, str], Edge] = {}
+    if not samples:
+        return [], per
+
+    def bucket(p: Proc) -> dict[str, Any]:
+        b = per.get(p.pid)
+        if not b:
+            b = {
+                "pid": p.pid,
+                "ppid": p.ppid,
+                "cmd": p.cmd,
+                "comm": p.comm,
+                "running_s": 0.0,
+                "blocked_s": 0.0,
+                "alive_s": 0.0,
+                "last_state": p.state,
+                "instrument": is_instrument(p),
+                "user_wrapper": is_user_wrapper(p),
+            }
+            per[p.pid] = b
+        b["cmd"] = prefer_cmd(b["cmd"], p.cmd)
+        if not weak_name(p.comm) and (weak_name(b["comm"]) or len(p.comm or "") >= len(b["comm"] or "")):
+            b["comm"] = p.comm or b["comm"]
+        b["last_state"] = p.state
+        b["instrument"] = b["instrument"] or is_instrument(p)
+        b["user_wrapper"] = b["user_wrapper"] or is_user_wrapper(p)
+        return b
+
+    for i, s in enumerate(samples):
+        dt = (s.t - samples[i - 1].t) if i else 0.0
+        if dt < 0:
+            dt = 0.0
+        for p in s.procs:
+            b = bucket(p)
+            b["alive_s"] += dt
+            if p.running:
+                b["running_s"] += dt
+            elif not p.zombie:
+                b["blocked_s"] += dt
+        for e in s.edges:
+            key = (e.src, e.dst, e.kind)
+            w = edge_w.get(key)
+            if not w:
+                w = Edge(src=e.src, dst=e.dst, kind=e.kind, detail=e.detail, peer_cmd=e.peer_cmd, s=0.0, source="tree")
+                edge_w[key] = w
+            w.s += dt
+            w.detail = e.detail or w.detail
+            w.peer_cmd = e.peer_cmd or w.peer_cmd
+    return list(edge_w.values()), per
+
+
+def classify_link(link: dict[str, Any]) -> None:
+    rs, ws = link["read_stall_s"], link["write_stall_s"]
+    if ws >= rs and ws > 0.005:
+        link["relation"] = "blocked-on-write"
+        link["toward"] = link["to"]
+    elif rs > ws and rs > 0.005:
+        link["relation"] = "blocked-on-read"
+        link["toward"] = link["from"]
+    else:
+        link["relation"] = "flowing"
+        link["toward"] = None
+
+
+def merge_conversation(
+    tree_edges: list[Edge],
+    per: dict[int, dict[str, Any]],
+    stages: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+) -> list[Edge]:
+    """Meters and tree edges become one wait-for graph.
+
+    A meter stall is a pipe conversation with real seconds. Tree edges
+    add child-wait / fifo / tcp / hidden pipes. Instrument processes
+    (--wrap/--meter) are contracted so a stage's wait lands on the
+    command, not on our scaffolding.
+    """
+    instrument = {pid for pid, b in per.items() if b.get("instrument")}
+    out: list[Edge] = []
+    meter_pairs: set[tuple[int, int]] = set()
+
+    def cmd_of(pid: int) -> str:
+        if pid == 0:
+            return "kernel"
+        b = per.get(pid)
+        if b:
+            return short_cmd(b.get("cmd") or b.get("comm") or "", 42)
+        for st in stages:
+            if st.get("pid") == pid:
+                return st.get("label") or ""
+        return f"pid {pid}"
+
+    for lk in links:
+        classify_link(lk)
+        sp = stages[lk["from"]].get("pid") if lk["from"] < len(stages) else None
+        dp = stages[lk["to"]].get("pid") if lk["to"] < len(stages) else None
+        if not sp or not dp:
+            continue
+        rel = lk.get("relation")
+        if rel == "blocked-on-write":
+            src, dst, kind, s = sp, dp, "pipe-full", float(lk["write_stall_s"])
+        elif rel == "blocked-on-read":
+            src, dst, kind, s = dp, sp, "pipe-empty", float(lk["read_stall_s"])
+        else:
+            continue
+        if s < 0.005:
+            continue
+        out.append(
+            Edge(
+                src=src,
+                dst=dst,
+                kind=kind,
+                s=s,
+                detail=f"{lk.get('bytes', 0)}B",
+                peer_cmd=cmd_of(dst),
+                source="meter",
+            )
+        )
+        meter_pairs.add((min(src, dst), max(src, dst)))
+
+    for e in tree_edges:
+        if e.src in instrument or (e.dst and e.dst in instrument):
+            continue
+        if e.kind.startswith("pipe") and (min(e.src, e.dst), max(e.src, e.dst)) in meter_pairs:
+            continue
+        if e.s < 0.02 and e.kind in {"sleep", "wchan"}:
+            continue
+        e.peer_cmd = e.peer_cmd or cmd_of(e.dst)
+        e.source = e.source or "tree"
+        out.append(e)
+    return out
+
+
+def _kids(per: dict[int, dict[str, Any]]) -> dict[int, list[int]]:
+    kids: dict[int, list[int]] = defaultdict(list)
+    for pid, b in per.items():
+        kids[int(b.get("ppid") or 0)].append(pid)
+    return kids
+
+
+def retarget_stage_roots(
+    edges: list[Edge],
+    per: dict[int, dict[str, Any]],
+    stages: list[dict[str, Any]],
+) -> list[Edge]:
+    """A meter names a stage pid. If that pid only child-waits, the
+    wait-source of the pipe is the descendant — retarget dst/src.
+    """
+    by_src: dict[int, list[Edge]] = defaultdict(list)
+    for e in edges:
+        by_src[e.src].append(e)
+    stage_pids = {st.get("pid") for st in stages if st.get("pid")}
+
+    def sink_pid(pid: int) -> int:
+        return walk_blocker(pid, by_src, per, set())
+
+    rewritten: list[Edge] = []
+    for e in edges:
+        src, dst = e.src, e.dst
+        note = e.detail
+        if e.source == "meter":
+            if dst in stage_pids:
+                sunk = sink_pid(dst) or dst
+                if sunk != dst:
+                    note = ((note + " ") if note else "") + "via child-wait"
+                dst = sunk
+            if src in stage_pids:
+                src_sink = sink_pid(src)
+                outs = [x for x in by_src.get(src, []) if x.kind == "child-wait" and x.dst]
+                if outs and src_sink and src_sink != src:
+                    src = src_sink
+                    note = ((note + " ") if note else "") + "via child-wait"
+        rewritten.append(
+            Edge(
+                src=src,
+                dst=dst,
+                kind=e.kind,
+                s=e.s,
+                detail=note,
+                peer_cmd=e.peer_cmd,
+                source=e.source,
+            )
+        )
+    return rewritten
+
+
+def walk_blocker(
+    pid: int,
+    by_src: dict[int, list[Edge]],
+    per: dict[int, dict[str, Any]],
+    seen: set[int],
+) -> int:
+    if pid in seen or pid == 0:
+        return pid
+    seen = seen | {pid}
+    outs = [e for e in by_src.get(pid, []) if e.dst and e.dst != pid]
+    if not outs:
+        return pid
+    b = per.get(pid) or {}
+    # A running process is a wait-source even if it also has child-wait
+    # edges from a brief fork. Prefer compute unless the only outgoing
+    # tree wait is child-wait *and* the process is mostly blocked.
+    running = float(b.get("running_s") or 0)
+    blocked = float(b.get("blocked_s") or 0)
+    specific = [e for e in outs if e.kind in SPECIFIC_KINDS]
+    child = [e for e in outs if e.kind == "child-wait"]
+    if specific:
+        pool = specific
+    elif child:
+        best_c = max(child, key=lambda e: e.s)
+        ch = per.get(best_c.dst) or {}
+        ch_run = float(ch.get("running_s") or 0)
+        ch_blk = float(ch.get("blocked_s") or 0)
+        comm = (b.get("comm") or "")
+        inner = (
+            b.get("user_wrapper")
+            or b.get("instrument")
+            or comm in INNER_WRAPPERS
+            or comm in USER_WRAPPER_COMMS
+            or blocked >= running
+            or (ch_run > 0 and ch_run >= running * 0.4)
+            or (ch_run + ch_blk) >= (running + blocked) * 0.55
+        )
+        if inner:
+            pool = child
+        else:
+            return pid
+    else:
+        return pid
+    best = max(pool, key=lambda e: e.s)
+    nxt = best.dst
+    if nxt in seen:
+        return _cycle_pick(seen | {nxt}, by_src)
+    return walk_blocker(nxt, by_src, per, seen)
+
+
+def _cycle_pick(members: set[int], by_src: dict[int, list[Edge]]) -> int:
+    specific: list[Edge] = []
+    for pid in members:
+        for e in by_src.get(pid, []):
+            if e.dst in members and e.kind in SPECIFIC_KINDS:
+                specific.append(e)
+    if specific:
+        return max(specific, key=lambda e: e.s).dst
+    return next(iter(members))
+
+
+def find_knot(
+    edges: list[Edge],
+    per: dict[int, dict[str, Any]],
+    stages: list[dict[str, Any]],
+    wall_s: float,
+) -> dict[str, Any]:
+    by_src: dict[int, list[Edge]] = defaultdict(list)
+    incoming: dict[int, float] = defaultdict(float)
+    for e in edges:
+        by_src[e.src].append(e)
+        if e.dst:
+            incoming[e.dst] += e.s * KIND_WEIGHT.get(e.kind, 1.0)
+        else:
+            incoming[e.src] += e.s * KIND_WEIGHT.get(e.kind, 1.0) * 0.5
+
+    skip = {pid for pid, b in per.items() if b.get("instrument")}
+    waiters = [e.src for e in edges if e.src not in skip]
+    if not waiters and per:
+        waiters = [pid for pid, b in per.items() if not b.get("instrument")]
+
+    sinks: dict[int, float] = defaultdict(float)
+    paths: dict[int, list[dict[str, Any]]] = {}
+    for w in waiters:
+        sink = walk_blocker(w, by_src, per, set())
+        if sink in skip or sink == 0:
+            continue
+        sinks[sink] += incoming.get(sink, 0.0) + 0.01
+        if sink not in paths:
+            paths[sink] = _path_from(w, sink, by_src, per)
+
+    if not sinks:
+        # single sleeper / compute process
+        cands = [b for b in per.values() if not b.get("instrument")]
+        if not cands:
+            return {"pid": None, "comm": None, "kind": "none", "reason": "no processes sampled", "path": []}
+        top = max(cands, key=lambda b: (b["running_s"] + b["blocked_s"], b["running_s"]))
+        kind = "compute" if top["running_s"] >= 0.35 * max(top["running_s"] + top["blocked_s"], 1e-9) else "wait"
+        return {
+            "pid": top["pid"],
+            "comm": top["comm"],
+            "cmd": short_cmd(top["cmd"], 80),
+            "kind": kind,
+            "incoming_s": 0.0,
+            "reason": f"lone process looks {kind}-bound",
+            "path": [{"pid": top["pid"], "cmd": short_cmd(top["cmd"], 50), "kind": None}],
+            "via": [],
+        }
+
+    knot_pid = max(sinks, key=lambda p: (sinks[p], incoming.get(p, 0.0), -p))
+    node = per.get(knot_pid) or {"pid": knot_pid, "comm": f"pid{knot_pid}", "cmd": "", "running_s": 0.0, "blocked_s": 0.0}
+    run, blk = float(node.get("running_s") or 0), float(node.get("blocked_s") or 0)
+    kind = "compute" if run >= 0.35 * max(run + blk, wall_s * 0.2, 1e-9) else "wait"
+    path = paths.get(knot_pid) or [{"pid": knot_pid, "cmd": short_cmd(node.get("cmd") or "", 50), "kind": None}]
+    via = [p["kind"] for p in path if p.get("kind")]
+    waiters_on = [e for e in edges if e.dst == knot_pid]
+    waited = sorted({short_cmd((per.get(e.src) or {}).get("cmd") or e.peer_cmd or "", 32) for e in waiters_on})
+    who = ", ".join(waiters_on_s for waiters_on_s in waited if waiters_on_s)[:80]
+    reason = f"wait-source of the tree ({kind}"
+    if who:
+        reason += f"; {who} waited here"
+    if via:
+        reason += f"; via {' · '.join(via)}"
+    reason += ")"
+    label = None
+    for st in stages:
+        if st.get("pid") == knot_pid:
+            label = st.get("label")
+    return {
+        "pid": knot_pid,
+        "comm": node.get("comm"),
+        "cmd": short_cmd(node.get("cmd") or "", 80),
+        "label": label,
+        "kind": kind,
+        "incoming_s": round(sum(e.s for e in waiters_on), 3),
+        "running_s": round(run, 3),
+        "blocked_s": round(blk, 3),
+        "reason": reason,
+        "path": path,
+        "via": via,
+    }
+
+
+def _path_from(start: int, sink: int, by_src: dict[int, list[Edge]], per: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    path = [{"pid": start, "cmd": short_cmd((per.get(start) or {}).get("cmd") or "", 50), "kind": None}]
+    seen = {start}
+    cur = start
+    for _ in range(16):
+        if cur == sink:
+            break
+        outs = [e for e in by_src.get(cur, []) if e.dst and e.dst not in seen]
+        if not outs:
+            break
+        specific = [e for e in outs if e.kind in SPECIFIC_KINDS]
+        e = max(specific or outs, key=lambda x: x.s)
+        path.append(
+            {
+                "pid": e.dst,
+                "cmd": short_cmd((per.get(e.dst) or {}).get("cmd") or "", 50),
+                "kind": e.kind,
+                "s": round(e.s, 3),
+            }
+        )
+        seen.add(e.dst)
+        cur = e.dst
+    if path[-1]["pid"] != sink:
+        path.append({"pid": sink, "cmd": short_cmd((per.get(sink) or {}).get("cmd") or "", 50), "kind": "walk"})
+    return path
+
+
+def edge_dict(e: Edge, per: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    src_cmd = short_cmd((per.get(e.src) or {}).get("cmd") or "", 42)
+    if e.dst:
+        dst_cmd = short_cmd((per.get(e.dst) or {}).get("cmd") or e.peer_cmd or "", 42)
+    else:
+        dst_cmd = "kernel"
+    return {
+        "src": e.src,
+        "dst": e.dst,
+        "kind": e.kind,
+        "s": round(e.s, 3),
+        "detail": e.detail,
+        "src_cmd": src_cmd,
+        "dst_cmd": dst_cmd,
+        "source": e.source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# render
+# ---------------------------------------------------------------------------
+
+
+def fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024**2:
+        return f"{n / 1024:.1f}KB"
+    if n < 1024**3:
+        return f"{n / 1024 ** 2:.2f}MB"
+    return f"{n / 1024 ** 3:.2f}GB"
+
+
+def bar(frac: float, width: int = 12) -> str:
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def render_human(rep: dict[str, Any]) -> str:
+    wall = rep.get("wall_s") or 0.0
+    rc = rep.get("exit")
+    knot = rep.get("knot") or {}
+    lines = [
+        f"knot {rep.get('version', __version__)}   wall {wall:.3f}s   exit {rc}",
+        "",
+    ]
+    if knot.get("pid"):
+        name = knot.get("label") or knot.get("cmd") or knot.get("comm") or f"pid {knot['pid']}"
+        lines.append(f"KNOT  {name}")
+        lines.append(
+            f"      {knot.get('kind')} · incoming {knot.get('incoming_s', 0):.2f}s"
+            f" · run {knot.get('running_s', 0):.2f}s  blocked {knot.get('blocked_s', 0):.2f}s"
+        )
+        if knot.get("reason"):
+            lines.append(f"      {knot['reason']}")
+        path = knot.get("path") or []
+        if len(path) >= 2:
+            bits = []
+            for i, p in enumerate(path):
+                lab = p.get("cmd") or f"pid {p.get('pid')}"
+                if i == 0:
+                    bits.append(lab)
+                else:
+                    bits.append(f"--{p.get('kind')} {p.get('s', 0):.2f}s--> {lab}")
+            lines.append("      " + " ".join(bits))
+    else:
+        lines.append(f"KNOT  (none)  {knot.get('reason', '')}")
+    conv = rep.get("conversation") or []
+    lines.append("")
+    lines.append("CONVERSATION  (waiter → blocker)")
+    shown = [e for e in conv if e.get("kind") not in {"sleep", "wchan"} or e.get("s", 0) >= 0.12]
+    if not shown:
+        shown = conv[:8]
+    if not shown:
+        lines.append("  (no blocking relationship above noise)")
+    else:
+        for e in shown[:14]:
+            dst = e.get("dst_cmd") or ("kernel" if not e.get("dst") else f"pid {e.get('dst')}")
+            src = e.get("src_cmd") or f"pid {e.get('src')}"
+            tag = "meter" if e.get("source") == "meter" else "tree"
+            lines.append(
+                f"  {e.get('kind', '?'):<12} {e.get('s', 0):6.2f}s  "
+                f"{short_cmd(src, 28):<28} → {short_cmd(dst, 28)}  [{tag}]"
+            )
+    stages = rep.get("stages") or []
+    links = rep.get("links") or []
+    if len(stages) >= 2:
+        lines.append("")
+        lines.append("STAGES")
+        knot_pid = knot.get("pid")
+        for i, st in enumerate(stages):
+            mark = "   ◀ contains knot" if knot_pid and st.get("pid") == knot_pid else ""
+            cpu = st.get("cpu_s") or 0.0
+            lines.append(f"  [{i}] {st.get('label', '?'):<40} cpu {cpu:6.3f}s{mark}")
+            if i < len(links):
+                lk = links[i]
+                rel = lk.get("relation") or "?"
+                who = ""
+                if rel == "blocked-on-write":
+                    who = f"  [{i}] waited on [{i + 1}]"
+                elif rel == "blocked-on-read":
+                    who = f"  [{i + 1}] waited on [{i}]"
+                lines.append(
+                    f"       │ {fmt_bytes(int(lk.get('bytes') or 0)):>8}  "
+                    f"empty {lk.get('read_stall_s', 0):6.3f}s  "
+                    f"full {lk.get('write_stall_s', 0):6.3f}s  {rel}{who}"
+                )
+    procs = [
+        p
+        for p in (rep.get("procs") or [])
+        if not p.get("instrument") and "set -o pipefail" not in (p.get("cmd") or "")
+    ]
+    if procs:
+        lines.append("")
+        lines.append("TREE")
+        named = knot.get("pid")
+        for p in procs[:10]:
+            tot = (p.get("running_s") or 0) + (p.get("blocked_s") or 0)
+            frac = (p.get("running_s") or 0) / tot if tot else 0.0
+            mark = "   ◀ knot" if p.get("pid") == named else ""
+            lines.append(
+                f"  {p.get('comm', '?'):<18} {bar(frac)} {frac:5.0%} run  "
+                f"{short_cmd(p.get('cmd') or '', 36)}{mark}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_report(text: str, report_path: Optional[str], as_json: bool) -> None:
+    if report_path is None:
+        sys.stderr.write(text)
+        if not text.endswith("\n"):
+            sys.stderr.write("\n")
+        return
+    if report_path == "-":
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    Path(report_path).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    if as_json:
+        sys.stderr.write(f"knot: wrote {report_path}\n")
+    else:
+        sys.stderr.write(text if text.endswith("\n") else text + "\n")
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+def load_json(path: str) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def build_pipeline_script(stages: list[list[str]], meter_logs: list[str], wrap_logs: list[str], bufsize: int) -> str:
+    self = knot_self()
+    chunks: list[str] = []
+    for i, argv in enumerate(stages):
+        wrap = self + ["--wrap", "--log", wrap_logs[i], "--"] + argv
+        chunks.append(" ".join(shell_quote(a) for a in wrap))
+        if i < len(stages) - 1:
+            meter = self + ["--meter", "--log", meter_logs[i], "--buf-size", str(bufsize)]
+            chunks.append(" ".join(shell_quote(a) for a in meter))
+    return "set -o pipefail; " + " | ".join(chunks)
+
+
+def supervise(
+    proc: subprocess.Popen,
+    backend: Backend,
+    interval: float,
+    timeout: Optional[float],
+) -> tuple[list[Sample], int]:
+    root = proc.pid
+    known: set[int] = {root}
+    samples: list[Sample] = []
+    stop = [False]
+    sampler = threading.Thread(
+        target=sample_loop,
+        args=(backend, root, interval, known, samples, stop),
+        daemon=True,
+    )
+    sampler.start()
+    timed_out = False
+    try:
+        if timeout:
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(root, signal.SIGTERM)
+                except OSError:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(root, signal.SIGKILL)
+                    except OSError:
+                        proc.kill()
+                    proc.wait(timeout=1)
+        else:
+            proc.wait()
+    except KeyboardInterrupt:
+        try:
+            os.killpg(root, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+        raise
+    finally:
+        stop[0] = True
+        sampler.join(timeout=0.6)
+    rc = proc.poll()
+    if rc is None:
+        rc = 124 if timed_out else 1
+    return samples, rc
+
+
+def annotate_from_stages(per: dict[int, dict[str, Any]], stages: list[dict[str, Any]]) -> None:
+    """Recover names macOS ps drops (`Python`, `<defunct>`) from wrap argv."""
+    stage_label: dict[int, str] = {}
+    stage_comm: dict[int, str] = {}
+    for st in stages:
+        pid = st.get("pid")
+        if not pid:
+            continue
+        argv_s = " ".join(st.get("argv") or [])
+        label = st.get("label") or argv_s
+        comm = Path((st.get("argv") or ["?"])[0]).name
+        stage_label[pid] = label
+        stage_comm[pid] = comm
+        if pid in per and weak_name(per[pid].get("cmd") or ""):
+            per[pid]["cmd"] = argv_s or label
+            per[pid]["comm"] = comm
+    ppid_of = {b["pid"]: int(b.get("ppid") or 0) for b in per.values()}
+    for pid, b in per.items():
+        if pid in stage_label:
+            continue
+        if not weak_name(b.get("cmd") or ""):
+            continue
+        cur = int(b.get("ppid") or 0)
+        seen = {pid}
+        while cur and cur not in seen:
+            seen.add(cur)
+            if cur in stage_label:
+                b["cmd"] = f"{stage_label[cur]} [child]"
+                if weak_name(b.get("comm") or ""):
+                    b["comm"] = stage_comm.get(cur) or b.get("comm")
+                break
+            cur = ppid_of.get(cur) or 0
+
+
+def assemble_report(
+    *,
+    samples: list[Sample],
+    stages: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+    wall_s: float,
+    rc: int,
+    command: Any,
+    instrument_pids: Optional[set[int]] = None,
+) -> dict[str, Any]:
+    tree_edges, per = fold_tree(samples)
+    for pid in instrument_pids or ():
+        if pid in per:
+            per[pid]["instrument"] = True
+    # attach stage pids to per if wrap saw them but samples missed
+    for st in stages:
+        pid = st.get("pid")
+        if pid and pid not in per:
+            per[pid] = {
+                "pid": pid,
+                "ppid": 0,
+                "cmd": " ".join(st.get("argv") or []) or st.get("label") or "",
+                "comm": default_label(st.get("argv") or []).split()[0] if st.get("argv") else st.get("label"),
+                "running_s": 0.0,
+                "blocked_s": float(st.get("wall_s") or 0),
+                "alive_s": float(st.get("wall_s") or 0),
+                "last_state": "?",
+                "instrument": False,
+                "user_wrapper": False,
+            }
+        elif pid and pid in per:
+            if weak_name(per[pid].get("cmd") or "") and st.get("argv"):
+                per[pid]["cmd"] = " ".join(st["argv"])
+                per[pid]["comm"] = Path(st["argv"][0]).name
+    annotate_from_stages(per, stages)
+    conv = merge_conversation(tree_edges, per, stages, links)
+    conv = retarget_stage_roots(conv, per, stages)
+    knot = find_knot(conv, per, stages, wall_s)
+    conversation = [edge_dict(e, per) for e in sorted(conv, key=lambda x: -x.s)]
+    procs = [
+        {
+            "pid": b["pid"],
+            "ppid": b["ppid"],
+            "comm": b["comm"],
+            "cmd": short_cmd(b["cmd"]),
+            "running_s": round(b["running_s"], 3),
+            "blocked_s": round(b["blocked_s"], 3),
+            "instrument": bool(b.get("instrument")),
+            "user_wrapper": bool(b.get("user_wrapper")),
+        }
+        for b in sorted(per.values(), key=lambda x: -(x["blocked_s"] + x["running_s"]))[:40]
+    ]
+    return {
+        "tool": "knot",
+        "version": __version__,
+        "command": command,
+        "wall_s": round(wall_s, 3),
+        "exit": rc,
+        "samples": len(samples),
+        "knot": knot,
+        "conversation": conversation,
+        "graph": conversation,
+        "stages": stages,
+        "links": links,
+        "procs": procs,
+    }
+
+
+def run_pipeline(
+    stages_argv: list[list[str]],
+    *,
+    json_out: bool,
+    report_path: Optional[str],
+    interval: float,
+    bufsize: int,
+    labels: dict[int, str],
+    timeout: Optional[float],
+    backend: Backend,
+    ignore_exit: bool,
+    expect_kind: list[str],
+    expect_comm: list[str],
+) -> int:
+    tmp = tempfile.mkdtemp(prefix="knot-")
+    meter_logs = [os.path.join(tmp, f"m{i}.json") for i in range(max(0, len(stages_argv) - 1))]
+    wrap_logs = [os.path.join(tmp, f"s{i}.json") for i in range(len(stages_argv))]
+    script = build_pipeline_script(stages_argv, meter_logs, wrap_logs, bufsize)
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        start_new_session=True,
+    )
+    samples, rc = supervise(proc, backend, interval, timeout)
+    wall_s = time.monotonic() - t0
+    harvested: list[dict[str, Any]] = []
+    instrument_pids: set[int] = set()
+    for i, argv in enumerate(stages_argv):
+        wrap = load_json(wrap_logs[i])
+        if wrap.get("wrap_pid"):
+            instrument_pids.add(int(wrap["wrap_pid"]))
+        label = labels.get(i) or default_label(argv)
+        cpu = float(wrap.get("ru_utime") or 0) + float(wrap.get("ru_stime") or 0)
+        st_wall = ns_to_s(wrap.get("wall_ns"))
+        harvested.append(
+            {
+                "i": i,
+                "argv": argv,
+                "label": label,
+                "exit": wrap.get("exit"),
+                "pid": wrap.get("pid"),
+                "wall_s": st_wall,
+                "ru_utime": wrap.get("ru_utime"),
+                "ru_stime": wrap.get("ru_stime"),
+                "cpu_s": cpu,
+                "cpu_frac": (cpu / st_wall) if st_wall > 0 else None,
+            }
+        )
+    links: list[dict[str, Any]] = []
+    for i, path in enumerate(meter_logs):
+        m = load_json(path)
+        if m.get("meter_pid"):
+            instrument_pids.add(int(m["meter_pid"]))
+        links.append(
+            {
+                "from": i,
+                "to": i + 1,
+                "bytes": int(m.get("bytes") or 0),
+                "reads": int(m.get("reads") or 0),
+                "writes": int(m.get("writes") or 0),
+                "read_stall_s": ns_to_s(m.get("read_stall_ns")),
+                "write_stall_s": ns_to_s(m.get("write_stall_ns")),
+                "both_stall_s": ns_to_s(m.get("both_stall_ns")),
+                "copy_s": ns_to_s(m.get("copy_ns")),
+                "wall_s": ns_to_s(m.get("wall_ns")),
+                "epipe": bool(m.get("epipe")),
+                "read_eof": bool(m.get("read_eof")),
+            }
+        )
+    report = assemble_report(
+        samples=samples,
+        stages=harvested,
+        links=links,
+        wall_s=wall_s,
+        rc=rc,
+        command=[" | ".join(" ".join(a) for a in stages_argv)],
+        instrument_pids=instrument_pids,
+    )
+    body = json.dumps(report, indent=2) + "\n" if json_out else render_human(report)
+    write_report(body, report_path, json_out)
+    return _finish(report, rc, ignore_exit, expect_kind, expect_comm)
+
+
+def run_single(
+    argv: list[str],
+    *,
+    json_out: bool,
+    report_path: Optional[str],
+    interval: float,
+    timeout: Optional[float],
+    backend: Backend,
+    ignore_exit: bool,
+    expect_kind: list[str],
+    expect_comm: list[str],
+) -> int:
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.Popen(argv, start_new_session=True)
+    except FileNotFoundError:
+        print(f"knot: not found: {argv[0]}", file=sys.stderr)
+        return 127
+    samples, rc = supervise(proc, backend, interval, timeout)
+    wall_s = time.monotonic() - t0
+    stages = [
+        {
+            "i": 0,
+            "argv": argv,
+            "label": default_label(argv),
+            "exit": rc,
+            "pid": proc.pid,
+            "wall_s": wall_s,
+            "cpu_s": None,
+            "cpu_frac": None,
+        }
+    ]
+    report = assemble_report(
+        samples=samples,
+        stages=stages,
+        links=[],
+        wall_s=wall_s,
+        rc=rc,
+        command=argv,
+    )
+    body = json.dumps(report, indent=2) + "\n" if json_out else render_human(report)
+    write_report(body, report_path, json_out)
+    return _finish(report, rc, ignore_exit, expect_kind, expect_comm)
+
+
+def _finish(report: dict[str, Any], rc: int, ignore_exit: bool, expect_kind: list[str], expect_comm: list[str]) -> int:
+    kinds = {e.get("kind") for e in report.get("conversation") or []}
+    kinds |= {e.get("kind") for e in report.get("graph") or []}
+    kinds |= set(report.get("knot", {}).get("via") or [])
+    if expect_kind:
+        missing = [k for k in expect_kind if k not in kinds]
+        if missing:
+            print(f"knot: expected kind {missing} not observed; saw {sorted(kinds)}", file=sys.stderr)
+            return 2
+    if expect_comm:
+        comm = (report.get("knot") or {}).get("comm") or ""
+        cmd = (report.get("knot") or {}).get("cmd") or ""
+        blob = f"{comm} {cmd}".lower()
+        for c in expect_comm:
+            if c.lower() not in blob:
+                print(f"knot: expected comm {c!r} not in knot {comm!r} {cmd!r}", file=sys.stderr)
+                return 2
+    return 0 if ignore_exit else int(rc if rc is not None else 1)
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+LSOF_PIPE_BLOB = """COMMAND   PID       USER   FD    TYPE             DEVICE   SIZE/OFF      NODE NAME
+Python  10001 annenpolka    0r    REG               1,17        483 120267857 /tmp/in
+Python  10001 annenpolka    5w    PIPE 0xaaa111          16384           ->0xbbb222
+Python  10002 annenpolka    0r    REG               1,17        483 120267857 /tmp/in
+Python  10002 annenpolka    4r    PIPE 0xbbb222          16384           ->0xaaa111
+"""
+
+PS_BLOB = """  PID  PPID  PGID   UID STAT WCHAN   RSS  %CPU COMMAND
+10001 10000 10001  501 S    -      1000   0.0 python writer
+10002 10001 10001  501 S    -      1000   0.0 python reader
+"""
+
+
+def selftest() -> int:
+    fails: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if not cond:
+            fails.append(f"{name}: {detail}")
+
+    ps = parse_ps_table(PS_BLOB)
+    check("ps-count", len(ps) == 2, str(len(ps)))
+
+    pipes = parse_lsof_text(LSOF_PIPE_BLOB)
+    w = next(fd for fd in pipes[10001] if fd.type == "PIPE")
+    r = next(fd for fd in pipes[10002] if fd.type == "PIPE")
+    check("pipe-mode-w", w.mode == "w", w.mode)
+    check("pipe-mode-r", r.mode == "r", r.mode)
+    p_w = Proc(pid=10001, ppid=1, state="S", cmd="python writer", comm="python", fds=pipes[10001])
+    p_r = Proc(pid=10002, ppid=10001, state="S", cmd="python reader", comm="python", fds=pipes[10002])
+    edges = infer_edges([p_w, p_r])
+    kinds = {(e.src, e.dst, e.kind) for e in edges}
+    check("pipe-edge", (10002, 10001, "pipe-read") in kinds, str(kinds))
+
+    same = Fd(fd="1", type="PIPE", mode="", name="->0xbbbb", local="0xaaaa", peer="0xbbbb", device="0xaaaa")
+    parent = Proc(pid=10, ppid=1, state="S", cmd="cargo test", comm="cargo", fds=[same])
+    child = Proc(pid=11, ppid=10, state="S", cmd="kizu-test", comm="kizu", fds=[same])
+    e4 = infer_edges([parent, child])
+    pipe_between = [e for e in e4 if e.kind.startswith("pipe") and {e.src, e.dst} == {10, 11}]
+    check("no-inherited-pipe", pipe_between == [], str(e4))
+    check("child-wait", any(e.src == 10 and e.dst == 11 and e.kind == "child-wait" for e in e4), str(e4))
+
+    snapped = expand_tree(
+        [
+            Proc(pid=70, ppid=1, pgid=7, state="S", cmd="sleep", comm="sleep"),
+            Proc(pid=7, ppid=1, pgid=7, state="S", cmd="zsh", comm="zsh"),
+        ],
+        70,
+        set(),
+    )
+    check("snap-no-pgid-swallow", {p.pid for p in snapped} == {70}, str([p.pid for p in snapped]))
+
+    # knot walk: just → cargo → rustc (sleep). knot is rustc, not cargo.
+    just = Proc(pid=1, ppid=0, state="S", cmd="just spec-check", comm="just")
+    cargo = Proc(pid=2, ppid=1, state="S", cmd="cargo test", comm="cargo")
+    rustc = Proc(pid=3, ppid=2, state="S", cmd="rustc --crate kizu", comm="rustc")
+    s0 = Sample(t=0.0, procs=[just, cargo, rustc], edges=[])
+    s1 = Sample(
+        t=1.0,
+        procs=[just, cargo, rustc],
+        edges=[
+            Edge(src=1, dst=2, kind="child-wait", s=0),
+            Edge(src=2, dst=3, kind="child-wait", s=0),
+            Edge(src=3, dst=0, kind="sleep", s=0),
+        ],
+    )
+    te, per = fold_tree([s0, s1])
+    conv = merge_conversation(te, per, [], [])
+    k = find_knot(conv, per, [], 1.0)
+    check("walk-rustc", k.get("comm") == "rustc", str(k))
+    check("via-child-wait", "child-wait" in (k.get("via") or []), str(k.get("via")))
+
+    # jq pipe-empty on running cargo: knot is cargo (compute source)
+    jq = Proc(pid=20, ppid=1, state="S", cmd="jq .packages", comm="jq")
+    cargo_r = Proc(pid=21, ppid=1, state="R", cmd="cargo metadata", comm="cargo")
+    s2 = Sample(t=0.0, procs=[jq, cargo_r], edges=[])
+    s3 = Sample(t=2.0, procs=[jq, cargo_r], edges=[Edge(src=20, dst=21, kind="pipe-read")])
+    te2, per2 = fold_tree([s2, s3])
+    k2 = find_knot(merge_conversation(te2, per2, [], []), per2, [], 2.0)
+    check("pipe-cargo", k2.get("comm") == "cargo", str(k2))
+
+    # meter + child-wait: jq waited on cargo, cargo waited on rustc → knot rustc
+    stages = [
+        {"i": 0, "pid": 21, "label": "cargo metadata", "argv": ["cargo"]},
+        {"i": 1, "pid": 20, "label": "jq", "argv": ["jq"]},
+    ]
+    links = [
+        {
+            "from": 0,
+            "to": 1,
+            "bytes": 100,
+            "read_stall_s": 1.8,
+            "write_stall_s": 0.0,
+        }
+    ]
+    rustc2 = Proc(pid=22, ppid=21, state="R", cmd="rustc --crate foo", comm="rustc")
+    cargo_s = Proc(pid=21, ppid=1, state="S", cmd="cargo metadata", comm="cargo")
+    jq_s = Proc(pid=20, ppid=1, state="S", cmd="jq", comm="jq")
+    s4 = Sample(t=0.0, procs=[cargo_s, jq_s, rustc2], edges=[])
+    s5 = Sample(
+        t=2.0,
+        procs=[cargo_s, jq_s, rustc2],
+        edges=[Edge(src=21, dst=22, kind="child-wait")],
+    )
+    te3, per3 = fold_tree([s4, s5])
+    conv3 = merge_conversation(te3, per3, stages, links)
+    conv3 = retarget_stage_roots(conv3, per3, stages)
+    k3 = find_knot(conv3, per3, stages, 2.0)
+    check("joint-rustc", k3.get("comm") == "rustc", str(k3))
+    check("joint-via-pipe", any(e.kind in {"pipe-empty", "pipe-read"} for e in conv3), str([e.kind for e in conv3]))
+
+    # cpu middle: both neighbors wait on it
+    prod = Proc(pid=30, ppid=1, state="S", cmd="producer", comm="prod")
+    cpu = Proc(pid=31, ppid=1, state="R", cmd="cpu_stage", comm="cpu_stage")
+    cons = Proc(pid=32, ppid=1, state="S", cmd="consumer", comm="cons")
+    stg = [
+        {"i": 0, "pid": 30, "label": "prod", "argv": ["p"]},
+        {"i": 1, "pid": 31, "label": "cpu_stage", "argv": ["c"]},
+        {"i": 2, "pid": 32, "label": "cons", "argv": ["k"]},
+    ]
+    lks = [
+        {"from": 0, "to": 1, "bytes": 10, "read_stall_s": 0.0, "write_stall_s": 0.8},
+        {"from": 1, "to": 2, "bytes": 10, "read_stall_s": 0.7, "write_stall_s": 0.0},
+    ]
+    s6 = Sample(t=0.0, procs=[prod, cpu, cons], edges=[])
+    s7 = Sample(t=1.0, procs=[prod, cpu, cons], edges=[])
+    te4, per4 = fold_tree([s6, s7])
+    conv4 = merge_conversation(te4, per4, stg, lks)
+    k4 = find_knot(conv4, per4, stg, 1.0)
+    check("cpu-middle", k4.get("comm") == "cpu_stage", str(k4))
+
+    # node ran AND slept; pkl ran. Inner-wrapper walk names pkl.
+    node_p = Proc(pid=40, ppid=1, state="R", cmd="node tools/spec-check", comm="node")
+    pkl_p = Proc(pid=41, ppid=40, state="R", cmd="pkl eval spec.pkl", comm="pkl")
+    sn0 = Sample(t=0.0, procs=[node_p, pkl_p], edges=[])
+    node_s = Proc(pid=40, ppid=1, state="S", cmd="node tools/spec-check", comm="node")
+    sn1 = Sample(t=0.5, procs=[node_p, pkl_p], edges=[Edge(src=40, dst=41, kind="child-wait")])
+    sn2 = Sample(t=1.0, procs=[node_s, pkl_p], edges=[Edge(src=40, dst=41, kind="child-wait")])
+    te5, per5 = fold_tree([sn0, sn1, sn2])
+    k5 = find_knot(merge_conversation(te5, per5, [], []), per5, [], 1.0)
+    check("inner-pkl", k5.get("comm") == "pkl", str(k5))
+
+    # later <defunct> must not wipe cargo's name
+    live = Proc(pid=50, ppid=1, state="S", cmd="cargo test --lib", comm="cargo")
+    dead = Proc(pid=50, ppid=1, state="Z", cmd="<defunct>", comm="<defunct>")
+    kid = Proc(pid=51, ppid=50, state="S", cmd="kizu-test", comm="kizu")
+    sf0 = Sample(t=0.0, procs=[live, kid], edges=[])
+    sf1 = Sample(
+        t=1.0,
+        procs=[dead, kid],
+        edges=[Edge(src=50, dst=51, kind="child-wait")],
+    )
+    te6, per6 = fold_tree([sf0, sf1])
+    check("keep-cargo-name", "cargo" in (per6[50]["cmd"] or ""), str(per6[50]))
+
+    bash_wrap = Proc(
+        pid=60,
+        ppid=1,
+        state="S",
+        cmd="bash -c set -o pipefail; python3 knot --wrap --log /tmp/s0 -- cargo",
+        comm="bash",
+    )
+    check("bash-not-instrument", not is_instrument(bash_wrap), bash_wrap.cmd)
+    wrap_py = Proc(pid=61, ppid=60, state="S", cmd="python3 knot --wrap --log /tmp/s0 -- cargo", comm="python3")
+    check("wrap-is-instrument", is_instrument(wrap_py), wrap_py.cmd)
+
+    parts = split_pipeline("cat 'a | b' | gzip | wc -c")
+    check("sh-split", parts == ["cat 'a | b'", "gzip", "wc -c"], str(parts))
+    stg_argv = split_stages_from_argv(["cargo", "test", "--", "--list", "+", "jq"])
+    check("plus-split", stg_argv == [["cargo", "test", "--", "--list"], ["jq"]], str(stg_argv))
+
+    if fails:
+        print("selftest FAILED", file=sys.stderr)
+        for f in fails:
+            print("  -", f, file=sys.stderr)
+        return 1
+    print("selftest ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+HELP = """knot — wait-for conversation of a command line
+
+A command line is both a pipeline and a process tree. One verb
+reports who waited for whom across pipes AND child-wait / sleep /
+fifo, then names the knot: the wait-source of the whole tree.
+
+USAGE
+  knot [opts] --sh 'cmd1 | cmd2 | cmd3'
+  knot [opts] -- cmd1 + cmd2 + cmd3
+  knot [opts] -- cmd [args...]
+  knot selftest
+
+OPTIONS
+  --json              report as JSON
+  --report PATH       write report to PATH ('-' = stdout). default: stderr
+  --interval S        tree sample interval (default 0.08)
+  --buf-size N        meter buffer bytes (default 65536)
+  --label I=NAME      name stage I (repeatable)
+  --sh SCRIPT         quote-aware split SCRIPT on |
+  --timeout S         SIGTERM the tree after S seconds
+  --ignore-exit       return 0 even if the child failed
+  --expect-kind KIND  exit 2 if KIND absent from the conversation
+  --expect-comm COMM  exit 2 if the knot's comm/cmd lacks COMM
+  --no-lsof           skip fd joining
+  --backend auto|ps|proc
+  --meter / --wrap    internal
+  -h, --help
+  --version
+
+`--` ends options (so `cargo test -- --list` stays one command).
+A lone `+` separates pipeline stages.
+
+EXAMPLES
+  knot -- python3 fixtures/pipe_block.py 0.6
+  knot -- python3 prod.py + python3 cons.py
+  knot --json --report knot.json --sh 'cargo metadata --format-version 1 | jq .packages'
+  knot -- cargo test --lib -- --list
+"""
+
+
+def parse_label_opt(raw: str) -> dict[int, str]:
+    if "=" not in raw:
+        raise SystemExit(f"knot: --label expects I=NAME, got {raw!r}")
+    idx, name = raw.split("=", 1)
+    try:
+        return {int(idx): name}
+    except ValueError:
+        raise SystemExit(f"knot: --label index must be int, got {idx!r}") from None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--meter":
+        p = argparse.ArgumentParser(add_help=False)
+        p.add_argument("--meter", action="store_true")
+        p.add_argument("--log", required=True)
+        p.add_argument("--buf-size", type=int, default=DEFAULT_BUF)
+        ns, _ = p.parse_known_args(argv)
+        return run_meter(ns.log, ns.buf_size)
+    if argv and argv[0] == "--wrap":
+        p = argparse.ArgumentParser(add_help=False)
+        p.add_argument("--wrap", action="store_true")
+        p.add_argument("--log", required=True)
+        p.add_argument("--buf-size", type=int, default=DEFAULT_BUF)
+        ns, rest = p.parse_known_args(argv)
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        return run_wrap(ns.log, rest)
+    if not argv or argv[0] in {"-h", "--help"}:
+        sys.stdout.write(HELP)
+        return 0
+    if argv[0] in {"--version", "-V"}:
+        print(__version__)
+        return 0
+    if argv[0] == "selftest" or (argv[:2] in (["--", "selftest"],)):
+        return selftest()
+
+    json_out = False
+    report_path: Optional[str] = None
+    interval = DEFAULT_INTERVAL
+    bufsize = DEFAULT_BUF
+    labels: dict[int, str] = {}
+    sh_script: Optional[str] = None
+    timeout: Optional[float] = None
+    ignore_exit = False
+    expect_kind: list[str] = []
+    expect_comm: list[str] = []
+    use_fds = True
+    backend_name = "auto"
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            json_out = True
+        elif a == "--report":
+            i += 1
+            report_path = argv[i]
+        elif a.startswith("--report="):
+            report_path = a.split("=", 1)[1]
+        elif a in {"-o", "--output"}:
+            i += 1
+            report_path = argv[i]
+        elif a == "--interval":
+            i += 1
+            interval = float(argv[i])
+        elif a.startswith("--interval="):
+            interval = float(a.split("=", 1)[1])
+        elif a == "--buf-size":
+            i += 1
+            bufsize = int(argv[i])
+        elif a.startswith("--buf-size="):
+            bufsize = int(a.split("=", 1)[1])
+        elif a == "--label":
+            i += 1
+            labels.update(parse_label_opt(argv[i]))
+        elif a.startswith("--label="):
+            labels.update(parse_label_opt(a.split("=", 1)[1]))
+        elif a == "--sh":
+            i += 1
+            sh_script = argv[i]
+        elif a.startswith("--sh="):
+            sh_script = a.split("=", 1)[1]
+        elif a == "--timeout":
+            i += 1
+            timeout = float(argv[i])
+        elif a.startswith("--timeout="):
+            timeout = float(a.split("=", 1)[1])
+        elif a == "--ignore-exit":
+            ignore_exit = True
+        elif a == "--expect-kind":
+            i += 1
+            expect_kind.append(argv[i])
+        elif a.startswith("--expect-kind="):
+            expect_kind.append(a.split("=", 1)[1])
+        elif a == "--expect-comm":
+            i += 1
+            expect_comm.append(argv[i])
+        elif a.startswith("--expect-comm="):
+            expect_comm.append(a.split("=", 1)[1])
+        elif a == "--no-lsof":
+            use_fds = False
+        elif a == "--backend":
+            i += 1
+            backend_name = argv[i]
+        elif a == "--":
+            rest.extend(argv[i:])
+            break
+        elif a.startswith("-"):
+            print(f"knot: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            rest.extend(argv[i:])
+            break
+        i += 1
+
+    backend = pick_backend(backend_name, use_fds)
+    common = dict(
+        json_out=json_out,
+        report_path=report_path,
+        interval=interval,
+        timeout=timeout,
+        backend=backend,
+        ignore_exit=ignore_exit,
+        expect_kind=expect_kind,
+        expect_comm=expect_comm,
+    )
+    if sh_script is not None:
+        parts = split_pipeline(sh_script)
+        if not parts:
+            print("knot: empty --sh script", file=sys.stderr)
+            return 2
+        stages = [stage_from_sh(p) for p in parts]
+        return run_pipeline(stages, bufsize=bufsize, labels=labels, **common)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    stages = split_stages_from_argv(rest)
+    if not stages:
+        print("knot: no command", file=sys.stderr)
+        return 2
+    if len(stages) == 1:
+        return run_single(stages[0], **common)
+    return run_pipeline(stages, bufsize=bufsize, labels=labels, **common)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\nknot: interrupted\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.exit(0)

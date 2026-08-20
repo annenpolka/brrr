@@ -1,0 +1,157 @@
+{
+  "tool": "pinch",
+  "version": "0.2.0",
+  "wall_s": 0.26711683394387364,
+  "exit": 127,
+  "stages": [
+    {
+      "i": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "--offline"
+      ],
+      "label": "cargo test --lib --offline",
+      "exit": 101,
+      "pid": 43978,
+      "wall_s": 0.198297375,
+      "ru_utime": 0.065222,
+      "ru_stime": 0.10853,
+      "ru_maxrss": 88801280,
+      "cpu_s": 0.17375200000000002,
+      "cpu_frac": 0.8762193649815083
+    },
+    {
+      "i": 1,
+      "argv": [
+        "--list"
+      ],
+      "label": "--list",
+      "exit": 127,
+      "pid": null,
+      "wall_s": 0.0,
+      "ru_utime": null,
+      "ru_stime": null,
+      "ru_maxrss": null,
+      "cpu_s": 0.0,
+      "cpu_frac": null
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "bytes": 0,
+      "reads": 1,
+      "writes": 0,
+      "read_stall_s": 0.177857708,
+      "write_stall_s": 0.0,
+      "both_stall_s": 0.0,
+      "copy_s": 1.5334e-05,
+      "wall_s": 0.177910917,
+      "epipe": true,
+      "read_eof": false,
+      "relation": "blocked-on-read",
+      "toward": 0
+    }
+  ],
+  "pinch": {
+    "stage": 0,
+    "kind": "compute",
+    "reason": "stage 0 (cargo test --lib --offline) absorbed 0.178s of neighbor stall and looks compute-bound",
+    "blame": [
+      0.177857708,
+      0.0
+    ],
+    "wait_for": [
+      {
+        "waiter": 1,
+        "waited_s": 0.177857708,
+        "reason": "blocked-on-read",
+        "on": 0
+      }
+    ],
+    "busy_frac": 0.8762193649815083,
+    "inner": {
+      "comm": "cargo",
+      "kind": "wait",
+      "reason": "inner pinch is cargo (wait, 1 run / 2 sleep samples)",
+      "waited_on_inner": []
+    }
+  },
+  "samples": {
+    "n": 5,
+    "span_s": 0.20729933283291757,
+    "busy_frac": 0.3333333333333333,
+    "run_slots": 1,
+    "sleep_slots": 2,
+    "by_comm": {
+      "bash": {
+        "run": 1,
+        "sleep": 4,
+        "other": 0
+      },
+      "Python": {
+        "run": 0,
+        "sleep": 7,
+        "other": 0
+      },
+      "cargo": {
+        "run": 1,
+        "sleep": 2,
+        "other": 0
+      },
+      "(Python)": {
+        "run": 0,
+        "sleep": 1,
+        "other": 0
+      },
+      "(cargo)": {
+        "run": 1,
+        "sleep": 0,
+        "other": 0
+      }
+    },
+    "wall_s": 0.26711683394387364,
+    "inner": {
+      "workers": {
+        "cargo": {
+          "comm": "cargo",
+          "run": 1,
+          "sleep": 2,
+          "other": 0,
+          "run_frac": 0.3333333333333333
+        }
+      },
+      "busy_frac": 0.3333333333333333,
+      "phases": [
+        {
+          "t0": 0.0,
+          "t1": 0.1044,
+          "run": [],
+          "sleep": [
+            "cargo"
+          ]
+        },
+        {
+          "t0": 0.1044,
+          "t1": 0.1581,
+          "run": [
+            "cargo"
+          ],
+          "sleep": []
+        },
+        {
+          "t0": 0.1581,
+          "t1": 0.2073,
+          "run": [],
+          "sleep": [
+            "cargo"
+          ]
+        }
+      ]
+    }
+  },
+  "tmpdir": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/pinch-9ijyuq6r"
+}

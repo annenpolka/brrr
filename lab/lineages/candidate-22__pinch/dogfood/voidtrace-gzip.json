@@ -1,0 +1,148 @@
+{
+  "tool": "pinch",
+  "version": "0.1.0",
+  "wall_s": 0.09300841693766415,
+  "exit": 0,
+  "stages": [
+    {
+      "i": 0,
+      "argv": [
+        "cat",
+        "packages/spec-artifacts/src/contracts.generated.ts",
+        "packages/spec-artifacts/src/ids.generated.ts",
+        "packages/spec-artifacts/src/schema-index.generated.ts"
+      ],
+      "label": "cat packages/spec-artifacts/src/contracts.generated.ts \u2026",
+      "exit": 0,
+      "pid": 29098,
+      "wall_s": 0.003928375,
+      "ru_utime": 0.000593,
+      "ru_stime": 0.001482,
+      "ru_maxrss": 1458176,
+      "cpu_s": 0.002075,
+      "cpu_frac": 0.5282082285932479
+    },
+    {
+      "i": 1,
+      "argv": [
+        "gzip",
+        "-1"
+      ],
+      "label": "gzip -1",
+      "exit": 0,
+      "pid": 29100,
+      "wall_s": 0.015128542,
+      "ru_utime": 0.000703,
+      "ru_stime": 0.001266,
+      "ru_maxrss": 1687552,
+      "cpu_s": 0.001969,
+      "cpu_frac": 0.13015133910458787
+    },
+    {
+      "i": 2,
+      "argv": [
+        "wc",
+        "-c"
+      ],
+      "label": "wc -c",
+      "exit": 0,
+      "pid": 29099,
+      "wall_s": 0.027133542,
+      "ru_utime": 0.00061,
+      "ru_stime": 0.001379,
+      "ru_maxrss": 1556480,
+      "cpu_s": 0.001989,
+      "cpu_frac": 0.07330410456548576
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "bytes": 50535,
+      "reads": 3,
+      "writes": 2,
+      "read_stall_s": 0.009549625,
+      "write_stall_s": 0.0,
+      "both_stall_s": 0.0,
+      "copy_s": 1.9958e-05,
+      "wall_s": 0.009610541,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-read",
+      "toward": 0
+    },
+    {
+      "from": 1,
+      "to": 2,
+      "bytes": 10378,
+      "reads": 1,
+      "writes": 1,
+      "read_stall_s": 0.021015875,
+      "write_stall_s": 0.0,
+      "both_stall_s": 0.0,
+      "copy_s": 1.6541e-05,
+      "wall_s": 0.021076292,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-read",
+      "toward": 1
+    }
+  ],
+  "pinch": {
+    "stage": 1,
+    "kind": "wait",
+    "reason": "stage 1 (gzip -1) absorbed 0.021s of neighbor stall and looks wait-bound",
+    "blame": [
+      0.009549625,
+      0.021015875,
+      0.0
+    ],
+    "wait_for": [
+      {
+        "waiter": 1,
+        "waited_s": 0.009549625,
+        "reason": "blocked-on-read",
+        "on": 0
+      },
+      {
+        "waiter": 2,
+        "waited_s": 0.021015875,
+        "reason": "blocked-on-read",
+        "on": 1
+      }
+    ],
+    "busy_frac": 0.13015133910458787
+  },
+  "samples": {
+    "n": 2,
+    "span_s": 0.043537541991099715,
+    "busy_frac": 0.2222222222222222,
+    "run_slots": 2,
+    "sleep_slots": 7,
+    "by_comm": {
+      "bash": {
+        "run": 1,
+        "sleep": 1,
+        "other": 0
+      },
+      "Python": {
+        "run": 1,
+        "sleep": 4,
+        "other": 0
+      },
+      "wc": {
+        "run": 0,
+        "sleep": 1,
+        "other": 0
+      },
+      "gzip": {
+        "run": 0,
+        "sleep": 1,
+        "other": 0
+      }
+    },
+    "wall_s": 0.09300841693766415
+  },
+  "tmpdir": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/pinch-xobjvyoz"
+}

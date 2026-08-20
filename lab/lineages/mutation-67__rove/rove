@@ -1,0 +1,1915 @@
+#!/usr/bin/env python3
+"""rove — occupancy of a token along a file identity.
+
+berth --follow occupies the file. grep -- PATH still dies at git mv, because
+the pathspec is the current name. rove grep --follow greps the identity:
+query the old name or the new name, the token's eras stay on the roost.
+
+--no-follow is ancestor path-limited grep. --boolean is ancestor held.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Optional
+
+TOOL = "rove"
+GLOB_CHARS = set("*?[")
+GREP_BATCH = 80
+HOLDER_PRINT_LIMIT = 8
+INVERT_HOLDER = "(no match)"
+
+DOC_BASENAMES = {
+    "readme",
+    "readme.md",
+    "readme.rst",
+    "readme.txt",
+    "readme.markdown",
+    "agents.md",
+    "claude.md",
+    "contributing.md",
+    "changelog.md",
+    "changelog",
+    "history.md",
+    "copying",
+    "license",
+    "license.md",
+    "authors",
+    "notice",
+    "code_of_conduct.md",
+}
+DOC_DIRS = {"docs", "doc", "documentation"}
+
+
+class GitError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{TOOL}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_git(
+    repo: str,
+    args: list[str],
+    check: bool = True,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", repo, *args]
+    r = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
+    if check and r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        raise GitError(err)
+    return r
+
+
+def resolve_repo(path: str) -> str:
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        die(f"not a git repository: {path}")
+    r = run_git(path, ["rev-parse", "--show-toplevel"], check=False)
+    if r.returncode != 0:
+        die(f"not a git repository: {path}")
+    top = r.stdout.strip()
+    if not top:
+        die(f"not a git repository: {path}")
+    return top
+
+
+def is_glob(path: str) -> bool:
+    return any(ch in path for ch in GLOB_CHARS)
+
+
+@dataclass
+class Sample:
+    sha: str
+    short: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str
+    value: bool = False
+    witnesses: list[str] = field(default_factory=list)
+
+    def as_json(self) -> dict:
+        return {
+            "sha": self.sha,
+            "short": self.short,
+            "timestamp": self.timestamp,
+            "iso": self.iso,
+            "subject": self.subject,
+            "kind": self.kind,
+        }
+
+
+@dataclass
+class Era:
+    value: bool
+    samples: list[Sample]
+    split: str = "start"
+    kind_name: str = "absent"
+    added: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    origin: Optional[Sample] = None
+    origin_count: int = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.samples)
+
+    @property
+    def start(self) -> Sample:
+        return self.samples[0]
+
+    @property
+    def end(self) -> Sample:
+        return self.samples[-1]
+
+    @property
+    def holders(self) -> list[str]:
+        if not self.value:
+            return []
+        return list(self.start.witnesses)
+
+
+def day(iso: str) -> str:
+    return iso[:10]
+
+
+def fmt_dates(start: Sample, end: Sample, always_arrow: bool = False) -> str:
+    a, b = day(start.iso), day(end.iso)
+    if a == b and not always_arrow:
+        return a
+    return f"{a} → {b}"
+
+
+def fmt_span(start: Sample, end: Sample) -> str:
+    if start.short == end.short:
+        return start.short
+    return f"{start.short}..{end.short}"
+
+
+def load_commits(
+    repo: str, spec: str, first_parent: bool, limit: Optional[int]
+) -> list[Sample]:
+    args = ["log", "--reverse", "--pretty=format:%H\t%ct\t%ci\t%s"]
+    if first_parent:
+        args.append("--first-parent")
+    args.append(spec)
+    r = run_git(repo, args, check=False)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if "outside repository" in err:
+            raise GitError(err)
+        if not r.stdout.strip():
+            return []
+        raise GitError(err)
+    samples: list[Sample] = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
+            continue
+        sha, ts, iso, subject = parts
+        samples.append(
+            Sample(
+                sha=sha,
+                short=sha[:7],
+                timestamp=int(ts),
+                iso=iso,
+                subject=subject,
+                kind="commit",
+            )
+        )
+    if limit is not None and limit >= 0:
+        samples = samples[-limit:]
+    return samples
+
+
+def reachable_count(repo: str, spec: str) -> int:
+    r = run_git(repo, ["rev-list", "--count", spec], check=False)
+    if r.returncode != 0:
+        return 0
+    try:
+        return int(r.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def now_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        short="WORKTREE",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def index_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="INDEX",
+        short="INDEX",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="staged index",
+        kind="index",
+    )
+
+
+def is_missing_line(line: str) -> bool:
+    return line.endswith(" missing") or line == "missing"
+
+
+def git_pathspec_filter(names: list[str], spec: str) -> list[str]:
+    rx = []
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if ch == "*":
+            rx.append(".*")
+        elif ch == "?":
+            rx.append(".")
+        elif ch == "[":
+            j = spec.find("]", i + 1)
+            if j < 0:
+                rx.append(re.escape(ch))
+            else:
+                rx.append(spec[i : j + 1])
+                i = j
+        else:
+            rx.append(re.escape(ch))
+        i += 1
+    pat = re.compile("^" + "".join(rx) + "$")
+    return [n for n in names if pat.match(n)]
+
+
+def exists_at_commits(repo: str, shas: list[str], path: str) -> list[tuple[bool, list[str]]]:
+    if not shas:
+        return []
+    if is_glob(path):
+        out: list[tuple[bool, list[str]]] = []
+        for sha in shas:
+            r = run_git(
+                repo,
+                ["ls-files", "-z", "--with-tree", sha, "--", path],
+                check=False,
+            )
+            names = [n for n in r.stdout.split("\0") if n]
+            if not names:
+                r2 = run_git(
+                    repo, ["ls-tree", "-r", "-z", "--name-only", sha], check=False
+                )
+                names = git_pathspec_filter(
+                    [n for n in r2.stdout.split("\0") if n], path
+                )
+            names.sort()
+            out.append((bool(names), names))
+        return out
+    payload = "".join(f"{sha}:{path}\n" for sha in shas)
+    r = run_git(repo, ["cat-file", "--batch-check"], input_text=payload)
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    if len(lines) != len(shas):
+        out = []
+        for sha in shas:
+            rr = run_git(
+                repo, ["cat-file", "--batch-check"], input_text=f"{sha}:{path}\n"
+            )
+            miss = is_missing_line(rr.stdout.strip())
+            out.append((not miss, [] if miss else [path]))
+        return out
+    out = []
+    for line in lines:
+        miss = is_missing_line(line)
+        out.append((not miss, [] if miss else [path]))
+    return out
+
+
+def exists_worktree(repo: str, path: str) -> tuple[bool, list[str]]:
+    if is_glob(path):
+        r = run_git(
+            repo,
+            ["ls-files", "-co", "--exclude-standard", "-z", "--", path],
+            check=False,
+        )
+        names = [n for n in r.stdout.split("\0") if n]
+        if not names:
+            r2 = run_git(
+                repo, ["ls-files", "-co", "--exclude-standard", "-z"], check=False
+            )
+            all_names = [n for n in r2.stdout.split("\0") if n]
+            names = git_pathspec_filter(all_names, path)
+        names.sort()
+        return bool(names), names
+    p = os.path.join(repo, path)
+    ok = os.path.lexists(p)
+    return ok, ([path] if ok else [])
+
+
+def exists_index(repo: str, path: str) -> tuple[bool, list[str]]:
+    r = run_git(repo, ["ls-files", "-c", "-z", "--full-name", "--", path], check=False)
+    names = [n for n in r.stdout.split("\0") if n]
+    names.sort()
+    if names:
+        return True, names if is_glob(path) else [path]
+    return False, []
+
+
+def unquote_git_path(path: str) -> str:
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        raw = path[1:-1]
+        out = bytearray()
+        i = 0
+        while i < len(raw):
+            if raw[i] == "\\" and i + 3 < len(raw) and raw[i + 1 : i + 4].isdigit():
+                out.append(int(raw[i + 1 : i + 4], 8))
+                i += 4
+                continue
+            if raw[i] == "\\" and i + 1 < len(raw):
+                esc = {"n": 10, "t": 9, "r": 13, '"': 34, "\\": 92}.get(raw[i + 1])
+                if esc is not None:
+                    out.append(esc)
+                    i += 2
+                    continue
+            out.extend(raw[i].encode("utf-8", "surrogateescape"))
+            i += 1
+        return out.decode("utf-8", "surrogateescape")
+    return path
+
+
+def collect_tree_changes(
+    repo: str, spec: str, first_parent: bool
+) -> dict[str, tuple[list[tuple[str, str]], set[str], set[str]]]:
+    """sha → (renames old→new, added, deleted). Copies are not identity moves."""
+    args = [
+        "-c",
+        "core.quotepath=false",
+        "log",
+        "--reverse",
+        "--find-renames",
+        "--name-status",
+        "--pretty=format:COMMIT %H",
+    ]
+    if first_parent:
+        args.append("--first-parent")
+    args.append(spec)
+    r = run_git(repo, args, check=False)
+    out: dict[str, tuple[list[tuple[str, str]], set[str], set[str]]] = {}
+    sha: Optional[str] = None
+    renames: list[tuple[str, str]] = []
+    added: set[str] = set()
+    deleted: set[str] = set()
+
+    def flush() -> None:
+        nonlocal sha, renames, added, deleted
+        if sha:
+            out[sha] = (renames, added, deleted)
+        sha = None
+        renames, added, deleted = [], set(), set()
+
+    for line in r.stdout.splitlines():
+        if line.startswith("COMMIT "):
+            flush()
+            sha = line.split(" ", 1)[1].strip()
+            continue
+        if not line.strip() or sha is None:
+            continue
+        parts = line.split("\t")
+        code = parts[0] if parts else ""
+        if code.startswith("R") and len(parts) >= 3:
+            renames.append((unquote_git_path(parts[1]), unquote_git_path(parts[2])))
+        elif code.startswith("A") and len(parts) >= 2:
+            added.add(unquote_git_path(parts[1]))
+        elif code.startswith("D") and len(parts) >= 2:
+            deleted.add(unquote_git_path(parts[1]))
+    flush()
+    return out
+
+
+def follow_names(
+    shas: list[str],
+    path: str,
+    changes: dict[str, tuple[list[tuple[str, str]], set[str], set[str]]],
+    existed: list[bool],
+) -> list[Optional[str]]:
+    """Path of this identity at each commit, or None if the identity is absent.
+
+    Bidirectional: a query for the old name follows forward through R records;
+    a query for the new name follows backward. A later file at a dead path is
+    a different identity and is not picked up.
+    """
+    n = len(shas)
+    names: list[Optional[str]] = [None] * n
+    if n == 0:
+        return names
+
+    def rec(i: int) -> tuple[list[tuple[str, str]], set[str], set[str]]:
+        return changes.get(shas[i], ([], set(), set()))
+
+    seed = next((i for i, ok in enumerate(existed) if ok), None)
+    if seed is None:
+        for i in range(n):
+            renames, _, _ = rec(i)
+            for old, new in renames:
+                if path == new:
+                    seed = i
+                    names[i] = new
+                    break
+                if path == old:
+                    if i > 0:
+                        seed = i - 1
+                        names[seed] = old
+                    else:
+                        seed = i
+                        names[i] = new
+                    break
+            if seed is not None:
+                break
+        if seed is None:
+            return names
+    else:
+        names[seed] = path
+
+    cur = names[seed]
+    for i in range(seed, 0, -1):
+        if cur is None:
+            break
+        renames, added, _deleted = rec(i)
+        moved = False
+        for old, new in renames:
+            if new == cur:
+                cur = old
+                names[i - 1] = cur
+                moved = True
+                break
+        if moved:
+            continue
+        if cur in added:
+            break
+        names[i - 1] = cur
+
+    cur = names[seed]
+    for i in range(seed, n - 1):
+        if cur is None:
+            break
+        renames, _added, deleted = rec(i + 1)
+        moved = False
+        for old, new in renames:
+            if old == cur:
+                cur = new
+                names[i + 1] = cur
+                moved = True
+                break
+        if moved:
+            continue
+        if cur in deleted:
+            break
+        names[i + 1] = cur
+    return names
+
+
+def identity_chain(names: list[Optional[str]]) -> list[str]:
+    out: list[str] = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def resolve_identity_names(
+    repo: str,
+    shas: list[str],
+    path: str,
+    spec: str,
+    *,
+    full_commits: Optional[list[Sample]] = None,
+    changes: Optional[dict] = None,
+) -> tuple[list[Optional[str]], list[str], int]:
+    """Path of this identity at each sha, plus the full name chain.
+
+    Rename records come from all reachable history so a first-parent walk
+    still knows old→dest when the merge added dest as A (no R on mainline).
+    Occupancy is still evaluated only on `shas`.
+    """
+    probes = 0
+    if full_commits is None:
+        full_commits = load_commits(repo, spec, first_parent=False, limit=None)
+        probes += 1
+    if not full_commits:
+        return [None] * len(shas), [], probes
+    if changes is None:
+        changes = collect_tree_changes(repo, spec, first_parent=False)
+        probes += 1
+    full_shas = [c.sha for c in full_commits]
+    seed_hits = exists_at_commits(repo, full_shas, path)
+    probes += 1
+    names_full = follow_names(
+        full_shas, path, changes, [ok for ok, _ in seed_hits]
+    )
+    by_sha = {sha: n for sha, n in zip(full_shas, names_full)}
+    names = [by_sha.get(sha) for sha in shas]
+    return names, identity_chain(names_full), probes
+
+
+def exists_follow_at_commits(
+    repo: str,
+    shas: list[str],
+    path: str,
+    spec: str,
+    first_parent: bool,
+) -> tuple[list[tuple[bool, list[str]]], list[Optional[str]], list[str], int]:
+    del first_parent  # identity is resolved from all reachable R records
+    if not shas:
+        return [], [], [], 0
+    names, ident, probes = resolve_identity_names(repo, shas, path, spec)
+    out: list[tuple[bool, list[str]]] = [(False, []) for _ in shas]
+    payload: list[str] = []
+    query_idx: list[int] = []
+    for i, sha in enumerate(shas):
+        n = names[i]
+        if n:
+            payload.append(f"{sha}:{n}\n")
+            query_idx.append(i)
+    if not payload:
+        return out, names, ident, probes
+    r = run_git(repo, ["cat-file", "--batch-check"], input_text="".join(payload))
+    probes += 1
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    for i, line in zip(query_idx, lines):
+        n = names[i]
+        if n and not is_missing_line(line):
+            out[i] = (True, [n])
+        else:
+            names[i] = None
+            out[i] = (False, [])
+    return out, names, ident, probes
+
+
+def follow_dirty_name(
+    repo: str, head_name: Optional[str], *, cached: bool
+) -> Optional[str]:
+    if not head_name:
+        return None
+    args = ["-c", "core.quotepath=false", "diff", "-M", "--name-status"]
+    if cached:
+        args.append("--cached")
+    args.append("HEAD")
+    r = run_git(repo, args, check=False)
+    cur = head_name
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if not parts:
+            continue
+        code = parts[0]
+        if code.startswith("R") and len(parts) >= 3:
+            old, new = unquote_git_path(parts[1]), unquote_git_path(parts[2])
+            if old == cur:
+                cur = new
+        elif code.startswith("D") and len(parts) >= 2:
+            if unquote_git_path(parts[1]) == cur:
+                return None
+    return cur
+
+
+def exists_follow_worktree(
+    repo: str, head_name: Optional[str]
+) -> tuple[bool, list[str]]:
+    name = follow_dirty_name(repo, head_name, cached=False)
+    if not name:
+        return False, []
+    ok = os.path.lexists(os.path.join(repo, name))
+    return ok, ([name] if ok else [])
+
+
+def exists_follow_index(repo: str, head_name: Optional[str]) -> tuple[bool, list[str]]:
+    name = follow_dirty_name(repo, head_name, cached=True)
+    if not name:
+        return False, []
+    r = run_git(repo, ["ls-files", "-c", "--error-unmatch", "--", name], check=False)
+    if r.returncode == 0:
+        return True, [name]
+    return False, []
+
+
+def follow_paths_ok(paths: list[str]) -> bool:
+    return bool(paths) and all(not is_glob(p) for p in paths)
+
+
+def grep_follow_at_commits(
+    repo: str,
+    shas: list[str],
+    pattern: str,
+    paths: list[str],
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    grain: str,
+    spec: str,
+    first_parent: bool,
+) -> tuple[list[tuple[bool, list[str]]], list[str], list[Optional[str]], int]:
+    """Grep each exact path as a file identity.
+
+    Occupancy is the token in whatever name that identity has at the commit.
+    A copy is not a follow. A later file at a dead path is a new identity.
+    Identity is resolved from all reachable R records even on a first-parent walk.
+    """
+    del first_parent
+    if not shas:
+        return [], [], [], 0
+    full_commits = load_commits(repo, spec, first_parent=False, limit=None)
+    changes = collect_tree_changes(repo, spec, first_parent=False)
+    probes = 2
+    names_by_path: list[list[Optional[str]]] = []
+    identity: list[str] = []
+    unique: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        names, ident, n = resolve_identity_names(
+            repo,
+            shas,
+            path,
+            spec,
+            full_commits=full_commits,
+            changes=changes,
+        )
+        probes += n
+        names_by_path.append(names)
+        for name in ident:
+            if name not in identity:
+                identity.append(name)
+        for name in ident:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        for name in names:
+            if name and name not in seen:
+                seen.add(name)
+                unique.append(name)
+    by_name: dict[str, list[tuple[bool, list[str]]]] = {}
+    for name in unique:
+        res, n = grep_at_commits(
+            repo,
+            shas,
+            pattern,
+            [name],
+            ignore_case=ignore_case,
+            fixed=fixed,
+            word=word,
+            grain=grain,
+        )
+        probes += n
+        by_name[name] = res
+    out: list[tuple[bool, list[str]]] = []
+    for i in range(len(shas)):
+        wits: list[str] = []
+        for names in names_by_path:
+            n = names[i]
+            if not n:
+                continue
+            val, hits = by_name[n][i]
+            if val:
+                wits.extend(hits)
+        cleaned: list[str] = []
+        for w in wits:
+            if w not in cleaned:
+                cleaned.append(w)
+        out.append((bool(cleaned), cleaned))
+    head_names = [names[-1] if names else None for names in names_by_path]
+    return out, identity, head_names, probes
+
+
+def grep_follow_worktree(
+    repo: str,
+    pattern: str,
+    head_names: list[Optional[str]],
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    grain: str,
+    cached: bool,
+) -> tuple[bool, list[str]]:
+    dirty: list[str] = []
+    for hn in head_names:
+        name = follow_dirty_name(repo, hn, cached=cached)
+        if name and name not in dirty:
+            dirty.append(name)
+    if not dirty:
+        return False, []
+    return grep_worktree(
+        repo, pattern, dirty, ignore_case, fixed, word, grain, cached=cached
+    )
+
+
+def rename_dest_at(
+    changes: dict[str, tuple[list[tuple[str, str]], set[str], set[str]]],
+    sha: str,
+    path: str,
+) -> Optional[str]:
+    rec = changes.get(sha)
+    if not rec:
+        return None
+    for old, new in rec[0]:
+        if old == path:
+            return new
+    return None
+
+
+def _grep_flags(
+    pattern: str,
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    grain: str,
+) -> list[str]:
+    flags = ["grep", "-I", "--full-name", "-z"]
+    if grain == "files":
+        flags.append("-l")
+    else:
+        flags.append("-n")
+    if ignore_case:
+        flags.append("-i")
+    if fixed:
+        flags.append("-F")
+    if word:
+        flags.append("-w")
+    flags += ["-e", pattern]
+    return flags
+
+
+def _holder_from_match(path: str, line: str, content: str, grain: str) -> str:
+    if grain == "lines":
+        return f"{path}:{line}"
+    if grain == "loci":
+        return f"{path}:{content}"
+    return path
+
+
+def _parse_grep_n(stdout: str) -> list[tuple[str, str, str, str]]:
+    out: list[tuple[str, str, str, str]] = []
+    for rec in stdout.split("\n"):
+        if not rec:
+            continue
+        if "\0" in rec:
+            head, rest = rec.split("\0", 1)
+            if "\0" not in rest:
+                continue
+            line, content = rest.split("\0", 1)
+            content = content.rstrip("\n")
+            if ":" not in head:
+                # worktree: path\0line\0content
+                out.append(("", head, line, content))
+                continue
+            sha, path = head.split(":", 1)
+            out.append((sha, path, line, content))
+            continue
+        parts = rec.split(":", 3)
+        if len(parts) < 4:
+            continue
+        sha, path, line, content = parts
+        out.append((sha, path, line, content))
+    return out
+
+
+def grep_at_commits(
+    repo: str,
+    shas: list[str],
+    pattern: str,
+    paths: list[str],
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    grain: str,
+) -> tuple[list[tuple[bool, list[str]]], int]:
+    if not shas:
+        return [], 0
+    flags = _grep_flags(pattern, ignore_case, fixed, word, grain)
+    found: dict[str, list[str]] = {s: [] for s in shas}
+    probes = 0
+    for i in range(0, len(shas), GREP_BATCH):
+        chunk = shas[i : i + GREP_BATCH]
+        args = flags + chunk
+        if paths:
+            args += ["--", *paths]
+        r = run_git(repo, args, check=False)
+        probes += 1
+        if r.returncode not in (0, 1):
+            continue
+        if grain == "files":
+            for part in r.stdout.split("\0"):
+                if not part or ":" not in part:
+                    continue
+                sha, path = part.split(":", 1)
+                if sha in found:
+                    found[sha].append(path)
+        else:
+            for sha, path, line, content in _parse_grep_n(r.stdout):
+                if sha in found:
+                    found[sha].append(_holder_from_match(path, line, content, grain))
+    out = []
+    for sha in shas:
+        wits = sorted(set(found[sha]))
+        out.append((bool(wits), wits))
+    return out, probes
+
+
+def grep_worktree(
+    repo: str,
+    pattern: str,
+    paths: list[str],
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    grain: str,
+    cached: bool = False,
+) -> tuple[bool, list[str]]:
+    flags = _grep_flags(pattern, ignore_case, fixed, word, grain)
+    if cached:
+        flags.append("--cached")
+    if paths:
+        flags += ["--", *paths]
+    r = run_git(repo, flags, check=False)
+    if r.returncode not in (0, 1):
+        return False, []
+    names: list[str] = []
+    if grain == "files":
+        for n in r.stdout.split("\0"):
+            if not n:
+                continue
+            if ":" in n and not os.path.exists(os.path.join(repo, n)):
+                names.append(n.split(":", 1)[-1])
+            else:
+                names.append(n)
+    else:
+        for sha, path, line, content in _parse_grep_n(r.stdout):
+            names.append(_holder_from_match(path or sha, line, content, grain))
+    cleaned = sorted(set(names))
+    return bool(cleaned), cleaned
+
+
+def probe_exec(
+    repo: str, shas: list[str], command: list[str], timeout: float
+) -> list[tuple[bool, list[str]]]:
+    if not shas:
+        return []
+    tmp = tempfile.mkdtemp(prefix="rove-wt-")
+    added = False
+    out: list[tuple[bool, list[str]]] = []
+    try:
+        add = run_git(
+            repo, ["worktree", "add", "--detach", "-f", tmp, shas[0]], check=False
+        )
+        if add.returncode != 0:
+            return _probe_exec_archive(repo, shas, command, timeout)
+        added = True
+        for sha in shas:
+            co = run_git(tmp, ["checkout", "--detach", "-f", "-q", sha], check=False)
+            if co.returncode != 0:
+                out.append((False, []))
+                continue
+            out.append(_run_cmd(command, tmp, timeout))
+    finally:
+        if added:
+            run_git(repo, ["worktree", "remove", "--force", tmp], check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+def _probe_exec_archive(
+    repo: str, shas: list[str], command: list[str], timeout: float
+) -> list[tuple[bool, list[str]]]:
+    out = []
+    for sha in shas:
+        tmp = tempfile.mkdtemp(prefix="rove-ar-")
+        try:
+            arch = subprocess.run(
+                ["git", "-C", repo, "archive", sha],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if arch.returncode != 0:
+                out.append((False, []))
+                continue
+            tar = subprocess.run(
+                ["tar", "-x", "-C", tmp],
+                input=arch.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if tar.returncode != 0:
+                out.append((False, []))
+                continue
+            out.append(_run_cmd(command, tmp, timeout))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+def _run_cmd(command: list[str], cwd: str, timeout: float) -> tuple[bool, list[str]]:
+    try:
+        r = subprocess.run(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if r.returncode == 0:
+            holders = [ln for ln in (r.stdout or "").splitlines() if ln]
+            return True, holders
+        return False, []
+    except subprocess.TimeoutExpired:
+        return False, ["(timeout)"]
+    except OSError:
+        return False, []
+
+
+def exec_worktree(repo: str, command: list[str], timeout: float) -> tuple[bool, list[str]]:
+    return _run_cmd(command, repo, timeout)
+
+
+def exec_index(repo: str, command: list[str], timeout: float) -> tuple[bool, list[str]]:
+    r = run_git(repo, ["write-tree"], check=False)
+    if r.returncode != 0:
+        return False, []
+    tree = r.stdout.strip()
+    tmp = tempfile.mkdtemp(prefix="rove-ix-")
+    try:
+        arch = subprocess.run(
+            ["git", "-C", repo, "archive", tree],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if arch.returncode != 0:
+            return False, []
+        tar = subprocess.run(
+            ["tar", "-x", "-C", tmp],
+            input=arch.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if tar.returncode != 0:
+            return False, []
+        return _run_cmd(command, tmp, timeout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pathspec_alive(repo: str, shas: list[str], paths: list[str]) -> list[str]:
+    dead = []
+    if not shas or not paths:
+        return dead
+    for path in paths:
+        alive = False
+        if is_glob(path):
+            for sha in shas:
+                r = run_git(
+                    repo,
+                    ["ls-files", "--with-tree", sha, "--", path],
+                    check=False,
+                )
+                if r.stdout.strip():
+                    alive = True
+                    break
+        else:
+            payload = "".join(f"{sha}:{path}\n" for sha in shas)
+            r = run_git(repo, ["cat-file", "--batch-check"], input_text=payload)
+            for line in r.stdout.splitlines():
+                if line and not is_missing_line(line):
+                    alive = True
+                    break
+        if not alive:
+            dead.append(path)
+    return dead
+
+
+def holder_path(holder: str, grain: str) -> str:
+    if holder == INVERT_HOLDER or grain == "files":
+        return holder
+    if grain == "lines":
+        return holder.rsplit(":", 1)[0] if ":" in holder else holder
+    return holder.split(":", 1)[0] if ":" in holder else holder
+
+
+def is_doc_holder(holder: str, grain: str) -> bool:
+    path = holder_path(holder, grain)
+    if path == INVERT_HOLDER:
+        return False
+    base = os.path.basename(path)
+    if base == "SKILL.md":
+        return False
+    low = base.lower()
+    if low in DOC_BASENAMES or low.startswith("readme"):
+        return True
+    parts = path.replace("\\", "/").split("/")
+    if parts and parts[0].lower() in DOC_DIRS:
+        return True
+    if any(p.lower() in DOC_DIRS for p in parts[:-1]):
+        return True
+    return False
+
+
+def is_ghost_transition(prev_holders: list[str], cur_holders: list[str], grain: str) -> bool:
+    if not cur_holders or INVERT_HOLDER in cur_holders:
+        return False
+    remaining_doc = all(is_doc_holder(h, grain) for h in cur_holders)
+    dropped = [h for h in prev_holders if h not in cur_holders]
+    dropped_code = any(not is_doc_holder(h, grain) for h in dropped)
+    return remaining_doc and dropped_code
+
+
+def union_holders(start: list[str], end: list[str]) -> list[str]:
+    seen: list[str] = []
+    for h in start + end:
+        if h not in seen:
+            seen.append(h)
+    return seen
+
+
+def compress(samples: list[Sample], split_holders: bool) -> list[Era]:
+    eras: list[Era] = []
+    for s in samples:
+        if not eras:
+            eras.append(Era(value=s.value, samples=[s], split="start"))
+            continue
+        prev = eras[-1]
+        if prev.value != s.value:
+            eras.append(Era(value=s.value, samples=[s], split="boolean"))
+            continue
+        if split_holders and s.value and list(prev.end.witnesses) != list(s.witnesses):
+            eras.append(Era(value=s.value, samples=[s], split="holders"))
+            continue
+        prev.samples.append(s)
+    return eras
+
+
+def same_file_move(added: list[str], dropped: list[str], grain: str) -> bool:
+    """True when a single holder was renamed (same basename, new path)."""
+    if len(added) != 1 or len(dropped) != 1:
+        return False
+    a = os.path.basename(holder_path(added[0], grain))
+    d = os.path.basename(holder_path(dropped[0], grain))
+    return bool(a) and a == d
+
+
+def classify_eras(eras: list[Era], grain: str, *, follow: bool = False) -> None:
+    for i, era in enumerate(eras):
+        prev = eras[i - 1] if i else None
+        prev_h = list(prev.holders) if prev and prev.value else []
+        cur_h = list(era.holders) if era.value else []
+        if era.value:
+            era.added = sorted(set(cur_h) - set(prev_h))
+            era.dropped = sorted(set(prev_h) - set(cur_h))
+        else:
+            era.added = []
+            era.dropped = []
+        if not era.value:
+            era.kind_name = "absent" if prev is None else "death"
+            continue
+        if prev is None or not prev.value:
+            era.kind_name = "birth"
+            continue
+        # Identity follow (and same-basename git mv) is a move, never a ghost.
+        # Ghost is grep: a definition left and only documentation still matches.
+        if follow and era.added and era.dropped:
+            era.kind_name = "move"
+            continue
+        if same_file_move(era.added, era.dropped, grain):
+            era.kind_name = "move"
+            continue
+        if is_ghost_transition(prev_h, cur_h, grain):
+            era.kind_name = "ghost"
+        elif era.added and era.dropped:
+            era.kind_name = "move"
+        elif era.added:
+            era.kind_name = "spread"
+        elif era.dropped:
+            era.kind_name = "shrink"
+        else:
+            era.kind_name = "birth"
+
+
+def ghost_hint(era: Era, grain: str) -> str:
+    docs: list[str] = []
+    defs: list[str] = []
+    for h in era.holders:
+        p = holder_path(h, grain)
+        if p not in docs:
+            docs.append(p)
+    for h in era.dropped:
+        if not is_doc_holder(h, grain):
+            p = holder_path(h, grain)
+            if p not in defs:
+                defs.append(p)
+    doc_txt = ", ".join(docs) if docs else "documentation"
+    def_txt = ", ".join(defs) if defs else "definition"
+    return (
+        f"now=TRUE only as a documentation mention ({doc_txt}); "
+        f"definition {def_txt} is gone"
+    )
+
+
+def merge_parents(repo: str, sha: str) -> list[str]:
+    r = run_git(repo, ["rev-list", "--parents", "-n", "1", sha], check=False)
+    if r.returncode != 0:
+        return []
+    parts = r.stdout.strip().split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+def annotate_origins(
+    repo: str,
+    eras: list[Era],
+    first_parent: bool,
+    probe_fn: Callable[..., list[tuple[bool, list[str]]]],
+) -> int:
+    extra = 0
+    if not first_parent:
+        return extra
+    for era in eras:
+        if not era.value or era.start.kind != "commit":
+            continue
+        parents = merge_parents(repo, era.start.sha)
+        if len(parents) < 2:
+            continue
+        behind = load_commits(repo, era.start.sha, first_parent=False, limit=None)
+        prior = [s for s in behind if s.sha != era.start.sha]
+        if not prior:
+            continue
+        extra += 1
+        results = probe_fn([s.sha for s in prior], era.start.sha)
+        first_true = None
+        ntrue = 0
+        for s, (val, wits) in zip(prior, results):
+            if val:
+                ntrue += 1
+                if first_true is None:
+                    s.value = True
+                    s.witnesses = wits
+                    first_true = s
+        if first_true is not None:
+            era.origin = first_true
+            era.origin_count = ntrue
+    return extra
+
+
+def predicate_string(args: argparse.Namespace) -> str:
+    if args.cmd == "exists":
+        return f"exists {args.path}"
+    if args.cmd == "grep":
+        flags = []
+        if args.ignore_case:
+            flags.append("-i")
+        if args.fixed:
+            flags.append("-F")
+        if args.word:
+            flags.append("-w")
+        if args.invert:
+            flags.append("-v")
+        body = " ".join(flags + [args.pattern]).strip()
+        if args.paths:
+            return f"grep {body} -- {' '.join(args.paths)}"
+        return f"grep {body}"
+    cmd = [c for c in args.command if c != "--"]
+    return "exec " + " ".join(cmd)
+
+
+def use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(value: bool, enabled: bool) -> str:
+    raw = "TRUE" if value else "FALSE"
+    if not enabled:
+        return f"{raw:<5}"
+    if value:
+        return f"\033[32;1m{raw:<5}\033[0m"
+    return f"\033[31m{raw}\033[0m"
+
+
+def fmt_witnesses(wits: list[str], limit: int = HOLDER_PRINT_LIMIT) -> Optional[str]:
+    if not wits:
+        return None
+    shown = wits[:limit]
+    extra = len(wits) - limit
+    text = ", ".join(shown)
+    if extra > 0:
+        text += f" (+{extra})"
+    return text
+
+
+def print_human(
+    report: dict,
+    eras: list[Era],
+    color: bool,
+    show_wits: bool,
+    boolean_mode: bool,
+) -> None:
+    name = os.path.basename(report["repo"])
+    scanned = report["commits_scanned"]
+    reachable = report["reachable"]
+    walk = "first-parent" if report["first_parent"] else "full"
+    extra = []
+    if scanned != reachable:
+        count = f"{scanned} of {reachable} commits"
+    else:
+        count = f"{scanned} commits"
+    if report["include_now"]:
+        extra.append("now")
+    if report.get("follow"):
+        extra.append("follow")
+    bits = ", ".join([count, walk, *extra])
+    print(f"# {report['predicate']}  ({name}, {bits})")
+    ident = report.get("identity") or []
+    if report.get("follow") and len(ident) > 1:
+        print(f"       identity: " + " → ".join(ident))
+    for era in eras:
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        unit = "commit" if era.count == 1 else "commits"
+        label = paint(era.value, color)
+        print(f"{label} {era.count:>3} {unit:<8} {span}  {dates}".rstrip())
+        if era.count == 1:
+            print(f"       {era.start.subject}")
+        else:
+            print(f"       {era.start.short}  {era.start.subject}")
+            print(f"       {era.end.short}  {era.end.subject}")
+        if era.origin is not None:
+            n = era.origin_count
+            as_name = ""
+            if era.origin.witnesses:
+                as_name = f"  as {era.origin.witnesses[0]}"
+            print(
+                f"       origin: {era.origin.short}  {era.origin.subject}"
+                f"  ({n} commit{'s' if n != 1 else ''} before this merge)"
+                f"{as_name}"
+            )
+        if show_wits and era.value:
+            if boolean_mode:
+                wits = union_holders(era.start.witnesses, era.end.witnesses)
+                wtxt = fmt_witnesses(wits)
+                if wtxt:
+                    print(f"       witnesses: {wtxt}")
+            else:
+                wtxt = fmt_witnesses(era.holders)
+                if wtxt:
+                    print(f"       holders: {wtxt}")
+                if era.split == "holders":
+                    for h in era.added:
+                        print(f"       + {h}")
+                    for h in era.dropped:
+                        print(f"       - {h}")
+                    if era.kind_name == "ghost":
+                        print(
+                            "       ghost: definition left; "
+                            "name still roves in documentation"
+                        )
+    holds = "TRUE" if report["holds_now"] else "FALSE"
+    holder_splits = sum(1 for e in eras if e.split == "holders")
+    bits_out = [
+        f"now={holds}",
+        f"true={report['true_commits']}/{report['commits_scanned']}",
+        f"eras={len(eras)}",
+    ]
+    if report["split_holders"] and holder_splits:
+        bits_out.append(f"boolean={report['boolean_eras']}")
+        bits_out.append(f"holder_splits={holder_splits}")
+    bits_out.append(f"probes={report['probes']}")
+    if report.get("follow") and report.get("identity"):
+        bits_out.append("aka=" + ",".join(report["identity"]))
+    print("  ".join(bits_out))
+    for w in report["warnings"]:
+        print(f"warning: {w}")
+    for h in report["hints"]:
+        print(f"hint: {h}")
+
+
+def print_oneline(eras: list[Era]) -> None:
+    for era in eras:
+        flag = "T" if era.value else "F"
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        holders = ",".join(era.holders)
+        split = "" if era.split == "start" else era.split
+        print(
+            f"{flag}\t{era.count}\t{span}\t{dates}\t{holders}\t{split}\t{era.kind_name}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=TOOL,
+        description=(
+            "Show eras of git history where a predicate holds, split again when "
+            "the witness set changes. grep --follow -- PATH greps a file identity: "
+            "a path-limited grep survives git mv. --no-follow is path-limited grep. "
+            "exists --follow occupies the identity. --boolean is ancestor held."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  rove grep ghost -- 'old name.txt'
+  rove --no-follow grep ghost -- 'old name.txt'
+  rove grep ghost -- 'new name.txt'
+  rove --full grep '10 の AI' -- docs/deep-research-ai-agent-hooks.md
+  rove exists 'old name.txt'
+  rove grep preact-zero-mock
+  rove exec -- test -f Makefile
+""",
+    )
+    p.add_argument("-C", "--repo", default=".", help="repository (default: cwd)")
+    p.add_argument("--rev", default="HEAD", help="end revision (default: HEAD)")
+    p.add_argument("--range", dest="rev_range", metavar="REV_RANGE", help="limit to A..B")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="walk every reachable commit, not only first-parent",
+    )
+    p.add_argument("--now", action="store_true", help="append the working tree as a final sample")
+    p.add_argument(
+        "--index",
+        action="store_true",
+        help="append the index as a sample (implies nothing else)",
+    )
+    p.add_argument("--limit", type=int, default=None, help="keep only the last N commits")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
+    p.add_argument("--oneline", action="store_true", help="T/F count span dates")
+    p.add_argument("--revs", action="store_true", help="print SHAs where the predicate holds")
+    p.add_argument(
+        "--bounds",
+        action="store_true",
+        help="print start_sha end_sha value count for each era",
+    )
+    p.add_argument(
+        "--true-bounds",
+        action="store_true",
+        help="like --bounds but only TRUE eras",
+    )
+    p.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    p.add_argument(
+        "--timeout", type=float, default=30.0, help="seconds per exec probe (default: 30)"
+    )
+    p.add_argument(
+        "--no-witnesses", action="store_true", help="do not print holder paths"
+    )
+    p.add_argument(
+        "--boolean",
+        action="store_true",
+        help="compress only on TRUE/FALSE (ancestor held). ignore holder changes",
+    )
+    p.add_argument(
+        "--grain",
+        choices=["files", "loci", "lines"],
+        default="files",
+        help="what counts as a holder: matching files (default), path+line-text (loci), or path:lineno (lines)",
+    )
+    p.add_argument(
+        "--follow",
+        dest="follow",
+        action="store_true",
+        default=None,
+        help="treat a rename as one identity (default for exists and path-limited grep of exact paths)",
+    )
+    p.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        help="path occupancy: a rename is a death plus a birth (ancestor path-limited grep)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pe = sub.add_parser("exists", help="true when PATH exists in the tree")
+    pe.add_argument("path", help="path or glob relative to repo root")
+
+    pg = sub.add_parser("grep", help="true when PATTERN matches a tracked blob")
+    pg.add_argument("-i", "--ignore-case", action="store_true")
+    pg.add_argument("-F", "--fixed-strings", action="store_true", dest="fixed")
+    pg.add_argument("-w", "--word-regexp", action="store_true", dest="word")
+    pg.add_argument("-v", "--invert-match", action="store_true", dest="invert")
+    pg.add_argument("pattern")
+    pg.add_argument("paths", nargs="*", help="optional path limiters")
+
+    px = sub.add_parser("exec", help="true when COMMAND exits 0 at that checkout")
+    px.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command to run; prefix with -- to avoid flag eating",
+    )
+    return p
+
+
+def resolve_follow(args: argparse.Namespace) -> bool:
+    if args.follow is not None:
+        return bool(args.follow)
+    if args.cmd == "exists" and not is_glob(getattr(args, "path", "")):
+        return True
+    if args.cmd == "grep" and follow_paths_ok(getattr(args, "paths", None) or []):
+        return True
+    return False
+
+
+def apply_results(
+    samples: list[Sample], results: list[tuple[bool, list[str]]], invert: bool
+) -> None:
+    for s, (val, wits) in zip(samples, results):
+        if invert:
+            s.value = not val
+            s.witnesses = [INVERT_HOLDER] if s.value else []
+        else:
+            s.value = val
+            if val:
+                s.witnesses = wits
+            elif wits == ["(timeout)"]:
+                s.witnesses = wits
+            else:
+                s.witnesses = []
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd == "exec":
+        cmd = list(args.command or [])
+        if cmd[:1] == ["--"]:
+            cmd = cmd[1:]
+        if not cmd:
+            parser.print_usage(sys.stderr)
+            print(f"{TOOL}: error: exec requires a command", file=sys.stderr)
+            return 2
+        args.command = cmd
+
+    try:
+        repo = resolve_repo(args.repo)
+    except GitError as e:
+        die(e.message)
+
+    spec = args.rev_range if args.rev_range else args.rev
+    end_rev = spec
+    first_parent = not args.full
+    invert = bool(getattr(args, "invert", False))
+    grain = args.grain
+    split_holders = not args.boolean
+    follow = resolve_follow(args)
+    if args.follow is True and args.cmd == "exec":
+        die("--follow applies to exists and path-limited grep, not exec")
+    if args.follow is True and args.cmd == "grep" and not (args.paths or []):
+        die("--follow grep requires a path (file identity), not a tree-wide search")
+    if follow and args.cmd == "exists" and is_glob(args.path):
+        die("--follow requires a single path, not a glob")
+    if follow and args.cmd == "grep" and any(is_glob(p) for p in (args.paths or [])):
+        die("--follow requires exact paths, not a glob")
+
+    try:
+        commits = load_commits(repo, spec, first_parent=first_parent, limit=args.limit)
+    except GitError as e:
+        msg = e.message
+        die(msg)
+
+    if not commits:
+        die(f"no commits at {spec} (empty repository?)")
+
+    reachable = reachable_count(repo, spec)
+    probes = 0
+    shas = [c.sha for c in commits]
+
+    def probe_exists(sha_list: list[str]) -> list[tuple[bool, list[str]]]:
+        return exists_at_commits(repo, sha_list, args.path)
+
+    def probe_grep(
+        sha_list: list[str], ignore_case: Optional[bool] = None
+    ) -> tuple[list[tuple[bool, list[str]]], int]:
+        ic = args.ignore_case if ignore_case is None else ignore_case
+        return grep_at_commits(
+            repo,
+            sha_list,
+            args.pattern,
+            args.paths,
+            ignore_case=ic,
+            fixed=args.fixed,
+            word=args.word,
+            grain=grain if ignore_case is None else "files",
+        )
+
+    warnings: list[str] = []
+    hints: list[str] = []
+    extra_samples: list[Sample] = []
+    identity: list[str] = []
+    follow_names_at: list[Optional[str]] = []
+
+    if args.cmd == "exists":
+        if follow:
+            results, follow_names_at, identity, n = exists_follow_at_commits(
+                repo, shas, args.path, spec, first_parent
+            )
+            probes += n
+            apply_results(commits, results, invert=False)
+            if not identity:
+                identity = identity_chain(follow_names_at)
+            head_name = follow_names_at[-1] if follow_names_at else None
+            if args.index:
+                s = index_sample()
+                val, wits = exists_follow_index(repo, head_name)
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+            if args.now:
+                s = now_sample()
+                val, wits = exists_follow_worktree(repo, head_name)
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+        else:
+            results = probe_exists(shas)
+            probes += len(shas) if is_glob(args.path) else 1
+            apply_results(commits, results, invert=False)
+            if args.index:
+                s = index_sample()
+                val, wits = exists_index(repo, args.path)
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+            if args.now:
+                s = now_sample()
+                val, wits = exists_worktree(repo, args.path)
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+        samples = commits + extra_samples
+    elif args.cmd == "grep":
+        follow_head: list[Optional[str]] = []
+        if follow:
+            results, identity, follow_head, n = grep_follow_at_commits(
+                repo,
+                shas,
+                args.pattern,
+                args.paths,
+                ignore_case=args.ignore_case,
+                fixed=args.fixed,
+                word=args.word,
+                grain=grain,
+                spec=spec,
+                first_parent=first_parent,
+            )
+            probes += n
+            apply_results(commits, results, invert=invert)
+            if args.index:
+                s = index_sample()
+                val, wits = grep_follow_worktree(
+                    repo,
+                    args.pattern,
+                    follow_head,
+                    args.ignore_case,
+                    args.fixed,
+                    args.word,
+                    grain,
+                    cached=True,
+                )
+                if invert:
+                    val = not val
+                    wits = [INVERT_HOLDER] if val else []
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+            if args.now:
+                s = now_sample()
+                val, wits = grep_follow_worktree(
+                    repo,
+                    args.pattern,
+                    follow_head,
+                    args.ignore_case,
+                    args.fixed,
+                    args.word,
+                    grain,
+                    cached=False,
+                )
+                if invert:
+                    val = not val
+                    wits = [INVERT_HOLDER] if val else []
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+        else:
+            results, n = probe_grep(shas)
+            probes += n
+            apply_results(commits, results, invert=invert)
+            if args.index:
+                s = index_sample()
+                val, wits = grep_worktree(
+                    repo,
+                    args.pattern,
+                    args.paths,
+                    args.ignore_case,
+                    args.fixed,
+                    args.word,
+                    grain,
+                    cached=True,
+                )
+                if invert:
+                    val = not val
+                    wits = [INVERT_HOLDER] if val else []
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+            if args.now:
+                s = now_sample()
+                val, wits = grep_worktree(
+                    repo,
+                    args.pattern,
+                    args.paths,
+                    args.ignore_case,
+                    args.fixed,
+                    args.word,
+                    grain,
+                    cached=False,
+                )
+                if invert:
+                    val = not val
+                    wits = [INVERT_HOLDER] if val else []
+                s.value, s.witnesses = val, (wits if val else [])
+                extra_samples.append(s)
+                probes += 1
+        samples = commits + extra_samples
+        if args.paths and not follow:
+            dead = pathspec_alive(repo, shas, args.paths)
+            probes += 1
+            for d in dead:
+                warnings.append(
+                    f"pathspec '{d}' matched no file in any scanned commit. "
+                    f"If you meant a phrase, quote it: {TOOL} grep '{args.pattern} {d}'"
+                )
+        elif args.paths and follow and not identity:
+            for d in args.paths:
+                warnings.append(
+                    f"pathspec '{d}' matched no file identity in any scanned commit. "
+                    f"If you meant a phrase, quote it: {TOOL} grep '{args.pattern} {d}'"
+                )
+    elif args.cmd == "exec":
+        results = probe_exec(repo, shas, args.command, args.timeout)
+        probes += len(shas)
+        apply_results(commits, results, invert=False)
+        if args.index:
+            s = index_sample()
+            val, wits = exec_index(repo, args.command, args.timeout)
+            s.value, s.witnesses = val, wits if (val or wits == ["(timeout)"]) else []
+            extra_samples.append(s)
+            probes += 1
+        if args.now:
+            s = now_sample()
+            val, wits = exec_worktree(repo, args.command, args.timeout)
+            s.value, s.witnesses = val, wits if (val or wits == ["(timeout)"]) else []
+            extra_samples.append(s)
+            probes += 1
+        samples = commits + extra_samples
+    else:
+        die(f"unknown command: {args.cmd}")
+
+    true_commit_n = sum(1 for s in samples if s.kind == "commit" and s.value)
+    holds_now = bool(samples[-1].value)
+    never_held = not any(s.value for s in samples)
+    always_held = all(s.value for s in samples)
+
+    if never_held and args.cmd == "grep" and not warnings:
+        if not args.ignore_case:
+            if follow:
+                ic_results, _id, _h, n = grep_follow_at_commits(
+                    repo,
+                    shas,
+                    args.pattern,
+                    args.paths,
+                    ignore_case=True,
+                    fixed=args.fixed,
+                    word=args.word,
+                    grain="files",
+                    spec=spec,
+                    first_parent=first_parent,
+                )
+            else:
+                ic_results, n = probe_grep(shas, ignore_case=True)
+            probes += n
+            ic_true = [(sha, wits) for sha, (val, wits) in zip(shas, ic_results) if val]
+            if ic_true:
+                example = ic_true[0][1][0] if ic_true[0][1] else ic_true[0][0][:7]
+                hints.append(
+                    f"0 case-sensitive matches; {len(ic_true)} commits match with -i "
+                    f"(e.g. {example}). rerun with -i"
+                )
+        if first_parent:
+            full_commits = load_commits(repo, spec, first_parent=False, limit=None)
+            full_shas = [c.sha for c in full_commits]
+            if follow:
+                full_res, _id, _h, n = grep_follow_at_commits(
+                    repo,
+                    full_shas,
+                    args.pattern,
+                    args.paths,
+                    ignore_case=args.ignore_case,
+                    fixed=args.fixed,
+                    word=args.word,
+                    grain="files",
+                    spec=spec,
+                    first_parent=False,
+                )
+            else:
+                full_res, n = probe_grep(full_shas, ignore_case=args.ignore_case)
+            probes += n
+            full_true = [c for c, (val, _) in zip(full_commits, full_res) if val]
+            if full_true:
+                a, b = full_true[0], full_true[-1]
+                hints.append(
+                    f"never held on first-parent, but matched in {len(full_true)} reachable "
+                    f"commits off the mainline ({a.short}..{b.short}  {fmt_dates(a, b, always_arrow=True)}). "
+                    f"rerun with --full"
+                )
+    elif never_held and args.cmd == "exists" and first_parent:
+        full_commits = load_commits(repo, spec, first_parent=False, limit=None)
+        probes += 1
+        full_res = probe_exists([c.sha for c in full_commits])
+        full_true = [c for c, (val, _) in zip(full_commits, full_res) if val]
+        if full_true:
+            a, b = full_true[0], full_true[-1]
+            hints.append(
+                f"never held on first-parent, but existed in {len(full_true)} reachable "
+                f"commits off the mainline ({a.short}..{b.short}  {fmt_dates(a, b, always_arrow=True)}). "
+                f"rerun with --full"
+            )
+
+    boolean_eras = compress(samples, split_holders=False)
+    eras = compress(samples, split_holders=split_holders)
+    classify_eras(eras, grain, follow=follow)
+
+    if (
+        args.cmd == "grep"
+        and not follow
+        and follow_paths_ok(getattr(args, "paths", None) or [])
+        and not invert
+    ):
+        changes = collect_tree_changes(repo, spec, first_parent)
+        probes += 1
+        for path in args.paths:
+            dest = None
+            at = None
+            for s in samples:
+                if s.kind != "commit":
+                    continue
+                d = rename_dest_at(changes, s.sha, path)
+                if d:
+                    dest, at = d, s
+            if dest and at is not None:
+                hints.append(
+                    f"pathspec '{path}' died at rename {at.short} → {dest}. "
+                    f"rerun with --follow to grep the file identity"
+                )
+
+    # First-parent TRUE era starting at a merge: name the off-mainline birth.
+    if args.cmd == "exists":
+
+        def _exists_origin(
+            sha_list: list[str], tip: str = ""
+        ) -> list[tuple[bool, list[str]]]:
+            if follow:
+                res, _names, _ident, _n = exists_follow_at_commits(
+                    repo,
+                    sha_list,
+                    args.path,
+                    spec=tip or spec,
+                    first_parent=False,
+                )
+                return res
+            return probe_exists(sha_list)
+
+        probes += annotate_origins(repo, eras, first_parent, _exists_origin)
+    elif args.cmd == "grep":
+
+        def _grep_origin(
+            sha_list: list[str], tip: str = ""
+        ) -> list[tuple[bool, list[str]]]:
+            if follow:
+                res, _ident, _head, n = grep_follow_at_commits(
+                    repo,
+                    sha_list,
+                    args.pattern,
+                    args.paths,
+                    ignore_case=args.ignore_case,
+                    fixed=args.fixed,
+                    word=args.word,
+                    grain=grain,
+                    spec=tip or spec,
+                    first_parent=False,
+                )
+                return res
+            res, n = probe_grep(sha_list)
+            return res
+
+        probes += annotate_origins(repo, eras, first_parent, _grep_origin)
+
+    ghost_now = bool(
+        holds_now and eras and eras[-1].value and eras[-1].kind_name == "ghost"
+    )
+    if ghost_now:
+        hints.insert(0, ghost_hint(eras[-1], grain))
+
+    pred = predicate_string(args)
+    report = {
+        "repo": repo,
+        "predicate": pred,
+        "end_rev": end_rev,
+        "first_parent": first_parent,
+        "include_now": bool(args.now),
+        "holds_now": holds_now,
+        "never_held": never_held,
+        "always_held": always_held,
+        "commits_scanned": len(commits),
+        "reachable": reachable,
+        "probes": probes,
+        "true_commits": true_commit_n,
+        "boolean_eras": len(boolean_eras),
+        "grain": grain,
+        "split_holders": split_holders,
+        "ghost_now": ghost_now,
+        "follow": follow,
+        "identity": identity,
+        "eras": [],
+        "hint": hints[0] if hints else None,
+        "hints": hints,
+        "warnings": warnings,
+    }
+    for era in eras:
+        rec = {
+            "value": era.value,
+            "count": era.count,
+            "split": era.split,
+            "kind": era.kind_name,
+            "start": era.start.as_json(),
+            "end": era.end.as_json(),
+            "holders": list(era.holders),
+            "added": list(era.added),
+            "dropped": list(era.dropped),
+            "witnesses_start": list(era.start.witnesses) if era.value else [],
+            "witnesses_end": list(era.end.witnesses) if era.value else [],
+        }
+        if era.origin is not None:
+            rec["origin"] = era.origin.as_json()
+            rec["origin_true_commits"] = era.origin_count
+        report["eras"].append(rec)
+
+    if not args.quiet:
+        if args.json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        elif args.revs:
+            for s in samples:
+                if s.value and s.kind == "commit":
+                    print(s.sha)
+        elif args.true_bounds:
+            for era in eras:
+                if era.value:
+                    print(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+        elif args.bounds:
+            for era in eras:
+                print(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+        elif args.oneline:
+            print_oneline(eras)
+        else:
+            print_human(
+                report,
+                eras,
+                use_color(args.color),
+                show_wits=not args.no_witnesses,
+                boolean_mode=args.boolean,
+            )
+
+    return 0 if holds_now else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except GitError as e:
+        die(e.message)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

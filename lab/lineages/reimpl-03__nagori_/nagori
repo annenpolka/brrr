@@ -1,0 +1,1490 @@
+#!/usr/bin/env python3
+"""nagori (名残) — leftover claims a diff just made false."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+NAME = "nagori"
+VERSION = "0.2.0"
+DEFAULT_MIN_SCORE = 55
+DEFAULT_KINDS = ("value", "rename", "polarity", "string")
+ALL_KINDS = ("polarity", "removal", "rename", "string", "value")
+MAX_FILE_BYTES = 1_048_576
+NEARBY_WINDOW = 3
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".hg",
+    ".svn",
+    ".build",
+    "DerivedData",
+    "Pods",
+    ".idea",
+    ".vscode",
+}
+
+CONFIG_EXTS = {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf"}
+DOCS_EXTS = {".md", ".txt", ".rst", ".adoc", ".markdown"}
+TEST_NAME_RE = re.compile(r"(?:^|/)(?:tests?|specs?)(?:/|$)", re.I)
+TEST_FILE_RE = re.compile(r"(?:^|[\b_/.-])(?:tests?|specs?)(?:[\b_/.-]|$)", re.I)
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+KEBAB_RE = re.compile(r"(?<![A-Za-z0-9])[a-z][a-z0-9]*(?:-[a-z0-9]+)+")
+CAMEL_SPLIT_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|$)|[0-9]+")
+NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?")
+SOME_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:Some|Option)\s*(?:<[^>]+>)?\s*\(\s*([^)]+?)\s*\)"
+)
+TYPED_ASSIGN_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[A-Za-z_][A-Za-z0-9_.<>,\[\]& ]*\s*=\s*([^\s,;#]+)"
+)
+ASSIGN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s,;#]+)")
+COLON_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*([^\s,;#]+)")
+QUOTED_KEY_RE = re.compile(
+    r"""["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:\s*([^\s,;}]+)"""
+)
+QUOTED_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
+POLARITY = {
+    ("True", "False"),
+    ("False", "True"),
+    ("true", "false"),
+    ("false", "true"),
+}
+POLARITY_VALS = {"True", "False", "true", "false"}
+CONFIG_NOUNS = {"timeout", "retries", "version", "intent", "threshold"}
+COMMON_INT = {str(i) for i in range(11)}
+TYPE_LIKE = re.compile(
+    r"^(?:"
+    r"[A-Z][A-Za-z0-9_]*"
+    r"|u?int\d*|f(?:32|64)|usize|isize|str|bool|bytes|char"
+    r"|Double|Float|Int|String|Bool|Optional|Option|Some|None"
+    r"|Array|List|Dict|Map|Set|Vec"
+    r")(?:[<\[].*[>\]])?$"
+)
+STOP_FALLBACK = {
+    "this",
+    "that",
+    "with",
+    "from",
+    "have",
+    "been",
+    "were",
+    "they",
+    "them",
+    "will",
+    "into",
+    "over",
+    "under",
+    "then",
+    "than",
+    "also",
+    "just",
+    "only",
+    "when",
+    "what",
+    "which",
+    "where",
+    "while",
+    "after",
+    "before",
+    "about",
+    "there",
+    "here",
+    "true",
+    "false",
+    "none",
+    "null",
+    "self",
+    "type",
+    "name",
+    "file",
+    "path",
+    "line",
+    "data",
+    "info",
+    "text",
+    "note",
+    "todo",
+    "active",
+    "oracles",
+    "generated",
+    "compiled",
+    "schemas",
+    "clauses",
+}
+
+ALIASES = {
+    "timeout": ("タイムアウト", "time-out"),
+    "retries": ("retry", "リトライ"),
+    "version": ("バージョン",),
+    "threshold": ("閾値", "しきい値"),
+    "cache": ("キャッシュ",),
+    "intent": ("意図",),
+}
+
+CLAIM_BONUS = {
+    "assert": 30,
+    "config": 28,
+    "comment": 26,
+    "docs": 24,
+    "test": 20,
+    "code": 12,
+}
+
+
+@dataclass
+class Origin:
+    path: str
+    line: int
+    excerpt: str
+
+
+@dataclass
+class Fact:
+    kind: str
+    name: str
+    old: str
+    new: str
+    origin: Origin
+
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.kind, self.name, self.old, self.new)
+
+
+@dataclass
+class Finding:
+    fact: Fact
+    path: str
+    line: int
+    claim: str
+    excerpt: str
+    score: int
+    why: list[str]
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{NAME}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def real_root(path: str) -> str:
+    return str(Path(path).resolve())
+
+
+def run_git(root: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", root, *args],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+
+
+def is_git_repo(root: str) -> bool:
+    p = run_git(root, "rev-parse", "--is-inside-work-tree")
+    return p.returncode == 0 and p.stdout.strip() == "true"
+
+
+def strip_quotes(val: str) -> str:
+    val = val.strip().rstrip(",")
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        return val[1:-1]
+    return val
+
+
+def is_code_shaped(name: str) -> bool:
+    if "_" in name or "-" in name:
+        return True
+    if re.search(r"[a-z][A-Z]", name):
+        return True
+    if re.search(r"[A-Z]{2,}[a-z]", name):
+        return True
+    letters = [c for c in name if c.isalpha()]
+    if letters and all(c.isupper() for c in letters) and len(letters) >= 2:
+        return True
+    return False
+
+
+def is_common_number(val: str) -> bool:
+    return val in COMMON_INT
+
+
+def is_type_like(val: str) -> bool:
+    v = strip_quotes(val)
+    if v.startswith("&"):
+        v = v[1:]
+    if v in POLARITY_VALS or v in {"None", "null", "nil", "Some"}:
+        return False
+    # SCREAMING_SNAKE / ALLCAPS constants are names, not types
+    if v.isupper() or "_" in v:
+        return False
+    return bool(TYPE_LIKE.match(v))
+
+
+def is_ident_like(val: str) -> bool:
+    if not val or " " in val:
+        return False
+    return bool(IDENT_RE.fullmatch(val) or KEBAB_RE.fullmatch(val))
+
+
+def is_inflection(a: str, b: str) -> bool:
+    x, y = a.lower(), b.lower()
+    if x == y:
+        return True
+    for p, q in ((x, y), (y, x)):
+        if p + "s" == q or p + "es" == q:
+            return True
+        if p.endswith("y") and p[:-1] + "ies" == q:
+            return True
+        if p + "ed" == q or p + "ing" == q:
+            return True
+        if p.endswith("e") and p + "d" == q:
+            return True
+    return False
+
+
+def similar_names(a: str, b: str) -> bool:
+    if a == b or not a or not b:
+        return False
+    if is_inflection(a, b):
+        return False
+    al, bl = a.lower(), b.lower()
+    if al == bl:
+        return False
+    if al.startswith(bl) or bl.startswith(al):
+        return min(len(al), len(bl)) >= 3
+    if al.endswith(bl) or bl.endswith(al):
+        return min(len(al), len(bl)) >= 4
+    # shared snake/camel prefix
+    def parts(s: str) -> list[str]:
+        bits = []
+        for chunk in re.split(r"[_\-]", s):
+            bits.extend(p.lower() for p in CAMEL_SPLIT_RE.findall(chunk) if p)
+        return bits
+
+    pa, pb = parts(a), parts(b)
+    if pa and pb and (pa[0] == pb[0] and len(pa[0]) >= 3):
+        return True
+    if pa and pb and pa[-1] == pb[-1] and len(pa[-1]) >= 4:
+        return True
+    # token overlap
+    sa, sb = set(pa), set(pb)
+    if sa & sb and (sa - sb or sb - sa):
+        shared = max((len(t) for t in sa & sb), default=0)
+        if shared >= 4:
+            return True
+    # prefix of 4+
+    n = 0
+    for ca, cb in zip(al, bl):
+        if ca == cb:
+            n += 1
+        else:
+            break
+    return n >= 4
+
+
+def allowed_value_name(name: str, old: str, new: str) -> bool:
+    if is_code_shaped(name) or name.lower() in CONFIG_NOUNS:
+        return True
+    # lowercase prose names only when the values are distinctive
+    if is_common_number(old) or is_common_number(new):
+        return False
+    return len(name) >= 4
+
+
+def unquote_tokens(text: str) -> str:
+    return QUOTED_RE.sub(lambda m: strip_quotes(m.group(1)), text)
+
+
+def is_literal_value(val: str) -> bool:
+    if not val:
+        return False
+    if val in POLARITY_VALS or val in {"None", "null", "nil"}:
+        return True
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", val):
+        return True
+    if VERSION_RE.fullmatch(val):
+        return True
+    if KEBAB_RE.fullmatch(val):
+        return True
+    if not val.isascii():
+        return True
+    if " " in val or "/" in val or val.endswith(("%", "s", "ms")):
+        return True
+    return False
+
+
+def parse_value_token(raw: str) -> str | None:
+    raw = raw.strip().rstrip(",;")
+    if not raw:
+        return None
+    if raw.endswith(")"):
+        inner = re.match(r"(?:Some|Some!|Optional)\(\s*(.+)\s*\)$", raw)
+        if inner:
+            raw = inner.group(1).strip()
+    quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'"
+    val = strip_quotes(raw)
+    if not val:
+        return None
+    if quoted:
+        return val
+    if is_type_like(val):
+        return None
+    if not is_literal_value(val):
+        return None
+    return val
+
+
+def extract_bindings(line: str) -> list[tuple[str, str]]:
+    """Return (name, value) pairs from a source/doc line."""
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(name: str, raw: str) -> None:
+        if is_type_like(name):
+            return
+        val = parse_value_token(raw)
+        if val is None:
+            return
+        key = (name, val)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(key)
+
+    for rx in (SOME_RE, TYPED_ASSIGN_RE, ASSIGN_RE, COLON_RE, QUOTED_KEY_RE):
+        for m in rx.finditer(line):
+            add(m.group(1), m.group(2))
+
+    # CLI-style: --timeout 10
+    for m in re.finditer(r"--([A-Za-z][A-Za-z0-9_-]*)\s+(\S+)", line):
+        add(m.group(1).replace("-", "_") if False else m.group(1), m.group(2))
+
+    if not found:
+        # "timeout 10" / "timeout 30" on a nearly-bare line
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+(" + NUMBER_RE.pattern + r")\b", line)
+        if m:
+            add(m.group(1), m.group(2))
+
+    if not found:
+        nums = list(NUMBER_RE.finditer(line))
+        idents = [m.group(0) for m in IDENT_RE.finditer(line)]
+        if len(nums) == 1:
+            candidates = [
+                i
+                for i in idents
+                if i.lower() not in STOP_FALLBACK
+                and i[0].islower()
+                and len(i) >= 4
+                and not is_common_number(i)
+            ]
+            if candidates:
+                name = max(candidates, key=len)
+                add(name, nums[0].group(0))
+    return found
+
+
+def line_idents(line: str) -> list[str]:
+    names = IDENT_RE.findall(line)
+    names.extend(KEBAB_RE.findall(line))
+    # preserve order, unique
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def quoted_strings(line: str) -> list[str]:
+    return [strip_quotes(m.group(1)) for m in QUOTED_RE.finditer(line)]
+
+
+def parse_unified_diff(text: str) -> list[tuple[str, list[tuple[int, str]], list[tuple[int, str]]]]:
+    """Return [(path, deleted_lines, added_lines)] grouped per hunk, flattened per file hunks."""
+    hunks: list[tuple[str, list[tuple[int, str]], list[tuple[int, str]]]] = []
+    path = ""
+    deleted: list[tuple[int, str]] = []
+    added: list[tuple[int, str]] = []
+    old_ln = 0
+    new_ln = 0
+    in_hunk = False
+
+    def flush() -> None:
+        nonlocal deleted, added
+        if path and (deleted or added):
+            hunks.append((path, deleted, added))
+        deleted, added = [], []
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            flush()
+            in_hunk = False
+            rest = raw[len("diff --git ") :]
+            m = re.search(r" b/(.+)$", rest)
+            path = m.group(1) if m else ""
+            if path.startswith('"') and path.endswith('"'):
+                path = path[1:-1].encode("utf-8").decode("unicode_escape")
+            continue
+        if raw.startswith("+++ "):
+            rhs = raw[4:]
+            if rhs != "/dev/null":
+                if rhs.startswith("b/"):
+                    rhs = rhs[2:]
+                path = rhs.strip('"')
+            continue
+        if raw.startswith("@@"):
+            flush()
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            if not m:
+                continue
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(2))
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if raw.startswith("+"):
+            added.append((new_ln, raw[1:]))
+            new_ln += 1
+        elif raw.startswith("-"):
+            deleted.append((old_ln, raw[1:]))
+            old_ln += 1
+        elif raw.startswith("\\"):
+            continue
+        else:
+            # context, including leading space or empty
+            old_ln += 1
+            new_ln += 1
+    flush()
+    return hunks
+
+
+def pair_lines(
+    deleted: list[tuple[int, str]], added: list[tuple[int, str]]
+) -> list[tuple[tuple[int, str] | None, tuple[int, str] | None]]:
+    pairs: list[tuple[tuple[int, str] | None, tuple[int, str] | None]] = []
+    used_d: set[int] = set()
+    used_a: set[int] = set()
+
+    def names_of(text: str) -> list[str]:
+        ns = [n for n, _ in extract_bindings(text)]
+        if not ns:
+            ns = [n for n in line_idents(text) if is_code_shaped(n) or n.lower() in CONFIG_NOUNS]
+        return ns
+
+    # match identical primary names
+    for i, (dln, dt) in enumerate(deleted):
+        dn = names_of(dt)
+        if not dn:
+            continue
+        for j, (aln, at) in enumerate(added):
+            if j in used_a:
+                continue
+            an = names_of(at)
+            if any(n in an for n in dn):
+                pairs.append(((dln, dt), (aln, at)))
+                used_d.add(i)
+                used_a.add(j)
+                break
+
+    # remaining: similar names
+    for i, (dln, dt) in enumerate(deleted):
+        if i in used_d:
+            continue
+        dn = names_of(dt) or line_idents(dt)
+        best = None
+        best_j = None
+        for j, (aln, at) in enumerate(added):
+            if j in used_a:
+                continue
+            an = names_of(at) or line_idents(at)
+            if any(similar_names(a, b) for a in dn for b in an):
+                best = (aln, at)
+                best_j = j
+                break
+        if best is not None and best_j is not None:
+            pairs.append(((dln, dt), best))
+            used_d.add(i)
+            used_a.add(best_j)
+
+    # positional leftover
+    rest_d = [deleted[i] for i in range(len(deleted)) if i not in used_d]
+    rest_a = [added[j] for j in range(len(added)) if j not in used_a]
+    for k in range(max(len(rest_d), len(rest_a))):
+        pairs.append((rest_d[k] if k < len(rest_d) else None, rest_a[k] if k < len(rest_a) else None))
+    return pairs
+
+
+def added_text(added: list[tuple[int, str]]) -> str:
+    return "\n".join(t for _, t in added)
+
+
+def richness(fact: Fact) -> tuple[int, int]:
+    excerpt = fact.origin.excerpt
+    has_val = 1 if ("=" in excerpt or fact.kind in {"value", "polarity"}) else 0
+    return (has_val, -fact.origin.line)
+
+
+def extract_facts(
+    diff_text: str, kinds: Iterable[str]
+) -> list[Fact]:
+    kindset = set(kinds)
+    facts: list[Fact] = []
+    index: dict[tuple[str, str, str, str], Fact] = {}
+
+    def emit(fact: Fact) -> None:
+        if fact.kind not in kindset:
+            return
+        if fact.old == fact.new and fact.kind != "removal":
+            return
+        k = fact.key()
+        prev = index.get(k)
+        if prev is None or richness(fact) > richness(prev):
+            index[k] = fact
+
+    for path, deleted, added in parse_unified_diff(diff_text):
+        add_blob = added_text(added)
+        for old, new in pair_lines(deleted, added):
+            if old and new:
+                facts_from_pair(path, old, new, add_blob, emit)
+            elif old and "removal" in kindset:
+                for name, val in extract_bindings(old[1]):
+                    emit(
+                        Fact(
+                            "removal",
+                            name,
+                            val,
+                            "",
+                            Origin(path, old[0], old[1].strip()),
+                        )
+                    )
+                for ident in line_idents(old[1]):
+                    if is_code_shaped(ident) or KEBAB_RE.fullmatch(ident):
+                        emit(
+                            Fact(
+                                "removal",
+                                ident,
+                                ident,
+                                "",
+                                Origin(path, old[0], old[1].strip()),
+                            )
+                        )
+                for s in quoted_strings(old[1]):
+                    if s:
+                        emit(
+                            Fact(
+                                "removal",
+                                s,
+                                s,
+                                "",
+                                Origin(path, old[0], old[1].strip()),
+                            )
+                        )
+    # preserve discovery order
+    ordered: list[Fact] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for path, deleted, added in parse_unified_diff(diff_text):
+        add_blob = added_text(added)
+        for old, new in pair_lines(deleted, added):
+            if not (old and new):
+                continue
+            bucket: list[Fact] = []
+
+            def catch(f: Fact) -> None:
+                bucket.append(f)
+
+            facts_from_pair(path, old, new, add_blob, catch)
+            for f in bucket:
+                kept = index.get(f.key())
+                if kept is None:
+                    continue
+                k = kept.key()
+                if k in seen:
+                    continue
+                seen.add(k)
+                ordered.append(kept)
+    # removals not in ordered
+    for f in index.values():
+        if f.key() not in seen:
+            ordered.append(f)
+    return ordered
+
+
+def facts_from_pair(
+    path: str,
+    old: tuple[int, str],
+    new: tuple[int, str],
+    add_blob: str,
+    emit,
+) -> None:
+    old_ln, old_t = old
+    new_ln, new_t = new
+    origin = Origin(path, old_ln, old_t.strip())
+    old_binds = extract_bindings(old_t)
+    new_binds = extract_bindings(new_t)
+    old_names = [n for n, _ in old_binds]
+    new_names = [n for n, _ in new_binds]
+    old_by = {n: v for n, v in old_binds}
+    new_by = {n: v for n, v in new_binds}
+
+    # same-name value / polarity
+    for name, ov in old_binds:
+        if name in new_by:
+            nv = new_by[name]
+            if ov == nv:
+                continue
+            if (ov, nv) in POLARITY:
+                emit(Fact("polarity", name, ov, nv, origin))
+            elif is_ident_like(ov) and is_ident_like(nv) and similar_names(ov, nv):
+                emit(Fact("rename", ov, ov, nv, origin))
+                emit(Fact("string", ov, ov, nv, origin))
+            elif allowed_value_name(name, ov, nv):
+                emit(Fact("value", name, ov, nv, origin))
+                if " " in ov or " " in nv:
+                    emit(Fact("string", ov, ov, nv, origin))
+
+    # renamed binding (similar names, possibly with values)
+    paired_old: set[str] = set()
+    paired_new: set[str] = set()
+    for on in old_names:
+        if on in new_by:
+            continue
+        for nn in new_names:
+            if nn in old_by:
+                continue
+            if similar_names(on, nn):
+                if ident_in_text(on, add_blob):
+                    continue
+                emit(Fact("rename", on, on, nn, origin))
+                ov, nv = old_by[on], new_by[nn]
+                if ov != nv:
+                    if (ov, nv) in POLARITY:
+                        emit(Fact("polarity", on, ov, nv, origin))
+                    elif allowed_value_name(on, ov, nv):
+                        emit(Fact("value", on, ov, nv, origin))
+                paired_old.add(on)
+                paired_new.add(nn)
+                break
+
+    # ident remames without bindings
+    if not old_binds and not new_binds:
+        oids = [i for i in line_idents(old_t) if is_code_shaped(i) or KEBAB_RE.fullmatch(i)]
+        nids = [i for i in line_idents(new_t) if is_code_shaped(i) or KEBAB_RE.fullmatch(i)]
+        for oi in oids:
+            if ident_in_text(oi, add_blob) and oi not in nids:
+                # old ident still present on added side — refuse remames
+                continue
+            for ni in nids:
+                if similar_names(oi, ni) and not is_inflection(oi, ni):
+                    emit(Fact("rename", oi, oi, ni, origin))
+                    break
+
+    # quoted string pairs by position
+    oqs = quoted_strings(old_t)
+    nqs = quoted_strings(new_t)
+    if oqs and nqs:
+        for ov, nv in zip(oqs, nqs):
+            if ov == nv:
+                continue
+            if is_ident_like(ov) and is_ident_like(nv):
+                if similar_names(ov, nv):
+                    emit(Fact("rename", ov, ov, nv, origin))
+                    emit(Fact("string", ov, ov, nv, origin))
+                continue
+            if not any(n for n, _ in old_binds):
+                emit(Fact("string", ov, ov, nv, origin))
+
+
+def stems_of(name: str) -> list[str]:
+    parts: list[str] = []
+    for chunk in re.split(r"[_\-]", name):
+        parts.extend(p.lower() for p in CAMEL_SPLIT_RE.findall(chunk) if p)
+    if not parts:
+        parts = [name.lower()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        if len(p) < 4:
+            continue
+        extras = [p]
+        if p.endswith("s") and len(p) > 4:
+            extras.append(p[:-1])
+        extras.extend(ALIASES.get(p, ()))
+        extras.extend(ALIASES.get(name.lower(), ()))
+        for e in extras:
+            el = e.lower() if e.isascii() else e
+            if el not in seen:
+                seen.add(el)
+                out.append(e)
+    for e in ALIASES.get(name.lower(), ()):
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def ident_in_text(ident: str, text: str) -> bool:
+    if not ident:
+        return False
+    if not ident.isascii() or not re.match(r"^[A-Za-z0-9_\-]+$", ident):
+        return ident in text
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(ident) + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def value_in_text(val: str, text: str) -> bool:
+    if not val:
+        return False
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", val):
+        return re.search(r"(?<![0-9.])" + re.escape(val) + r"(?![0-9.])", text) is not None
+    if is_ident_like(val):
+        return ident_in_text(val, text)
+    return val in text
+
+
+def is_comment_line(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith(("#", "//", "--", "/*", "* ", "*", "; "))
+
+
+def is_assert_line(line: str) -> bool:
+    return bool(re.search(r"\bassert(?:Equal|Eq|_eq|_eq!)?\b", line)) or bool(
+        re.search(r"\bassert\b", line)
+    )
+
+
+def classify_claim(path: str, line: str) -> str:
+    if is_assert_line(line):
+        return "assert"
+    ext = Path(path).suffix.lower()
+    base = Path(path).name
+    if ext in CONFIG_EXTS:
+        return "config"
+    if ext in DOCS_EXTS or base.upper().startswith("README") or "/docs/" in path.replace("\\", "/"):
+        return "docs"
+    posix = path.replace("\\", "/")
+    if TEST_NAME_RE.search(posix) or TEST_FILE_RE.search(base) or "spec" in base.lower():
+        return "test"
+    if is_comment_line(line):
+        return "comment"
+    return "code"
+
+
+def is_generic_ident(name: str) -> bool:
+    if is_code_shaped(name):
+        return False
+    return name.islower() or name.lower() in CONFIG_NOUNS
+
+
+def bound_literal(line: str, name: str) -> str | None:
+    for n, v in extract_bindings(line):
+        if n == name:
+            return v
+    return None
+
+
+def score_line(
+    fact: Fact, path: str, line_no: int, line: str, nearby: str, file_text: str
+) -> tuple[int, list[str]]:
+    why: list[str] = []
+    score = 0
+    claim = classify_claim(path, line)
+    same_line_name = ident_in_text(fact.name, line)
+    stem_hit = False
+    for stem in stems_of(fact.name):
+        if ident_in_text(stem, line) or (not stem.isascii() and stem in line):
+            stem_hit = True
+            break
+    nearby_name = False
+    if not same_line_name:
+        if ident_in_text(fact.name, nearby):
+            nearby_name = True
+        else:
+            for stem in stems_of(fact.name):
+                if ident_in_text(stem, nearby) or (not stem.isascii() and stem in nearby):
+                    nearby_name = True
+                    stem_hit = True
+                    break
+
+    old_ident = fact.kind == "rename" and ident_in_text(fact.old, line)
+    old_value = fact.kind != "rename" and value_in_text(fact.old, line)
+    if fact.kind == "rename":
+        # remames look for the old identifier
+        old_ident = ident_in_text(fact.old, line)
+    else:
+        old_value = value_in_text(fact.old, line)
+        if fact.kind == "polarity" and ident_in_text(fact.old, line):
+            old_value = True
+
+    if not old_ident and not old_value and fact.kind == "rename":
+        return 0, []
+    if not old_ident and not old_value and fact.kind != "rename":
+        # require the old fact somewhere on the line
+        if not value_in_text(fact.old, line) and not ident_in_text(fact.old, line):
+            return 0, []
+
+    also_new = False
+    if fact.new and value_in_text(fact.new, line):
+        also_new = True
+    if fact.kind == "rename" and fact.new and ident_in_text(fact.new, line):
+        also_new = True
+
+    file_has_new = False
+    if fact.new:
+        if fact.kind == "rename":
+            file_has_new = ident_in_text(fact.new, file_text)
+        else:
+            file_has_new = value_in_text(fact.new, file_text)
+
+    same_file = path == fact.origin.path
+    generic = fact.kind == "rename" and is_generic_ident(fact.name)
+    off_file_prose = fact.kind == "rename" and (not same_file) and (
+        generic or not is_code_shaped(fact.name)
+    )
+
+    if same_line_name:
+        score += 40
+        why.append("same-line-name")
+    if nearby_name:
+        score += 14
+        why.append("nearby-name")
+    if stem_hit and not same_line_name:
+        score += 18
+        why.append("name-stem")
+    if old_ident:
+        score += 28
+        why.append("old-ident")
+    if old_value:
+        score += 20
+        why.append("old-value")
+    if also_new:
+        score -= 20
+        why.append("also-new-value")
+    if same_file:
+        score += 12
+        why.append("same-file")
+    if generic:
+        score -= 28
+        why.append("generic-ident")
+    score += CLAIM_BONUS.get(claim, 0)
+    why.append(f"claim:{claim}")
+    if file_has_new:
+        score -= 32
+        why.append("file-has-new")
+    if off_file_prose:
+        score -= 40
+        why.append("off-file-prose-rename")
+    if fact.name.lower() == "version" and claim == "config":
+        score += 15
+        why.append("version-config")
+
+    if score < 0:
+        score = 0
+    return score, why
+
+
+def homonym_skip(fact: Fact, line: str) -> bool:
+    names = {fact.name}
+    if fact.kind == "rename":
+        names.add(fact.old)
+    for n in names:
+        lit = bound_literal(line, n)
+        if lit is None:
+            continue
+        if fact.kind == "value" and lit != fact.old:
+            return True
+        if fact.kind == "rename" and lit not in {fact.old, fact.new} and lit != fact.old:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", lit) and lit != fact.old:
+                return True
+    return False
+
+
+def iter_worktree_files(root: str) -> Iterable[str]:
+    root_path = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        keep = []
+        for d in dirnames:
+            if d in SKIP_DIRS:
+                continue
+            if d == ".git":
+                continue
+            keep.append(d)
+        dirnames[:] = keep
+        for name in filenames:
+            if name in {".DS_Store"}:
+                continue
+            full = Path(dirpath) / name
+            try:
+                if full.is_symlink():
+                    continue
+                rel = full.relative_to(root_path).as_posix()
+            except ValueError:
+                continue
+            yield rel
+
+
+def read_worktree_file(root: str, rel: str) -> str | None:
+    full = Path(root) / rel
+    try:
+        if not full.is_file():
+            return None
+        size = full.stat().st_size
+        if size > MAX_FILE_BYTES:
+            return None
+        data = full.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in data[:8192]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def iter_rev_files(root: str, rev: str) -> list[str]:
+    p = run_git(root, "ls-tree", "-r", "--name-only", "-z", rev)
+    if p.returncode != 0:
+        return []
+    return [x for x in p.stdout.split("\0") if x]
+
+
+def read_rev_file(root: str, rev: str, rel: str) -> str | None:
+    p = run_git(root, "cat-file", "-s", f"{rev}:{rel}")
+    if p.returncode != 0:
+        return None
+    try:
+        size = int(p.stdout.strip() or "0")
+    except ValueError:
+        size = 0
+    if size > MAX_FILE_BYTES:
+        return None
+    p = run_git(root, "show", f"{rev}:{rel}")
+    if p.returncode != 0:
+        return None
+    if "\x00" in p.stdout[:8192]:
+        return None
+    return p.stdout
+
+
+def search_tree(
+    facts: list[Fact],
+    root: str,
+    dest: str,
+    min_score: int,
+) -> list[Finding]:
+    """dest is 'worktree' or a git revision."""
+    findings: list[Finding] = []
+    if dest == "worktree":
+        paths = list(iter_worktree_files(root))
+
+        def loader(rel: str) -> str | None:
+            return read_worktree_file(root, rel)
+
+    else:
+        paths = iter_rev_files(root, dest)
+
+        def loader(rel: str) -> str | None:
+            return read_rev_file(root, dest, rel)
+
+    for rel in paths:
+        text = loader(rel)
+        if text is None:
+            continue
+        lines = text.splitlines()
+        n = len(lines)
+        for i, line in enumerate(lines):
+            nearby_parts = []
+            for j in range(max(0, i - NEARBY_WINDOW), min(n, i + NEARBY_WINDOW + 1)):
+                if j != i:
+                    nearby_parts.append(lines[j])
+            nearby = "\n".join(nearby_parts)
+            for fact in facts:
+                if homonym_skip(fact, line):
+                    continue
+                score, why = score_line(fact, rel, i + 1, line, nearby, text)
+                if score < min_score or not why:
+                    continue
+                # require some leftover signal
+                if not any(
+                    t in why
+                    for t in (
+                        "old-value",
+                        "old-ident",
+                        "same-line-name",
+                        "name-stem",
+                        "nearby-name",
+                    )
+                ):
+                    continue
+                findings.append(
+                    Finding(
+                        fact=fact,
+                        path=rel,
+                        line=i + 1,
+                        claim=classify_claim(rel, line),
+                        excerpt=line.strip(),
+                        score=score,
+                        why=why,
+                    )
+                )
+    findings.sort(key=lambda f: (-f.score, f.path, f.line, f.fact.kind, f.fact.name))
+    return findings
+
+
+def format_facts(facts: list[Fact], from_rev: str, to_rev: str) -> str:
+    lines = [f"{NAME}: {len(facts)} fact(s)  {from_rev} → {to_rev}"]
+    for f in facts:
+        lines.append(
+            f"  {f.kind:<8} {f.name}: '{f.old}' → '{f.new}'  ({f.origin.path}:{f.origin.line})"
+        )
+    return "\n".join(lines) + ("\n" if facts or True else "")
+
+
+def format_human(
+    facts: list[Fact],
+    findings: list[Finding],
+    from_rev: str,
+    to_rev: str,
+    root: str,
+    explain: bool,
+) -> str:
+    n = len(findings)
+    noun = "afterimage" if n == 1 else "afterimages"
+    out = [f"{NAME}: {n} {noun}  {from_rev} → {to_rev}  ({root})"]
+    if n == 0:
+        if facts:
+            out.append(
+                f"  {len(facts)} fact(s) changed; none left an afterimage (min-score gated)."
+            )
+        else:
+            out.append("  no fact mutations in this diff.")
+        return "\n".join(out) + "\n"
+
+    groups: list[tuple[Fact, list[Finding]]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for fn in findings:
+        k = fn.fact.key()
+        if k in seen:
+            continue
+        seen.add(k)
+        bucket = [x for x in findings if x.fact.key() == k]
+        groups.append((fn.fact, bucket))
+
+    out.append("")
+    for fact, bucket in groups:
+        if fact.kind == "rename":
+            head = f"RENAME {fact.old} → {fact.new}   {fact.origin.path}:{fact.origin.line}"
+        elif fact.kind == "polarity":
+            head = f"FLIP {fact.name}: {fact.old} → {fact.new}   {fact.origin.path}:{fact.origin.line}"
+        else:
+            head = f"FACT {fact.name}: {fact.old} → {fact.new}   {fact.origin.path}:{fact.origin.line}"
+        out.append(head)
+        for fn in bucket:
+            loc = f"{fn.path}:{fn.line}"
+            if len(loc) < 42:
+                loc = loc.ljust(42)
+            out.append(f"{fn.score:5d} {fn.claim:<7s} {loc} {fn.excerpt}")
+            if explain:
+                out.append(f"         why: {', '.join(fn.why)}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def format_tsv(findings: list[Finding]) -> str:
+    rows = ["score\tclaim\tpath\tline\tname\told\tnew\tkind\texcerpt"]
+    for fn in findings:
+        rows.append(
+            "\t".join(
+                [
+                    str(fn.score),
+                    fn.claim,
+                    fn.path,
+                    str(fn.line),
+                    fn.fact.name,
+                    fn.fact.old,
+                    fn.fact.new,
+                    fn.fact.kind,
+                    fn.excerpt,
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def origin_dict(o: Origin) -> dict:
+    return {"path": o.path, "line": o.line, "excerpt": o.excerpt}
+
+
+def fact_dict(f: Fact) -> dict:
+    return {
+        "kind": f.kind,
+        "name": f.name,
+        "old": f.old,
+        "new": f.new,
+        "origin": origin_dict(f.origin),
+    }
+
+
+def format_json(
+    facts: list[Fact],
+    findings: list[Finding],
+    from_rev: str,
+    to_rev: str,
+    root: str,
+) -> str:
+    payload = {
+        "from": from_rev,
+        "to": to_rev,
+        "root": root,
+        "version": VERSION,
+        "facts": [fact_dict(f) for f in facts],
+        "findings": [
+            {
+                "fact": fact_dict(fn.fact),
+                "path": fn.path,
+                "line": fn.line,
+                "claim": fn.claim,
+                "excerpt": fn.excerpt,
+                "score": fn.score,
+                "why": fn.why,
+            }
+            for fn in findings
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def get_diff(
+    root: str,
+    from_rev: str | None,
+    to_rev: str | None,
+    staged: bool,
+    diff_file: str | None,
+) -> tuple[str, str, str]:
+    """Return (diff_text, from_label, to_label). to_label is 'worktree', 'index', or a rev."""
+    if diff_file is not None:
+        if diff_file == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                text = Path(diff_file).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                die(f"cannot read {diff_file}: {e}")
+        return text, "diff", "worktree"
+
+    if not is_git_repo(root):
+        die(f"not a git repository: {root} (pass --diff or run inside a repo)")
+
+    if staged:
+        args = ["diff", "--cached", "--no-color", "--no-ext-diff"]
+        labels = ("HEAD", "index")
+    elif from_rev and to_rev:
+        args = ["diff", from_rev, to_rev, "--no-color", "--no-ext-diff"]
+        labels = (from_rev, to_rev)
+    elif from_rev:
+        args = ["diff", from_rev, "--no-color", "--no-ext-diff"]
+        labels = (from_rev, "worktree")
+    else:
+        args = ["diff", "HEAD", "--no-color", "--no-ext-diff"]
+        labels = ("HEAD", "worktree")
+
+    p = run_git(root, *args)
+    if p.returncode != 0:
+        shown = " ".join(args)
+        err = p.stderr.rstrip() or p.stdout.rstrip() or "unknown error"
+        die(f"git {shown} failed: {err}")
+    return p.stdout, labels[0], labels[1]
+
+
+# ----- self-test ----------------------------------------------------------
+
+
+def _ok(label: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        extra = f" — {detail}" if detail else ""
+        print(f"  FAIL  {label}{extra}")
+        raise SystemExit(1)
+
+
+def run_self_test() -> None:
+    diff_assign = """diff --git a/src/a.py b/src/a.py
+--- a/src/a.py
++++ b/src/a.py
+@@ -1,3 +1,3 @@
+-MAX_RETRIES = 3
+-HOOK_TIMEOUT = 10
+-ENABLE_CACHE = True
++MAX_ATTEMPTS = 8
++HOOK_TIMEOUT = 30
++ENABLE_CACHE = False
+"""
+    facts = extract_facts(diff_assign, DEFAULT_KINDS)
+    paths = {f.origin.path for f in facts}
+    _ok("parse file path", paths == {"src/a.py"})
+    vals = {(f.kind, f.name, f.old, f.new) for f in facts}
+    _ok("bound value 3→8", ("value", "MAX_RETRIES", "3", "8") in vals)
+    _ok("rename MAX_RETRIES", ("rename", "MAX_RETRIES", "MAX_RETRIES", "MAX_ATTEMPTS") in vals)
+    _ok("polarity true→false", ("polarity", "ENABLE_CACHE", "True", "False") in vals)
+
+    ver = extract_facts(
+        """diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,1 +1,1 @@
+-version = "0.3.0"
++version = "0.7.0"
+""",
+        DEFAULT_KINDS,
+    )
+    _ok(
+        "version pair",
+        any(f.kind == "value" and f.name == "version" and f.old == "0.3.0" and f.new == "0.7.0" for f in ver),
+    )
+
+    some = extract_facts(
+        """diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,1 @@
+-timeout: Some(10)
++timeout: Some(30)
+""",
+        DEFAULT_KINDS,
+    )
+    _ok(
+        "Some(10) rust option",
+        any(f.kind == "value" and f.name == "timeout" and f.old == "10" and f.new == "30" for f in some),
+    )
+
+    fact = Fact("value", "MAX_RETRIES", "3", "8", Origin("src/a.py", 3, "MAX_RETRIES = 3"))
+    sc, why = score_line(
+        fact,
+        "src/comment_only.py",
+        1,
+        "# leftover MAX_RETRIES is 3",
+        "",
+        "# leftover MAX_RETRIES is 3\n",
+    )
+    _ok("comment leftover scores high", sc >= 80 and "claim:comment" in why, str((sc, why)))
+
+    hdr = Fact("value", "threshold", "0.4", "0.45", Origin("x.swift", 30, "threshold: Double = 0.4,"))
+    body = "# threshold 0.4\nnew is 0.45\n"
+    sc_h, why_h = score_line(hdr, "docs/adr.md", 1, "# threshold 0.4", "", body)
+    sc_c, _ = score_line(
+        hdr,
+        "README.md",
+        3,
+        "the threshold 0.4 cutoff",
+        "",
+        "the threshold 0.4 cutoff\n",
+    )
+    _ok(
+        "historical header downranked",
+        sc_h < sc_c and "file-has-new" in why_h,
+        str((sc_h, sc_c, why_h)),
+    )
+
+    _ok("needle word bound", not ident_in_text("MAX_RETRIES", "MAX_RETRIES_OLD"))
+    _ok("needle not substring of version", not value_in_text("3", "version 0.3.0"))
+
+    prose = extract_facts(
+        """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,2 @@
+-The Exit path
+-a Patch was applied
++The exit path
++Patches were applied
+""",
+        DEFAULT_KINDS,
+    )
+    _ok("ignore prose remames", len(prose) == 0, str(prose))
+
+    kebab = extract_facts(
+        """diff --git a/src/err.rs b/src/err.rs
+--- a/src/err.rs
++++ b/src/err.rs
+@@ -1,1 +1,1 @@
+-    "not-found"
++    "not-found-error"
+""",
+        DEFAULT_KINDS,
+    )
+    _ok(
+        "keep kebab error-code rename",
+        any(f.kind == "rename" and f.old == "not-found" and f.new == "not-found-error" for f in kebab),
+        str(kebab),
+    )
+
+    jsver = extract_facts(
+        """diff --git a/plugin.json b/plugin.json
+--- a/plugin.json
++++ b/plugin.json
+@@ -1,3 +1,3 @@
+ {
+-  "version": "0.3.0",
++  "version": "0.7.0",
+   "x": 1
+ }
+""",
+        DEFAULT_KINDS,
+    )
+    _ok(
+        "json quoted version pair",
+        any(
+            f.kind == "value" and f.name == "version" and f.old == "0.3.0" and f.new == "0.7.0"
+            for f in jsver
+        ),
+        str(jsver),
+    )
+
+    frag = extract_facts(
+        """diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1,1 +1,1 @@
+-Critical-tier Sweep
++fixed-tier Sweep
+""",
+        DEFAULT_KINDS,
+    )
+    _ok(
+        "ignore mid-ident kebab fragment",
+        not any("ritical" in (f.old + f.new + f.name) for f in frag),
+        str(frag),
+    )
+
+    # homonym: bound to a different literal
+    fth = Fact("value", "threshold", "0.4", "0.45", Origin("a.swift", 1, "threshold: Double = 0.4"))
+    _ok("homonym different binding", homonym_skip(fth, "private let threshold: Double = 0.7"))
+    fr = Fact("value", "MAX_RETRIES", "3", "8", Origin("a.py", 1, "MAX_RETRIES = 3"))
+    _ok("not homonym same leftover value", not homonym_skip(fr, "MAX_RETRIES = 3  # leftover"))
+
+
+def parse_kinds(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return DEFAULT_KINDS
+    if raw.strip() == "":
+        print(f"{NAME}: empty --kinds", file=sys.stderr)
+        raise SystemExit(0)
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    unknown = [p for p in parts if p not in ALL_KINDS]
+    if unknown:
+        die(f"unknown kinds {unknown}; allowed: {sorted(ALL_KINDS)}")
+    return tuple(parts)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(
+        prog=NAME,
+        description="Print leftover claims a diff just made false (afterimages).",
+    )
+    parser.add_argument("-C", "--root", default=".", help="repository root (default: cwd)")
+    parser.add_argument(
+        "--diff",
+        metavar="FILE",
+        help="read unified diff from FILE ('-' = stdin) instead of git",
+    )
+    parser.add_argument("--staged", action="store_true", help="compare index to HEAD")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--tsv", action="store_true", help="TSV output")
+    parser.add_argument("--facts-only", action="store_true", help="print extracted facts and stop")
+    parser.add_argument("--explain", action="store_true", help="show score reasons")
+    parser.add_argument(
+        "--min-score",
+        type=int,
+        default=DEFAULT_MIN_SCORE,
+        help=f"minimum finding score (default {DEFAULT_MIN_SCORE})",
+    )
+    parser.add_argument(
+        "--kinds",
+        help="comma-separated fact kinds (value,rename,polarity,string,removal)",
+    )
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("from_rev", nargs="?", help="git revision (old side). Default: HEAD")
+    parser.add_argument("to_rev", nargs="?", help="git revision (new side). Default: worktree")
+
+    # version-only short circuit before parse errors on extras
+    if argv == ["--version"]:
+        print(f"{NAME} {VERSION}")
+        return 0
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 2
+        return 2 if code else 0
+
+    if args.version:
+        print(f"{NAME} {VERSION}")
+        return 0
+
+    if args.from_rev == "self-test" and args.to_rev is None and not args.diff:
+        run_self_test()
+        return 0
+
+    root = real_root(args.root)
+    kinds = parse_kinds(args.kinds)
+
+    try:
+        diff_text, from_l, to_l = get_diff(
+            root, args.from_rev, args.to_rev, args.staged, args.diff
+        )
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 2
+
+    facts = extract_facts(diff_text, kinds)
+
+    if args.facts_only:
+        if args.json:
+            sys.stdout.write(format_json(facts, [], from_l, to_l, root))
+        else:
+            sys.stdout.write(format_facts(facts, from_l, to_l))
+        return 0
+
+    dest = "worktree" if to_l in {"worktree", "index"} else to_l
+    # --staged still searches worktree files (index comparison extracts facts;
+    # leftovers live in the destination the user is looking at). Observed:
+    # --staged with a clean worktree vs dirty index still walks the disk tree
+    # only for leftovers of those facts. Search the worktree always unless
+    # dest is a commit-ish.
+    if to_l == "index":
+        dest = "worktree"
+    findings = search_tree(facts, root, dest, args.min_score)
+
+    if args.json:
+        sys.stdout.write(format_json(facts, findings, from_l, to_l, root))
+    elif args.tsv:
+        sys.stdout.write(format_tsv(findings))
+    else:
+        sys.stdout.write(format_human(facts, findings, from_l, to_l, root, args.explain))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,2002 @@
+#!/usr/bin/env python3
+"""pin — mint a durable fingerprint address; resolve it onto a later tree.
+
+A file:line is a locator. It dies when the file splits. A pin is the
+fingerprint (line + identifiers + in-scope neighbors + path hint +
+optional repo origin) so a ticket can store the address without the SHA.
+
+v0.4 keeps the v0.3 refuses and flips the leftover-stub overcorrection:
+  * leftover stubs at the old path are not identity
+  * extract-and-keep is not a move — if the origin function still holds
+    the implementation body, that path is the locus (not a stem-split copy).
+    Comments that push the body past --context are not a leftover stub.
+  * unique means unique in both snapshots
+  * files over 1 MB still mint and resolve
+  * NFC and NFD path bytes are one path
+  * a missing --to ref is an error, not a deletion
+  * a truncated token fails closed
+  * a pin does not land on a foreign repo unless --any-repo
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import zlib
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.4.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEF_RE = re.compile(
+    r"""^(\s*)(?:(?:pub(?:\s*\([^)]*\))?|crate|async|unsafe|static|
+         private|protected|public|internal|open|override|fileprivate|
+         export|default)\s+)*
+        (?:fn|def|func|function|class|struct|enum|trait|interface|impl|
+         extension|typedef|type)\b""",
+    re.VERBOSE,
+)
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "class",
+    "const",
+    "crate",
+    "def",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "i",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "int",
+    "let",
+    "mod",
+    "mut",
+    "n",
+    "none",
+    "not",
+    "of",
+    "or",
+    "pub",
+    "return",
+    "self",
+    "static",
+    "str",
+    "struct",
+    "t",
+    "the",
+    "this",
+    "to",
+    "true",
+    "type",
+    "use",
+    "var",
+    "void",
+    "where",
+    "with",
+}
+TRIVIAL_NORMS = {
+    "",
+    "{",
+    "}",
+    "};",
+    "[",
+    "]",
+    "(",
+    ")",
+    "else",
+    "else:",
+    "pass",
+    "break",
+    "continue",
+    "end",
+    "end;",
+    "//",
+    "#",
+    "*/",
+    "/*",
+}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+# Omit was 1_000_000 and silently dropped godfiles. Text below HARD_MAX
+# is always indexed. The mint target is loaded even when larger.
+HARD_MAX_BYTES = 48_000_000
+MAX_TEXT_CHARS = 240
+MAX_NEIGHBOR_CHARS = 140
+MAX_PIN_PLAIN = 64_000
+TIE_EPS = 1e-6
+EXACT_NS_KEEP = 0.15
+STRONG_NS_FLOOR = 0.40
+
+PREFIX = "pin1."
+_PIN_BODY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+@dataclass
+class Fingerprint:
+    path: str
+    line: int
+    text: str
+    tokens: list[str] = field(default_factory=list)
+    unique: list[str] = field(default_factory=list)
+    before: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)
+    anchors: list[str] = field(default_factory=list)
+    col: Optional[int] = None
+    origin: Optional[str] = None
+
+    def payload(self) -> dict:
+        d: dict = {"v": 2, "p": self.path, "n": self.line, "t": self.text}
+        if self.tokens:
+            d["k"] = self.tokens
+        if self.unique:
+            d["u"] = self.unique
+        if self.before:
+            d["b"] = self.before
+        if self.after:
+            d["a"] = self.after
+        if self.anchors:
+            d["g"] = self.anchors
+        if self.col is not None:
+            d["c"] = self.col
+        if self.origin:
+            d["o"] = self.origin
+        return d
+
+    @classmethod
+    def from_payload(cls, d: dict) -> "Fingerprint":
+        if not isinstance(d, dict) or d.get("v") not in (1, 2):
+            raise ValueError("unsupported pin version")
+        text = d.get("t")
+        path = d.get("p")
+        line = d.get("n")
+        if not isinstance(text, str) or not isinstance(path, str) or not isinstance(line, int):
+            raise ValueError("pin missing path/line/text")
+        origin = d.get("o")
+        return cls(
+            path=canon_path(path),
+            line=line,
+            text=text,
+            tokens=_str_list(d.get("k")),
+            unique=_str_list(d.get("u")),
+            before=_str_list(d.get("b")),
+            after=_str_list(d.get("a")),
+            anchors=_str_list(d.get("g")),
+            col=d.get("c") if isinstance(d.get("c"), int) else None,
+            origin=origin if isinstance(origin, str) and origin else None,
+        )
+
+
+@dataclass
+class Hit:
+    fp: Fingerprint
+    name: Optional[str]
+    token: str
+    status: str
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+    gap_path: Optional[str] = None
+    gap_line: Optional[int] = None
+    alts: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass
+class Scored:
+    score: float
+    path: str
+    line: int
+    text: str
+    ns: float
+    exact: bool
+    body_ns: float = 0.0
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    git_names: dict[str, str] = field(default_factory=dict)
+    origin: Optional[str] = None
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        keyed = {canon_path(p): lines for p, lines in self.files.items()}
+        self.files = keyed
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+
+def _str_list(val: object) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    return [x for x in val if isinstance(x, str)]
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/") if p.startswith("/") and not p.startswith("//") else p
+
+
+def canon_path(path: str) -> str:
+    return unicodedata.normalize("NFC", posix_rel(path))
+
+
+def path_forms(path: str) -> set[str]:
+    raw = posix_rel(path)
+    return {raw, unicodedata.normalize("NFC", raw), unicodedata.normalize("NFD", raw)}
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def clip(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def decode_bytes(data: bytes, *, required: bool = False, path: str = "") -> Optional[str]:
+    if b"\x00" in data[:8192]:
+        if required:
+            die(f"pin: binary file cannot be fingerprinted: {path or '?'}")
+        return None
+    if len(data) > HARD_MAX_BYTES:
+        if required:
+            die(
+                f"pin: file exceeds {HARD_MAX_BYTES} bytes: {path or '?'} "
+                f"({len(data)} bytes)"
+            )
+        print(
+            f"pin: skipping huge file {path} ({len(data)} bytes)",
+            file=sys.stderr,
+        )
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def verify_git_ref(root: Path, ref: str) -> str:
+    """Fail closed on a missing --from/--to. Empty is not 'deleted'."""
+    cp = git(root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{object}}"], check=False)
+    sha = cp.stdout.decode("ascii", "replace").strip()
+    if cp.returncode != 0 or not sha:
+        die(f"pin: unknown ref: {ref}")
+    return sha
+
+
+def repo_origin(root: Optional[Path], ref: Optional[str] = None) -> Optional[str]:
+    """Identity of the repository, not of --from/--to. Same roots ⇒ same repo."""
+    if root is None:
+        return None
+    raw = git_ok(root, ["rev-list", "--max-parents=0", "--all"])
+    if not raw or not raw.strip():
+        hint = ref or "HEAD"
+        raw = git_ok(root, ["rev-list", "--max-parents=0", hint])
+    if not raw or not raw.strip():
+        return None
+    roots = sorted({ln.strip()[:16] for ln in raw.splitlines() if ln.strip()})
+    if not roots:
+        return None
+    return "git:" + ",".join(roots[:4])
+
+
+def load_git_paths(root: Path, ref: Optional[str]) -> list[tuple[str, str]]:
+    """Return (nfc_key, git_name) pairs. Git failure is an error, not []."""
+    if ref is None:
+        cp = git(root, ["ls-files", "-z"], check=False)
+        label = "worktree"
+    else:
+        verify_git_ref(root, ref)
+        cp = git(root, ["ls-tree", "-r", "--name-only", "-z", ref], check=False)
+        label = ref
+    if cp.returncode != 0:
+        err = cp.stderr.decode("utf-8", "replace").strip() or "git list failed"
+        die(f"pin: cannot list {label}: {err}")
+    raw = cp.stdout.decode("utf-8", "surrogateescape")
+    out: list[tuple[str, str]] = []
+    for p in raw.split("\0"):
+        if not p or should_skip_path(p):
+            continue
+        out.append((canon_path(p), p))
+    return out
+
+
+def read_git_file(
+    root: Path,
+    ref: Optional[str],
+    git_name: str,
+    *,
+    required: bool = False,
+) -> Optional[list[str]]:
+    if ref is None:
+        return read_fs_file(root / git_name, required=required, display=git_name)
+    try:
+        cp = git(root, ["show", f"{ref}:{git_name}"], check=True)
+    except subprocess.CalledProcessError:
+        if required:
+            die(f"pin: cannot read {ref}:{git_name}")
+        return None
+    text = decode_bytes(cp.stdout, required=required, path=git_name)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def walk_dir_files(root: Path) -> Iterator[tuple[str, Path]]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield canon_path(rel), full
+
+
+def read_fs_file(fp: Path, *, required: bool = False, display: str = "") -> Optional[list[str]]:
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        if required:
+            die(f"pin: cannot read {display or fp}")
+        return None
+    text = decode_bytes(data, required=required, path=display or str(fp))
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    untracked: bool,
+    label: str,
+    empty_ok: bool = False,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    git_names: dict[str, str] = {}
+    origin: Optional[str] = None
+    if directory is not None:
+        if not directory.is_dir():
+            die(f"pin: not a directory: {directory}")
+        nested = discover_repo(directory)
+        if nested is not None and nested == directory.resolve():
+            origin = repo_origin(nested)
+        for path, full in walk_dir_files(directory):
+            lines = read_fs_file(full, display=path)
+            if lines is not None:
+                files[path] = lines
+        if not files and not empty_ok:
+            die(f"pin: destination snapshot is empty: {directory}")
+        snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+        snap.index()
+        return snap
+    if git_root is None:
+        die("pin: not a git repository (use --repo or --from-dir/--to-dir)")
+    origin = repo_origin(git_root, ref)
+    pairs = load_git_paths(git_root, ref)
+    if ref is None and untracked:
+        extra = git_ok(git_root, ["ls-files", "-o", "--exclude-standard", "-z"]) or ""
+        for p in extra.split("\0"):
+            if p and not should_skip_path(p):
+                pairs.append((canon_path(p), p))
+    for nfc, git_name in pairs:
+        lines = read_git_file(git_root, ref, git_name)
+        if lines is not None:
+            files[nfc] = lines
+            git_names[nfc] = git_name
+    snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+    snap.index()
+    return snap
+
+
+def inject_file(snap: Snapshot, path: str, lines: list[str], git_name: Optional[str] = None) -> str:
+    key = canon_path(path)
+    snap.files[key] = lines
+    if git_name:
+        snap.git_names[key] = git_name
+    snap.index()
+    return key
+
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    forms = path_forms(raw)
+    nfc = canon_path(raw)
+    known_map = {canon_path(k): k for k in known}
+    if nfc in known_map:
+        return known_map[nfc]
+    for f in forms:
+        if f in known_map:
+            return known_map[f]
+    best = None
+    for kp in known_map:
+        if any(nfc.endswith("/" + f) or kp.endswith("/" + f) for f in forms):
+            if nfc.endswith("/" + kp) or kp.endswith("/" + nfc):
+                if best is None or len(kp) > len(best):
+                    best = kp
+        if nfc.endswith("/" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    return best
+
+
+def parse_locator(text: str, known: Iterable[str]) -> tuple[str, int, Optional[int]]:
+    if is_pin_token(text):
+        die("pin mint: that looks like a pin token; use resolve")
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        die(f"pin: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    bound = bind_path(rest, known)
+    path = bound or canon_path(rest)
+    if not path:
+        die(f"pin: missing path in {text}")
+    return path, line, col
+
+
+def is_pin_token(s: str) -> bool:
+    s = s.strip()
+    if not s.startswith(PREFIX):
+        return False
+    body = s[len(PREFIX) :]
+    # Long enough to be a compressed payload, urlsafe charset only.
+    return len(body) >= 12 and bool(_PIN_BODY_RE.fullmatch(body))
+
+
+def encode_pin(fp: Fingerprint) -> str:
+    raw = json.dumps(fp.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    packed = zlib.compress(raw, 9)
+    return PREFIX + base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+def decode_pin(token: str) -> Fingerprint:
+    token = token.strip()
+    if not is_pin_token(token):
+        raise ValueError("not a pin token")
+    b64 = token[len(PREFIX) :]
+    pad = "=" * (-len(b64) % 4)
+    try:
+        packed = base64.urlsafe_b64decode(b64 + pad)
+        raw = zlib.decompress(packed)
+    except Exception as e:
+        raise ValueError(f"corrupt pin: {e}") from e
+    if len(raw) > MAX_PIN_PLAIN:
+        raise ValueError("pin payload too large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt pin json: {e}") from e
+    return Fingerprint.from_payload(data)
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def is_def_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "//", "/*", "*", "///", "--", "!", "{", "}")):
+        return False
+    return bool(DEF_RE.match(line.rstrip()))
+
+
+def is_comment_or_attr(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith(("#", "//", "/*", "*", "///", "--", "@", "#[", "#[derive"))
+
+
+def is_docstring_line(line: str) -> bool:
+    s = line.lstrip()
+    for q in ('"""', "'''"):
+        if s.startswith(q) or s.startswith("r" + q) or s.startswith("f" + q):
+            return True
+    return False
+
+
+def is_body_line(line: str) -> bool:
+    """Implementation text, not a def / docstring / comment / trivial."""
+    if normalize(line) in TRIVIAL_NORMS:
+        return False
+    if is_def_line(line) or is_comment_or_attr(line) or is_docstring_line(line):
+        return False
+    return True
+
+
+def collect_neighbors(lines: list[str], idx: int, ctx: int) -> tuple[list[str], list[str]]:
+    """Neighbors of this line, stopping at a sibling definition."""
+    here = lines[idx - 1]
+    here_indent = indent_of(here)
+    here_is_def = is_def_line(here)
+    before: list[str] = []
+    j = idx - 1
+    while j >= 1 and len(before) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j -= 1
+            continue
+        if here_is_def and is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        if here_is_def and indent_of(raw) > here_indent and not is_comment_or_attr(raw):
+            j -= 1
+            continue
+        before.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j -= 1
+    before.reverse()
+    after: list[str] = []
+    j = idx + 1
+    while j <= len(lines) and len(after) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j += 1
+            continue
+        if is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        after.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j += 1
+    return before, after
+
+
+def lookup_lines(src: Snapshot, path: str) -> tuple[str, list[str]]:
+    nfc = canon_path(path)
+    if nfc in src.files:
+        return nfc, src.files[nfc]
+    for form in path_forms(path):
+        key = canon_path(form)
+        if key in src.files:
+            return key, src.files[key]
+    hits = [p for p in src.files if p == nfc or p.endswith("/" + nfc)]
+    if len(hits) == 1:
+        return hits[0], src.files[hits[0]]
+    if not hits:
+        raise SystemExit(f"pin mint: source path not in snapshot: {path}")
+    raise SystemExit(f"pin mint: source path ambiguous: {path}")
+
+
+def mint_fingerprint(
+    src: Snapshot, path: str, line: int, col: Optional[int], ctx: int, force: bool
+) -> Fingerprint:
+    path, src_lines = lookup_lines(src, path)
+    if line < 1 or line > len(src_lines):
+        raise SystemExit(f"pin mint: line {line} out of range ({path} has {len(src_lines)} lines)")
+    raw = src_lines[line - 1]
+    if normalize(raw) in TRIVIAL_NORMS and not force:
+        raise SystemExit(f"pin mint: line is too trivial to fingerprint: {path}:{line}")
+    toks = tokens(raw)
+    ranked = sorted(set(toks), key=lambda t: (-len(t), t.lower()))[:8]
+    # Unique in THIS snapshot. Resolve will re-check dest uniqueness.
+    unique = []
+    for tok in ranked:
+        if src.token_df.get(tok, 99) == 1 and len(tok) >= 4:
+            unique.append(tok)
+    before, after = collect_neighbors(src_lines, line, ctx)
+    skip = set(ranked)
+    nearby: list[tuple[int, str]] = []
+    for i, src_raw in enumerate(src_lines, start=1):
+        if i == line or not is_def_line(src_raw):
+            continue
+        for tok in tokens(src_raw):
+            if tok in skip or len(tok) < 4:
+                continue
+            if src.token_df.get(tok, 99) == 1:
+                nearby.append((abs(i - line), tok))
+                break
+    nearby.sort()
+    anchors: list[str] = []
+    seen_anchor: set[str] = set()
+    for _, tok in nearby:
+        if tok in seen_anchor:
+            continue
+        anchors.append(tok)
+        seen_anchor.add(tok)
+        if len(anchors) >= 4:
+            break
+    return Fingerprint(
+        path=path,
+        line=line,
+        text=clip(raw, MAX_TEXT_CHARS),
+        tokens=ranked,
+        unique=unique,
+        before=before,
+        after=after,
+        anchors=anchors,
+        col=col,
+        origin=src.origin,
+    )
+
+
+def is_stem_split(src: str, dst: str) -> bool:
+    src, dst = canon_path(src), canon_path(dst)
+    stem, _ = os.path.splitext(src)
+    return dst.startswith(stem + "/")
+
+
+def path_score(src: str, dst: str) -> float:
+    src, dst = canon_path(src), canon_path(dst)
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    s_stem, s_ext = os.path.splitext(src)
+    score = 0.0
+    # File split into a directory of the same stem beats basename bait
+    # (src/calc.py → src/calc/ops.py, not src/legacy/calc.py).
+    if dst.startswith(s_stem + "/") or is_stem_split(src, dst):
+        score += 0.88
+    elif s_base == d_base:
+        score += 0.42
+    else:
+        s_stem_base = os.path.splitext(s_base)[0]
+        if s_stem_base and os.path.splitext(d_base)[0] == s_stem_base:
+            score += 0.28
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.04
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.12 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def neighbor_window_score(fp: Fingerprint, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    neigh = fp.before + fp.after
+    if not neigh or ctx <= 0:
+        return 0.0
+    lo = max(1, dst_i - ctx)
+    hi = min(len(dst_lines), dst_i + ctx)
+    window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+    hits = sum(1 for n in neigh if normalize(n) in window)
+    return hits / len(neigh)
+
+
+def enclosing_function_lines(lines: list[str], idx: int) -> list[str]:
+    """Lines of the enclosing def, or the whole file if there is no def.
+
+    The ctx neighbor window is the leftover-stub *ranker*. Body-hold asks a
+    different question: is the minted implementation still in this function,
+    even if comments pushed it past `--context`?
+    """
+    if idx < 1 or idx > len(lines):
+        return []
+    raw = lines[idx - 1]
+    start = idx
+    start_indent = indent_of(raw)
+    if not is_def_line(raw):
+        found = False
+        j = idx - 1
+        while j >= 1:
+            cand = lines[j - 1]
+            if is_def_line(cand) and indent_of(cand) <= indent_of(raw):
+                start = j
+                start_indent = indent_of(cand)
+                found = True
+                break
+            j -= 1
+        if not found:
+            return list(lines)
+    end = len(lines)
+    j = start + 1
+    while j <= len(lines):
+        cand = lines[j - 1]
+        if is_def_line(cand) and indent_of(cand) <= start_indent:
+            end = j - 1
+            break
+        j += 1
+    return lines[start - 1 : end]
+
+
+def body_window_score(fp: Fingerprint, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    """Fraction of minted *implementation* neighbors still in the dest function.
+
+    Docstrings and comments are not the body. A leftover stub that kept a
+    docstring can score ns=0.5; that is not extract-and-keep. The search is
+    the enclosing function, not the ctx window — origin still holding the
+    return after inserted comments is identity, not a leftover stub.
+    """
+    body = [normalize(x) for x in (fp.before + fp.after) if is_body_line(x)]
+    if not body:
+        return neighbor_window_score(fp, dst_lines, dst_i, ctx)
+    scope = enclosing_function_lines(dst_lines, dst_i)
+    if not scope:
+        return 0.0
+    window = {normalize(x) for x in scope}
+    here = normalize(dst_lines[dst_i - 1]) if 1 <= dst_i <= len(dst_lines) else ""
+    window.discard(here)
+    hits = sum(1 for n in body if n in window)
+    return hits / len(body)
+
+
+def dest_unique_token(fp: Fingerprint, draw: str, dst: Snapshot) -> bool:
+    """Token is unique in dest *and* was unique at mint. Both snapshots."""
+    if not fp.unique:
+        return False
+    dt = set(tokens(draw))
+    return any(u in dt and dst.token_df.get(u, 99) == 1 for u in fp.unique)
+
+
+def score_pin(
+    fp: Fingerprint,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+    dst: Snapshot,
+) -> tuple[float, float, bool]:
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_window_score(fp, dst_lines, dst_i, ctx)
+    ps = path_score(fp.path, dst_path)
+    exact = fp.text == draw or normalize(fp.text) == normalize(draw)
+    if exact:
+        n = normalize(fp.text)
+        unique_line = n not in TRIVIAL_NORMS and len(dst.by_norm.get(n, ())) == 1
+        uniq_tok = dest_unique_token(fp, draw, dst)
+        if unique_line:
+            return 1.0, ns, True
+        if uniq_tok:
+            # Unique in dest: there is one address. Neighbors may be
+            # missing when the dest file is a shorter exact copy.
+            return 1.0, ns, True
+        same_path = canon_path(fp.path) == canon_path(dst_path)
+        if same_path and ns >= 0.5:
+            return 1.0, ns, True
+        # Leftover stub / common clone: neighbors decide. Cap below 1.0
+        # so a 1.000 never means "two addresses".
+        return min(0.999, 0.58 + 0.32 * ns + 0.10 * ps), ns, True
+    lr = line_ratio(fp.text, draw)
+    ts = token_score(fp.text, draw)
+    ub = 0.0
+    if fp.unique:
+        dt = set(tokens(draw))
+        hits = sum(1 for u in fp.unique if u in dt and dst.token_df.get(u, 99) == 1)
+        if fp.unique:
+            ub = 0.08 * hits / len(fp.unique)
+    return min(1.0, W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps + ub), ns, False
+
+
+def candidates_for_pin(fp: Fingerprint, dst: Snapshot) -> list[tuple[str, int]]:
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(canon_path(path), line)] = None
+
+    n = normalize(fp.text)
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    for tok in list(fp.unique) + [t for t in fp.tokens if t not in fp.unique]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred: list[str] = []
+    nfc = canon_path(fp.path)
+    if nfc in dst.files:
+        preferred.append(nfc)
+    stem = os.path.splitext(nfc)[0]
+    base = os.path.basename(nfc)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base):
+            preferred.append(p)
+    for p in preferred:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(fp: Fingerprint, dst_path: Optional[str], dst_raw: str, dst_line: Optional[int], score: float) -> str:
+    if dst_path is None or dst_line is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    same_text = normalize(fp.text) == normalize(dst_raw) or line_ratio(fp.text, dst_raw) >= 0.96
+    if same_text and canon_path(fp.path) == canon_path(dst_path):
+        if fp.line == dst_line:
+            return "same"
+        return "shifted"
+    if same_text:
+        return "moved"
+    return "edited"
+
+
+def describe_hole(fp: Fingerprint, dst: Snapshot) -> tuple[Optional[str], Optional[int], str]:
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    for raw in reversed(fp.before):
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            prev_hit = locs[0]
+            break
+    for raw in fp.after:
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            next_hit = locs[0]
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return prev_hit[0], min(hi, lo + 1), f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return (
+            next_hit[0],
+            next_hit[1],
+            f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}",
+        )
+    if prev_hit:
+        return prev_hit[0], prev_hit[1], f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return next_hit[0], next_hit[1], f"next context at {next_hit[0]}:{next_hit[1]}"
+    surviving: list[str] = []
+    gap_path = None
+    gap_line = None
+    for tok in fp.anchors:
+        locs = dst.by_token.get(tok, [])
+        if len(locs) == 1:
+            p, i = locs[0]
+            surviving.append(f"{tok} at {p}:{i}")
+            if gap_path is None:
+                gap_path, gap_line = p, i
+    if surviving:
+        return gap_path, gap_line, "surviving anchors: " + "; ".join(surviving[:4])
+    return None, None, "no candidates"
+
+
+def origin_holds_body(fp: Fingerprint, exacts: list[Scored]) -> Optional[Scored]:
+    """If the minted path still holds the implementation, that is not a move.
+
+    Stem-split is a tie-break against leftover stubs (weak body at origin),
+    not against the original body copied into src/oldstem/…. Preferring
+    same-path on ns >= 0.5 would hide extract-and-keep *and* re-open a
+    leftover that kept a docstring neighbor. Body neighbors are the vote.
+    """
+    same = [
+        s
+        for s in exacts
+        if canon_path(s.path) == canon_path(fp.path) and s.exact
+    ]
+    if len(same) != 1:
+        return None
+    hit = same[0]
+    if hit.body_ns >= 1.0 - TIE_EPS:
+        return hit
+    return None
+
+
+def _pick_exact(fp: Fingerprint, exacts: list[Scored]) -> Optional[Scored]:
+    """Among exact line copies, leftover stubs lose; extract-and-keep stays."""
+    if not exacts:
+        return None
+    kept = origin_holds_body(fp, exacts)
+    if kept is not None:
+        return kept
+    if len(exacts) == 1:
+        return exacts[0]
+    best_ns = max(s.ns for s in exacts)
+    strong = [s for s in exacts if s.ns >= best_ns - EXACT_NS_KEEP]
+    if best_ns >= STRONG_NS_FLOOR:
+        strong = [s for s in strong if s.ns >= STRONG_NS_FLOOR]
+    if len(strong) == 1:
+        return strong[0]
+    if len(strong) > 1:
+        splits = [s for s in strong if is_stem_split(fp.path, s.path)]
+        if len(splits) == 1:
+            return splits[0]
+        return None
+    return max(exacts, key=lambda s: (s.ns, s.score, -len(s.path)))
+
+
+def resolve_fingerprint(fp: Fingerprint, dst: Snapshot, ctx: int, debug: bool) -> Hit:
+    cands = candidates_for_pin(fp, dst)
+    scored: list[Scored] = []
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc, ns, exact = score_pin(fp, dpath, dlines, dline, ctx, dst)
+        body_ns = body_window_score(fp, dlines, dline, ctx)
+        scored.append(Scored(sc, dpath, dline, dlines[dline - 1], ns, exact, body_ns))
+    token = encode_pin(fp)
+    if debug and scored:
+        top = max(scored, key=lambda s: s.score)
+        print(
+            f"# debug {fp.path}:{fp.line} -> {top.path}:{top.line} score={top.score:.3f} cands={len(scored)}",
+            file=sys.stderr,
+        )
+    if not scored:
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            score=0.0,
+            note=note,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+
+    exacts = [s for s in scored if s.exact]
+    picked: Optional[Scored] = None
+    ambiguous_alts: list[Scored] = []
+    if len(exacts) > 1:
+        picked = _pick_exact(fp, exacts)
+        if picked is None:
+            best_ns = max(s.ns for s in exacts)
+            ambiguous_alts = [
+                s
+                for s in exacts
+                if s.ns >= best_ns - EXACT_NS_KEEP and (best_ns < STRONG_NS_FLOOR or s.ns >= STRONG_NS_FLOOR)
+            ]
+            if len(ambiguous_alts) < 2:
+                ambiguous_alts = exacts
+    if picked is None and not ambiguous_alts:
+        scored.sort(key=lambda s: (-s.score, s.path, s.line))
+        top = scored[0].score
+        ties = [s for s in scored if abs(s.score - top) <= TIE_EPS and s.score >= RESOLVE_THRESHOLD]
+        if len(ties) > 1:
+            ambiguous_alts = ties
+        else:
+            picked = scored[0]
+
+    if ambiguous_alts:
+        ambiguous_alts.sort(key=lambda s: (s.path, s.line))
+        locs = "; ".join(f"{s.path}:{s.line}" for s in ambiguous_alts[:8])
+        best = max(s.score for s in ambiguous_alts)
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="ambiguous",
+            score=best,
+            note=f"{len(ambiguous_alts)} copies: {locs}",
+            alts=[(s.path, s.line) for s in ambiguous_alts],
+        )
+
+    assert picked is not None
+    skipped_note = ""
+    if len(exacts) > 1:
+        bits: list[str] = []
+        for s in exacts:
+            if s.path == picked.path and s.line == picked.line:
+                continue
+            if canon_path(s.path) == canon_path(fp.path):
+                # Origin was not picked: it did not hold the body.
+                bits.append(f"leftover stub {s.path}:{s.line}")
+            elif is_stem_split(fp.path, s.path):
+                bits.append(f"extracted copy {s.path}:{s.line}")
+            elif os.path.basename(s.path) == os.path.basename(fp.path):
+                bits.append(f"basename bait {s.path}:{s.line}")
+            else:
+                bits.append(f"{s.path}:{s.line}")
+        if bits:
+            skipped_note = "skipped " + "; ".join(bits[:4])
+    status = classify(fp, picked.path, picked.text, picked.line, picked.score)
+    if status == "deleted":
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        if skipped_note:
+            note = note + "; " + skipped_note
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            dest_path=picked.path,
+            dest_line=picked.line,
+            score=picked.score,
+            note=note,
+            dest_text=picked.text,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "shifted":
+        note = "same file, line number drifted"
+    if skipped_note:
+        note = (note + "; " if note else "") + skipped_note
+    return Hit(
+        fp=fp,
+        name=None,
+        token=token,
+        status=status,
+        dest_path=picked.path,
+        dest_line=picked.line,
+        score=picked.score,
+        note=note,
+        dest_text=picked.text,
+    )
+
+
+def format_from(fp: Fingerprint) -> str:
+    col = f":{fp.col}" if fp.col is not None else ""
+    return f"{fp.path}:{fp.line}{col}"
+
+
+def format_to(hit: Hit) -> str:
+    if hit.status == "ambiguous" and hit.alts:
+        return ",".join(f"{p}:{n}" for p, n in hit.alts)
+    if hit.dest_path is None or hit.dest_line is None or hit.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{hit.fp.col}" if hit.fp.col is not None else ""
+    return f"{hit.dest_path}:{hit.dest_line}{col}"
+
+
+def print_human_hit(hit: Hit) -> None:
+    src = format_from(hit.fp)
+    dst = format_to(hit)
+    if hit.status == "deleted":
+        dst = "(deleted)"
+    extra = f"  {hit.note}" if hit.note else ""
+    label = f"{hit.name}  " if hit.name else ""
+    print(f"{label}{src:40} → {dst:40} {hit.status:11} {hit.score:5.2f}{extra}")
+
+
+def print_porcelain_hit(hit: Hit) -> None:
+    note = hit.note.replace("\t", " ").replace("\n", " ")
+    name = hit.name or "-"
+    print(f"{hit.status}\t{name}\t{format_from(hit.fp)}\t{format_to(hit)}\t{hit.score:.3f}\t{note}")
+
+
+def print_json_hit(hit: Hit) -> None:
+    obj = {
+        "pin": hit.token,
+        "name": hit.name,
+        "from": {"path": hit.fp.path, "line": hit.fp.line, "col": hit.fp.col},
+        "to": (
+            None
+            if hit.dest_path is None or hit.status in {"deleted", "unresolved", "ambiguous"}
+            else {"path": hit.dest_path, "line": hit.dest_line, "col": hit.fp.col}
+        ),
+        "status": hit.status,
+        "score": round(hit.score, 4),
+        "note": hit.note,
+        "text": hit.fp.text,
+        "dest_text": hit.dest_text or None,
+        "origin": hit.fp.origin,
+    }
+    if hit.gap_path is not None:
+        obj["gap"] = {"path": hit.gap_path, "line": hit.gap_line}
+    if hit.alts:
+        obj["candidates"] = [{"path": p, "line": n} for p, n in hit.alts]
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def print_show(fp: Fingerprint, token: str, file=sys.stdout) -> None:
+    print(token, file=file)
+    print(f"  minted: {format_from(fp)}", file=file)
+    print(f"  text:   {fp.text}", file=file)
+    if fp.origin:
+        print(f"  origin: {fp.origin}", file=file)
+    if fp.tokens:
+        print(f"  tokens: {', '.join(fp.tokens)}", file=file)
+    if fp.unique:
+        print(f"  unique: {', '.join(fp.unique)}", file=file)
+    if fp.anchors:
+        print(f"  anchors: {', '.join(fp.anchors)}", file=file)
+    if fp.before:
+        print("  before:", file=file)
+        for line in fp.before:
+            print(f"    - {line}", file=file)
+    if fp.after:
+        print("  after:", file=file)
+        for line in fp.after:
+            print(f"    - {line}", file=file)
+
+
+def parse_pinfile_line(line: str) -> Optional[tuple[Optional[str], str]]:
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    parts = raw.split()
+    token = None
+    name = None
+    for i, part in enumerate(parts):
+        if is_pin_token(part):
+            token = part
+            if i > 0:
+                name = " ".join(parts[:i])
+            break
+    if token is None:
+        return None
+    return name, token
+
+
+def load_pinfile(text: str) -> list[tuple[Optional[str], str]]:
+    out: list[tuple[Optional[str], str]] = []
+    for line in text.splitlines():
+        parsed = parse_pinfile_line(line)
+        if parsed:
+            out.append(parsed)
+    return out
+
+
+def append_pinfile(path: Path, name: Optional[str], token: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{name}\t{token}\n" if name else f"{token}\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def add_common(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--repo", "-C", type=Path, default=None, help="git repository (default: discover from cwd)")
+    sp.add_argument("--json", action="store_true", help="NDJSON output")
+    sp.add_argument("--porcelain", action="store_true", help="TSV output")
+    sp.add_argument("--strict", action="store_true", help="exit 1 if a pin is unresolved or ambiguous")
+    sp.add_argument("--debug", action="store_true", help="scorer traces on stderr")
+    sp.add_argument("--context", type=int, default=3, help="neighbor window (default 3)")
+    sp.add_argument("--untracked", action="store_true", help="include untracked files in worktree snapshots")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="pin",
+        description="Mint a durable fingerprint address and resolve it onto a later tree. Not a locator string.",
+    )
+    p.add_argument("--version", action="version", version=f"pin {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    m = sub.add_parser("mint", help="capture path:line once as a pin token")
+    add_common(m)
+    m.add_argument("locations", nargs="*", help="path:line (once). omit to read locators from stdin")
+    m.add_argument("--from", dest="from_ref", default=None, help="source git ref to mint from")
+    m.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory (skip git)")
+    m.add_argument("--name", action="append", default=None, help="pinfile name (repeat to match locators)")
+    m.add_argument("--file", type=Path, default=None, help="append minted pins to a pinfile")
+    m.add_argument("--force", action="store_true", help="mint even if the line looks trivial")
+    m.add_argument("--pretty", action="store_true", help="dump fingerprint to stderr")
+
+    r = sub.add_parser("resolve", help="land a stored pin on --to / --to-dir; no path:line")
+    add_common(r)
+    r.add_argument("pins", nargs="*", help="pin1.… tokens (or names if --file). omit to read a pinfile on stdin")
+    r.add_argument("--to", dest="to_ref", default=None, help="destination git ref (must exist if given)")
+    r.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    r.add_argument("--file", type=Path, default=None, help="pinfile of stored pins")
+    r.add_argument(
+        "--any-repo",
+        action="store_true",
+        help="allow resolving onto a repository with a different origin fingerprint",
+    )
+
+    s = sub.add_parser("show", help="decode a pin without resolving")
+    s.add_argument("pins", nargs="+", help="pin1.… tokens")
+    s.add_argument("--json", action="store_true", help="JSON payload")
+
+    sub.add_parser("selftest", help="internal checks")
+    return p
+
+
+def git_root_from_args(args: argparse.Namespace, need_git: bool) -> Optional[Path]:
+    if not need_git:
+        return None
+    cwd = Path.cwd()
+    start = args.repo if getattr(args, "repo", None) is not None else cwd
+    git_root = discover_repo(start)
+    if args.repo is not None:
+        git_root = args.repo.resolve()
+        if not (git_root / ".git").exists() and not (git_root / ".git").is_file():
+            print(f"pin: {git_root} is not a git repo", file=sys.stderr)
+            raise SystemExit(2)
+    return git_root
+
+
+def emit_hit(hit: Hit, args: argparse.Namespace) -> None:
+    if args.json:
+        print_json_hit(hit)
+    elif args.porcelain:
+        print_porcelain_hit(hit)
+    else:
+        print_human_hit(hit)
+
+
+def load_one_into(
+    snap: Snapshot,
+    path: str,
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+) -> Optional[str]:
+    """Mint-target fallback: load one file even if the snapshot skipped it."""
+    nfc = canon_path(path)
+    if directory is not None:
+        for form in path_forms(path):
+            fp = directory / form
+            if fp.is_file():
+                lines = read_fs_file(fp, required=True, display=form)
+                if lines is not None:
+                    return inject_file(snap, nfc, lines)
+        return None
+    if git_root is None:
+        return None
+    names = load_git_paths(git_root, ref)
+    git_name = None
+    for key, gn in names:
+        if key == nfc or gn in path_forms(path) or canon_path(gn) == nfc:
+            git_name = gn
+            break
+    if git_name is None:
+        # last chance: try the locator bytes against the filesystem / git
+        for form in path_forms(path):
+            lines = read_git_file(git_root, ref, form, required=False)
+            if lines is not None:
+                return inject_file(snap, nfc, lines, git_name=form)
+        return None
+    lines = read_git_file(git_root, ref, git_name, required=True)
+    if lines is None:
+        return None
+    return inject_file(snap, nfc, lines, git_name=git_name)
+
+
+def cmd_mint(args: argparse.Namespace) -> int:
+    need_git = args.from_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.from_ref:
+        verify_git_ref(git_root, args.from_ref)
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else args.from_ref,
+        directory=args.from_dir,
+        untracked=args.untracked,
+        label=str(args.from_dir or args.from_ref or "worktree"),
+        empty_ok=True,
+    )
+    locations = list(args.locations)
+    if not locations:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["mint", "-h"])
+            return 2
+        for line in sys.stdin.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            locations.append(line)
+    names = list(args.name or [])
+    if names and len(names) not in (1, len(locations)):
+        print("pin mint: --name count must be 1 or match locators", file=sys.stderr)
+        return 2
+    if names and len(names) == 1 and len(locations) > 1:
+        print("pin mint: give one --name per locator", file=sys.stderr)
+        return 2
+    unresolved = False
+    for i, loc in enumerate(locations):
+        try:
+            path, line, col = parse_locator(loc, src.paths)
+            if canon_path(path) not in src.files:
+                loaded = load_one_into(
+                    src,
+                    path,
+                    git_root=git_root,
+                    ref=None if args.from_dir is not None else args.from_ref,
+                    directory=args.from_dir,
+                )
+                if loaded:
+                    path = loaded
+            fp = mint_fingerprint(src, path, line, col, args.context, args.force)
+        except SystemExit as e:
+            msg = str(e)
+            if msg and msg != "2":
+                print(msg if msg.startswith("pin") else f"pin mint: {msg}", file=sys.stderr)
+            unresolved = True
+            continue
+        token = encode_pin(fp)
+        name = names[i] if names else None
+        if args.file is not None:
+            append_pinfile(args.file, name, token)
+        if args.pretty:
+            print_show(fp, token, file=sys.stderr)
+            print(f"{name}\t{token}" if name else token)
+            continue
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "pin": token,
+                        "name": name,
+                        "from": {"path": fp.path, "line": fp.line, "col": fp.col},
+                        "text": fp.text,
+                        "tokens": fp.tokens,
+                        "unique": fp.unique,
+                        "origin": fp.origin,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        elif args.porcelain:
+            n = name or "-"
+            print(f"minted\t{n}\t{format_from(fp)}\t{token}")
+        elif name:
+            print(f"{name}\t{token}")
+        else:
+            print(token)
+    if unresolved:
+        return 1
+    return 0
+
+
+def origins_match(pin_origin: Optional[str], dest_origin: Optional[str]) -> bool:
+    if not pin_origin or not dest_origin:
+        return True
+    return pin_origin == dest_origin
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    items: list[tuple[Optional[str], str]] = []
+    file_entries: list[tuple[Optional[str], str]] = []
+    if args.file is not None:
+        try:
+            text = args.file.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"pin resolve: cannot read {args.file}: {e}", file=sys.stderr)
+            return 2
+        file_entries = load_pinfile(text)
+        by_name = {n: t for n, t in file_entries if n}
+    else:
+        by_name = {}
+
+    if args.pins:
+        for raw in args.pins:
+            if is_pin_token(raw):
+                items.append((None, raw))
+            elif raw in by_name:
+                items.append((raw, by_name[raw]))
+            elif ":" in raw and not is_pin_token(raw) and re.search(r":\d+$", raw):
+                print(
+                    f"pin resolve: {raw} is a locator; pins are minted tokens, not path:line",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                print(f"pin resolve: not a pin token: {raw}", file=sys.stderr)
+                return 2
+    elif args.file is not None:
+        items = file_entries
+    else:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["resolve", "-h"])
+            return 2
+        items = load_pinfile(sys.stdin.read())
+        if not items:
+            print("pin resolve: stdin had no pin tokens", file=sys.stderr)
+            return 2
+
+    need_git = args.to_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.to_ref:
+        verify_git_ref(git_root, args.to_ref)
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else args.to_ref,
+        directory=args.to_dir,
+        untracked=args.untracked,
+        label=str(args.to_dir or args.to_ref or "worktree"),
+        empty_ok=bool(need_git and args.to_ref),
+    )
+
+    unresolved = False
+    ambiguous = False
+    for name, token in items:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            # Fail closed, like show. A clipped token is not a search result.
+            print(f"pin resolve: {e}", file=sys.stderr)
+            return 1
+        dest_origin = dst.origin
+        if not getattr(args, "any_repo", False) and not origins_match(fp.origin, dest_origin):
+            print(
+                f"pin resolve: pin belongs to a different repository "
+                f"({fp.origin} vs {dest_origin}); pass --any-repo to override",
+                file=sys.stderr,
+            )
+            return 1
+        hit = resolve_fingerprint(fp, dst, args.context, args.debug)
+        hit.name = name
+        hit.token = token
+        emit_hit(hit, args)
+        if hit.status == "unresolved":
+            unresolved = True
+        if hit.status == "ambiguous":
+            ambiguous = True
+    if args.strict and (unresolved or ambiguous):
+        return 1
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    rc = 0
+    for token in args.pins:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            print(f"pin show: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        if args.json:
+            print(json.dumps({"pin": token, **fp.payload()}, ensure_ascii=False))
+        else:
+            print_show(fp, token)
+    return rc
+
+
+def _snap(files: dict[str, str], label: str = "t", origin: Optional[str] = None) -> Snapshot:
+    parsed = {canon_path(k): v.splitlines() for k, v in files.items()}
+    s = Snapshot(label=label, files=parsed, origin=origin)
+    s.index()
+    return s
+
+
+def cmd_selftest() -> int:
+    fails = 0
+
+    def check(cond: bool, msg: str) -> None:
+        nonlocal fails
+        if not cond:
+            print(f"selftest FAIL: {msg}", file=sys.stderr)
+            fails += 1
+
+    fp = Fingerprint(
+        path="src/app.rs",
+        line=529,
+        text="pub fn seen_hunk_fingerprint(",
+        tokens=["seen_hunk_fingerprint"],
+        unique=["seen_hunk_fingerprint"],
+        before=["/// the hunk behaves as if it were unmarked (auto-expand)."],
+        after=["    seen: &BTreeMap<(PathBuf, usize), u64>,"],
+        origin="git:deadbeefdeadbeef",
+    )
+    token = encode_pin(fp)
+    check(token.startswith(PREFIX), "token prefix")
+    back = decode_pin(token)
+    check(back.path == fp.path and back.text == fp.text, "roundtrip fields")
+    check(back.origin == fp.origin, "origin survives the token")
+    check(encode_pin(back) == token, "canonical re-encode")
+    check(path_score("src/app.rs", "src/app/layout.rs") >= 0.80, "split-dir path affinity")
+    check(path_score("src/calc.py", "src/calc/ops.py") > path_score("src/calc.py", "src/legacy/calc.py"), "stem split beats basename")
+    check(path_score("src/calc.py", "src/math/ops.py") < 1.0, "rename is not identity")
+    check(normalize("  fn foo  ") == "fn foo", "normalize")
+    check("seen_hunk_fingerprint" in tokens("pub fn seen_hunk_fingerprint("), "tokens")
+    sample = [
+        "def secret_sauce(x):",
+        "    MAGIC = 0xDEADBEEF",
+        "    return x ^ MAGIC",
+        "",
+        "def doomed():",
+        "    return \"this will be deleted\"",
+        "",
+        "def helper_keep():",
+        "    return \"stable helper\"",
+    ]
+    b, a = collect_neighbors(sample, 8, 3)
+    check(not any("doomed" in x for x in b + a), "sibling def is not a neighbor")
+    check(not any("deleted" in x for x in b + a), "previous function body is not a neighbor")
+    check(any("stable helper" in x for x in a), "body after a def is a neighbor")
+    check(is_def_line("pub fn seen_hunk_fingerprint("), "rust pub fn is a def")
+    check(is_def_line("pub(crate) fn edit_insert_str("), "rust vis fn is a def")
+    check(is_def_line("public func transform(_ request: TransformRequest)"), "swift func is a def")
+    check(not is_def_line("/// the hunk behaves"), "doc comment is not a def")
+    try:
+        decode_pin("pin1.not-valid-base64xx")
+        check(False, "corrupt pin should raise")
+    except ValueError:
+        check(True, "corrupt pin")
+    check(not is_pin_token("pin1.xxxx"), "short junk is not a pin token")
+    check(not is_pin_token("pin1."), "bare prefix is not a pin token")
+
+    nfc = canon_path("src/cafe\u0301.py")
+    check(nfc == "src/caf\u00e9.py", "NFD locator canons to NFC")
+    check(canon_path("src/caf\u00e9.py") == nfc, "NFC is stable")
+
+    src = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            )
+        },
+        origin="git:aaaaaaaaaaaaaaaa",
+    )
+    minted = mint_fingerprint(src, "src/calc.py", 4, None, 3, False)
+    check("helper_keep" in minted.unique, "helper_keep unique at mint")
+    check(any("stable helper" in x for x in minted.after), "body captured")
+
+    leftover = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.calc.ops import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    "    from src.calc.ops import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+        }
+    )
+    hit = resolve_fingerprint(minted, leftover, 3, False)
+    check(hit.status == "moved", f"leftover stub status {hit.status}")
+    check(
+        hit.dest_path == "src/calc/ops.py",
+        f"leftover stub stole the pin: {hit.dest_path}:{hit.dest_line} {hit.note}",
+    )
+    check(hit.score < 1.0 or hit.dest_path == "src/calc/ops.py", "stub must not be 1.000 identity")
+    check("leftover stub" in hit.note, f"note should name the skipped stub: {hit.note}")
+    check("basename bait" in hit.note, f"note should name basename bait: {hit.note}")
+    add_fp = mint_fingerprint(src, "src/calc.py", 1, None, 3, False)
+    add_hit = resolve_fingerprint(add_fp, leftover, 3, False)
+    check(
+        add_hit.dest_path == "src/calc/ops.py",
+        f"add() leftover stub stole the pin: {add_hit.dest_path} {add_hit.note}",
+    )
+
+    # Extract-and-keep: origin file is untouched; a stem-split copy exists.
+    # That is identity, not a move, and origin is not basename bait.
+    kept = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+        }
+    )
+    keep_hit = resolve_fingerprint(minted, kept, 3, False)
+    check(
+        keep_hit.status in {"same", "shifted"},
+        f"extract-and-keep status {keep_hit.status} {keep_hit.dest_path}",
+    )
+    check(
+        keep_hit.dest_path == "src/calc.py",
+        f"extract-and-keep reported as move to {keep_hit.dest_path}:{keep_hit.dest_line} {keep_hit.note}",
+    )
+    check("basename bait src/calc.py" not in keep_hit.note, f"origin labeled bait: {keep_hit.note}")
+    check("extracted copy" in keep_hit.note, f"note should name the extract: {keep_hit.note}")
+    check("basename bait src/legacy/calc.py" in keep_hit.note, f"legacy still bait: {keep_hit.note}")
+    keep_add = resolve_fingerprint(add_fp, kept, 3, False)
+    check(
+        keep_add.dest_path == "src/calc.py",
+        f"extract-and-keep add() moved: {keep_add.dest_path} {keep_add.note}",
+    )
+
+    # Leftover that kept the docstring: ns can be 0.5 at origin. Body is gone.
+    docstub = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.calc.ops import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    from src.calc.ops import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    return a + b",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    src_doc = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            )
+        }
+    )
+    add_doc = mint_fingerprint(src_doc, "src/calc.py", 1, None, 3, False)
+    add_doc_hit = resolve_fingerprint(add_doc, docstub, 3, False)
+    check(
+        add_doc_hit.dest_path == "src/calc/ops.py",
+        f"docstring leftover stole add(): {add_doc_hit.dest_path} {add_doc_hit.note}",
+    )
+    check("leftover stub" in add_doc_hit.note, f"docstring leftover unnamed: {add_doc_hit.note}")
+
+    # Origin still has the body; comments pushed it past ctx=3.
+    noisy = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    """kept docs"""',
+                    "    # noisy",
+                    "    # noisy",
+                    "    # noisy",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    noisy_src = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            )
+        }
+    )
+    noisy_fp = mint_fingerprint(noisy_src, "src/calc.py", 1, None, 3, False)
+    noisy_hit = resolve_fingerprint(noisy_fp, noisy, 3, False)
+    check(
+        noisy_hit.dest_path == "src/calc.py",
+        f"noisy extract-and-keep moved: {noisy_hit.dest_path} {noisy_hit.note}",
+    )
+    check(
+        noisy_hit.status in {"same", "shifted"},
+        f"noisy extract-and-keep status {noisy_hit.status}",
+    )
+    check("leftover stub src/calc.py" not in noisy_hit.note, f"origin labeled stub: {noisy_hit.note}")
+    check("extracted copy" in noisy_hit.note, f"noisy note should name extract: {noisy_hit.note}")
+
+    twins = _snap(
+        {
+            "a/ops.py": "def helper_keep():\n    return \"stable helper\"\n",
+            "z/calc.py": "def helper_keep():\n    return \"stable helper\"\n",
+        }
+    )
+    hit2 = resolve_fingerprint(minted, twins, 3, False)
+    check(hit2.status == "ambiguous", f"identical helpers should be ambiguous, got {hit2.status} {hit2.dest_path}")
+    check(hit2.score < 1.0 or hit2.status == "ambiguous", "must not emit 1.000 at two addresses as a landing")
+    note = hit2.note
+    check("a/ops.py" in note and "z/calc.py" in note, f"ambiguous note lists both: {note}")
+
+    foreign = _snap({"pkg/util.py": "def helper_keep():\n    return \"stable helper\"\n"}, origin="git:bbbbbbbbbbbbbbbb")
+    check(not origins_match(minted.origin, foreign.origin), "foreign origin detected")
+    check(origins_match(minted.origin, minted.origin), "same origin ok")
+    check(origins_match(minted.origin, None), "gitless dest allowed")
+
+    v1 = {"v": 1, "p": "src/a.py", "n": 1, "t": "x = 1"}
+    old = Fingerprint.from_payload(v1)
+    check(old.origin is None and old.path == "src/a.py", "v1 payload still decodes")
+
+    if fails:
+        print(f"selftest: {fails} failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+_VALUE_FLAGS = {
+    "--repo",
+    "-C",
+    "--from",
+    "--from-dir",
+    "--to",
+    "--to-dir",
+    "--file",
+    "--name",
+    "--context",
+}
+_COMMANDS = {"mint", "resolve", "show", "selftest"}
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Allow flags on either side of the subcommand, and `pin pin1.…` as resolve."""
+    if not argv:
+        return argv
+    if argv[0] in _COMMANDS or argv[0] in {"-h", "--help", "--version"}:
+        return argv
+    if is_pin_token(argv[0]) or (argv[0] == "-" and len(argv) == 1):
+        return ["resolve", *argv]
+
+    i = 0
+    cmd_at: Optional[int] = None
+    while i < len(argv):
+        a = argv[i]
+        if a in _COMMANDS:
+            cmd_at = i
+            break
+        if is_pin_token(a) or a == "-":
+            return ["resolve", *argv]
+        if a.startswith("--") and "=" in a:
+            i += 1
+            continue
+        if a in _VALUE_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        i += 1
+    if cmd_at is not None and cmd_at != 0:
+        return [argv[cmd_at], *argv[:cmd_at], *argv[cmd_at + 1 :]]
+    if any(is_pin_token(a) for a in argv):
+        return ["resolve", *argv]
+    return argv
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = normalize_argv(argv)
+    args = build_parser().parse_args(argv)
+    if not args.cmd:
+        build_parser().print_help()
+        return 2
+    if args.cmd == "mint":
+        return cmd_mint(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    if args.cmd == "show":
+        return cmd_show(args)
+    if args.cmd == "selftest":
+        return cmd_selftest()
+    build_parser().print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
+        print(f"pin: git failed: {err}", file=sys.stderr)
+        sys.exit(2)

@@ -1,0 +1,38 @@
+follow-up after attack.py (targeted)
+
+1. paint("red")
+   ./tacit -C fixtures/kwpos --all --header paint
+   only unlabeled.swift:9 (opacity OVERRIDE) and :11 (both SHADOW).
+   paint("red") at :8 is absent.
+
+2. block-comment call
+   residue.swift:8 PresenceArbiter(/* presentThreshold: 0.45 */ sensors: ["camera"])
+   not in comments.tsv. :7 and :9 TACIT only.
+
+3. FOSSIL-only --check
+   default 0.45→0.50, only caller restates 0.45
+   FOSSIL OVERRIDE 0.45
+   --check rc=0
+
+4. FOSSIL 0.40 of old 0.4
+   FOSSIL OVERRIDE presentThreshold 0.4→0.45 passed 0.40
+
+5. e9b0f75 insert order
+   parent: sensors, threshold=0.4, emaAlpha=0.3, frameProvider
+   new:    sensors, presentThreshold=0.45, absentThreshold=0.35, emaAlpha=0.3, frameProvider
+   absentThreshold inserted AFTER the renamed slot; emaAlpha kept so index 2 is not stolen.
+   shift fixture (insert BEFORE) pairs absentThreshold with old threshold 0.4→0.35.
+
+6. kizu quoted --agent
+   no --agent "..." or --agent='...' in kizu *.rs.
+   quoted-value hole is fixture-only.
+
+7. kizu hook-post-tool without --agent
+   every hit is comment, contains(), or token match.
+   the 6 TACIT rows are exactly the command-shaped subset of those.
+
+8. tenaoshi PanelSession.swift:623
+   func reopenUnit(id: String) { review?.reopenUnit(id: id) }
+   false TACIT on the wrapper signature.
+
+selftest 33/33, demo 32/32 after all of the above. no rewrite.

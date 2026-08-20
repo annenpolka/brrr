@@ -12,8 +12,8 @@ Coordinator stays in the parent workspace. Candidates live in isolated git workt
 - `lab/STATE.md` — live experiment board (generation, workers, decisions)
 - `lab/PROTOCOL.md` — how candidates report, how judges score
 - `lab/heartbeat.md` — heartbeat log
-- `lab/lineages/` — collected candidate reports copied out of worktrees
-- `EVOLUTION_REPORT.md` — written in the last twenty minutes
+- `lab/lineages/` — harvested reports **and implementations** (CLI + fixtures/tests). Worktrees were the authoring surface; this tree is the archive.
+- `EVOLUTION_REPORT.md` — final jury + preservation pass
 
 ## Phases (JST)
 

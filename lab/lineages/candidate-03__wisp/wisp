@@ -1,0 +1,1130 @@
+#!/usr/bin/env python3
+"""wisp — code that lived between two git refs and vanished, plus remnants."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator
+
+VERSION = "0.2.0"
+
+# Python 3 \w is Unicode-aware; reject leading digits.
+IDENT_RE = re.compile(r"[^\W\d][\w]*", re.UNICODE)
+
+RE_RUST = [
+    re.compile(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+        r"(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
+        r"(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+        r"(?:fn|struct|enum|trait|type|mod)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(r"^\s*impl(?:\s*<[^>]*>)?\s+(?:[A-Za-z_][A-Za-z0-9_:]*\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_PY = [
+    re.compile(r"^\s*(?:async\s+)?def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_RB = [
+    re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*module\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_JS = [
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*(?:export\s+)?(?:type|interface|enum|namespace)\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r"(?:async\s+)?(?:function\b|\()"
+    ),
+]
+RE_GO = [
+    re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_SWIFT = [
+    re.compile(
+        r"^\s*(?:public\s+|private\s+|internal\s+|fileprivate\s+|open\s+)?"
+        r"(?:override\s+)?(?:mutating\s+)?"
+        r"(?:func|class|struct|enum|protocol|actor|typealias)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+]
+RE_KT = [
+    re.compile(
+        r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+)?"
+        r"(?:override\s+)?(?:fun|class|object|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+]
+RE_SH = [
+    re.compile(r"^\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)|(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\))"),
+]
+RE_PKL = [
+    re.compile(r"^\s*(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*typealias\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*module\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+# Conservative fallback: keywords, never JS let/const or shell name().
+RE_FALLBACK = RE_RUST + RE_PY + RE_GO + RE_SWIFT
+
+EXT_RES: dict[str, list[re.Pattern[str]]] = {}
+for _ext, _res in (
+    ((".rs",), RE_RUST),
+    ((".py",), RE_PY),
+    ((".rb",), RE_RB),
+    ((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"), RE_JS),
+    ((".go",), RE_GO),
+    ((".swift",), RE_SWIFT),
+    ((".kt", ".kts"), RE_KT),
+    ((".sh", ".bash", ".zsh"), RE_SH),
+    ((".pkl",), RE_PKL),
+):
+    for _e in _ext:
+        EXT_RES[_e] = _res
+
+# `use foo as bar` / `app_with_files as fake_app` — living aliases, not ghosts.
+ALIAS_RE = re.compile(r"\bas\s+([A-Za-z_][A-Za-z0-9_]*)\s*[,}\n]")
+# Head/base presence only: a let/const binding means the name still lives.
+LIVE_BIND_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:pub(?:\([^)]*\))?\s+)?"
+    r"(?:let|const|var|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+
+KIND_HINT = (
+    (re.compile(r"\bfn\b|\bfunc\b|\bfunction\b|\bdef\b|\bfun\b"), "fn"),
+    (re.compile(r"\bstruct\b"), "struct"),
+    (re.compile(r"\benum\b"), "enum"),
+    (re.compile(r"\bclass\b|\bobject\b"), "class"),
+    (re.compile(r"\btrait\b|\bprotocol\b|\binterface\b"), "trait"),
+    (re.compile(r"\btype\b|\btypealias\b"), "type"),
+    (re.compile(r"\bmod\b|\bmodule\b|\bnamespace\b"), "mod"),
+)
+
+STOP = {
+    "a", "an", "the", "and", "or", "if", "else", "for", "while", "do", "in", "of",
+    "to", "from", "with", "by", "as", "is", "it", "at", "on", "be", "this", "that",
+    "self", "super", "crate", "true", "false", "none", "null", "nil", "ok", "err",
+    "error", "result", "option", "some", "where", "when", "then", "return", "break",
+    "continue", "let", "var", "const", "mut", "pub", "use", "import", "export",
+    "default", "new", "get", "set", "len", "map", "list", "item", "data", "value",
+    "name", "type", "file", "path", "info", "debug", "log", "fmt", "str", "string",
+    "int", "bool", "byte", "bytes", "char", "float", "number", "object", "array",
+    "vec", "hash", "hashmap", "dict", "init", "main", "app", "view", "config",
+    "parse", "dump", "load", "save", "read", "write", "update", "create", "delete",
+    "add", "remove", "make", "build", "run", "start", "stop", "test", "tests",
+    "spec", "assert", "expect", "should", "describe", "context", "before", "after",
+    "id", "key", "val", "src", "dst", "out", "input", "output", "left", "right",
+    "next", "prev", "first", "last", "index", "count", "size", "length", "text",
+    "line", "row", "col", "msg", "message", "code", "status", "state", "mode",
+    "kind", "flag", "args", "arg", "opts", "opt", "param", "params", "tmp", "temp",
+    "foo", "bar", "baz", "qux", "todo", "fixme", "xxx", "note", "hack",
+    "string", "integer", "boolean", "undefined", "function", "class", "struct",
+    "impl", "trait", "enum", "module", "package", "namespace",
+    "head", "take", "span", "chars", "sticky", "body", "rule", "user", "html",
+    "func", "client", "sample", "score", "entry", "plugin", "present",
+    "presence", "center", "alert", "granted", "action", "step", "amount",
+    "manual", "patterns", "voidtrace", "kizu", "sitbone", "tenaoshi",
+}
+
+SKIP_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".pdf", ".zip",
+    ".gz", ".tgz", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".mov",
+    ".wav", ".mp3", ".bin", ".wasm", ".lock", ".min.js", ".min.css", ".map",
+    ".sum", ".snap", ".pb", ".exe", ".dll", ".so", ".dylib",
+}
+
+SKIP_PATH_PARTS = (
+    "/node_modules/",
+    "/.pnpm-store/",
+    "/target/",
+    "/.build/",
+    "/dist/",
+    "/vendor/",
+    "/.git/",
+)
+
+COMMENT_LINE = re.compile(
+    r"^\s*(?:#|//|--|/\*|\*|<!--|;;|;)"
+)
+
+DOC_EXT = {".md", ".mdx", ".rst", ".txt", ".adoc", ".org"}
+CODE_EXT = {
+    ".rs", ".py", ".go", ".js", ".jsx", ".ts", ".tsx", ".swift", ".rb", ".c",
+    ".h", ".cc", ".cpp", ".java", ".kt", ".kts", ".cs", ".php", ".sh", ".bash",
+    ".zsh", ".lua", ".r", ".jl", ".scala", ".hs", ".erl", ".ex", ".exs", ".ml",
+    ".m", ".mm", ".vue", ".svelte", ".pkl",
+}
+SKIP_REMNANT_EXT = {".json", ".jsonl", ".lock", ".svg", ".csv", ".bin", ".dat"}
+
+
+class WispError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def color_enabled(no_color: bool) -> bool:
+    if no_color or os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+class Ink:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _c(self, code: str, text: str) -> str:
+        if not self.enabled:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def bold(self, t: str) -> str:
+        return self._c("1", t)
+
+    def dim(self, t: str) -> str:
+        return self._c("2", t)
+
+    def red(self, t: str) -> str:
+        return self._c("31", t)
+
+    def yellow(self, t: str) -> str:
+        return self._c("33", t)
+
+    def cyan(self, t: str) -> str:
+        return self._c("36", t)
+
+    def green(self, t: str) -> str:
+        return self._c("32", t)
+
+
+def git(repo: str, *args: str, check: bool = True, input: str | None = None) -> str:
+    cmd = ["git", "-C", repo, "-c", "core.quotepath=false", *args]
+    proc = subprocess.run(
+        cmd,
+        input=input,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if check and proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"git {' '.join(args)} failed"
+        raise WispError(err)
+    return proc.stdout
+
+
+def git_ok(repo: str, *args: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    return proc.returncode == 0
+
+
+def short_sha(sha: str) -> str:
+    return sha[:8] if sha else ""
+
+
+def empty_tree(repo: str) -> str:
+    return git(repo, "hash-object", "-t", "tree", "--stdin", input="").strip()
+
+
+@dataclass
+class Range:
+    repo: str
+    base: str | None  # None means the empty tree (inclusive root)
+    head: str
+    base_label: str
+    head_label: str
+    truncated: bool
+    commit_count: int = 0
+
+
+@dataclass
+class CommitInfo:
+    sha: str
+    ts: int
+    subject: str
+
+
+@dataclass
+class FileWisp:
+    path: str
+    born: CommitInfo | None = None
+    died: CommitInfo | None = None
+
+
+@dataclass
+class SymbolHist:
+    name: str
+    adds: list[tuple[CommitInfo, str, str]] = field(default_factory=list)  # commit, path, snippet
+    dels: list[tuple[CommitInfo, str, str]] = field(default_factory=list)
+    kinds: set[str] = field(default_factory=set)
+
+
+@dataclass
+class SymbolWisp:
+    name: str
+    kind: str
+    path: str
+    born: CommitInfo | None
+    died: CommitInfo | None
+    snippet: str
+    testlike: bool
+
+
+@dataclass
+class Remnant:
+    name: str
+    path: str
+    line: int
+    text: str
+    role: str  # code | comment | doc | other
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    proc = subprocess.run(
+        ["git", "-C", start, "-c", "core.quotepath=false", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if proc.returncode != 0:
+        raise WispError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+def rev_parse(repo: str, ref: str) -> str:
+    try:
+        return git(repo, "rev-parse", "--verify", ref).strip()
+    except WispError as e:
+        raise WispError(f"unknown ref {ref!r}: {e}") from e
+
+
+def default_branch_ref(repo: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    for name in ("main", "master", "trunk", "develop"):
+        if git_ok(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return f"refs/heads/{name}"
+    return None
+
+
+def auto_range(repo: str, max_commits: int, root: bool) -> Range:
+    head = rev_parse(repo, "HEAD")
+    head_label = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() or "HEAD"
+    if head_label == "HEAD":
+        head_label = short_sha(head)
+
+    if root:
+        count = int(git(repo, "rev-list", "--count", "HEAD").strip() or "0")
+        truncated = count > max_commits
+        if truncated:
+            # Walk the most recent window so we still have a commit as base.
+            window = git(repo, "rev-list", f"--max-count={max_commits + 1}", "HEAD").splitlines()
+            base = window[-1]
+            return Range(repo, base, head, short_sha(base), head_label, True, max_commits)
+        return Range(repo, None, head, "∅", head_label, False, count)
+
+    branch = default_branch_ref(repo)
+    if branch:
+        base = git(repo, "merge-base", branch, "HEAD").strip()
+        branch_sha = rev_parse(repo, branch)
+        if base != head:
+            count = int(git(repo, "rev-list", "--count", f"{base}..{head}").strip() or "0")
+            label = branch.replace("refs/heads/", "").replace("refs/remotes/", "")
+            truncated = count > max_commits
+            return Range(repo, base, head, label, head_label, truncated, min(count, max_commits))
+        if branch_sha == head:
+            # On the default branch: fall through to a history window.
+            pass
+
+    window = git(repo, "rev-list", f"--max-count={max_commits + 1}", "HEAD").splitlines()
+    if not window:
+        raise WispError("repository has no commits")
+    if len(window) == 1:
+        return Range(repo, None, head, "∅", head_label, False, 1)
+    if len(window) > max_commits:
+        base = window[-1]
+        return Range(repo, base, head, short_sha(base), head_label, True, max_commits)
+    oldest = window[-1]
+    parents = git(repo, "rev-list", "--parents", "-n", "1", oldest).split()
+    if len(parents) <= 1:
+        return Range(repo, None, head, "∅", head_label, False, len(window))
+    return Range(repo, oldest, head, short_sha(oldest), head_label, False, len(window) - 1)
+
+
+def resolve_range(repo: str, base_arg: str | None, head_arg: str | None, max_commits: int, root: bool) -> Range:
+    if root and (base_arg or head_arg):
+        raise WispError("--root cannot be combined with explicit refs")
+    if not base_arg and not head_arg:
+        rng = auto_range(repo, max_commits, root)
+        rng.commit_count = count_commits(rng, max_commits)
+        return rng
+    head_label = head_arg or "HEAD"
+    head = rev_parse(repo, head_label)
+    if not base_arg:
+        rng = Range(repo, None, head, "∅", head_label, False)
+        rng.commit_count = count_commits(rng, max_commits)
+        return rng
+    base = rev_parse(repo, base_arg)
+    rng = Range(repo, base, head, base_arg, head_label, False)
+    rng.commit_count = count_commits(rng, max_commits)
+    return rng
+
+
+def count_commits(rng: Range, max_commits: int) -> int:
+    args = log_prefix(rng) + [f"--max-count={max_commits + 1}", "--pretty=format:%H"]
+    shas = [l for l in git(rng.repo, *args).splitlines() if l]
+    if len(shas) > max_commits:
+        rng.truncated = True
+        return max_commits
+    return len(shas)
+
+
+def log_prefix(rng: Range) -> list[str]:
+    if rng.base is None:
+        return ["log", "--root", rng.head]
+    return ["log", f"{rng.base}..{rng.head}"]
+
+
+def path_args(path: str | None) -> list[str]:
+    if not path:
+        return []
+    return ["--", path]
+
+
+def skip_path(path: str) -> bool:
+    norm = "/" + path.replace("\\", "/").lstrip("/")
+    if any(part in norm for part in SKIP_PATH_PARTS):
+        return True
+    lower = path.lower()
+    for ext in SKIP_EXT:
+        if lower.endswith(ext):
+            return True
+    return False
+
+
+def ext_of(path: str) -> str:
+    return os.path.splitext(path.lower().replace("\\", "/"))[1]
+
+
+def def_regexes_for(path: str) -> list[re.Pattern[str]]:
+    ext = ext_of(path)
+    if ext in DOC_EXT:
+        return []
+    return EXT_RES.get(ext, RE_FALLBACK if ext in CODE_EXT else [])
+
+
+def extract_def(line: str, path: str = "") -> tuple[str, str] | None:
+    raw = line[1:] if line[:1] in "+-" else line
+    if raw.startswith("+++") or raw.startswith("---"):
+        return None
+    if COMMENT_LINE.match(raw):
+        return None
+    regexes = def_regexes_for(path) if path else RE_FALLBACK
+    if not regexes:
+        return None
+    for cre in regexes:
+        m = cre.match(raw)
+        if not m:
+            continue
+        name = next((g for g in m.groups() if g), None)
+        if not name:
+            continue
+        kind = "def"
+        for kre, label in KIND_HINT:
+            if kre.search(raw):
+                kind = label
+                break
+        return name, kind
+    return None
+
+
+def parse_name_status(rng: Range, max_commits: int, path: str | None) -> tuple[dict[str, FileWisp], dict[str, CommitInfo]]:
+    args = log_prefix(rng) + [
+        f"--max-count={max_commits}",
+        "--reverse",
+        "--find-renames",
+        "--name-status",
+        "--pretty=format:COMMIT\t%H\t%ct\t%s",
+        *path_args(path),
+    ]
+    out = git(rng.repo, *args)
+    files: dict[str, FileWisp] = {}
+    commits: dict[str, CommitInfo] = {}
+    current: CommitInfo | None = None
+    for raw in out.splitlines():
+        if not raw:
+            continue
+        if raw.startswith("COMMIT\t"):
+            _, sha, ts, subject = (raw.split("\t", 3) + [""])[:4]
+            current = CommitInfo(sha, int(ts or 0), subject)
+            commits[sha] = current
+            continue
+        if current is None:
+            continue
+        parts = raw.split("\t")
+        status = parts[0]
+        letter = status[:1]
+        if letter == "R" or letter == "C":
+            if len(parts) < 3:
+                continue
+            old, new = parts[1], parts[2]
+            fw = files.setdefault(old, FileWisp(old))
+            fw.died = current
+            fw = files.setdefault(new, FileWisp(new))
+            if fw.born is None:
+                fw.born = current
+            continue
+        if len(parts) < 2:
+            continue
+        p = parts[1]
+        fw = files.setdefault(p, FileWisp(p))
+        if letter == "A":
+            if fw.born is None:
+                fw.born = current
+        elif letter == "D":
+            fw.died = current
+        else:
+            if fw.born is None:
+                fw.born = current
+    return files, commits
+
+
+def ls_tree_names(repo: str, ref: str | None) -> set[str]:
+    if ref is None:
+        return set()
+    out = git(repo, "ls-tree", "-r", "-z", "--name-only", ref)
+    return {p for p in out.split("\0") if p}
+
+
+def ephemeral_files(tracked: dict[str, FileWisp], base_names: set[str], head_names: set[str]) -> list[FileWisp]:
+    out = []
+    for path, fw in tracked.items():
+        if skip_path(path):
+            continue
+        if path in base_names or path in head_names:
+            continue
+        # Must have appeared as a birth in-range, or simply not at either end.
+        out.append(fw)
+    out.sort(key=lambda f: (f.born.ts if f.born else 0, f.path))
+    return out
+
+
+def parse_patches(rng: Range, max_commits: int, path: str | None, commits: dict[str, CommitInfo]) -> dict[str, SymbolHist]:
+    args = log_prefix(rng) + [
+        f"--max-count={max_commits}",
+        "--reverse",
+        "-U0",
+        "--pretty=format:COMMIT\t%H\t%ct\t%s",
+        *path_args(path),
+    ]
+    out = git(rng.repo, *args)
+    symbols: dict[str, SymbolHist] = {}
+    current: CommitInfo | None = None
+    file_path = ""
+    old_path = ""
+    pending_snippet: list[str] = []
+    pending_name: str | None = None
+    pending_sign: str | None = None
+
+    def flush() -> None:
+        nonlocal pending_name, pending_snippet, pending_sign
+        if pending_name and current:
+            snip = "\n".join(pending_snippet[:4])
+            hist = symbols.setdefault(pending_name, SymbolHist(pending_name))
+            entry = (current, file_path, snip)
+            if pending_sign == "+":
+                hist.adds.append(entry)
+            else:
+                hist.dels.append(entry)
+        pending_name = None
+        pending_snippet = []
+        pending_sign = None
+
+    for raw in out.splitlines():
+        if raw.startswith("COMMIT\t"):
+            flush()
+            _, sha, ts, subject = (raw.split("\t", 3) + [""])[:4]
+            current = commits.get(sha) or CommitInfo(sha, int(ts or 0), subject)
+            commits[sha] = current
+            file_path = ""
+            old_path = ""
+            continue
+        if raw.startswith("diff --git "):
+            flush()
+            rest = raw[len("diff --git "):]
+            idx = rest.find(" b/")
+            if idx >= 0:
+                file_path = rest[idx + 3 :]
+            else:
+                file_path = ""
+            old_path = ""
+            continue
+        if raw.startswith("--- a/"):
+            old_path = raw[6:]
+            continue
+        if raw.startswith("+++ b/"):
+            file_path = raw[6:]
+            continue
+        if raw.startswith("+++ /dev/null"):
+            file_path = old_path or file_path
+            continue
+        if not raw or raw.startswith("@@") or raw.startswith("index ") or raw.startswith("new file") or raw.startswith("deleted file") or raw.startswith("similarity ") or raw.startswith("rename "):
+            if raw.startswith("@@"):
+                flush()
+            continue
+        sign = raw[:1]
+        if sign not in "+-":
+            continue
+        found = extract_def(raw, file_path)
+        if found:
+            flush()
+            pending_name, kind = found
+            pending_sign = sign
+            pending_snippet = [raw[1:]]
+            symbols.setdefault(pending_name, SymbolHist(pending_name)).kinds.add(kind)
+        elif pending_name and sign == pending_sign and len(pending_snippet) < 4:
+            pending_snippet.append(raw[1:])
+    flush()
+    return symbols
+
+
+def iter_tree_blobs(repo: str, ref: str | None) -> Iterator[tuple[str, str]]:
+    if ref is None:
+        return
+    out = git(repo, "ls-tree", "-r", "-z", ref)
+    entries = [e for e in out.split("\0") if e]
+    batch: list[tuple[str, str]] = []
+    for entry in entries:
+        try:
+            meta, path = entry.split("\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        mode, typ, sha = parts[0], parts[1], parts[2]
+        if typ != "blob" or mode == "160000":
+            continue
+        if skip_path(path):
+            continue
+        batch.append((path, sha))
+    if not batch:
+        return
+    proc = subprocess.Popen(
+        ["git", "-C", repo, "-c", "core.quotepath=false", "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin and proc.stdout
+    try:
+        for path, sha in batch:
+            proc.stdin.write(f"{sha}\n".encode("ascii"))
+        proc.stdin.close()
+        for path, sha in batch:
+            header = proc.stdout.readline()
+            if not header:
+                break
+            try:
+                rec = header.decode("utf-8", "replace").rstrip("\n")
+                _sha, kind, size_s = rec.split()
+                size = int(size_s)
+            except ValueError:
+                continue
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)  # trailing newline
+            if kind != "blob" or size > 512_000:
+                continue
+            if b"\0" in data[:4096]:
+                continue
+            text = data.decode("utf-8", errors="replace")
+            yield path, text
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def defs_in_text(text: str, path: str) -> Iterator[tuple[str, str, int]]:
+    for i, line in enumerate(text.splitlines(), 1):
+        found = extract_def(line, path)
+        if found:
+            yield found[0], found[1], i
+        bind = LIVE_BIND_RE.match(line)
+        if bind:
+            yield bind.group(1), "bind", i
+        if ext_of(path) in {".rs", ".py", ".ts", ".tsx", ".js", ".jsx"}:
+            for m in ALIAS_RE.finditer(line + "\n"):
+                yield m.group(1), "alias", i
+
+
+def collect_defs(repo: str, ref: str | None) -> dict[str, list[tuple[str, int, str]]]:
+    found: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    if ref is None:
+        return found
+    for path, text in iter_tree_blobs(repo, ref):
+        if not looks_like_source(path):
+            continue
+        for name, kind, line in defs_in_text(text, path):
+            found[name].append((path, line, kind))
+    return found
+
+
+def looks_like_source(path: str) -> bool:
+    lower = path.lower()
+    _, ext = os.path.splitext(lower)
+    if ext in CODE_EXT:
+        return True
+    # extensionless scripts sometimes
+    return False
+
+
+def remnant_role(path: str, text: str) -> str:
+    _, ext = os.path.splitext(path.lower())
+    if ext in DOC_EXT:
+        return "doc"
+    if COMMENT_LINE.match(text):
+        return "comment"
+    if ext in CODE_EXT:
+        return "code"
+    return "other"
+
+
+def is_testlike(name: str, path: str) -> bool:
+    n = name.lower()
+    p = path.replace("\\", "/").lower()
+    if n.startswith("test_") or n.endswith("_test") or n.startswith("it_") or n.startswith("should_"):
+        return True
+    if n.endswith("tests") and n[0].isupper():
+        return True
+    # Rust-style descriptive tests: handle_key_ctrl_c_sets_should_quit
+    if n == name and n.count("_") >= 3:
+        return True
+    if "/tests/" in f"/{p}/" or "/test/" in f"/{p}/" or "/__tests__/" in f"/{p}/":
+        return True
+    if p.endswith("_test.rs") or p.endswith("_test.go") or p.endswith(".test.ts") or p.endswith(".test.js"):
+        return True
+    if p.endswith("_spec.rb") or p.endswith(".spec.ts"):
+        return True
+    if "/plans/" in f"/{p}/" or p.endswith(".md") or "/docs/" in f"/{p}/":
+        return False
+    return False
+
+
+def interesting_name(name: str, min_length: int) -> bool:
+    ascii_only = all(ord(c) < 128 for c in name)
+    if ascii_only and len(name) < min_length:
+        return False
+    if not ascii_only and len(name) < 1:
+        return False
+    if name in STOP or name.lower() in STOP:
+        return False
+    if ascii_only and name.isupper() and len(name) < 5:
+        return False
+    return True
+
+
+def remnant_worthy(name: str, repo_name: str) -> bool:
+    if name in STOP or name.lower() in STOP:
+        return False
+    if name.lower() == repo_name.lower():
+        return False
+    if any(ord(c) > 127 for c in name):
+        return len(name) >= 1
+    if any(c.isupper() for c in name[1:]) and any(c.islower() for c in name):
+        return True
+    if "_" in name and len(name) >= 8:
+        return True
+    if len(name) >= 14:
+        return True
+    return False
+
+
+def drop_live_aliases(symbols: list[SymbolWisp], remnants: list[Remnant], min_code: int = 5) -> tuple[list[SymbolWisp], list[Remnant]]:
+    """A vanished 'def' with many live code hits is a missed alias, not a ghost."""
+    code_hits = Counter(r.name for r in remnants if r.role == "code")
+    live = {n for n, c in code_hits.items() if c >= min_code}
+    if not live:
+        return symbols, remnants
+    symbols = [s for s in symbols if s.name not in live]
+    remnants = [r for r in remnants if r.name not in live]
+    return symbols, remnants
+
+
+def build_symbol_wisps(
+    hist: dict[str, SymbolHist],
+    base_defs: dict[str, list[tuple[str, int, str]]],
+    head_defs: dict[str, list[tuple[str, int, str]]],
+    min_length: int,
+) -> list[SymbolWisp]:
+    out: list[SymbolWisp] = []
+    for name, h in hist.items():
+        if not interesting_name(name, min_length):
+            continue
+        if name in base_defs or name in head_defs:
+            continue
+        if not h.adds:
+            # Never born in-range: a net deletion, visible in git diff.
+            continue
+        last_add = h.adds[-1]
+        last_del = h.dels[-1] if h.dels else None
+        path = (last_del[1] if last_del else last_add[1]) or last_add[1]
+        snippet = last_del[2] if last_del and last_del[2] else last_add[2]
+        kind = next(iter(h.kinds), "def")
+        out.append(
+            SymbolWisp(
+                name=name,
+                kind=kind,
+                path=path,
+                born=h.adds[0][0],
+                died=last_del[0] if last_del else None,
+                snippet=snippet.strip(),
+                testlike=is_testlike(name, path),
+            )
+        )
+    out.sort(key=lambda s: (not s.testlike, s.born.ts if s.born else 0, s.name))
+    return out
+
+
+def find_remnants(
+    repo: str,
+    ref: str,
+    names: Iterable[str],
+    head_defs: dict[str, list[tuple[str, int, str]]],
+) -> list[Remnant]:
+    wanted = {n for n in names if n not in head_defs}
+    if not wanted:
+        return []
+    hits: list[Remnant] = []
+    seen_row: set[tuple[str, str, int]] = set()
+    for path, text in iter_tree_blobs(repo, ref):
+        if ext_of(path) in SKIP_REMNANT_EXT:
+            continue
+        base = os.path.basename(path)
+        if "Generated" in base or base.endswith(".generated.ts"):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            for tok in IDENT_RE.findall(line):
+                if tok not in wanted:
+                    continue
+                key = (tok, path, i)
+                if key in seen_row:
+                    continue
+                seen_row.add(key)
+                hits.append(
+                    Remnant(
+                        name=tok,
+                        path=path,
+                        line=i,
+                        text=line.strip()[:240],
+                        role=remnant_role(path, line),
+                    )
+                )
+    hits.sort(key=lambda r: ({"code": 0, "comment": 1, "doc": 2, "other": 3}[r.role], r.path, r.line, r.name))
+    return hits
+
+
+def emit_json(
+    rng: Range,
+    files: list[FileWisp],
+    symbols: list[SymbolWisp],
+    remnants: list[Remnant],
+) -> None:
+    def cinfo(c: CommitInfo | None) -> dict | None:
+        if not c:
+            return None
+        return {"sha": c.sha, "short": short_sha(c.sha), "ts": c.ts, "subject": c.subject}
+
+    payload = {
+        "base": rng.base,
+        "base_label": rng.base_label,
+        "head": rng.head,
+        "head_label": rng.head_label,
+        "commits": rng.commit_count,
+        "truncated": rng.truncated,
+        "files": [
+            {"path": f.path, "born": cinfo(f.born), "died": cinfo(f.died)}
+            for f in files
+        ],
+        "symbols": [
+            {
+                "name": s.name,
+                "kind": s.kind,
+                "path": s.path,
+                "testlike": s.testlike,
+                "born": cinfo(s.born),
+                "died": cinfo(s.died),
+                "snippet": s.snippet,
+            }
+            for s in symbols
+        ],
+        "remnants": [
+            {
+                "name": r.name,
+                "path": r.path,
+                "line": r.line,
+                "text": r.text,
+                "role": r.role,
+            }
+            for r in remnants
+        ],
+    }
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def emit_tsv(
+    files: list[FileWisp],
+    symbols: list[SymbolWisp],
+    remnants: list[Remnant],
+) -> None:
+    for f in files:
+        print(
+            "file\t"
+            f"{f.path}\t"
+            f"{short_sha(f.born.sha) if f.born else ''}\t"
+            f"{short_sha(f.died.sha) if f.died else ''}"
+        )
+    for s in symbols:
+        print(
+            "symbol\t"
+            f"{s.name}\t{s.kind}\t{s.path}\t"
+            f"{short_sha(s.born.sha) if s.born else ''}\t"
+            f"{short_sha(s.died.sha) if s.died else ''}"
+        )
+    for r in remnants:
+        print(f"remnant\t{r.name}\t{r.role}\t{r.path}\t{r.line}\t{r.text}")
+
+
+def emit_human(
+    ink: Ink,
+    rng: Range,
+    files: list[FileWisp],
+    symbols: list[SymbolWisp],
+    remnants: list[Remnant],
+    show_files: bool,
+    show_symbols: bool,
+    show_remnants: bool,
+) -> None:
+    base = rng.base_label
+    head = rng.head_label
+    trunc = " truncated" if rng.truncated else ""
+    print(
+        ink.bold("wisp")
+        + f" {base}..{head}"
+        + ink.dim(f"  {rng.commit_count} commits{trunc}")
+    )
+    print()
+
+    if show_files:
+        print(ink.cyan(f"EPHEMERAL FILES ({len(files)})") + ink.dim("  born and died between the refs"))
+        if not files:
+            print(ink.dim("  (none)"))
+        for f in files:
+            born = short_sha(f.born.sha) if f.born else "?"
+            died = short_sha(f.died.sha) if f.died else "?"
+            subj = ""
+            if f.died:
+                subj = ink.dim(f"  {f.died.subject[:60]}")
+            print(f"  {ink.bold(f.path)}")
+            print(f"    {ink.green('+' + born)} {ink.red('-' + died)}{subj}")
+        print()
+
+    if show_symbols:
+        code_syms = [s for s in symbols if not s.testlike]
+        test_syms = [s for s in symbols if s.testlike]
+        print(
+            ink.cyan(f"EPHEMERAL SYMBOLS ({len(code_syms)})")
+            + ink.dim("  defined then gone; not at either endpoint")
+        )
+        if not code_syms:
+            print(ink.dim("  (none)"))
+        for s in code_syms:
+            born = short_sha(s.born.sha) if s.born else "?"
+            died = short_sha(s.died.sha) if s.died else "?"
+            print(f"  {ink.bold(s.name)}  {ink.dim(s.kind)}  {s.path}")
+            print(f"    {ink.green('+' + born)} {ink.red('-' + died)}")
+            if s.snippet:
+                first = s.snippet.splitlines()[0].strip()
+                print(ink.dim(f"    {first[:100]}"))
+        if test_syms:
+            print()
+            print(ink.dim(f"EPHEMERAL TESTS ({len(test_syms)})  (renames and discarded cases)"))
+            for s in test_syms[:40]:
+                print(ink.dim(f"  {s.name}  {s.path}"))
+            if len(test_syms) > 40:
+                print(ink.dim(f"  … {len(test_syms) - 40} more"))
+        print()
+
+    if show_remnants:
+        print(
+            ink.yellow(f"REMNANTS ({len(remnants)})")
+            + ink.dim("  vanished names that still appear at HEAD")
+        )
+        if not remnants:
+            print(ink.dim("  (none)"))
+        grouped: dict[str, list[Remnant]] = defaultdict(list)
+        for r in remnants:
+            grouped[r.name].append(r)
+        # Preserve remnant sort (code first) using first hit of each name.
+        names = []
+        seen = set()
+        for r in remnants:
+            if r.name not in seen:
+                names.append(r.name)
+                seen.add(r.name)
+        for name in names:
+            rows = grouped[name]
+            roles = Counter(x.role for x in rows)
+            summary = " ".join(f"{k}:{v}" for k, v in roles.items())
+            print(f"  {ink.bold(name)}  {ink.dim(summary)}")
+            for r in rows[:3]:
+                mark = {"code": ink.red("code"), "comment": ink.yellow("cmt"), "doc": "doc", "other": "   "}[r.role]
+                print(f"    {mark} {r.path}:{r.line}  {ink.dim(r.text[:120])}")
+            if len(rows) > 3:
+                print(ink.dim(f"    … {len(rows) - 3} more"))
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="wisp",
+        description="Show code that lived between two git refs and vanished, plus remnants it left at HEAD.",
+    )
+    p.add_argument("base", nargs="?", help="older ref (default: auto)")
+    p.add_argument("head", nargs="?", help="newer ref (default: HEAD)")
+    p.add_argument("-C", dest="repo", help="git repository path")
+    p.add_argument("--root", action="store_true", help="scan from the empty tree to HEAD")
+    p.add_argument("--max-commits", type=int, default=400, help="cap commits walked (default 400)")
+    p.add_argument("--path", help="limit to a path")
+    p.add_argument("--json", action="store_true", help="JSON on stdout")
+    p.add_argument("--tsv", action="store_true", help="TSV on stdout (file|symbol|remnant rows)")
+    p.add_argument("--check", action="store_true", help="exit 1 if code/comment remnants exist (docs ignored)")
+    p.add_argument("-q", "--quiet", action="store_true", help="no output; useful with --check")
+    p.add_argument("--files", action="store_true", help="only ephemeral files")
+    p.add_argument("--symbols", action="store_true", help="only ephemeral symbols")
+    p.add_argument("--remnants", action="store_true", help="only remnants")
+    p.add_argument("--no-remnants", action="store_true", help="skip remnant search")
+    p.add_argument("--hide-tests", action="store_true", help="drop testlike symbols")
+    p.add_argument("--all-remnants", action="store_true", help="do not rank/filter remnant names")
+    p.add_argument("--min-length", type=int, default=4, help="minimum identifier length")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="version", version=f"wisp {VERSION}")
+    return p.parse_args(argv)
+
+
+def select_sections(args: argparse.Namespace) -> tuple[bool, bool, bool]:
+    specified = args.files or args.symbols or args.remnants
+    if not specified:
+        return True, True, not args.no_remnants
+    return args.files, args.symbols, args.remnants and not args.no_remnants
+
+
+def run(argv: list[str]) -> int:
+    args = parse_args(argv)
+    repo = resolve_repo(args.repo)
+    rng = resolve_range(repo, args.base, args.head, args.max_commits, args.root)
+    show_files, show_symbols, show_remnants = select_sections(args)
+
+    tracked, commits = parse_name_status(rng, args.max_commits, args.path)
+    base_names = ls_tree_names(repo, rng.base)
+    head_names = ls_tree_names(repo, rng.head)
+    files_all = ephemeral_files(tracked, base_names, head_names) if (show_files or show_remnants) else []
+    files = files_all if show_files else []
+
+    symbols: list[SymbolWisp] = []
+    remnants: list[Remnant] = []
+    head_defs: dict[str, list[tuple[str, int, str]]] = {}
+    if show_symbols or show_remnants:
+        hist = parse_patches(rng, args.max_commits, args.path, commits)
+        base_defs = collect_defs(repo, rng.base)
+        head_defs = collect_defs(repo, rng.head)
+        symbols = build_symbol_wisps(hist, base_defs, head_defs, args.min_length)
+        if args.hide_tests:
+            symbols = [s for s in symbols if not s.testlike]
+    if show_remnants:
+        repo_name = os.path.basename(repo.rstrip(os.sep))
+        if args.all_remnants:
+            wanted = [s.name for s in symbols]
+        else:
+            wanted = [
+                s.name
+                for s in symbols
+                if not s.testlike and remnant_worthy(s.name, repo_name)
+            ]
+        remnants = find_remnants(repo, rng.head, wanted, head_defs)
+        extra = []
+        for f in files_all:
+            stem = os.path.splitext(os.path.basename(f.path))[0]
+            if args.all_remnants or remnant_worthy(stem, repo_name):
+                extra.append(stem)
+        if extra:
+            more = find_remnants(repo, rng.head, extra, head_defs)
+            seen = {(r.name, r.path, r.line) for r in remnants}
+            for r in more:
+                key = (r.name, r.path, r.line)
+                if key not in seen:
+                    remnants.append(r)
+                    seen.add(key)
+            remnants.sort(key=lambda r: ({"code": 0, "comment": 1, "doc": 2, "other": 3}[r.role], r.path, r.line, r.name))
+        if not args.all_remnants:
+            symbols, remnants = drop_live_aliases(symbols, remnants)
+
+    if args.quiet:
+        pass
+    elif args.json:
+        emit_json(rng, files, symbols, remnants)
+    elif args.tsv:
+        emit_tsv(files, symbols, remnants)
+    else:
+        emit_human(
+            Ink(color_enabled(args.no_color)),
+            rng,
+            files,
+            symbols,
+            remnants,
+            show_files,
+            show_symbols,
+            show_remnants,
+        )
+
+    if args.check and any(r.role in ("code", "comment") for r in remnants):
+        return 1
+    return 0
+
+
+def main() -> None:
+    try:
+        sys.exit(run(sys.argv[1:]))
+    except WispError as e:
+        print(f"wisp: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

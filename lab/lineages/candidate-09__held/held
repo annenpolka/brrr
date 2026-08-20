@@ -1,0 +1,1026 @@
+#!/usr/bin/env python3
+"""held — intervals of git history where a predicate holds.
+
+Bisect finds one transition and assumes the world is monotonic.
+held walks a commit list and compresses the boolean into eras.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime
+from fnmatch import fnmatch
+from typing import Iterable, Sequence
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class HeldError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Sample:
+    sha: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str = "commit"  # commit | worktree | index
+
+    @property
+    def short(self) -> str:
+        if self.kind != "commit":
+            return self.sha
+        return self.sha[:7]
+
+
+@dataclass
+class Era:
+    value: bool
+    start: Sample
+    end: Sample
+    count: int
+    witnesses_start: list[str] = field(default_factory=list)
+    witnesses_end: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Report:
+    repo: str
+    predicate: str
+    end_rev: str
+    first_parent: bool
+    include_now: bool
+    holds_now: bool
+    never_held: bool
+    always_held: bool
+    commits_scanned: int
+    reachable: int
+    probes: int
+    true_commits: int
+    eras: list[Era]
+    hint: str | None = None
+    hints: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: str | None = None,
+    input_text: str | None = None,
+    check: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=check,
+        env=env,
+    )
+
+
+def git(repo: str, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", repo, *args], input_text=input_text)
+
+
+def git_ok(repo: str, *args: str) -> str:
+    proc = git(repo, *args)
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or f"git {' '.join(args)} failed"
+        raise HeldError(msg)
+    return proc.stdout
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    if not os.path.isdir(start):
+        raise HeldError(f"not a directory: {start}")
+    proc = run(["git", "-C", start, "rev-parse", "--show-toplevel"])
+    if proc.returncode != 0:
+        raise HeldError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+def color_enabled(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never" or args.json or args.oneline or args.revs or args.bounds:
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def paint(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def list_samples(
+    repo: str,
+    *,
+    end_rev: str,
+    rev_range: str | None,
+    first_parent: bool,
+    limit: int | None,
+) -> list[Sample]:
+    spec = rev_range if rev_range else end_rev
+    fmt = "%H%x09%ct%x09%ci%x09%s"
+    cmd = ["log", "--reverse", f"--format={fmt}"]
+    if first_parent:
+        cmd.append("--first-parent")
+    cmd.append(spec)
+    proc = git(repo, *cmd)
+    if proc.returncode != 0:
+        raise HeldError(proc.stderr.strip() or f"cannot walk {spec}")
+    samples: list[Sample] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 3:
+            continue
+        sha, ct, iso = parts[0], parts[1], parts[2]
+        subject = parts[3] if len(parts) > 3 else ""
+        try:
+            timestamp = int(ct)
+        except ValueError:
+            timestamp = 0
+        samples.append(Sample(sha=sha, timestamp=timestamp, iso=iso, subject=subject))
+    if limit is not None and limit >= 0 and len(samples) > limit:
+        samples = samples[-limit:]
+    return samples
+
+
+def worktree_sample(repo: str) -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def index_sample(repo: str) -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="INDEX",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="staged index",
+        kind="index",
+    )
+
+
+def probe_exists(
+    repo: str,
+    samples: Sequence[Sample],
+    path: str,
+) -> tuple[list[bool], list[list[str]], int]:
+    commit_idx = [i for i, s in enumerate(samples) if s.kind == "commit"]
+    values = [False] * len(samples)
+    witnesses: list[list[str]] = [[] for _ in samples]
+    probes = 0
+    globbed = any(ch in path for ch in "*?[]")
+
+    if commit_idx:
+        if globbed:
+            # One ls-tree per commit would be slow; still cheaper than checkout.
+            for i in commit_idx:
+                proc = git(repo, "ls-tree", "-r", "--name-only", samples[i].sha)
+                probes += 1
+                if proc.returncode != 0:
+                    continue
+                hits = [p for p in proc.stdout.splitlines() if fnmatch(p, path)]
+                values[i] = bool(hits)
+                witnesses[i] = hits[:12]
+        else:
+            payload = "".join(f"{samples[i].sha}:{path}\n" for i in commit_idx)
+            proc = git(repo, "cat-file", "--batch-check", input_text=payload)
+            probes += 1
+            if proc.returncode != 0:
+                raise HeldError(proc.stderr.strip() or "git cat-file --batch-check failed")
+            lines = proc.stdout.splitlines()
+            if len(lines) != len(commit_idx):
+                raise HeldError(
+                    f"cat-file returned {len(lines)} lines for {len(commit_idx)} queries"
+                )
+            for i, line in zip(commit_idx, lines):
+                exists = not line.endswith(" missing")
+                values[i] = exists
+                if exists:
+                    witnesses[i] = [path]
+
+    for i, sample in enumerate(samples):
+        if sample.kind == "worktree":
+            probes += 1
+            if globbed:
+                hits: list[str] = []
+                for root, dirs, files in os.walk(repo):
+                    rel_root = os.path.relpath(root, repo)
+                    if rel_root == ".git" or rel_root.startswith(".git" + os.sep):
+                        dirs[:] = []
+                        continue
+                    if ".git" in dirs:
+                        dirs.remove(".git")
+                    for name in files:
+                        rel = name if rel_root == "." else os.path.join(rel_root, name)
+                        rel = rel.replace(os.sep, "/")
+                        if fnmatch(rel, path):
+                            hits.append(rel)
+                values[i] = bool(hits)
+                witnesses[i] = hits[:12]
+            else:
+                values[i] = os.path.lexists(os.path.join(repo, path))
+                if values[i]:
+                    witnesses[i] = [path]
+        elif sample.kind == "index":
+            probes += 1
+            if globbed:
+                proc = git(repo, "ls-files", "-z", "--cached", "--", path)
+                hits = [p for p in proc.stdout.split("\0") if p and fnmatch(p, path)]
+                values[i] = bool(hits)
+                witnesses[i] = hits[:12]
+            else:
+                proc = git(repo, "ls-files", "--cached", "--error-unmatch", "--", path)
+                values[i] = proc.returncode == 0
+                if values[i]:
+                    witnesses[i] = [path]
+    return values, witnesses, probes
+
+
+def _chunked(items: Sequence[str], size: int) -> Iterable[list[str]]:
+    for i in range(0, len(items), size):
+        yield list(items[i : i + size])
+
+
+def probe_grep(
+    repo: str,
+    samples: Sequence[Sample],
+    pattern: str,
+    paths: Sequence[str],
+    *,
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    invert: bool,
+) -> tuple[list[bool], list[list[str]], int]:
+    values = [False] * len(samples)
+    witnesses: list[list[str]] = [[] for _ in samples]
+    probes = 0
+    flags: list[str] = ["-l", "-I", "--full-name", "-e", pattern]
+    if ignore_case:
+        flags.append("-i")
+    if fixed:
+        flags.append("-F")
+    if word:
+        flags.append("-w")
+
+    commit_idx = [i for i, s in enumerate(samples) if s.kind == "commit"]
+    by_sha = {samples[i].sha: i for i in commit_idx}
+    shas = [samples[i].sha for i in commit_idx]
+    path_args: list[str] = ["--", *paths] if paths else []
+
+    for chunk in _chunked(shas, 80) if shas else []:
+        cmd = ["grep", *flags, *chunk, *path_args]
+        proc = git(repo, *cmd)
+        probes += 1
+        # git grep: 0 match, 1 no match, 2+ error (except some versions use 1 for no match)
+        if proc.returncode not in (0, 1):
+            err = proc.stderr.strip()
+            # A missing pathspec in some commits is not fatal for other commits;
+            # git grep may still error. Fall back to per-commit for this chunk.
+            if "did not match any file(s) known to git" in err or proc.returncode > 1:
+                for sha in chunk:
+                    one = git(repo, "grep", *flags, sha, *path_args)
+                    probes += 1
+                    if one.returncode not in (0, 1):
+                        # path absent in this tree → no match
+                        continue
+                    hits = _parse_grep_lines(one.stdout, expected_sha=sha)
+                    idx = by_sha[sha]
+                    values[idx] = bool(hits)
+                    witnesses[idx] = hits[:12]
+                continue
+            raise HeldError(err or "git grep failed")
+        for line in proc.stdout.splitlines():
+            sha, path = _split_grep_line(line)
+            if sha not in by_sha:
+                continue
+            idx = by_sha[sha]
+            if path and path not in witnesses[idx] and len(witnesses[idx]) < 12:
+                witnesses[idx].append(path)
+            values[idx] = True
+
+    if invert:
+        for i in range(len(values)):
+            values[i] = not values[i]
+            if values[i]:
+                if not witnesses[i]:
+                    witnesses[i] = ["(no match)"]
+            else:
+                # inverted: original witnesses were the matches that now falsify
+                pass
+
+    for i, sample in enumerate(samples):
+        if sample.kind not in ("worktree", "index"):
+            continue
+        probes += 1
+        if sample.kind == "index":
+            cmd = ["grep", *flags, "--cached", *path_args]
+        else:
+            cmd = ["grep", *flags, *path_args]
+        proc = git(repo, *cmd)
+        if proc.returncode not in (0, 1):
+            values[i] = False if not invert else True
+            continue
+        hits = []
+        for line in proc.stdout.splitlines():
+            # working-tree git grep: path or path:rest
+            path = line.split(":", 1)[0] if ":" in line else line
+            if path and path not in hits:
+                hits.append(path)
+        matched = bool(hits)
+        values[i] = (not matched) if invert else matched
+        witnesses[i] = hits[:12] if values[i] else hits[:12]
+    return values, witnesses, probes
+
+
+def _split_grep_line(line: str) -> tuple[str, str]:
+    # "<40-hex-sha>:<path>" when trees are given
+    if len(line) >= 41 and line[40] == ":" and SHA_RE.match(line[:40]):
+        return line[:40], line[41:]
+    # fallback: first colon
+    sha, _, rest = line.partition(":")
+    return sha, rest
+
+
+def _parse_grep_lines(stdout: str, expected_sha: str) -> list[str]:
+    hits: list[str] = []
+    for line in stdout.splitlines():
+        sha, path = _split_grep_line(line)
+        if sha == expected_sha:
+            if path and path not in hits:
+                hits.append(path)
+        elif not path:
+            # some git versions omit the sha when a single tree is given
+            if sha and sha not in hits:
+                hits.append(sha)
+        elif path and path not in hits:
+            hits.append(path)
+    return hits
+
+
+def probe_exec(
+    repo: str,
+    samples: Sequence[Sample],
+    command: Sequence[str],
+    *,
+    timeout: float | None,
+) -> tuple[list[bool], list[list[str]], int]:
+    values = [False] * len(samples)
+    witnesses: list[list[str]] = [[] for _ in samples]
+    probes = 0
+    tmp: str | None = None
+    created_worktree = False
+    try:
+        tmp = tempfile.mkdtemp(prefix="held-wt-")
+        # Empty dir required by worktree add.
+        first_commit = next((s.sha for s in samples if s.kind == "commit"), None)
+        if first_commit is None:
+            # only synthetic samples
+            for i, sample in enumerate(samples):
+                probes += 1
+                values[i], witnesses[i] = _run_exec_command(
+                    command, cwd=repo, sample=sample, timeout=timeout
+                )
+            return values, witnesses, probes
+
+        add = git(repo, "worktree", "add", "--detach", "-f", tmp, first_commit)
+        if add.returncode != 0:
+            raise HeldError(add.stderr.strip() or "git worktree add failed")
+        created_worktree = True
+        # Don't let hooks or local config rewrite files mid-scan.
+        git(tmp, "config", "core.hooksPath", "/dev/null")
+
+        for i, sample in enumerate(samples):
+            probes += 1
+            if sample.kind == "commit":
+                chk = git(tmp, "checkout", "--detach", "-f", "-q", sample.sha)
+                if chk.returncode != 0:
+                    values[i] = False
+                    witnesses[i] = ["(checkout failed)"]
+                    continue
+                cwd = tmp
+            else:
+                cwd = repo
+            values[i], witnesses[i] = _run_exec_command(
+                command, cwd=cwd, sample=sample, timeout=timeout
+            )
+    finally:
+        if created_worktree:
+            git(repo, "worktree", "remove", "--force", tmp or "")
+        elif tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return values, witnesses, probes
+
+
+def _run_exec_command(
+    command: Sequence[str],
+    *,
+    cwd: str,
+    sample: Sample,
+    timeout: float | None,
+) -> tuple[bool, list[str]]:
+    env = os.environ.copy()
+    env["HELD_COMMIT"] = sample.sha
+    env["HELD_KIND"] = sample.kind
+    env["HELD_SUBJECT"] = sample.subject
+    try:
+        proc = subprocess.run(
+            list(command),
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise HeldError(f"exec command not found: {exc}") from exc
+    except subprocess.TimeoutExpired:
+        return False, ["(timeout)"]
+    ok = proc.returncode == 0
+    witness: list[str] = []
+    if proc.stdout.strip():
+        first = proc.stdout.strip().splitlines()[0][:120]
+        witness.append(first)
+    elif not ok and proc.stderr.strip():
+        first = proc.stderr.strip().splitlines()[0][:120]
+        witness.append(first)
+    return ok, witness
+
+
+def compress(samples: Sequence[Sample], values: Sequence[bool], witnesses: Sequence[Sequence[str]]) -> list[Era]:
+    if not samples:
+        return []
+    eras: list[Era] = []
+    start = 0
+    for i in range(1, len(samples) + 1):
+        if i < len(samples) and values[i] == values[start]:
+            continue
+        eras.append(
+            Era(
+                value=bool(values[start]),
+                start=samples[start],
+                end=samples[i - 1],
+                count=i - start,
+                witnesses_start=list(witnesses[start]),
+                witnesses_end=list(witnesses[i - 1]),
+            )
+        )
+        start = i
+    return eras
+
+
+def count_reachable(repo: str, spec: str) -> int:
+    proc = git(repo, "rev-list", "--count", spec)
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _hit_span(repo: str, values: Sequence[bool], samples: Sequence[Sample]) -> tuple[int, str]:
+    hits = [s for s, v in zip(samples, values) if v and s.kind == "commit"]
+    if not hits:
+        return 0, ""
+    first, last = hits[0], hits[-1]
+    if first.sha == last.sha:
+        span = f"{first.short} {first.subject}"
+    else:
+        span = f"{first.short}..{last.short}  {first.iso[:10]} → {last.iso[:10]}"
+    return len(hits), span
+
+
+def _shell_single_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def diagnose(
+    *,
+    args: argparse.Namespace,
+    repo: str,
+    samples: Sequence[Sample],
+    never_held: bool,
+    end_rev: str,
+) -> tuple[list[str], list[str], int]:
+    """Warnings/hints from failed queries. Extra probes only run on never_held or dead pathspecs."""
+    warnings: list[str] = []
+    hints: list[str] = []
+    extra = 0
+    first_parent = not args.full
+
+    dead_paths: list[str] = []
+    if args.cmd == "grep" and args.paths:
+        for path in args.paths:
+            vals, _, probes = probe_exists(repo, samples, path)
+            extra += probes
+            if not any(vals):
+                dead_paths.append(path)
+        if dead_paths:
+            phrase = " ".join([args.pattern, *dead_paths])
+            warnings.append(
+                "pathspec "
+                + ", ".join(repr(p) for p in dead_paths)
+                + " matched no file in any scanned commit. "
+                + "If you meant a phrase, quote it: held grep "
+                + _shell_single_quote(phrase)
+            )
+
+    if args.cmd == "exists" and first_parent and never_held and args.path:
+        full_samples = list_samples(
+            repo, end_rev=end_rev, rev_range=args.rev_range, first_parent=False, limit=None
+        )
+        vals, _, probes = probe_exists(repo, full_samples, args.path)
+        extra += probes
+        n, span = _hit_span(repo, vals, full_samples)
+        if n:
+            hints.append(
+                f"never held on first-parent, but existed in {n} reachable commit"
+                f"{'' if n == 1 else 's'} off the mainline ({span}). rerun with --full"
+            )
+
+    if args.cmd == "grep" and never_held and not args.invert_match and not dead_paths:
+        ci_hits = 0
+        full_hits = 0
+        if not args.ignore_case:
+            vals, wits, probes = probe_grep(
+                repo,
+                samples,
+                args.pattern,
+                args.paths,
+                ignore_case=True,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=False,
+            )
+            extra += probes
+            ci_hits = sum(1 for s, v in zip(samples, vals) if v and s.kind == "commit")
+            if ci_hits:
+                example = ""
+                for group in wits:
+                    if group:
+                        example = group[0]
+                        break
+                extra_ex = f" (e.g. {example})" if example else ""
+                hints.append(
+                    f"0 case-sensitive matches; {ci_hits} commit"
+                    f"{'' if ci_hits == 1 else 's'} match with -i{extra_ex}. rerun with -i"
+                )
+        if first_parent:
+            full_samples = list_samples(
+                repo, end_rev=end_rev, rev_range=args.rev_range, first_parent=False, limit=None
+            )
+            vals, _, probes = probe_grep(
+                repo,
+                full_samples,
+                args.pattern,
+                args.paths,
+                ignore_case=args.ignore_case,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=False,
+            )
+            extra += probes
+            full_hits, span = _hit_span(repo, vals, full_samples)
+            if full_hits:
+                hints.append(
+                    f"never held on first-parent, but matched in {full_hits} reachable commit"
+                    f"{'' if full_hits == 1 else 's'} off the mainline ({span}). rerun with --full"
+                )
+        if first_parent and not args.ignore_case and not ci_hits and not full_hits:
+            full_samples = list_samples(
+                repo, end_rev=end_rev, rev_range=args.rev_range, first_parent=False, limit=None
+            )
+            vals, wits, probes = probe_grep(
+                repo,
+                full_samples,
+                args.pattern,
+                args.paths,
+                ignore_case=True,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=False,
+            )
+            extra += probes
+            n, span = _hit_span(repo, vals, full_samples)
+            if n:
+                example = ""
+                for group in wits:
+                    if group:
+                        example = group[0]
+                        break
+                extra_ex = f" (e.g. {example})" if example else ""
+                hints.append(
+                    f"0 matches on first-parent or case-sensitive full history; "
+                    f"{n} reachable commits match with --full -i{extra_ex}. rerun with --full -i"
+                )
+
+    return warnings, hints, extra
+
+
+def format_human(report: Report, *, color: bool, show_witnesses: bool) -> str:
+    lines: list[str] = []
+    head = f"# {report.predicate}"
+    if report.reachable > report.commits_scanned:
+        scanned = (
+            f"{report.commits_scanned} of {report.reachable} commit"
+            + ("" if report.reachable == 1 else "s")
+        )
+    else:
+        scanned = (
+            f"{report.commits_scanned} commit"
+            + ("" if report.commits_scanned == 1 else "s")
+        )
+    bits = [
+        os.path.basename(report.repo) or report.repo,
+        scanned,
+        "first-parent" if report.first_parent else "full",
+    ]
+    if report.include_now:
+        bits.append("now")
+    lines.append(head + "  (" + ", ".join(bits) + ")")
+    if not report.eras:
+        lines.append("  (no commits)")
+        return "\n".join(lines)
+
+    label_w = 5
+    count_w = max(len(str(e.count)) for e in report.eras) + len(" commits")
+    for era in report.eras:
+        raw = "TRUE" if era.value else "FALSE"
+        label = paint(color, "32;1" if era.value else "31", f"{raw:<{label_w}}")
+        unit = "commit" if era.count == 1 else "commits"
+        count = f"{era.count} {unit}".ljust(count_w)
+        if era.start.sha == era.end.sha:
+            span = f"{era.start.short}"
+        else:
+            span = f"{era.start.short}..{era.end.short}"
+        dates = _date_span(era.start, era.end)
+        lines.append(f"{label}  {count}  {span}  {dates}")
+        if era.start.sha != era.end.sha:
+            lines.append(f"       {era.start.short}  {era.start.subject}")
+            lines.append(f"       {era.end.short}  {era.end.subject}")
+        else:
+            lines.append(f"       {era.start.subject}")
+        if show_witnesses and era.value:
+            w = _uniq(era.witnesses_start + era.witnesses_end)
+            if w:
+                shown = w[:5]
+                extra = f" (+{len(w) - 5})" if len(w) > 5 else ""
+                lines.append("       witnesses: " + ", ".join(shown) + extra)
+    summary = (
+        f"now={'TRUE' if report.holds_now else 'FALSE'}  "
+        f"true={report.true_commits}/{report.commits_scanned}  "
+        f"eras={len(report.eras)}  probes={report.probes}"
+    )
+    lines.append(summary)
+    for warning in report.warnings:
+        lines.append("warning: " + warning)
+    for hint in report.hints or ([report.hint] if report.hint else []):
+        lines.append("hint: " + hint)
+    return "\n".join(lines)
+
+
+def _date_span(a: Sample, b: Sample) -> str:
+    da = a.iso[:10] if a.iso else ""
+    db = b.iso[:10] if b.iso else ""
+    if not da and not db:
+        return ""
+    if da == db or not db:
+        return da
+    return f"{da} → {db}"
+
+
+def _uniq(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def format_oneline(report: Report) -> str:
+    rows = []
+    for era in report.eras:
+        flag = "T" if era.value else "F"
+        if era.start.sha == era.end.sha:
+            span = era.start.short
+        else:
+            span = f"{era.start.short}..{era.end.short}"
+        rows.append(f"{flag}\t{era.count}\t{span}\t{_date_span(era.start, era.end)}")
+    return "\n".join(rows)
+
+
+def format_bounds(report: Report, *, only_true: bool) -> str:
+    rows = []
+    for era in report.eras:
+        if only_true and not era.value:
+            continue
+        if era.start.kind != "commit" or era.end.kind != "commit":
+            rows.append(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+            continue
+        rows.append(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+    return "\n".join(rows)
+
+
+def report_to_json(report: Report) -> dict:
+    def sample_dict(s: Sample) -> dict:
+        return {
+            "sha": s.sha,
+            "short": s.short,
+            "timestamp": s.timestamp,
+            "iso": s.iso,
+            "subject": s.subject,
+            "kind": s.kind,
+        }
+
+    return {
+        "repo": report.repo,
+        "predicate": report.predicate,
+        "end_rev": report.end_rev,
+        "first_parent": report.first_parent,
+        "include_now": report.include_now,
+        "holds_now": report.holds_now,
+        "never_held": report.never_held,
+        "always_held": report.always_held,
+        "commits_scanned": report.commits_scanned,
+        "reachable": report.reachable,
+        "probes": report.probes,
+        "true_commits": report.true_commits,
+        "eras": [
+            {
+                "value": e.value,
+                "count": e.count,
+                "start": sample_dict(e.start),
+                "end": sample_dict(e.end),
+                "witnesses_start": e.witnesses_start,
+                "witnesses_end": e.witnesses_end,
+            }
+            for e in report.eras
+        ],
+        "hint": report.hint,
+        "hints": report.hints,
+        "warnings": report.warnings,
+    }
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="held",
+        description=(
+            "Show contiguous eras of git history where a predicate holds. "
+            "The missing partner of git-bisect: no monotonicity assumption, every interval."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  held exists .travis.yml
+  held grep FocusRiverView
+  held --full exists Sources/SitboneUI/FocusRiverView.swift
+  held exec -- test -f Makefile
+  held --json grep -i todo -- src | jq '.eras[] | select(.value)'
+""",
+    )
+    parser.add_argument("-C", "--repo", default=None, help="repository (default: cwd)")
+    parser.add_argument("--rev", default="HEAD", help="end revision (default: HEAD)")
+    parser.add_argument("--range", dest="rev_range", default=None, help="limit to A..B")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="walk every reachable commit, not only first-parent",
+    )
+    parser.add_argument(
+        "--now",
+        action="store_true",
+        help="append the working tree as a final sample",
+    )
+    parser.add_argument(
+        "--index",
+        action="store_true",
+        help="append the index as a sample (implies nothing else)",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="keep only the last N commits")
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument("--oneline", action="store_true", help="T/F count span dates")
+    parser.add_argument("--revs", action="store_true", help="print SHAs where the predicate holds")
+    parser.add_argument(
+        "--bounds",
+        action="store_true",
+        help="print start_sha end_sha value count for each era",
+    )
+    parser.add_argument(
+        "--true-bounds",
+        action="store_true",
+        help="like --bounds but only TRUE eras",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds per exec probe (default: 30)",
+    )
+    parser.add_argument(
+        "--no-witnesses",
+        action="store_true",
+        help="do not print witness paths",
+    )
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_exists = sub.add_parser("exists", help="true when PATH exists in the tree")
+    p_exists.add_argument("path", help="path or glob relative to repo root")
+
+    p_grep = sub.add_parser("grep", help="true when PATTERN matches a tracked blob")
+    p_grep.add_argument("-i", "--ignore-case", action="store_true")
+    p_grep.add_argument("-F", "--fixed-strings", action="store_true")
+    p_grep.add_argument("-w", "--word-regexp", action="store_true")
+    p_grep.add_argument("-v", "--invert-match", action="store_true")
+    p_grep.add_argument("pattern")
+    p_grep.add_argument("paths", nargs="*", help="optional path limiters")
+
+    p_exec = sub.add_parser("exec", help="true when COMMAND exits 0 at that checkout")
+    p_exec.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command to run; prefix with -- to avoid flag eating",
+    )
+
+    args = parser.parse_args(list(argv))
+    if args.cmd == "exec":
+        command = list(args.command)
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            parser.error("exec requires a command")
+        args.command = command
+    return args
+
+
+def predicate_label(args: argparse.Namespace) -> str:
+    if args.cmd == "exists":
+        return f"exists {args.path}"
+    if args.cmd == "grep":
+        extra = []
+        if args.ignore_case:
+            extra.append("-i")
+        if args.fixed_strings:
+            extra.append("-F")
+        if args.word_regexp:
+            extra.append("-w")
+        if args.invert_match:
+            extra.append("-v")
+        flags = (" " + " ".join(extra)) if extra else ""
+        paths = (" -- " + " ".join(args.paths)) if args.paths else ""
+        return f"grep{flags} {args.pattern}{paths}"
+    return "exec " + " ".join(args.command)
+
+
+def collect_true_shas(samples: Sequence[Sample], values: Sequence[bool]) -> list[str]:
+    return [s.sha for s, v in zip(samples, values) if v and s.kind == "commit"]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        repo = resolve_repo(args.repo)
+        # Empty repo: rev-parse HEAD fails.
+        if args.rev_range is None:
+            probe = git(repo, "rev-parse", "--verify", args.rev)
+            if probe.returncode != 0:
+                raise HeldError(f"no commits at {args.rev} (empty repository?)")
+        samples = list_samples(
+            repo,
+            end_rev=args.rev,
+            rev_range=args.rev_range,
+            first_parent=not args.full,
+            limit=args.limit,
+        )
+        if args.index:
+            samples.append(index_sample(repo))
+        if args.now:
+            samples.append(worktree_sample(repo))
+
+        if args.cmd == "exists":
+            values, witnesses, probes = probe_exists(repo, samples, args.path)
+        elif args.cmd == "grep":
+            values, witnesses, probes = probe_grep(
+                repo,
+                samples,
+                args.pattern,
+                args.paths,
+                ignore_case=args.ignore_case,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=args.invert_match,
+            )
+        else:
+            values, witnesses, probes = probe_exec(
+                repo, samples, args.command, timeout=args.timeout
+            )
+
+        eras = compress(samples, values, witnesses)
+        true_n = sum(1 for v in values if v)
+        holds_now = bool(values[-1]) if values else False
+        never_held = true_n == 0
+        always_held = bool(values) and true_n == len(values)
+        spec = args.rev_range or args.rev
+        reachable = count_reachable(repo, spec)
+        warnings, hints, extra_probes = diagnose(
+            args=args,
+            repo=repo,
+            samples=samples,
+            never_held=never_held,
+            end_rev=args.rev,
+        )
+        probes += extra_probes
+        report = Report(
+            repo=repo,
+            predicate=predicate_label(args),
+            end_rev=spec,
+            first_parent=not args.full,
+            include_now=bool(args.now),
+            holds_now=holds_now,
+            never_held=never_held,
+            always_held=always_held,
+            commits_scanned=sum(1 for s in samples if s.kind == "commit"),
+            reachable=reachable,
+            probes=probes,
+            true_commits=sum(1 for s, v in zip(samples, values) if v and s.kind == "commit"),
+            eras=eras,
+            hint=hints[0] if hints else None,
+            hints=hints,
+            warnings=warnings,
+        )
+
+        if not args.quiet:
+            if args.json:
+                print(json.dumps(report_to_json(report), indent=2, ensure_ascii=False))
+            elif args.revs:
+                print("\n".join(collect_true_shas(samples, values)))
+            elif args.bounds or args.true_bounds:
+                text = format_bounds(report, only_true=args.true_bounds)
+                if text:
+                    print(text)
+            elif args.oneline:
+                text = format_oneline(report)
+                if text:
+                    print(text)
+            else:
+                print(
+                    format_human(
+                        report,
+                        color=color_enabled(args),
+                        show_witnesses=not args.no_witnesses,
+                    )
+                )
+
+        return 0 if holds_now else 1
+    except HeldError as exc:
+        eprint(f"held: {exc}")
+        return exc.code
+    except KeyboardInterrupt:
+        eprint("held: interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

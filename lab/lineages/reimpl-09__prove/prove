@@ -1,0 +1,2057 @@
+#!/usr/bin/env python3
+"""prove — env ABI of a load image set. DUE is a getenv-shaped use, not a token."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import stat
+import struct
+import sys
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+# ---------------------------------------------------------------------------
+# KIND
+# ---------------------------------------------------------------------------
+
+DUE_HOWS = {
+    "getenv",
+    "secure_getenv",
+    "_Py_GETENV",
+    "env::var",
+    "env::var_os",
+    "env::getenv",
+    "std::getenv",
+    "os.getenv",
+    "os.environ[]",
+    "os.environ.get",
+    "process.env",
+    "process.env[]",
+    "shell",
+    "$VAR",
+    "${}",
+    "call",
+}
+LATENT_HOWS = {"help", "dollar", "prose", "assign", "cstring-assign"}
+LOOSE_HOWS = {"packed", "prefix", "rodata", "cstring"}
+
+EV_RANK = {"call": 3, "shell": 2, "string": 1}
+
+BARE_APP = {
+    "PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONCASEOK", "PYTHONUSERBASE",
+    "PYTHONHASHSEED", "PYTHONSAFEPATH", "PYTHONEXECUTABLE", "PYTHONDUMPREFS",
+    "PYTHONDEVMODE", "PYTHONUNBUFFERED", "PYTHONINSPECT", "PYTHONIOENCODING",
+    "PYTHONNOUSERSITE", "PYTHONUTF8", "PYTHONWARNINGS", "PYTHONTRACEMALLOC",
+    "PYTHONPROFILEIMPORTTIME", "PYTHONMALLOC", "PYTHONCOERCECLOCALE",
+    "PYTHONBREAKPOINT", "PYTHONDEBUG", "PYTHONFAULTHANDLER", "PYTHONHISTORY",
+    "LSCOLORS", "LS_COLORS", "LSCOLORS",
+}
+
+LIBC_ENV = {
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TERMCAP", "TERMINFO",
+    "PWD", "OLDPWD", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP",
+    "COLUMNS", "LINES", "DISPLAY", "EDITOR", "PAGER", "VISUAL", "MAIL",
+    "HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "SHLVL", "PS1", "PS2", "IFS",
+    "CLICOLOR", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy", "FTP_PROXY",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "MALLOC_CONF", "RJEM_MALLOC_CONF", "_RJEM_MALLOC_CONF", "MALLOC_CHECK_", "MallocNanoZone",
+    "MallocGuardEdges", "MallocScribble", "MallocPreScribble",
+    "MallocStackLogging", "MallocDebugReport",
+    "POSIXLY_CORRECT", "COMMAND_MODE", "CRLE_LIBPATH",
+    "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY",
+    "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE",
+    "LC_MEASUREMENT", "LC_IDENTIFICATION",
+}
+
+SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE)", re.I)
+
+SKIP_DIR_NAMES = {
+    "node_modules", ".git", "__pycache__", "target", "dist", "vendor",
+    ".venv", "venv", "build", ".build", ".tox", ".mypy_cache",
+}
+SOURCE_EXTS = {
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
+    ".rs", ".py", ".sh", ".bash", ".zsh", ".ksh",
+    ".ts", ".js", ".mjs", ".cjs", ".go", ".rb",
+}
+
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_env_token(name: str) -> bool:
+    if not name or len(name) > 128 or not ENV_NAME_RE.fullmatch(name):
+        return False
+    if name.endswith("_") or (name.startswith("_") and name[1:] not in LIBC_ENV):
+        return False
+    if name in LIBC_ENV or name in BARE_APP:
+        return True
+    if "_" in name:
+        parts = [p for p in name.split("_") if p]
+        if len(parts) < 2:
+            return False
+        return all(len(p) >= 1 for p in parts)
+    return name.isupper() and len(name) >= 4
+
+
+def hide_app(name: str) -> bool:
+    if name in LIBC_ENV:
+        return True
+    if name.startswith("LC_") and name not in ("LC_ALL",):
+        return name[3:].isupper()
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Facts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Fact:
+    name: str
+    hows: set[str] = field(default_factory=set)
+    sources: list[str] = field(default_factory=list)
+    evidence: str = "string"
+    vas: list[int] = field(default_factory=list)
+    call_how: str = ""
+
+    def add(self, how: str, source: str, evidence: str, va: Optional[int] = None) -> None:
+        self.hows.add(how)
+        if source and source not in self.sources:
+            self.sources.append(source)
+        if EV_RANK.get(evidence, 0) > EV_RANK.get(self.evidence, 0):
+            self.evidence = evidence
+        if va is not None:
+            self.vas.append(va)
+            if how in DUE_HOWS and not self.call_how:
+                self.call_how = how
+
+    @property
+    def due(self) -> bool:
+        return bool(self.hows & DUE_HOWS)
+
+    @property
+    def latent(self) -> bool:
+        return bool(self.hows & LATENT_HOWS)
+
+    @property
+    def kind(self) -> str:
+        d, l = self.due, self.latent
+        if d and l:
+            return "BOTH"
+        if d:
+            return "DUE"
+        if l:
+            return "LATENT"
+        return "DUE"  # loose packed search aid
+
+    @property
+    def source(self) -> str:
+        return self.sources[0] if self.sources else ""
+
+    @property
+    def how_plus(self) -> str:
+        return "+".join(sorted(self.hows))
+
+    @property
+    def how_csv(self) -> str:
+        return ",".join(sorted(self.hows))
+
+    @property
+    def detail(self) -> str:
+        extra = ""
+        if len(self.sources) > 1:
+            extra = "; also " + ",".join(self.sources[1:3])
+        return self.how_plus + extra
+
+
+class Harvest:
+    def __init__(self) -> None:
+        self.facts: dict[str, Fact] = {}
+        self.calls: list[tuple[str, str, int, str]] = []  # name, how, va, source
+
+    def add(
+        self,
+        name: str,
+        how: str,
+        source: str,
+        evidence: str = "string",
+        va: Optional[int] = None,
+    ) -> None:
+        if not is_env_token(name):
+            return
+        fact = self.facts.get(name)
+        if fact is None:
+            fact = Fact(name=name)
+            self.facts[name] = fact
+        fact.add(how, source, evidence, va)
+        if evidence == "call" and va is not None:
+            self.calls.append((name, how, va, source))
+
+    def merge(self, other: "Harvest") -> None:
+        for name, fact in other.facts.items():
+            for how in fact.hows:
+                ev = fact.evidence
+                if how not in DUE_HOWS and how not in LATENT_HOWS:
+                    ev = "string"
+                elif how in DUE_HOWS and how in ("shell", "$VAR", "${}"):
+                    ev = "shell" if how != "call" else "call"
+                if how in DUE_HOWS and how not in ("shell", "$VAR", "${}"):
+                    ev = fact.evidence if fact.evidence == "call" else (
+                        "call" if how not in ("shell", "$VAR", "${}") else "shell"
+                    )
+                self.add(name, how, fact.source, fact.evidence)
+            for src in fact.sources[1:]:
+                self.add(name, next(iter(fact.hows)), src, fact.evidence)
+        self.calls.extend(other.calls)
+
+
+# ---------------------------------------------------------------------------
+# Mach-O
+# ---------------------------------------------------------------------------
+
+MH_MAGIC_64 = 0xFEEDFACF
+MH_CIGAM_64 = 0xCFFAEDFE
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
+FAT_MAGIC_64 = 0xCAFEBABF
+FAT_CIGAM_64 = 0xBFBAFECA
+CPU_TYPE_ARM64 = 0x0100000C
+CPU_TYPE_X86_64 = 0x01000007
+LC_REQ_DYLD = 0x80000000
+LC_SEGMENT_64 = 0x19
+LC_SYMTAB = 0x2
+LC_DYSYMTAB = 0xB
+LC_LOAD_DYLIB = 0xC
+LC_ID_DYLIB = 0xD
+LC_LOAD_DYLINKER = 0xE
+LC_LOAD_WEAK_DYLIB = 0x18
+LC_RPATH = 0x1C
+LC_REEXPORT_DYLIB = 0x1F
+LC_FUNCTION_STARTS = 0x26
+LC_DYLD_INFO = 0x22
+LC_DYLD_INFO_ONLY = 0x22 | LC_REQ_DYLD
+
+ARM64_BL = 0x94000000
+ARM64_B = 0x14000000
+
+
+def _u32(data: bytes, off: int, be: bool = False) -> int:
+    if be:
+        return struct.unpack_from(">I", data, off)[0]
+    return struct.unpack_from("<I", data, off)[0]
+
+
+def sx(val: int, bits: int) -> int:
+    sign = 1 << (bits - 1)
+    return (val & (sign - 1)) - (val & sign)
+
+
+def pick_fat_slice(data: bytes) -> bytes:
+    magic = struct.unpack_from(">I", data, 0)[0]
+    if magic in (FAT_CIGAM, FAT_CIGAM_64):
+        # swapped; still stored big-endian on disk for fat headers
+        pass
+    if magic in (FAT_MAGIC, FAT_CIGAM):
+        nfat = struct.unpack_from(">I", data, 4)[0]
+        archs = []
+        for i in range(nfat):
+            cputype, cpusub, offset, size, align = struct.unpack_from(">IIIII", data, 8 + i * 20)
+            archs.append((cputype, cpusub, offset, size))
+    elif magic in (FAT_MAGIC_64, FAT_CIGAM_64):
+        nfat = struct.unpack_from(">I", data, 4)[0]
+        archs = []
+        for i in range(nfat):
+            cputype, cpusub, offset, size, align, reserved = struct.unpack_from(
+                ">IIQQII", data, 8 + i * 32
+            )
+            archs.append((cputype, cpusub, offset, size))
+    else:
+        return data
+    # prefer host ARM64, then arm64e (higher subtype), then x86_64
+    def score(item: tuple[int, int, int, int]) -> tuple[int, int]:
+        cputype, cpusub, _, _ = item
+        cpu = cputype & 0x00FFFFFF
+        if cputype == CPU_TYPE_ARM64 or cpu == 12:
+            return (2, cpusub & 0xFF)
+        if cputype == CPU_TYPE_X86_64 or cpu == 7:
+            return (1, 0)
+        return (0, 0)
+
+    archs.sort(key=score, reverse=True)
+    if not archs or score(archs[0])[0] == 0:
+        raise ValueError("no usable fat slice")
+    _, _, offset, size = archs[0]
+    return data[offset : offset + size]
+
+
+@dataclass
+class Section:
+    seg: str
+    name: str
+    addr: int
+    size: int
+    off: int
+    flags: int
+    reserved1: int
+    reserved2: int
+
+
+@dataclass
+class Segment:
+    name: str
+    vmaddr: int
+    vmsize: int
+    fileoff: int
+    filesize: int
+
+
+class MachO:
+    def __init__(self, path: str, data: bytes):
+        self.path = path
+        self.data = data
+        self.cputype = 0
+        self.segments: list[Segment] = []
+        self.sects: list[Section] = []
+        self.dylibs: list[str] = []
+        self.rpaths: list[str] = []
+        self.symoff = self.nsyms = self.stroff = self.strsize = 0
+        self.indirectoff = self.nindirect = 0
+        self.text: Optional[Section] = None
+        self._parse()
+
+    def _parse(self) -> None:
+        data = self.data
+        magic = _u32(data, 0)
+        if magic == MH_CIGAM_64:
+            raise ValueError("big-endian Mach-O unsupported")
+        if magic != MH_MAGIC_64:
+            raise ValueError("not mach-o 64")
+        self.cputype = _u32(data, 4)
+        ncmds = _u32(data, 16)
+        off = 32
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", data, off)
+            raw = cmd & ~LC_REQ_DYLD
+            if raw == LC_SEGMENT_64:
+                segname = data[off + 8 : off + 24].split(b"\0", 1)[0].decode("ascii", "replace")
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+                nsects = struct.unpack_from("<I", data, off + 64)[0]
+                self.segments.append(Segment(segname, vmaddr, vmsize, fileoff, filesize))
+                so = off + 72
+                for _s in range(nsects):
+                    sectname = data[so : so + 16].split(b"\0", 1)[0].decode("ascii", "replace")
+                    seg2 = data[so + 16 : so + 32].split(b"\0", 1)[0].decode("ascii", "replace")
+                    addr, size = struct.unpack_from("<QQ", data, so + 32)
+                    sectoff, align, reloff, nreloc, flags, r1, r2, r3 = struct.unpack_from(
+                        "<IIIIIIII", data, so + 48
+                    )
+                    rec = Section(seg2, sectname, addr, size, sectoff, flags, r1, r2)
+                    self.sects.append(rec)
+                    if sectname == "__text" and rec.seg == "__TEXT":
+                        self.text = rec
+                    so += 80
+            elif raw == LC_SYMTAB:
+                self.symoff, self.nsyms, self.stroff, self.strsize = struct.unpack_from(
+                    "<IIII", data, off + 8
+                )
+            elif raw == LC_DYSYMTAB:
+                fields = struct.unpack_from("<" + "I" * 18, data, off + 8)
+                self.indirectoff = fields[12]
+                self.nindirect = fields[13]
+            elif raw in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB):
+                nloff = _u32(data, off + 8)
+                name = data[off + nloff : off + cmdsize].split(b"\0", 1)[0].decode("utf-8", "replace")
+                self.dylibs.append(name)
+            elif raw == LC_RPATH:
+                nloff = _u32(data, off + 8)
+                name = data[off + nloff : off + cmdsize].split(b"\0", 1)[0].decode("utf-8", "replace")
+                self.rpaths.append(name)
+            off += cmdsize
+
+    def va_to_off(self, va: int) -> Optional[int]:
+        for s in self.segments:
+            if s.vmaddr <= va < s.vmaddr + s.filesize:
+                return s.fileoff + (va - s.vmaddr)
+        for s in self.sects:
+            if s.size and s.addr <= va < s.addr + s.size:
+                return s.off + (va - s.addr)
+        return None
+
+    def read_va(self, va: int, n: int) -> bytes:
+        o = self.va_to_off(va)
+        if o is None or o < 0 or o >= len(self.data):
+            return b""
+        return bytes(self.data[o : o + n])
+
+    def cstring_at(self, va: int, maxlen: int = 160) -> str:
+        raw = self.read_va(va, maxlen)
+        if not raw:
+            return ""
+        s = raw.split(b"\0", 1)[0]
+        if not s or any(c < 0x20 or c > 0x7E for c in s):
+            return ""
+        return s.decode("ascii", "strict")
+
+    def slice_at(self, va: int, n: int) -> str:
+        raw = self.read_va(va, n)
+        if len(raw) != n:
+            return ""
+        if any(c < 0x20 or c > 0x7E for c in raw):
+            return ""
+        return raw.decode("ascii", "strict")
+
+    def symbols(self) -> Iterator[tuple[str, int, int, int]]:
+        if not self.nsyms:
+            return
+        for i in range(self.nsyms):
+            o = self.symoff + i * 16
+            nidx, typ, sect, desc, value = struct.unpack_from("<IBBhQ", self.data, o)
+            end = self.stroff + self.strsize
+            start = self.stroff + nidx
+            if start >= end:
+                name = ""
+            else:
+                z = self.data.find(b"\0", start, min(start + 512, end))
+                name = self.data[start : z if z >= 0 else start].decode("utf-8", "replace")
+            yield name, value, typ, i
+
+    def stub_symbols(self) -> dict[int, str]:
+        names: dict[int, str] = {}
+        for name, value, typ, i in self.symbols():
+            names[i] = name
+        out: dict[int, str] = {}
+        if not self.nindirect or self.indirectoff <= 0:
+            return out
+        for s in self.sects:
+            if s.name not in ("__stubs", "__auth_stubs", "__got"):
+                continue
+            stub_size = s.reserved2
+            if s.name in ("__stubs", "__auth_stubs"):
+                if stub_size <= 0:
+                    stub_size = 16 if s.name == "__auth_stubs" else 12
+                n = s.size // stub_size if stub_size else 0
+            else:
+                n = s.size // 8 if s.size else 0
+                stub_size = 8
+            for j in range(n):
+                idx_off = self.indirectoff + (s.reserved1 + j) * 4
+                if idx_off + 4 > len(self.data):
+                    break
+                idx = _u32(self.data, idx_off) & 0x0FFFFFFF
+                nm = names.get(idx, "")
+                if nm:
+                    out[s.addr + j * stub_size] = nm
+        return out
+
+    def is_arm64(self) -> bool:
+        return (self.cputype & 0x00FFFFFF) == 12 or self.cputype == CPU_TYPE_ARM64
+
+    def is_x86_64(self) -> bool:
+        return (self.cputype & 0x00FFFFFF) == 7 or self.cputype == CPU_TYPE_X86_64
+
+
+def getenv_how(sym: str) -> Optional[str]:
+    """Map a symbol name to a getenv-shaped use, or None."""
+    if not sym:
+        return None
+    n = sym[1:] if sym.startswith("_") and not sym.startswith("_Z") and not sym.startswith("_R") else sym
+    # C
+    if n in ("getenv", "secure_getenv") or sym in ("_getenv", "getenv", "_secure_getenv"):
+        return "getenv"
+    if n in ("_Py_GETENV",) or sym in ("_Py_GETENV", "Py_GETENV"):
+        return "_Py_GETENV"
+    if n.endswith("getenv") and "ung" not in n.lower():
+        # _Py_GETENV already handled; mimalloc __mi_prim_getenv etc.
+        if "prim" in n or n.endswith("_getenv"):
+            return "getenv"
+    # Rust v0 mangling: std::env::__var / __var_os / unix::getenv
+    if "3std3env4__var" in sym or sym.endswith("3env4__var"):
+        return "env::var"
+    if "3std3env7__var_os" in sym or "3env7__var_os" in sym:
+        return "env::var_os"
+    if "3std3sys3env4unix6getenv" in sym:
+        return "env::getenv"
+    # Itanium
+    if "_ZN3std3env3varE" in sym or sym.endswith("ZN3std3env3varE"):
+        return "env::var"
+    if "_ZN3std3env6var_osE" in sym:
+        return "env::var_os"
+    if "_ZNSt3env6getenvE" in n or "std::getenv" in n:
+        return "std::getenv"
+    if n in ("_ZSt6getenvPKc", "_ZSt6getenv"):
+        return "std::getenv"
+    return None
+
+
+# ARM64 decode --------------------------------------------------------------
+
+def dec_adrp(insn: int, pc: int) -> Optional[tuple[int, int]]:
+    if (insn & 0x9F000000) != 0x90000000:
+        return None
+    rd = insn & 0x1F
+    immlo = (insn >> 29) & 3
+    immhi = (insn >> 5) & 0x7FFFF
+    imm = sx((immhi << 2) | immlo, 21) << 12
+    return rd, (pc & ~0xFFF) + imm
+
+
+def dec_adr(insn: int, pc: int) -> Optional[tuple[int, int]]:
+    if (insn & 0x9F000000) != 0x10000000:
+        return None
+    rd = insn & 0x1F
+    immlo = (insn >> 29) & 3
+    immhi = (insn >> 5) & 0x7FFFF
+    imm = sx((immhi << 2) | immlo, 21)
+    return rd, pc + imm
+
+
+def dec_add_imm(insn: int) -> Optional[tuple[int, int, int]]:
+    # ADD (immediate): op0 sf=*, op=0, S=0, 100010
+    if (insn & 0x7F800000) != 0x11000000:
+        return None
+    rd = insn & 0x1F
+    rn = (insn >> 5) & 0x1F
+    imm12 = (insn >> 10) & 0xFFF
+    shift = (insn >> 22) & 3
+    if shift == 1:
+        imm12 <<= 12
+    elif shift != 0:
+        return None
+    return rd, rn, imm12
+
+
+def dec_mov_reg(insn: int) -> Optional[tuple[int, int]]:
+    # MOV Xd, Xm == ORR Xd, XZR, Xm  (shifted register, shift=0)
+    if (insn & 0xFFE0FFE0) == 0xAA0003E0:
+        return insn & 0x1F, (insn >> 16) & 0x1F
+    if (insn & 0xFFE0FFE0) == 0x2A0003E0:
+        return insn & 0x1F, (insn >> 16) & 0x1F
+    return None
+
+
+def dec_movz(insn: int) -> Optional[tuple[int, int]]:
+    if (insn & 0x7F800000) != 0x52800000:
+        return None
+    rd = insn & 0x1F
+    imm16 = (insn >> 5) & 0xFFFF
+    hw = (insn >> 21) & 3
+    return rd, imm16 << (16 * hw)
+
+
+def dec_movk(insn: int) -> Optional[tuple[int, int, int]]:
+    if (insn & 0x7F800000) != 0x72800000:
+        return None
+    rd = insn & 0x1F
+    imm16 = (insn >> 5) & 0xFFFF
+    hw = (insn >> 21) & 3
+    return rd, imm16, hw
+
+
+def dec_orr_imm(insn: int) -> Optional[tuple[int, int]]:
+    # ORR (immediate): sf N immr imms Rn Rd, opc=01, 00100100
+    if (insn & 0x7F800000) != 0x32000000:
+        return None
+    rd = insn & 0x1F
+    rn = (insn >> 5) & 0x1F
+    if rn != 31:
+        return None
+    sf = (insn >> 31) & 1
+    N = (insn >> 22) & 1
+    immr = (insn >> 16) & 0x3F
+    imms = (insn >> 10) & 0x3F
+    val = _decode_bitmask(sf, N, immr, imms)
+    if val is None:
+        return None
+    return rd, val & (0xFFFFFFFFFFFFFFFF if sf else 0xFFFFFFFF)
+
+
+def _decode_bitmask(sf: int, N: int, immr: int, imms: int) -> Optional[int]:
+    if sf == 0 and N != 0:
+        return None
+    len_val = (N << 6) | ((~imms) & 0x3F)
+    if len_val == 0:
+        return None
+    length = len_val.bit_length() - 1
+    esize = 1 << length
+    levels = esize - 1
+    S = imms & levels
+    R = immr & levels
+    welem = (1 << (S + 1)) - 1
+    # ror welem, R, within esize
+    if esize != 0:
+        welem = ((welem >> R) | (welem << (esize - R))) & ((1 << esize) - 1)
+    wmask = 0
+    span = 64 if sf else 32
+    for i in range(0, span, esize):
+        wmask |= welem << i
+    if not sf:
+        wmask &= 0xFFFFFFFF
+    return wmask
+
+
+def dec_bl(insn: int, pc: int) -> Optional[int]:
+    if (insn & 0xFC000000) != ARM64_BL:
+        return None
+    return pc + sx(insn & 0x03FFFFFF, 26) * 4
+
+
+def dec_b(insn: int, pc: int) -> Optional[int]:
+    if (insn & 0xFC000000) != ARM64_B:
+        return None
+    return pc + sx(insn & 0x03FFFFFF, 26) * 4
+
+
+def dec_ldr_uoff64(insn: int) -> Optional[tuple[int, int, int]]:
+    # LDR Xt, [Xn, #imm]  size=11 opc=01
+    if (insn & 0xFFC00000) != 0xF9400000:
+        return None
+    rt = insn & 0x1F
+    rn = (insn >> 5) & 0x1F
+    imm12 = (insn >> 10) & 0xFFF
+    return rt, rn, imm12 * 8
+
+
+def xref_arm64(m: MachO, targets: dict[int, str], harvest: Harvest, loose: bool = False) -> None:
+    if not m.text:
+        return
+    text = m.data[m.text.off : m.text.off + m.text.size]
+    base = m.text.addr
+    n = len(text) // 4
+    adrp = [None] * 32  # type: ignore
+    formed = [None] * 32  # type: ignore
+    imms = [None] * 32  # type: ignore
+    formed_at = [None] * 32  # type: ignore
+    imm_at = [None] * 32  # type: ignore
+    src = m.path
+    unpack = struct.unpack_from
+    for i in range(n):
+        insn = unpack("<I", text, i * 4)[0]
+        pc = base + i * 4
+        a = dec_adrp(insn, pc)
+        if a is not None:
+            rd, page = a
+            if rd != 31:
+                adrp[rd] = page
+                formed[rd] = None
+                formed_at[rd] = None
+            continue
+        ad = dec_adr(insn, pc)
+        if ad is not None:
+            rd, va = ad
+            if rd != 31:
+                formed[rd] = va
+                formed_at[rd] = i
+                adrp[rd] = va & ~0xFFF
+            continue
+        add = dec_add_imm(insn)
+        if add is not None:
+            rd, rn, imm = add
+            if rd != 31 and rn != 31:
+                if adrp[rn] is not None:
+                    formed[rd] = adrp[rn] + imm
+                    formed_at[rd] = i
+                elif formed[rn] is not None:
+                    formed[rd] = formed[rn] + imm
+                    formed_at[rd] = i
+            continue
+        mv = dec_mov_reg(insn)
+        if mv is not None:
+            rd, rm = mv
+            formed[rd] = formed[rm]
+            formed_at[rd] = formed_at[rm] if formed[rm] is not None else i
+            adrp[rd] = adrp[rm]
+            imms[rd] = imms[rm]
+            imm_at[rd] = imm_at[rm]
+            continue
+        mz = dec_movz(insn)
+        if mz is not None:
+            rd, val = mz
+            imms[rd] = val
+            imm_at[rd] = i
+            continue
+        mk = dec_movk(insn)
+        if mk is not None:
+            rd, val, hw = mk
+            cur = imms[rd] if imms[rd] is not None else 0
+            mask = 0xFFFF << (16 * hw)
+            imms[rd] = (cur & ~mask) | (val << (16 * hw))
+            imm_at[rd] = i
+            continue
+        oi = dec_orr_imm(insn)
+        if oi is not None:
+            rd, val = oi
+            imms[rd] = val
+            imm_at[rd] = i
+            continue
+        ldr = dec_ldr_uoff64(insn)
+        if ldr is not None:
+            rt, rn, off = ldr
+            if rn != 31 and adrp[rn] is not None:
+                # pointer load; do not treat GOT slot as a cstring
+                formed[rt] = None
+                formed_at[rt] = None
+            continue
+        tgt = dec_bl(insn, pc)
+        if tgt is None:
+            tgt = dec_b(insn, pc)
+        if tgt is None or tgt not in targets:
+            continue
+        how = targets[tgt]
+        len1 = imms[1]
+        # Rust &str length is load-bearing only when it was written next to x0.
+        # A stale w1 turns LLVM_DISABLE_SYMBOLIZATION into LLVM_DISABLE_SY.
+        if len1 is not None:
+            fa = formed_at[0]
+            ia = imm_at[1]
+            if fa is None or i - fa > 20:
+                len1 = None
+            elif ia is None or i - ia > 20:
+                len1 = None
+        name = recover_name(m, formed[0], len1)
+        if name:
+            harvest.add(name, how, src, evidence="call", va=pc)
+
+
+def recover_name(m: MachO, va0: Optional[int], len1: Optional[int]) -> str:
+    if va0 is None:
+        return ""
+    # Rust &str: (ptr, len). Length is load-bearing for packed literals.
+    if len1 is not None and 1 <= len1 <= 128:
+        s = m.slice_at(va0, len1)
+        if s and is_env_token(s):
+            return s
+    s = m.cstring_at(va0)
+    if s and is_env_token(s):
+        return s
+    return ""
+
+
+def xref_x86_64(m: MachO, targets: dict[int, str], harvest: Harvest) -> None:
+    if not m.text:
+        return
+    text = m.data[m.text.off : m.text.off + m.text.size]
+    base = m.text.addr
+    src = m.path
+    tset = targets
+    i = 0
+    n = len(text)
+    while i < n - 5:
+        if text[i] == 0xE8:
+            rel = struct.unpack_from("<i", text, i + 1)[0]
+            pc = base + i
+            tgt = pc + 5 + rel
+            if tgt in tset:
+                how = tset[tgt]
+                name = recover_x86_name(m, text, base, i)
+                if name:
+                    harvest.add(name, how, src, evidence="call", va=pc)
+            i += 5
+            continue
+        i += 1
+
+
+def recover_x86_name(m: MachO, text: bytes, base: int, call_off: int) -> str:
+    # look back ~32 bytes for lea rdi, [rip+disp]  48 8d 3d disp32
+    start = max(0, call_off - 40)
+    window = text[start:call_off]
+    for j in range(len(window) - 6):
+        if window[j : j + 3] == b"\x48\x8d\x3d":
+            disp = struct.unpack_from("<i", window, j + 3)[0]
+            insn_va = base + start + j
+            va = insn_va + 7 + disp
+            s = m.cstring_at(va)
+            if s and is_env_token(s):
+                return s
+        # lea rdi, [rip] with 4c/48 8d 3d already; also mov edi, imm32 (bf)
+        if window[j] == 0xBF:
+            imm = struct.unpack_from("<I", window, j + 1)[0]
+            s = m.cstring_at(imm)
+            if s and is_env_token(s):
+                return s
+    return ""
+
+
+def macho_targets(m: MachO) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for va, name in m.stub_symbols().items():
+        how = getenv_how(name)
+        if how:
+            out[va] = how
+    for name, value, typ, _i in m.symbols():
+        how = getenv_how(name)
+        if how and value:
+            out[value] = how
+    return out
+
+
+_SKIP_SECTS = {
+    "__text", "__stubs", "__auth_stubs", "__stub_helper", "__unwind_info",
+    "__eh_frame", "__got", "__la_symbol_ptr", "__nl_symbol_ptr",
+    "__mod_init_func", "__mod_term_func", "__bss", "__common", "__objc_methname",
+}
+S_ATTR_PURE_INSTRUCTIONS = 0x80000000
+
+
+def macho_string_blob(m: MachO) -> bytes:
+    """Documentation lives in cstring/const, not in 97MB of AMDGPU opcodes."""
+    parts: list[bytes] = []
+    for s in m.sects:
+        if s.name in _SKIP_SECTS or s.size <= 0:
+            continue
+        if s.flags & S_ATTR_PURE_INSTRUCTIONS:
+            continue
+        end = min(len(m.data), s.off + s.size)
+        if s.off >= end:
+            continue
+        parts.append(bytes(m.data[s.off:end]))
+        parts.append(b"\n")
+    return b"".join(parts) if parts else bytes(m.data)
+
+
+def harvest_macho(path: str, data: bytes, harvest: Harvest, loose: bool) -> None:
+    try:
+        if data[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+            data = pick_fat_slice(data)
+        m = MachO(path, data)
+    except Exception:
+        return
+    targets = macho_targets(m)
+    if m.is_arm64():
+        xref_arm64(m, targets, harvest, loose)
+    elif m.is_x86_64():
+        xref_x86_64(m, targets, harvest)
+    blob = macho_string_blob(m)
+    harvest_docs(path, blob, harvest)
+    if loose:
+        harvest_loose_tokens(path, blob, harvest)
+
+
+# ---------------------------------------------------------------------------
+# ELF
+# ---------------------------------------------------------------------------
+
+def harvest_elf(path: str, data: bytes, harvest: Harvest, loose: bool) -> None:
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        return
+    ei_class = data[4]
+    ei_data = data[5]
+    if ei_class != 2 or ei_data != 1:
+        harvest_docs(path, data, harvest)
+        if loose:
+            harvest_loose_tokens(path, data, harvest)
+        return
+    e_machine = struct.unpack_from("<H", data, 18)[0]
+    e_shoff = struct.unpack_from("<Q", data, 40)[0]
+    e_shentsize = struct.unpack_from("<H", data, 58)[0]
+    e_shnum = struct.unpack_from("<H", data, 60)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+    if e_shoff == 0 or e_shentsize == 0:
+        harvest_docs(path, data, harvest)
+        return
+
+    def sh(i: int) -> tuple:
+        o = e_shoff + i * e_shentsize
+        return struct.unpack_from("<IIQQQQIIQQ", data, o)
+
+    shstr_off = sh(e_shstrndx)[4]
+
+    def secname(i: int) -> str:
+        name_off = sh(i)[0]
+        z = data.find(b"\0", shstr_off + name_off, shstr_off + name_off + 64)
+        return data[shstr_off + name_off : z].decode("ascii", "replace")
+
+    sections = {}
+    for i in range(e_shnum):
+        n = secname(i)
+        sections[n] = (i, sh(i))
+
+    def dyn_symbols() -> list[str]:
+        for key in (".dynsym", ".symtab"):
+            if key not in sections:
+                continue
+            _, hdr = sections[key]
+            sh_offset, sh_size, sh_entsize = hdr[4], hdr[5], hdr[9]
+            strtab_idx = hdr[7]
+            stroff = sh(strtab_idx)[4]
+            strsz = sh(strtab_idx)[5]
+            entsize = sh_entsize or 24
+            names = []
+            for j in range(0, sh_size, entsize):
+                st_name = struct.unpack_from("<I", data, sh_offset + j)[0]
+                z = data.find(b"\0", stroff + st_name, stroff + strsz)
+                names.append(data[stroff + st_name : z].decode("utf-8", "replace"))
+            return names
+        return []
+
+    # PLT relocs
+    targets: dict[int, str] = {}
+    dyn_names = dyn_symbols()
+    for relk, entsize in ((".rela.plt", 24), (".rel.plt", 16)):
+        if relk not in sections:
+            continue
+        _, hdr = sections[relk]
+        off, sz = hdr[4], hdr[5]
+        for j in range(0, sz, entsize):
+            r_offset = struct.unpack_from("<Q", data, off + j)[0]
+            r_info = struct.unpack_from("<Q", data, off + j + 8)[0]
+            sym_idx = r_info >> 32
+            if sym_idx < len(dyn_names):
+                how = getenv_how(dyn_names[sym_idx])
+                if how:
+                    # plt slot: approximate via .plt + (j/entsize+1)*16
+                    if ".plt" in sections:
+                        plt_addr = sections[".plt"][1][3]
+                        plt_entsize = 16 if e_machine in (0x3E, 0xB7) else 16
+                        slot = plt_addr + ((j // entsize) + 1) * plt_entsize
+                        targets[slot] = how
+                    targets[r_offset] = how
+
+    # defined getenv-shaped symbols
+    for key in (".dynsym", ".symtab"):
+        if key not in sections:
+            continue
+        _, hdr = sections[key]
+        sh_offset, sh_size, sh_entsize = hdr[4], hdr[5], hdr[9]
+        strtab_idx = hdr[7]
+        stroff = sh(strtab_idx)[4]
+        strsz = sh(strtab_idx)[5]
+        entsize = sh_entsize or 24
+        for j in range(0, sh_size, entsize):
+            st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from(
+                "<IBBHQQ", data, sh_offset + j
+            )
+            z = data.find(b"\0", stroff + st_name, stroff + strsz)
+            nm = data[stroff + st_name : z].decode("utf-8", "replace")
+            how = getenv_how(nm)
+            if how and st_value:
+                targets[st_value] = how
+
+    # scan .text
+    if ".text" in sections and targets:
+        _, hdr = sections[".text"]
+        addr, off, sz = hdr[3], hdr[4], hdr[5]
+        text = data[off : off + sz]
+
+        class _E:
+            def __init__(self, data, segs):
+                self.data = data
+                self._off = segs
+
+            def va_to_off(self, va):
+                for a, o, s in self._off:
+                    if a <= va < a + s:
+                        return o + (va - a)
+                return None
+
+            def read_va(self, va, n):
+                o = self.va_to_off(va)
+                if o is None:
+                    return b""
+                return data[o : o + n]
+
+            def cstring_at(self, va, maxlen=160):
+                raw = self.read_va(va, maxlen)
+                s = raw.split(b"\0", 1)[0]
+                if not s or any(c < 0x20 or c > 0x7E for c in s):
+                    return ""
+                try:
+                    return s.decode("ascii")
+                except Exception:
+                    return ""
+
+            def slice_at(self, va, n):
+                raw = self.read_va(va, n)
+                if len(raw) != n or any(c < 0x20 or c > 0x7E for c in raw):
+                    return ""
+                try:
+                    return raw.decode("ascii")
+                except Exception:
+                    return ""
+
+        segs = []
+        for i in range(e_shnum):
+            hdr = sh(i)
+            if hdr[5] and hdr[4]:
+                segs.append((hdr[3], hdr[4], hdr[5]))
+        em = _E(data, segs)
+        if e_machine == 0xB7:  # AArch64
+            # reuse arm64 loop with a shim MachO-like
+            class Shim:
+                def __init__(self):
+                    self.data = data
+                    self.path = path
+                    self.text = type("T", (), {"off": off, "addr": addr, "size": sz})()
+
+                def read_va(self, va, n):
+                    return em.read_va(va, n)
+
+                def cstring_at(self, va, maxlen=160):
+                    return em.cstring_at(va, maxlen)
+
+                def slice_at(self, va, n):
+                    return em.slice_at(va, n)
+
+            xref_arm64(Shim(), targets, harvest, loose)  # type: ignore
+        elif e_machine == 0x3E:  # x86_64
+            class Shim:
+                def __init__(self):
+                    self.path = path
+                    self.text = type("T", (), {"off": off, "addr": addr, "size": sz})()
+                    self.data = data
+
+                def cstring_at(self, va, maxlen=160):
+                    return em.cstring_at(va, maxlen)
+
+            xref_x86_64(Shim(), targets, harvest)  # type: ignore
+
+    harvest_docs(path, data, harvest)
+    if loose:
+        harvest_loose_tokens(path, data, harvest)
+
+
+# ---------------------------------------------------------------------------
+# LATENT (documentation encodings) + --loose packed tokens
+# ---------------------------------------------------------------------------
+
+HELP_RE = re.compile(br"(?:^|[\n\r])([A-Z][A-Z0-9_]{1,80}) {2,}:")
+DOLLAR_RE = re.compile(br"\$([A-Z][A-Z0-9_]{2,80})\b")
+PROSE_RE = re.compile(
+    br"environment[ \t]+variable[ \t]+[`'\"]?([A-Z][A-Z0-9_]{1,80})",
+    re.IGNORECASE,
+)
+# NAME =  but not GPU assembler `FOO:BAR =`
+ASSIGN_RE = re.compile(br"(?:^|[\n\r]|[^:\w])([A-Z][A-Z0-9_]{1,80}) = ")
+PACKED_RE = re.compile(br"(?:(?<=[^A-Z0-9_])|^)([A-Z][A-Z0-9]*_[A-Z0-9_]{1,80})(?:(?=[^A-Z0-9_])|$)")
+CSTRING_ASSIGN_RE = re.compile(br"([A-Z][A-Z0-9_]{1,80}) = ")
+
+
+def _doc_name_ok(name: str) -> bool:
+    """Help-table / $VAR / NAME = must look documented, not an opcode table."""
+    if not is_env_token(name):
+        return False
+    if name in BARE_APP or name in LIBC_ENV:
+        return True
+    return "_" in name
+
+
+def harvest_docs(path: str, data: bytes, harvest: Harvest) -> None:
+    for m in HELP_RE.finditer(data):
+        name = m.group(1).decode("ascii")
+        if _doc_name_ok(name):
+            harvest.add(name, "help", path, "string")
+    for m in DOLLAR_RE.finditer(data):
+        name = m.group(1).decode("ascii")
+        if _doc_name_ok(name):
+            harvest.add(name, "dollar", path, "string")
+    for m in PROSE_RE.finditer(data):
+        name = m.group(1).decode("ascii")
+        if _doc_name_ok(name):
+            harvest.add(name, "prose", path, "string")
+    for m in ASSIGN_RE.finditer(data):
+        name = m.group(1).decode("ascii")
+        # GPU assembler is `SQ_PGM_RESOURCES:STACK_SIZE =` — colon already excluded.
+        # Still require an env-shaped name; SIZE-only opcodes drop.
+        if _doc_name_ok(name) and (name in BARE_APP or "_" in name):
+            harvest.add(name, "assign", path, "string")
+
+
+_LOOSE_SPLIT = re.compile(
+    r"(?=KIZU_|XDG_|KITTY_|TERM_PROGRAM|PYTHON_|RUSTC_|RUST_|CARGO_|GIT_|DUE_|ASSAY_|LODE_|APP_|HTTP_|HTTPS_|CLICOLOR)"
+)
+
+
+def harvest_loose_tokens(path: str, data: bytes, harvest: Harvest) -> None:
+    seen = set()
+    for m in PACKED_RE.finditer(data):
+        raw = m.group(1).decode("ascii", "replace")
+        end = m.end(1)
+        start = m.start(1)
+        isolated = start > 0 and data[start - 1] == 0 and end < len(data) and data[end] == 0
+        pieces = [p for p in _LOOSE_SPLIT.split(raw) if p]
+        if not pieces:
+            pieces = [raw]
+        for name in pieces:
+            if name in seen or not is_env_token(name):
+                continue
+            # refuse a peel that continues as more token bytes (COLOR_FORCE ⊂ CLICOLOR_FORCE)
+            if not isolated and end < len(data) and (65 <= data[end] <= 90 or 48 <= data[end] <= 57 or data[end] == 95):
+                # only reject the unsplit tail; split pieces already ended at a seed
+                if name == raw:
+                    continue
+            seen.add(name)
+            harvest.add(name, "cstring" if isolated else "packed", path, "string")
+
+
+# ---------------------------------------------------------------------------
+# Source harvest
+# ---------------------------------------------------------------------------
+
+C_GETENV = re.compile(r'\b(?:std::)?getenv\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+RS_ENV = re.compile(
+    r'\b(?:std::)?env::(?:var|var_os|remove_var|set_var)\s*(?:::<[^>]+>)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+)
+RS_ENV2 = re.compile(
+    r'\b(?:std::)?(?:env::)?(?:var|var_os)\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+)
+PY_ENVIRON_STORE = re.compile(r"""os\.environ\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]\s*=""")
+PY_ENVIRON = re.compile(r"""os\.environ\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]""")
+PY_ENVIRON_GET = re.compile(r"""os\.environ\.get\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]""")
+PY_GETENV = re.compile(r"""os\.getenv\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]""")
+PY_CONST = re.compile(r"""^([A-Za-z_]\w*)\s*=\s*['"]([A-Z_][A-Z0-9_]*)['"]""")
+PY_FROM_GETENV = re.compile(r"from\s+os\s+import\s+([^#\n]+)")
+PY_CALL = re.compile(r"""\b([A-Za-z_]\w*)\s*\(\s*(?:['"]([A-Z_][A-Z0-9_]*)['"]|([A-Za-z_]\w*))\s*[,)]""")
+JS_DOT = re.compile(r"process\.env\.([A-Za-z_][A-Za-z0-9_]*)")
+JS_BRK = re.compile(r"""process\.env\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]""")
+SH_BRC = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+SH_DOL = re.compile(r"\$([A-Z_][A-Z0-9_]{1,80})\b")
+SH_COMMENT = re.compile(r"^\s*#")
+C_COMMENT_LINE = re.compile(r"^\s*//")
+PY_COMMENT = re.compile(r"^\s*#")
+
+
+def harvest_source(path: str, text: str, harvest: Harvest) -> None:
+    ext = Path(path).suffix.lower()
+    lines = text.splitlines()
+    if ext in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}:
+        for i, line in enumerate(lines, 1):
+            if C_COMMENT_LINE.search(line):
+                continue
+            if "/*" in line and "getenv" in line and "*/" in line and "getenv" not in line.split("/*")[0]:
+                continue
+            for m in C_GETENV.finditer(line):
+                harvest.add(m.group(1), "getenv", f"{path}:{i}", "call")
+        return
+    if ext == ".rs":
+        for i, line in enumerate(lines, 1):
+            if C_COMMENT_LINE.search(line):
+                continue
+            for rx, how in ((RS_ENV, "env::var"), (RS_ENV2, "env::var")):
+                for m in rx.finditer(line):
+                    harvest.add(m.group(1), how, f"{path}:{i}", "call")
+        return
+    if ext in {".py"}:
+        consts: dict[str, str] = {}
+        aliases = {"getenv"}
+        for i, line in enumerate(lines, 1):
+            if PY_COMMENT.search(line):
+                continue
+            cm = PY_CONST.match(line.strip())
+            if cm:
+                consts[cm.group(1)] = cm.group(2)
+            fm = PY_FROM_GETENV.search(line)
+            if fm:
+                # getenv as take
+                for part in fm.group(1).split(","):
+                    part = part.strip()
+                    if "getenv" in part:
+                        if " as " in part:
+                            aliases.add(part.split(" as ", 1)[1].strip())
+                        else:
+                            aliases.add("getenv")
+            if PY_ENVIRON_STORE.search(line):
+                continue
+            for m in PY_ENVIRON.finditer(line):
+                harvest.add(m.group(1), "os.environ[]", f"{path}:{i}", "call")
+            for m in PY_ENVIRON_GET.finditer(line):
+                harvest.add(m.group(1), "os.environ.get", f"{path}:{i}", "call")
+            for m in PY_GETENV.finditer(line):
+                harvest.add(m.group(1), "os.getenv", f"{path}:{i}", "call")
+            for m in PY_CALL.finditer(line):
+                fn, lit, ident = m.group(1), m.group(2), m.group(3)
+                if fn not in aliases:
+                    continue
+                if lit:
+                    harvest.add(lit, "os.getenv", f"{path}:{i}", "call")
+                elif ident and ident in consts:
+                    harvest.add(consts[ident], "os.getenv", f"{path}:{i}", "call")
+        return
+    if ext in {".ts", ".js", ".mjs", ".cjs"}:
+        for i, line in enumerate(lines, 1):
+            if C_COMMENT_LINE.search(line):
+                continue
+            for m in JS_DOT.finditer(line):
+                harvest.add(m.group(1), "process.env", f"{path}:{i}", "call")
+            for m in JS_BRK.finditer(line):
+                harvest.add(m.group(1), "process.env[]", f"{path}:{i}", "call")
+        return
+    if ext in {".sh", ".bash", ".zsh", ".ksh"} or _looks_shell(text):
+        for i, line in enumerate(lines, 1):
+            if SH_COMMENT.search(line):
+                continue
+            for m in SH_BRC.finditer(line):
+                harvest.add(m.group(1), "${}", f"{path}:{i}", "shell")
+            for m in SH_DOL.finditer(line):
+                harvest.add(m.group(1), "$VAR", f"{path}:{i}", "shell")
+        return
+    # generic: C getenv + rust + python-ish
+    for i, line in enumerate(lines, 1):
+        for m in C_GETENV.finditer(line):
+            harvest.add(m.group(1), "getenv", f"{path}:{i}", "call")
+        for m in RS_ENV.finditer(line):
+            harvest.add(m.group(1), "env::var", f"{path}:{i}", "call")
+
+
+def _looks_shell(text: str) -> bool:
+    return text.startswith("#!") and any(s in text[:80] for s in ("sh", "bash", "zsh"))
+
+
+# ---------------------------------------------------------------------------
+# Load image set
+# ---------------------------------------------------------------------------
+
+def is_system_path(p: str) -> bool:
+    return (
+        p.startswith("/usr/lib/")
+        or p.startswith("/System/")
+        or p == "/usr/lib/libSystem.B.dylib"
+        or p.startswith("/lib/")
+        or p.startswith("/lib64/")
+        or "/ld-linux" in p
+        or p.startswith("/usr/lib64/")
+    )
+
+
+def file_kind(path: str, peek: bytes) -> str:
+    if peek[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe"):
+        return "macho"
+    if peek[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf"):
+        return "fat"
+    if peek[:4] == b"\x7fELF":
+        return "elf"
+    return "other"
+
+
+def resolve_load(name: str, loader: str, executable: str, rpaths: list[str]) -> Optional[str]:
+    def subst(p: str) -> str:
+        p = p.replace("@loader_path", str(Path(loader).resolve().parent))
+        p = p.replace("@executable_path", str(Path(executable).resolve().parent))
+        return p
+
+    if name.startswith("@rpath/"):
+        rest = name[len("@rpath/") :]
+        for rp in rpaths:
+            cand = os.path.normpath(os.path.join(subst(rp), rest))
+            if os.path.isfile(cand):
+                return cand
+        return None
+    if name.startswith("@loader_path/") or name.startswith("@executable_path/"):
+        cand = os.path.normpath(subst(name))
+        return cand if os.path.isfile(cand) else None
+    if os.path.isfile(name):
+        return name
+    return None
+
+
+@dataclass
+class Image:
+    role: str  # main / load / skip / miss
+    path: str
+    size: int = 0
+
+
+def macho_or_none(path: str) -> Optional[MachO]:
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    try:
+        if data[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf"):
+            data = pick_fat_slice(data)
+        if data[:4] != b"\xcf\xfa\xed\xfe":
+            return None
+        return MachO(path, data)
+    except Exception:
+        return None
+
+
+def elf_needed(path: str) -> list[str]:
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return []
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return []
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+    dyn = None
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        p_type = struct.unpack_from("<I", data, o)[0]
+        if p_type == 2:  # PT_DYNAMIC
+            p_offset, p_filesz = struct.unpack_from("<QQ", data, o + 8)[0], struct.unpack_from("<Q", data, o + 32)[0]
+            dyn = (p_offset, p_filesz)
+            break
+    if not dyn:
+        return []
+    off, sz = dyn
+    strtab = None
+    needed_off = []
+    k = off
+    while k + 16 <= off + sz:
+        tag, val = struct.unpack_from("<QQ", data, k)
+        if tag == 0:
+            break
+        if tag == 5:  # DT_STRTAB
+            strtab = val
+        if tag == 1:  # DT_NEEDED
+            needed_off.append(val)
+        k += 16
+    # map vaddr strtab to file via PT_LOAD
+    loads = []
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        p_type = struct.unpack_from("<I", data, o)[0]
+        if p_type == 1:
+            p_offset = struct.unpack_from("<Q", data, o + 8)[0]
+            p_vaddr = struct.unpack_from("<Q", data, o + 16)[0]
+            p_filesz = struct.unpack_from("<Q", data, o + 32)[0]
+            loads.append((p_vaddr, p_offset, p_filesz))
+    if strtab is None:
+        return []
+
+    def vaoff(va: int) -> Optional[int]:
+        for v, fo, fs in loads:
+            if v <= va < v + fs:
+                return fo + (va - v)
+        return None
+
+    so = vaoff(strtab)
+    if so is None:
+        return []
+    out = []
+    for n in needed_off:
+        z = data.find(b"\0", so + n, so + n + 256)
+        out.append(data[so + n : z].decode("utf-8", "replace"))
+    return out
+
+
+def walk_images(
+    main: str,
+    solo: bool = False,
+    system: bool = False,
+    closure: bool = False,
+    depth: int = 1,
+) -> list[Image]:
+    main_p = str(Path(main).resolve()) if os.path.isfile(main) else main
+    try:
+        sz = os.path.getsize(main_p)
+    except OSError:
+        sz = 0
+    images = [Image("main", main_p, sz)]
+    if solo:
+        return images
+    seen = {os.path.realpath(main_p)}
+    frontier = [(main_p, 0)]
+    executable = main_p
+    max_depth = 64 if closure else max(1, depth)
+    while frontier:
+        cur, d = frontier.pop(0)
+        if d >= max_depth:
+            continue
+        m = macho_or_none(cur)
+        deps: list[tuple[str, list[str]]] = []
+        if m is not None:
+            deps = [(n, m.rpaths) for n in m.dylibs]
+        else:
+            needed = elf_needed(cur)
+            rpaths: list[str] = []
+            deps = [(n, rpaths) for n in needed]
+        for name, rpaths in deps:
+            resolved = resolve_load(name, cur, executable, rpaths)
+            display = resolved or name
+            if resolved is None:
+                if is_system_path(name) and not system:
+                    images.append(Image("skip", name, 0))
+                else:
+                    images.append(Image("miss", name, 0))
+                continue
+            real = os.path.realpath(resolved)
+            if real in seen:
+                continue
+            seen.add(real)
+            if is_system_path(resolved) and not system:
+                images.append(Image("skip", resolved, os.path.getsize(resolved) if os.path.isfile(resolved) else 0))
+                continue
+            try:
+                dsz = os.path.getsize(resolved)
+            except OSError:
+                dsz = 0
+            images.append(Image("load", resolved, dsz))
+            frontier.append((resolved, d + 1))
+    return images
+
+
+# ---------------------------------------------------------------------------
+# File / tree harvest
+# ---------------------------------------------------------------------------
+
+def read_bytes_limited(path: str, limit: int = 256 * 1024 * 1024) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(limit)
+
+
+def harvest_file(path: str, harvest: Harvest, loose: bool) -> None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    try:
+        with open(path, "rb") as f:
+            peek = f.read(4)
+            rest_needed = True
+            kind = file_kind(path, peek)
+            if kind in ("macho", "fat", "elf"):
+                f.seek(0)
+                data = f.read()
+                if kind == "elf":
+                    harvest_elf(path, data, harvest, loose)
+                else:
+                    harvest_macho(path, data, harvest, loose)
+                return
+            # source / other
+            f.seek(0)
+            data = f.read()
+    except OSError:
+        return
+    ext = Path(path).suffix.lower()
+    if ext in SOURCE_EXTS or peek.startswith(b"#!"):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", "replace")
+        harvest_source(path, text, harvest)
+        return
+    # packed blob / unknown: docs + optional loose; NEVER default-DUE
+    harvest_docs(path, data, harvest)
+    if loose:
+        harvest_loose_tokens(path, data, harvest)
+
+
+def iter_tree_files(root: str) -> Iterator[str]:
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = os.path.basename(dirpath)
+        if base in SKIP_DIR_NAMES or base.startswith("."):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(".")]
+        for fn in filenames:
+            if fn.startswith("."):
+                continue
+            yield os.path.join(dirpath, fn)
+
+
+def harvest_target(target: str, harvest: Harvest, loose: bool, solo: bool, system: bool, closure: bool, depth: int) -> list[Image]:
+    if os.path.isdir(target):
+        for fp in iter_tree_files(target):
+            harvest_file(fp, harvest, loose)
+        return [Image("main", os.path.abspath(target), 0)]
+    if not os.path.isfile(target):
+        return []
+    with open(target, "rb") as f:
+        peek = f.read(4)
+    kind = file_kind(target, peek)
+    if kind in ("macho", "fat", "elf"):
+        images = walk_images(target, solo=solo, system=system, closure=closure, depth=depth)
+        for im in images:
+            if im.role in ("main", "load") and os.path.isfile(im.path):
+                harvest_file(im.path, harvest, loose)
+        return images
+    harvest_file(target, harvest, loose)
+    return [Image("main", os.path.abspath(target), os.path.getsize(target))]
+
+
+# ---------------------------------------------------------------------------
+# Resolve operand
+# ---------------------------------------------------------------------------
+
+def resolve_operand(spec: str) -> str:
+    if spec in ("-", "/dev/stdin"):
+        return spec
+    if os.path.exists(spec):
+        return spec
+    found = shutil.which(spec)
+    if found:
+        return found
+    raise FileNotFoundError(spec)
+
+
+# ---------------------------------------------------------------------------
+# Env files / join
+# ---------------------------------------------------------------------------
+
+ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def parse_env_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text("utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = ENV_LINE.match(s)
+        if not m:
+            continue
+        val = m.group(2)
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[m.group(1)] = val
+    return out
+
+
+def redact(name: str, val: Optional[str], show: bool) -> str:
+    if val is None:
+        return ""
+    if not show and val and SECRET_RE.search(name):
+        return "«redacted»"
+    return val
+
+
+FAIL_STATUSES = {"MISSING", "DIFF", "UNSET_LEFT", "UNSET_RIGHT", "UNDOCUMENTED"}
+
+
+def join_rows(
+    facts: dict[str, Fact],
+    left: Optional[dict[str, str]],
+    right: Optional[dict[str, str]],
+    example: Optional[dict[str, str]],
+    spare: bool,
+    show: bool,
+) -> list[dict]:
+    names = set(facts)
+    if spare and left:
+        names |= set(left)
+    if example:
+        names |= set(example)
+    rows = []
+    for name in sorted(names):
+        fact = facts.get(name)
+        kind = fact.kind if fact else "DUE"
+        ev = fact.evidence if fact else "example"
+        src = fact.source if fact else (next(iter(example.keys()), "") if example else "")
+        detail = fact.detail if fact else "documented but unread"
+        lv = left.get(name) if left and name in left else None
+        rv = right.get(name) if right and name in right else None
+        evv = example.get(name) if example and name in example else None
+        owed = name in facts
+        statuses: list[str] = []
+        if owed:
+            if left is not None and right is not None:
+                lin, rin = name in left, name in right
+                if not lin and not rin:
+                    statuses.append("MISSING")
+                elif lin and rin and left[name] != right[name]:
+                    statuses.append("DIFF")
+                elif lin and not rin:
+                    statuses.append("UNSET_RIGHT")
+                elif rin and not lin:
+                    statuses.append("UNSET_LEFT")
+                else:
+                    statuses.append("DUE")
+            elif left is not None:
+                if name in left:
+                    statuses.append("DUE")
+                else:
+                    statuses.append("MISSING")
+            else:
+                statuses.append("DUE")
+            if example is not None and name not in example:
+                statuses.append("UNDOCUMENTED")
+        else:
+            if example is not None and name in example and name not in facts:
+                statuses.append("STALE_EXAMPLE")
+            if spare and left is not None and name in left and name not in facts:
+                statuses.append("SPARE")
+        if not statuses:
+            continue
+        for st in statuses:
+            if st == "STALE_EXAMPLE":
+                src = next((p for p in [src] if p), "")
+                detail = "documented but unread"
+                ev = "example"
+            if st == "SPARE":
+                detail = "set but unread"
+                ev = "-"
+            rows.append(
+                {
+                    "status": st,
+                    "kind": kind,
+                    "name": name,
+                    "left": redact(name, lv if lv is not None else "", show) if lv is not None else "",
+                    "right": redact(name, rv if rv is not None else "", show) if rv is not None else "",
+                    "example": evv if evv is not None else "",
+                    "evidence": ev,
+                    "source": src if st != "STALE_EXAMPLE" else (list(example.keys()) and ""),
+                    "detail": detail,
+                }
+            )
+            if st == "STALE_EXAMPLE" and example:
+                rows[-1]["source"] = ""
+                # fill example path later
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# --abi
+# ---------------------------------------------------------------------------
+
+def load_abi(path: str) -> Harvest:
+    h = Harvest()
+    if path in ("-", "/dev/stdin"):
+        text = sys.stdin.read()
+    else:
+        text = Path(path).read_text("utf-8")
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if parts and parts[0] == "name":
+            continue
+        if len(parts) < 2:
+            continue
+        name, kind = parts[0], parts[1] if len(parts) > 1 else ""
+        evidence = parts[2] if len(parts) > 2 else "string"
+        source = parts[3] if len(parts) > 3 else ""
+        hows = parts[5] if len(parts) > 5 else (parts[4] if len(parts) > 4 else "")
+        tags = [t for t in re.split(r"[+,]", hows) if t]
+        if not tags:
+            if kind == "LATENT":
+                tags = ["help"]
+            elif kind == "BOTH":
+                tags = ["getenv", "help"]
+            else:
+                tags = ["getenv"]
+        for t in tags:
+            ev = evidence
+            if t in DUE_HOWS and t not in ("shell", "$VAR", "${}"):
+                ev = "call" if evidence == "call" else evidence
+            h.add(name, t, source, ev)
+    return h
+
+
+# ---------------------------------------------------------------------------
+# Filter / print
+# ---------------------------------------------------------------------------
+
+KIND_ORDER = {"BOTH": 0, "DUE": 1, "LATENT": 2}
+
+
+def select_facts(
+    facts: dict[str, Fact],
+    app: bool,
+    due: bool,
+    latent: bool,
+    min_ev: Optional[str],
+    loose: bool,
+) -> list[Fact]:
+    out = []
+    min_rank = EV_RANK.get(min_ev or "", 0)
+    for name, fact in facts.items():
+        if app and hide_app(name):
+            continue
+        if not loose and fact.hows and fact.hows <= LOOSE_HOWS:
+            continue
+        if min_rank and EV_RANK.get(fact.evidence, 0) < min_rank:
+            continue
+        k = fact.kind
+        if due and latent:
+            if k != "BOTH":
+                continue
+        elif due:
+            if k not in ("DUE", "BOTH"):
+                continue
+        elif latent:
+            if k not in ("LATENT", "BOTH"):
+                continue
+        out.append(fact)
+    return out
+
+
+def print_table(facts: list[Fact]) -> None:
+    if not facts:
+        print("(no owed names)")
+        return
+    rows = []
+    for f in sorted(facts, key=lambda x: (KIND_ORDER.get(x.kind, 9), x.name)):
+        rows.append((f.kind, f.name, f.evidence, f.source, f.how_plus))
+    w = [max(len(x) for x in col) for col in zip(*([("KIND", "NAME", "EVIDENCE", "SOURCE", "HOW")] + rows))]
+    w = [max(w[i], len(h)) for i, h in enumerate(("KIND", "NAME", "EVIDENCE", "SOURCE", "HOW"))]
+    fmt = f"{{:<{w[0]}}}  {{:<{w[1]}}}  {{:<{w[2]}}}  {{:<{w[3]}}}  {{:<{w[4]}}}"
+    print(fmt.format("KIND", "NAME", "EVIDENCE", "SOURCE", "HOW"))
+    print(fmt.format("-" * w[0], "-" * w[1], "-" * w[2], "-" * w[3], "-" * w[4]))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def print_dump_abi(facts: list[Fact]) -> None:
+    print("name\tkind\tevidence\tsource\tdetail\thows")
+    for f in sorted(facts, key=lambda x: x.name):
+        print(f"{f.name}\t{f.kind}\t{f.evidence}\t{f.source}\t{f.how_plus}\t{f.how_csv}")
+
+
+def print_images(images: list[Image]) -> None:
+    for im in images:
+        if im.role in ("skip", "miss"):
+            print(f"{im.role:4s}  {im.path}")
+        else:
+            print(f"{im.role:4s}  {im.path}  ({im.size})")
+
+
+# ---------------------------------------------------------------------------
+# vs-program: source ⋈ image. Packed needles of LEFT names still join.
+# ---------------------------------------------------------------------------
+
+def needle_in_images(name: str, image_paths: list[str]) -> bool:
+    needle = name.encode("ascii")
+    for p in image_paths:
+        try:
+            data = Path(p).read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def selftest() -> int:
+    import subprocess
+
+    failures = []
+
+    def check(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    # source
+    h = Harvest()
+    harvest_source(
+        "t.py",
+        'import os\nfrom os import getenv as take\nKEY="DUE_CONST"\nos.environ["DUE_PORT"]\nos.getenv("DUE_API_KEY")\ntake(KEY)\nos.environ["DUE_INTERNAL"]="x"\n',
+        h,
+    )
+    check("DUE_PORT" in h.facts, "py DUE_PORT")
+    check("DUE_API_KEY" in h.facts, "py DUE_API_KEY")
+    check("DUE_CONST" in h.facts, "py DUE_CONST alias+const")
+    check("DUE_INTERNAL" not in h.facts, "py store ignored")
+
+    h = Harvest()
+    harvest_source("t.c", 'int main(){ getenv("ASSAY_GETENV_ONLY"); getenv("ASSAY_BOTH"); }\n', h)
+    check(set(h.facts) == {"ASSAY_GETENV_ONLY", "ASSAY_BOTH"}, "c getenv")
+
+    h = Harvest()
+    harvest_source("t.rs", 'fn main(){ let _=std::env::var("DUE_TOKEN"); let _=env::var_os("DUE_HOME"); }\n', h)
+    check("DUE_TOKEN" in h.facts and "DUE_HOME" in h.facts, "rs env::var")
+
+    h = Harvest()
+    harvest_source("t.sh", "# $DUE_COMMENTED\necho ${DUE_HOME}\necho $DUE_PORT\n", h)
+    check("DUE_HOME" in h.facts and "DUE_PORT" in h.facts, "sh $VAR")
+    check("DUE_COMMENTED" not in h.facts, "sh comment")
+
+    cc = shutil.which("cc")
+    if cc:
+        with tempfile.TemporaryDirectory() as td:
+            host_c = Path(td) / "host.c"
+            host_c.write_text(Path(__file__).resolve().parent.joinpath("fixtures/split/host.c").read_text() if Path(__file__).resolve().parent.joinpath("fixtures/split/host.c").exists() else """
+#include <stdio.h>
+#include <stdlib.h>
+static const char help[] __attribute__((used)) =
+    "\\nASSAY_DOC_ONLY      : documented, never getenv\\n"
+    "ASSAY_BOTH      : getenv and documented\\n"
+    "Consider setting $ASSAY_DOLLAR to x\\n";
+int main(void) { getenv("ASSAY_GETENV_ONLY"); getenv("ASSAY_BOTH"); return 0; }
+""")
+            host_bin = Path(td) / "host"
+            r = subprocess.run([cc, "-o", str(host_bin), str(host_c)], capture_output=True)
+            check(r.returncode == 0, "cc host")
+            if r.returncode == 0:
+                h = Harvest()
+                harvest_file(str(host_bin), h, loose=False)
+                kinds = {n: f.kind for n, f in h.facts.items()}
+                check(kinds.get("ASSAY_GETENV_ONLY") == "DUE", f"GETENV_ONLY {kinds}")
+                check(kinds.get("ASSAY_DOC_ONLY") == "LATENT", f"DOC_ONLY {kinds}")
+                check(kinds.get("ASSAY_DOLLAR") == "LATENT", f"DOLLAR {kinds}")
+                check(kinds.get("ASSAY_BOTH") == "BOTH", f"BOTH {kinds}")
+                check(h.facts["ASSAY_GETENV_ONLY"].evidence == "call", "evidence call")
+            orphan_c = Path(td) / "orphan.c"
+            orphan_c.write_text('#include <stdio.h>\nint main(void){ puts("ORPHAN_ENV_NAME"); return 0; }\n')
+            orphan_bin = Path(td) / "orphan"
+            r = subprocess.run([cc, "-o", str(orphan_bin), str(orphan_c)], capture_output=True)
+            if r.returncode == 0:
+                h = Harvest()
+                harvest_file(str(orphan_bin), h, loose=False)
+                check("ORPHAN_ENV_NAME" not in h.facts, f"orphan default {list(h.facts)}")
+                h2 = Harvest()
+                harvest_file(str(orphan_bin), h2, loose=True)
+                check("ORPHAN_ENV_NAME" in h2.facts, "orphan --loose")
+            near_c = Path(td) / "near.c"
+            near_c.write_text('#include <stdio.h>\n#include <stdlib.h>\nint main(void){ getenv("REAL_GETENV_NAME"); puts("DECOY_ENV_NAME"); return 0; }\n')
+            near_bin = Path(td) / "near"
+            r = subprocess.run([cc, "-o", str(near_bin), str(near_c)], capture_output=True)
+            if r.returncode == 0:
+                h = Harvest()
+                harvest_file(str(near_bin), h, loose=False)
+                check("REAL_GETENV_NAME" in h.facts, "nearby real")
+                check("DECOY_ENV_NAME" not in h.facts, "nearby decoy")
+            packed = Path(td) / "packed.bin"
+            packed.write_bytes(b"\xd6DUE_FIXTURE_C\x00HOME\x00junkKIZU_CONFIGXDG_CONFIG_HOME")
+            h = Harvest()
+            harvest_file(str(packed), h, loose=False)
+            check("DUE_FIXTURE_C" not in h.facts and "KIZU_CONFIG" not in h.facts, "packed not DUE")
+            h = Harvest()
+            harvest_file(str(packed), h, loose=True)
+            check("DUE_FIXTURE_C" in h.facts, "packed --loose")
+
+    if failures:
+        print("selftest: FAIL")
+        for f in failures:
+            print("  ", f)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """prove — DUE vs LATENT of a load image set, by getenv-shaped use.
+
+DUE is a call-site xref (getenv / env::var / env::var_os / std::getenv), not an
+env-shaped token. LATENT is documentation (help tables, $VAR, NAME =,
+environment variable NAME). BOTH is the intersection.
+
+Usage:
+  prove PROGRAM
+  prove --due PROGRAM
+  prove --latent PROGRAM
+  prove --due --latent PROGRAM     # BOTH only
+  prove --solo PROGRAM
+  prove --images PROGRAM
+  prove --app python3
+  prove --calls --app python3
+  prove --dump-abi --app python3
+  prove --loose PROGRAM            # packed/orphan tokens as a search aid
+"""
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="prove",
+        description="DUE vs LATENT env of a load image set: getenv-shaped use versus documentation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP,
+    )
+    p.add_argument("programs", nargs="*", help="binary, script, source file, or tree")
+    p.add_argument("-C", dest="chdir", metavar="DIR")
+    p.add_argument("--vs", dest="vs", metavar="FILE", help="right-hand env file")
+    p.add_argument("--left", metavar="FILE")
+    p.add_argument("--right", metavar="FILE", help="alias for --vs")
+    p.add_argument("--example", metavar="FILE")
+    p.add_argument("--vs-pid", metavar="PID")
+    p.add_argument("--vs-program", metavar="PATH")
+    p.add_argument("--abi", metavar="FILE")
+    p.add_argument("--dump-abi", action="store_true")
+    p.add_argument("--names", action="store_true")
+    p.add_argument("--emit", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--spare", action="store_true")
+    p.add_argument("--app", action="store_true")
+    p.add_argument("--due", action="store_true")
+    p.add_argument("--latent", action="store_true")
+    p.add_argument("--loose", action="store_true")
+    p.add_argument("--min-evidence", choices=["call", "shell", "string"])
+    p.add_argument("--show-values", action="store_true")
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--solo", action="store_true")
+    p.add_argument("--images", action="store_true")
+    p.add_argument("--system", action="store_true")
+    p.add_argument("--closure", action="store_true")
+    p.add_argument("--depth", type=int, default=1, metavar="N")
+    p.add_argument("--calls", action="store_true", help="print getenv/env::var sites: name, how, va, source")
+    args = p.parse_args(argv)
+
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.selftest:
+        return selftest()
+    if args.chdir:
+        os.chdir(args.chdir)
+
+    right = args.right or args.vs
+    tsv = args.tsv or args.porcelain
+
+    if not args.programs and not args.abi:
+        print("prove: need a program/tree or --abi", file=sys.stderr)
+        return 2
+
+    harvest = Harvest()
+    images_all: list[Image] = []
+    resolved_programs: list[str] = []
+
+    if args.abi:
+        try:
+            harvest = load_abi(args.abi)
+        except Exception as e:
+            print(f"prove: --abi: {e}", file=sys.stderr)
+            return 2
+
+    for spec in args.programs:
+        try:
+            target = resolve_operand(spec)
+        except FileNotFoundError:
+            print(f"prove: {spec}: not a file, directory, or PATH command", file=sys.stderr)
+            return 2
+        resolved_programs.append(target)
+        try:
+            imgs = harvest_target(
+                target, harvest, args.loose, args.solo, args.system, args.closure, args.depth
+            )
+        except Exception as e:
+            print(f"prove: {spec}: {e}", file=sys.stderr)
+            return 2
+        images_all.extend(imgs)
+
+    if args.images:
+        if not images_all and resolved_programs:
+            print("(no owed names)")
+            return 0
+        print_images(images_all)
+        return 0
+
+    facts = harvest.facts
+
+    # vs-program join of name sets
+    if args.vs_program:
+        try:
+            right_path = resolve_operand(args.vs_program)
+        except FileNotFoundError:
+            print(f"prove: {args.vs_program}: not a file, directory, or PATH command", file=sys.stderr)
+            return 2
+        right_h = Harvest()
+        right_imgs = harvest_target(
+            right_path, right_h, args.loose, args.solo, args.system, args.closure, args.depth
+        )
+        left_sel = {f.name: f for f in select_facts(facts, args.app, False, False, args.min_evidence, args.loose)}
+        right_sel = {f.name: f for f in select_facts(right_h.facts, args.app, False, False, args.min_evidence, args.loose)}
+        image_files = [im.path for im in right_imgs if im.role in ("main", "load") and os.path.isfile(im.path)]
+        # needles from left survive as BOTH if the bytes exist in the image set
+        # (inlined Rust env::var does not leave x0 at the getenv bl).
+        for n in list(left_sel):
+            if n not in right_sel and needle_in_images(n, image_files):
+                right_sel[n] = left_sel[n]
+        names = sorted(set(left_sel) | set(right_sel))
+        if args.names:
+            for n in names:
+                if n in left_sel and n in right_sel:
+                    print(n)
+            return 0
+        print("status\tkind\tname")
+        for n in names:
+            if n in left_sel and n in right_sel:
+                st = "BOTH"
+            elif n in left_sel:
+                st = "LEFT_ONLY"
+            else:
+                st = "RIGHT_ONLY"
+            fact = left_sel.get(n) or right_sel.get(n)
+            kind = fact.kind if fact else "DUE"
+            print(f"{st}\t{kind}\t{n}")
+        return 0
+
+    selected = select_facts(facts, args.app, args.due, args.latent, args.min_evidence, args.loose)
+
+    if args.calls:
+        shown = {f.name for f in selected}
+        rows = [(n, how, va, src) for n, how, va, src in harvest.calls if n in shown]
+        if args.app:
+            rows = [r for r in rows if not hide_app(r[0])]
+        for n, how, va, src in rows:
+            print(f"{n}\t{how}\t{va:#x}\t{src}")
+        return 0
+
+    # env join
+    joining = args.left or right or args.example or args.emit
+    if joining:
+        left = parse_env_file(args.left) if args.left else None
+        rgt = parse_env_file(right) if right else None
+        ex = parse_env_file(args.example) if args.example else None
+        owed = {f.name: f for f in selected}
+        if args.emit:
+            if left is None:
+                print("prove: --emit needs --left", file=sys.stderr)
+                return 2
+            for name in sorted(owed):
+                if name in left:
+                    print(f"{name}={left[name]}")
+            return 0
+        rows = join_rows(owed, left, rgt, ex, args.spare, args.show_values)
+        # fill STALE source with example path
+        if ex is not None and args.example:
+            for row in rows:
+                if row["status"] == "STALE_EXAMPLE":
+                    row["source"] = args.example
+                    row["kind"] = owed[row["name"]].kind if row["name"] in owed else "DUE"
+        if tsv or not args.json:
+            if tsv:
+                print("status\tkind\tname\tleft\tright\texample\tevidence\tsource\tdetail")
+                for row in rows:
+                    print(
+                        f"{row['status']}\t{row['kind']}\t{row['name']}\t{row['left']}\t{row['right']}\t{row['example']}\t{row['evidence']}\t{row['source']}\t{row['detail']}"
+                    )
+            else:
+                print_table(selected)
+        fail = any(row["status"] in FAIL_STATUSES for row in rows)
+        if args.report_only:
+            return 0
+        return 1 if fail else 0
+
+    if args.dump_abi:
+        print_dump_abi(selected)
+        return 0
+    if args.names:
+        for f in sorted(selected, key=lambda x: x.name):
+            print(f.name)
+        return 0
+    print_table(selected)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

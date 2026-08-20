@@ -1,0 +1,1495 @@
+#!/usr/bin/env python3
+"""spar — compose two review-suggestion patches.
+
+twain occupies oracle-half vs production-half of a *commit* against a tree.
+plea/lodge occupy a suggestion against HEAD.
+
+spar does not occupy a tree. Two suggestions are a patch algebra:
+
+  COMMUTE   either order, same after-image (GitHub batch-safe)
+  ABSORB    one after-image already contains the other; drop the inner
+  ORDERED   only one order applies (chain / reply on the other's after)
+  CONFLICT  both orders fail, or same locus disagrees
+
+Input is GitHub review comments, markdown ```suggestion fences, or unified
+diffs. Reconstruction of a comment's before-image is the commented range,
+not every `+` line of a truncated diff_hunk.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from itertools import combinations
+from pathlib import Path
+from typing import Iterator
+
+VERSION = "0.2.0"  # 0.1 compose; 0.2 pairwise within original_commit_id
+
+EXIT_OK = 0       # COMMUTE / EQUAL / EMPTY (batch-safe)
+EXIT_ORDER = 1    # ABSORB nested / ORDERED (resolvable, not batch)
+EXIT_CONFLICT = 2
+EXIT_ERROR = 3
+
+RANK = {"EMPTY": 0, "COMMUTE": 1, "ABSORB": 2, "ORDERED": 3, "CONFLICT": 4}
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+PATH_LINE_RE = re.compile(
+    r"^(?:(?:path|file|filename)\s*:\s*)?"
+    r"(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?\s*$"
+)
+HEADING_PATH_RE = re.compile(
+    r"^#{1,6}\s+`?(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)`?"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?"
+)
+HTML_PATH_RE = re.compile(r"""<!--\s*(?:filepath|path|file)\s*:\s*([^\s>]+)""", re.I)
+IN_TICK_PATH_RE = re.compile(r"""(?:commented on|in)\s+`([^`]+\.[A-Za-z0-9+]+)`""", re.I)
+GAP_PREFIX = "__spar_gap_"
+
+
+# ---------------------------------------------------------------------------
+# objects
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Suggest:
+    id: str
+    path: str
+    before: list[str]
+    after: list[str]
+    start: int | None = None
+    end: int | None = None
+    side: str = "RIGHT"
+    commit_id: str | None = None
+    original_commit_id: str | None = None
+    in_reply_to: str | None = None
+    recon: str = ""
+    source: str = ""
+    user: str | None = None
+    body: str = ""
+
+    @property
+    def span(self) -> tuple[int | None, int | None]:
+        if self.start is None:
+            return None, None
+        if self.before:
+            end = self.start + len(self.before) - 1
+        else:
+            end = self.start - 1
+        if self.end is not None:
+            end = max(end, self.end) if self.before else self.end
+        return self.start, end
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "path": self.path,
+            "start": self.start,
+            "end": self.end,
+            "before": self.before,
+            "after": self.after,
+            "recon": self.recon,
+            "original_commit_id": self.original_commit_id,
+            "in_reply_to": self.in_reply_to,
+            "user": self.user,
+        }
+
+
+@dataclass
+class Verdict:
+    status: str
+    a: str
+    b: str
+    path: str
+    note: str = ""
+    order: str = ""          # "ab", "ba", "ab|ba"
+    absorber: str | None = None
+    batch: bool = False
+    a_path: str = ""
+    b_path: str = ""
+    a_start: int | None = None
+    b_start: int | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "a": self.a,
+            "b": self.b,
+            "path": self.path,
+            "note": self.note,
+            "order": self.order,
+            "absorber": self.absorber,
+            "batch": self.batch,
+            "a_path": self.a_path,
+            "b_path": self.b_path,
+            "a_start": self.a_start,
+            "b_start": self.b_start,
+        }
+
+
+# ---------------------------------------------------------------------------
+# reconstruction (commented range, not sate-all-plus)
+# ---------------------------------------------------------------------------
+
+def _strip_cr(s: str) -> str:
+    return s.replace("\r", "")
+
+
+def _as_int(v) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(*vals):
+    for v in vals:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _as_lines(val) -> list[str] | None:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [_strip_cr(str(x)).rstrip("\n") for x in val]
+    if isinstance(val, str):
+        return _strip_cr(val).splitlines()
+    return None
+
+
+def parse_diff_hunk(diff_hunk: str) -> tuple[int, int, list[tuple[str, str]]] | None:
+    text = _strip_cr(diff_hunk)
+    lines = text.splitlines()
+    if not lines:
+        return None
+    header_i = 0
+    while header_i < len(lines) and not lines[header_i].startswith("@@"):
+        header_i += 1
+    if header_i >= len(lines):
+        return None
+    m = HUNK_RE.match(lines[header_i])
+    if not m:
+        return None
+    old_start = int(m.group(1))
+    new_start = int(m.group(3))
+    tagged: list[tuple[str, str]] = []
+    for L in lines[header_i + 1 :]:
+        if L.startswith("\\"):
+            continue
+        if not L:
+            tagged.append((" ", ""))
+            continue
+        tag = L[0]
+        if tag in " +-":
+            tagged.append((tag, L[1:]))
+        else:
+            tagged.append((" ", L))
+    return old_start, new_start, tagged
+
+
+def _in_range(loc: int, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+    return lo <= loc <= hi
+
+
+def lines_in_range(
+    tagged: list[tuple[str, str]],
+    old_start: int,
+    new_start: int,
+    side: str,
+    start: int,
+    end: int,
+) -> list[str]:
+    old_ln, new_ln = old_start, new_start
+    out: list[str] = []
+    right = side in ("RIGHT", "NEW", "+")
+    for tag, text in tagged:
+        if tag == "+":
+            if right and _in_range(new_ln, start, end):
+                out.append(text)
+            new_ln += 1
+        elif tag == "-":
+            if not right and _in_range(old_ln, start, end):
+                out.append(text)
+            old_ln += 1
+        else:
+            loc = new_ln if right else old_ln
+            if _in_range(loc, start, end):
+                out.append(text)
+            old_ln += 1
+            new_ln += 1
+    return out
+
+
+def side_new_lines(tagged: list[tuple[str, str]], side: str) -> list[str]:
+    if side in ("LEFT", "OLD", "-"):
+        return [t for tag, t in tagged if tag in " -"]
+    return [t for tag, t in tagged if tag in " +"]
+
+
+def extract_suggestions(body: str) -> list[list[str]]:
+    if not body:
+        return []
+    body = _strip_cr(body)
+    out: list[list[str]] = []
+    for m in SUGGEST_RE.finditer(body):
+        raw = m.group(1)
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        out.append(raw.splitlines())
+    return out
+
+
+def reconstruct_before(obj: dict) -> tuple[list[str], str, int | None, int | None]:
+    explicit = _as_lines(obj.get("before"))
+    if explicit is not None:
+        start = _as_int(obj.get("start_line") or obj.get("original_start_line"))
+        end = _as_int(obj.get("line") or obj.get("original_line"))
+        return explicit, "explicit", start, end
+
+    side = str(obj.get("side") or obj.get("start_side") or "RIGHT").upper()
+    end = _as_int(_first(obj.get("line"), obj.get("original_line"), obj.get("originalLine")))
+    start = _as_int(
+        _first(
+            obj.get("start_line"),
+            obj.get("original_start_line"),
+            obj.get("startLine"),
+            obj.get("originalStartLine"),
+            end,
+        )
+    )
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    parsed = parse_diff_hunk(diff_hunk) if diff_hunk else None
+    if parsed and start is not None and end is not None:
+        old_start, new_start, tagged = parsed
+        got = lines_in_range(tagged, old_start, new_start, side, start, end)
+        if got:
+            return got, "range", start, end
+        n = max(1, abs(end - start) + 1)
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return side_lines[-n:], "hunk-tail", start, end
+    if parsed:
+        _old_start, _new_start, tagged = parsed
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return [side_lines[-1]], "hunk-last", start, end
+    return [], "none", start, end
+
+
+def _user_of(obj: dict) -> str | None:
+    u = obj.get("user") or obj.get("author")
+    if isinstance(u, dict):
+        login = u.get("login") or u.get("name")
+        return str(login) if login else None
+    if u:
+        return str(u)
+    return None
+
+
+def obj_to_suggests(obj: dict, source: str = "json") -> list[Suggest]:
+    path = obj.get("path") or obj.get("filename") or obj.get("file") or ""
+    if not path:
+        return []
+    cid = str(_first(obj.get("id"), obj.get("html_url"), obj.get("url"), path) or path)
+    afters = _as_lines(obj.get("after"))
+    body = obj.get("body") or obj.get("comment") or obj.get("suggestion") or ""
+    sug = extract_suggestions(body) if isinstance(body, str) else []
+    if afters is not None:
+        images = [afters]
+    elif sug:
+        images = sug
+    else:
+        return []
+    before, recon, start, end = reconstruct_before(obj)
+    side = str(obj.get("side") or "RIGHT").upper()
+    in_reply = obj.get("in_reply_to_id") or obj.get("in_reply_to")
+    commit = obj.get("commit_id") or obj.get("commitId")
+    orig = obj.get("original_commit_id") or obj.get("originalCommitId")
+    user = _user_of(obj)
+    out: list[Suggest] = []
+    for i, after in enumerate(images):
+        ident = cid if len(images) == 1 else f"{cid}#{i + 1}"
+        out.append(
+            Suggest(
+                id=str(ident),
+                path=str(path),
+                before=list(before),
+                after=list(after),
+                start=start,
+                end=end,
+                side=side,
+                commit_id=str(commit) if commit else None,
+                original_commit_id=str(orig) if orig else None,
+                in_reply_to=str(in_reply) if in_reply else None,
+                recon=recon,
+                source=source,
+                user=user,
+                body=body if isinstance(body, str) else "",
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# stream ingest
+# ---------------------------------------------------------------------------
+
+def _iter_json_objs(text: str) -> Iterator[dict]:
+    text = text.strip()
+    if not text:
+        return
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            if isinstance(data, dict):
+                if "comments" in data and isinstance(data["comments"], list):
+                    for o in data["comments"]:
+                        if isinstance(o, dict):
+                            yield o
+                    return
+                yield data
+                return
+            if isinstance(data, list):
+                for o in data:
+                    if isinstance(o, dict):
+                        yield o
+                return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line[0] != "{":
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(o, dict):
+            yield o
+
+
+def parse_markdown_stream(text: str, source: str = "markdown") -> list[Suggest]:
+    text = _strip_cr(text)
+    claims: list[Suggest] = []
+    path = ""
+    start: int | None = None
+    end: int | None = None
+    pending_quote: list[str] | None = None
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    seq = 0
+
+    def remember_path(p: str, a: str | None, b: str | None) -> None:
+        nonlocal path, start, end
+        path = p
+        start = int(a) if a else None
+        end = int(b) if b else start
+
+    while i < n:
+        L = lines[i]
+        hm = HEADING_PATH_RE.match(L.strip())
+        if hm:
+            remember_path(hm.group("path"), hm.group("a"), hm.group("b"))
+            i += 1
+            continue
+        html = HTML_PATH_RE.search(L)
+        if html:
+            path = html.group(1)
+            i += 1
+            continue
+        tick = IN_TICK_PATH_RE.search(L)
+        if tick:
+            path = tick.group(1)
+            i += 1
+            continue
+        pm = PATH_LINE_RE.match(L.strip().strip("`"))
+        if pm and not L.strip().startswith("```"):
+            remember_path(pm.group("path"), pm.group("a"), pm.group("b"))
+            i += 1
+            continue
+        stripped = L.strip()
+        if stripped.startswith("```") and not stripped.startswith("```suggestion"):
+            lang = stripped[3:].strip()
+            i += 1
+            block: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if lang.lower() in ("", "text", "code", "diff"):
+                pending_quote = block
+            continue
+        if stripped.startswith("```suggestion"):
+            i += 1
+            after: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                after.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if not path:
+                continue
+            seq += 1
+            before = pending_quote if pending_quote is not None else []
+            recon = "markdown-quote" if before else "markdown"
+            claims.append(
+                Suggest(
+                    id=f"md{seq}:{path}",
+                    path=path,
+                    before=list(before),
+                    after=list(after),
+                    start=start,
+                    end=end,
+                    recon=recon,
+                    source=source,
+                )
+            )
+            pending_quote = None
+            continue
+        i += 1
+    return claims
+
+
+def _strip_ab(path: str) -> str:
+    path = path.strip().strip('"')
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def parse_patch_suggests(text: str, source: str = "patch") -> list[Suggest]:
+    """Each unified-diff hunk is one suggestion (whole-hunk replacement)."""
+    suggests: list[Suggest] = []
+    old_path = new_path = ""
+    hunk: Suggest | None = None
+    tagged: list[tuple[str, str]] = []
+    per_file = 0
+
+    def flush() -> None:
+        nonlocal hunk, tagged, per_file
+        if hunk is None:
+            return
+        hunk.before = [t for op, t in tagged if op in " -"]
+        hunk.after = [t for op, t in tagged if op in " +"]
+        if hunk.before:
+            hunk.end = (hunk.start or 1) + len(hunk.before) - 1
+        suggests.append(hunk)
+        hunk = None
+        tagged = []
+
+    for raw in _strip_cr(text).splitlines():
+        if raw.startswith("diff --git "):
+            flush()
+            rest = raw[len("diff --git ") :]
+            idx = rest.find(" b/")
+            if idx != -1:
+                old_path = _strip_ab(rest[:idx])
+                new_path = _strip_ab(rest[idx + 1 :])
+            per_file = 0
+            continue
+        if raw.startswith("--- "):
+            rhs = raw[4:]
+            if "/dev/null" not in rhs:
+                old_path = _strip_ab(rhs)
+            continue
+        if raw.startswith("+++ "):
+            rhs = raw[4:]
+            if "/dev/null" not in rhs:
+                new_path = _strip_ab(rhs)
+            continue
+        m = HUNK_RE.match(raw)
+        if m:
+            flush()
+            per_file += 1
+            live = new_path or old_path
+            old_start = int(m.group(1)) or 1
+            hunk = Suggest(
+                id=f"{source}:{live}#{per_file}",
+                path=live,
+                before=[],
+                after=[],
+                start=old_start,
+                recon="patch",
+                source=source,
+            )
+            tagged = []
+            continue
+        if hunk is None:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("+"):
+            tagged.append(("+", raw[1:]))
+        elif raw.startswith("-"):
+            tagged.append(("-", raw[1:]))
+        elif raw.startswith(" "):
+            tagged.append((" ", raw[1:]))
+        elif raw == "":
+            tagged.append((" ", ""))
+    flush()
+    return suggests
+
+
+def looks_like_patch(text: str) -> bool:
+    s = text.lstrip("\ufeff")
+    return s.startswith("diff --git ") or s.startswith("--- ") or bool(HUNK_RE.match(s.splitlines()[0] if s else ""))
+
+
+def load_stream(text: str, source: str = "stream") -> list[Suggest]:
+    text = text.lstrip("\ufeff")
+    if looks_like_patch(text):
+        got = parse_patch_suggests(text, source=source)
+        if got:
+            return got
+    stripped = text.lstrip()
+    if stripped[:1] in "[{":
+        claims: list[Suggest] = []
+        for obj in _iter_json_objs(text):
+            claims.extend(obj_to_suggests(obj, source=source))
+        if claims:
+            return claims
+    md = parse_markdown_stream(text, source=source)
+    if md:
+        return md
+    claims = []
+    for obj in _iter_json_objs(text):
+        claims.extend(obj_to_suggests(obj, source=source))
+    return claims
+
+
+def load_path(path: str, label: str | None = None) -> list[Suggest]:
+    if path == "-":
+        return load_stream(sys.stdin.read(), source=label or "stdin")
+    p = Path(path)
+    return load_stream(p.read_text(encoding="utf-8"), source=label or str(p))
+
+
+# ---------------------------------------------------------------------------
+# algebra kernel — no tree
+# ---------------------------------------------------------------------------
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    first = needle[0]
+    start = 0
+    length = len(hay)
+    while start < length:
+        try:
+            j = hay.index(first, start)
+        except ValueError:
+            break
+        if hay[j : j + n] == needle:
+            hits.append(j)
+        start = j + 1
+    return hits
+
+
+def find_sub(hay: list[str], needle: list[str]) -> int | None:
+    hits = find_all(hay, needle)
+    return hits[0] if hits else None
+
+
+def apply_one(lines: list[str], s: Suggest, origin: int) -> list[str] | None:
+    """Replace s.before with s.after in a local original. None = does not apply."""
+    text = list(lines)
+    if s.before == s.after:
+        return text
+    if not s.before:
+        if s.start is None:
+            return None
+        i = s.start - origin
+        i = max(0, min(i, len(text)))
+        return text[:i] + list(s.after) + text[i:]
+    hits = find_all(text, s.before)
+    if not hits:
+        return None
+    if s.start is not None:
+        expected = s.start - origin
+        i = min(hits, key=lambda h: (abs(h - expected), h))
+    else:
+        if len(hits) != 1:
+            return None
+        i = hits[0]
+    return text[:i] + list(s.after) + text[i + len(s.before) :]
+
+
+def apply_all(lines: list[str], ss: list[Suggest], origin: int) -> list[str] | None:
+    text = list(lines)
+    ordered = sorted(ss, key=lambda s: (s.start is None, s.start or 0))
+    for s in ordered:
+        nxt = apply_one(text, s, origin)
+        if nxt is None:
+            return None
+        text = nxt
+    return text
+
+
+def paint(suggests: list[Suggest]) -> tuple[list[str], int] | None:
+    """Local original covering every before-image. Gaps are placeholders."""
+    numbered = [s for s in suggests if s.start is not None and s.before]
+    commits = {s.original_commit_id for s in suggests if s.original_commit_id}
+    if len(commits) > 1:
+        return None
+    if numbered:
+        lo = min(s.start or 1 for s in numbered)
+        hi = lo
+        for s in numbered:
+            _a, b = s.span
+            if b is not None:
+                hi = max(hi, b)
+            hi = max(hi, (s.start or lo) + len(s.before) - 1)
+        orig: list[str | None] = [None] * (hi - lo + 1)
+        for s in numbered:
+            start = s.start or lo
+            for j, line in enumerate(s.before):
+                idx = start + j - lo
+                if idx < 0 or idx >= len(orig):
+                    continue
+                if orig[idx] is None:
+                    orig[idx] = line
+                elif orig[idx] != line:
+                    return None
+        out: list[str] = []
+        for i, v in enumerate(orig):
+            out.append(v if v is not None else f"{GAP_PREFIX}{lo + i}__")
+        return out, lo
+    # unnumbered: nest or concat
+    if not suggests:
+        return [], 1
+    bodies = [s.before for s in suggests if s.before]
+    if not bodies:
+        # inserts only
+        return [], 1
+    bodies = sorted(bodies, key=len, reverse=True)
+    host = list(bodies[0])
+    for other in bodies[1:]:
+        if not other:
+            continue
+        if find_sub(host, other) is not None:
+            continue
+        if find_sub(other, host) is not None:
+            host = list(other)
+            continue
+        host = host + [f"{GAP_PREFIX}join__"] + list(other)
+    return host, 1
+
+
+def range_contains(outer: Suggest, inner: Suggest) -> bool:
+    os, oe = outer.span
+    ins, ine = inner.span
+    if None in (os, oe, ins, ine):
+        if not inner.before:
+            return False
+        return find_sub(outer.before, inner.before) is not None
+    return os <= ins and ine <= oe  # type: ignore[operator]
+
+
+def nested_absorb(outer: Suggest, inner: Suggest) -> bool:
+    """True iff taking outer already realizes inner's after-image."""
+    if outer.path != inner.path:
+        return False
+    if not inner.before:
+        return False
+    if outer.before == inner.before and outer.after == inner.after:
+        return True
+    pos = find_sub(outer.before, inner.before)
+    if pos is None:
+        return False
+    local = outer.before[:pos] + inner.after + outer.before[pos + len(inner.before) :]
+    if local == outer.after:
+        return True
+    prefix = outer.before[:pos]
+    suffix = outer.before[pos + len(inner.before) :]
+    if prefix and outer.after[: len(prefix)] != prefix:
+        return False
+    if suffix:
+        if len(outer.after) < len(suffix) or outer.after[-len(suffix) :] != suffix:
+            return False
+        mid = outer.after[len(prefix) : len(outer.after) - len(suffix)]
+    else:
+        mid = outer.after[len(prefix) :]
+    return mid == inner.after
+
+
+def _verdict(
+    status: str,
+    a: Suggest,
+    b: Suggest,
+    note: str = "",
+    order: str = "",
+    absorber: str | None = None,
+    batch: bool = False,
+) -> Verdict:
+    path = a.path if a.path == b.path else f"{a.path}|{b.path}"
+    return Verdict(
+        status=status,
+        a=a.id,
+        b=b.id,
+        path=path,
+        note=note,
+        order=order,
+        absorber=absorber,
+        batch=batch,
+        a_path=a.path,
+        b_path=b.path,
+        a_start=a.start,
+        b_start=b.start,
+    )
+
+
+def compose_pair(a: Suggest, b: Suggest) -> Verdict:
+    """Compose two suggestions. Never reads a tree."""
+    if a.path != b.path:
+        return _verdict("COMMUTE", a, b, note="disjoint-path", order="ab|ba", batch=True)
+
+    # identical images
+    if a.before == b.before and a.after == b.after:
+        return _verdict("ABSORB", a, b, note="equal", order="ab|ba", absorber="*", batch=True)
+
+    # chain on the same image
+    if a.after == b.before and a.before != b.before:
+        return _verdict("ORDERED", a, b, note="chain", order="ab", batch=False)
+    if b.after == a.before and b.before != a.before:
+        return _verdict("ORDERED", a, b, note="chain", order="ba", batch=False)
+
+    commits = {c for c in (a.original_commit_id, b.original_commit_id) if c}
+    different_commit = len(commits) > 1
+
+    if different_commit:
+        if a.before == b.before:
+            return _verdict("CONFLICT", a, b, note="unrelated-commit-same-before", batch=False)
+        # Same path, different snapshot: not GitHub-batchable.
+        return _verdict("COMMUTE", a, b, note="unrelated-commit", order="ab|ba", batch=False)
+
+    if nested_absorb(a, b) and not nested_absorb(b, a):
+        return _verdict("ABSORB", a, b, note="nested", absorber=a.id, batch=False)
+    if nested_absorb(b, a) and not nested_absorb(a, b):
+        return _verdict("ABSORB", a, b, note="nested", absorber=b.id, batch=False)
+    if nested_absorb(a, b) and nested_absorb(b, a):
+        return _verdict("ABSORB", a, b, note="equal-nested", absorber="*", batch=True)
+
+    painted = paint([a, b])
+    if painted is None:
+        if a.before == b.before:
+            return _verdict("CONFLICT", a, b, note="inconsistent-before", batch=False)
+        return _verdict("CONFLICT", a, b, note="inconsistent-before", batch=False)
+
+    orig, origin = painted
+    a_only = apply_one(orig, a, origin)
+    b_only = apply_one(orig, b, origin)
+    ab = apply_all(orig, [a, b], origin)
+    ba = apply_all(orig, [b, a], origin)
+
+    if ab is not None and ba is not None:
+        if ab != ba:
+            return _verdict("CONFLICT", a, b, note="order-disagrees", batch=False)
+        if a_only is not None and ab == a_only:
+            return _verdict("ABSORB", a, b, note="redundant", absorber=a.id, batch=False)
+        if b_only is not None and ba == b_only:
+            return _verdict("ABSORB", a, b, note="redundant", absorber=b.id, batch=False)
+        return _verdict("COMMUTE", a, b, note="either-order", order="ab|ba", batch=True)
+
+    if ab is not None and ba is None:
+        if a_only is not None and ab == a_only:
+            return _verdict("ABSORB", a, b, note="redundant", absorber=a.id, batch=False)
+        return _verdict("ORDERED", a, b, note="ab-only", order="ab", batch=False)
+    if ba is not None and ab is None:
+        if b_only is not None and ba == b_only:
+            return _verdict("ABSORB", a, b, note="redundant", absorber=b.id, batch=False)
+        return _verdict("ORDERED", a, b, note="ba-only", order="ba", batch=False)
+
+    # neither sequential apply: overlapping disagreement
+    return _verdict("CONFLICT", a, b, note="overlap", batch=False)
+
+
+def compose_patches(p: list[Suggest], q: list[Suggest]) -> tuple[str, list[Verdict]]:
+    """Patch-level: every p_i vs every q_j, plus worst status."""
+    if not p or not q:
+        return "EMPTY", []
+    pairs = [compose_pair(a, b) for a in p for b in q]
+    worst = "EMPTY"
+    for v in pairs:
+        if RANK[v.status] > RANK[worst]:
+            worst = v.status
+    return worst, pairs
+
+
+def commit_key(s: Suggest) -> str:
+    return s.original_commit_id or s.commit_id or ""
+
+
+def pairwise(ss: list[Suggest], all_commits: bool = False) -> tuple[str, list[Verdict], dict]:
+    """Compose pairs. Default: only within original_commit_id.
+
+    A harvested comments.json from two PRs must not look batch-safe.
+    `--all-commits` restores the cartesian product (v0.1).
+    """
+    meta = {"commits": 0, "skipped": 0, "singles": 0}
+    n = len(ss)
+    cartesian = n * (n - 1) // 2 if n >= 2 else 0
+    if n < 2:
+        return "EMPTY", [], meta
+    groups: dict[str, list[Suggest]] = {}
+    for s in ss:
+        groups.setdefault(commit_key(s), []).append(s)
+    meta["commits"] = len(groups)
+    if all_commits:
+        pairs = [compose_pair(a, b) for a, b in combinations(ss, 2)]
+        meta["skipped"] = 0
+        meta["singles"] = sum(1 for g in groups.values() if len(g) < 2)
+    else:
+        pairs = []
+        singles = 0
+        for g in groups.values():
+            if len(g) < 2:
+                singles += 1
+                continue
+            pairs.extend(compose_pair(a, b) for a, b in combinations(g, 2))
+        meta["singles"] = singles
+        meta["skipped"] = cartesian - len(pairs)
+    worst = "EMPTY"
+    for v in pairs:
+        if RANK[v.status] > RANK[worst]:
+            worst = v.status
+    return worst, pairs, meta
+
+
+# ---------------------------------------------------------------------------
+# emit composed unified diff (no tree)
+# ---------------------------------------------------------------------------
+
+def hunk_text(s: Suggest) -> str:
+    old_n = len(s.before)
+    new_n = len(s.after)
+    start = s.start or 1
+    lines = [f"@@ -{start},{old_n} +{start},{new_n} @@"]
+    # Prefer a true replacement listing: minus then plus. Context-style
+    # mixed hunks are reconstructed as wholesale before→after.
+    for t in s.before:
+        lines.append("-" + t)
+    for t in s.after:
+        lines.append("+" + t)
+    return "\n".join(lines)
+
+
+def emit_suggests(ss: list[Suggest]) -> str:
+    by_path: dict[str, list[Suggest]] = {}
+    for s in ss:
+        by_path.setdefault(s.path, []).append(s)
+    out: list[str] = []
+    for path, hunks in by_path.items():
+        hunks = sorted(hunks, key=lambda s: s.start or 0)
+        out.append(f"diff --git a/{path} b/{path}")
+        out.append(f"--- a/{path}")
+        out.append(f"+++ b/{path}")
+        for h in hunks:
+            out.append(hunk_text(h))
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def emit_pair(v: Verdict, a: Suggest, b: Suggest) -> str:
+    if v.status == "CONFLICT":
+        return ""
+    if v.status == "ABSORB":
+        if v.absorber == b.id:
+            return emit_suggests([b])
+        return emit_suggests([a])
+    if v.status == "ORDERED":
+        if v.order == "ba":
+            merged = Suggest(
+                id=f"{b.id}+{a.id}",
+                path=a.path,
+                before=list(b.before) if b.before else list(a.before),
+                after=list(a.after),
+                start=b.start if b.start is not None else a.start,
+                recon="ordered-merge",
+            )
+            return emit_suggests([merged])
+        merged = Suggest(
+            id=f"{a.id}+{b.id}",
+            path=a.path,
+            before=list(a.before) if a.before else list(b.before),
+            after=list(b.after),
+            start=a.start if a.start is not None else b.start,
+            recon="ordered-merge",
+        )
+        return emit_suggests([merged])
+    # COMMUTE: both, original coordinates
+    return emit_suggests([a, b])
+
+
+# ---------------------------------------------------------------------------
+# format
+# ---------------------------------------------------------------------------
+
+def worst_status(pairs: list[Verdict]) -> str:
+    worst = "EMPTY"
+    for v in pairs:
+        if RANK[v.status] > RANK[worst]:
+            worst = v.status
+    return worst
+
+
+def batch_safe(pairs: list[Verdict]) -> bool:
+    if not pairs:
+        return True
+    return all(v.batch for v in pairs)
+
+
+def counts_of(pairs: list[Verdict]) -> dict[str, int]:
+    c = Counter(v.status for v in pairs)
+    return {k: int(c.get(k, 0)) for k in ("COMMUTE", "ABSORB", "ORDERED", "CONFLICT")}
+
+
+def format_human(status: str, pairs: list[Verdict], interesting: bool, meta: dict | None = None) -> str:
+    c = counts_of(pairs)
+    batch = "yes" if batch_safe(pairs) else "no"
+    n = len(pairs)
+    extra = ""
+    if meta:
+        if meta.get("commits"):
+            extra += f"  commits={meta['commits']}"
+        if meta.get("skipped"):
+            extra += f"  skipped={meta['skipped']}"
+        if meta.get("singles"):
+            extra += f"  singles={meta['singles']}"
+    lines = [
+        f"spar  {status}  pairs={n}  "
+        f"COMMUTE={c['COMMUTE']}  ABSORB={c['ABSORB']}  "
+        f"ORDERED={c['ORDERED']}  CONFLICT={c['CONFLICT']}  batch={batch}{extra}"
+    ]
+    hidden = 0
+    for v in pairs:
+        if interesting and v.status == "COMMUTE" and v.note in ("disjoint-path", "unrelated-commit"):
+            hidden += 1
+            continue
+        extra = ""
+        if v.absorber:
+            extra += f"  absorber={v.absorber}"
+        if v.order:
+            extra += f"  order={v.order}"
+        loc = ""
+        if v.a_start is not None or v.b_start is not None:
+            loc = f"  @{v.a_start or '-'}×{v.b_start or '-'}"
+        lines.append(
+            f"  {v.status:<8} {v.path}  {v.a} × {v.b}  {v.note}{loc}{extra}"
+        )
+    if hidden:
+        lines.append(f"  ({hidden} disjoint/unrelated COMMUTE hidden; drop --interesting)")
+    return "\n".join(lines) + "\n"
+
+
+def format_porcelain(status: str, pairs: list[Verdict], meta: dict | None = None) -> str:
+    c = counts_of(pairs)
+    meta = meta or {}
+    return (
+        f"status {status}\n"
+        f"pairs {len(pairs)}\n"
+        f"commute {c['COMMUTE']}\n"
+        f"absorb {c['ABSORB']}\n"
+        f"ordered {c['ORDERED']}\n"
+        f"conflict {c['CONFLICT']}\n"
+        f"batch {int(batch_safe(pairs))}\n"
+        f"commits {int(meta.get('commits', 0))}\n"
+        f"skipped {int(meta.get('skipped', 0))}\n"
+        f"singles {int(meta.get('singles', 0))}\n"
+    )
+
+
+def format_tsv(pairs: list[Verdict]) -> str:
+    rows = ["status\ta\tb\tpath\tnote\torder\tabsorber\tbatch\ta_start\tb_start"]
+    for v in pairs:
+        rows.append(
+            "\t".join(
+                [
+                    v.status,
+                    v.a,
+                    v.b,
+                    v.path,
+                    v.note,
+                    v.order,
+                    v.absorber or "",
+                    "1" if v.batch else "0",
+                    "" if v.a_start is None else str(v.a_start),
+                    "" if v.b_start is None else str(v.b_start),
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def report_dict(
+    status: str,
+    pairs: list[Verdict],
+    left: list[Suggest],
+    right: list[Suggest] | None,
+    meta: dict | None = None,
+) -> dict:
+    meta = meta or {}
+    return {
+        "status": status,
+        "pairs": len(pairs),
+        "counts": counts_of(pairs),
+        "batch": batch_safe(pairs),
+        "commits": meta.get("commits", 0),
+        "skipped": meta.get("skipped", 0),
+        "singles": meta.get("singles", 0),
+        "left": [s.id for s in left],
+        "right": [s.id for s in right] if right is not None else None,
+        "verdicts": [v.as_dict() for v in pairs],
+    }
+
+
+def status_exit(status: str, pairs: list[Verdict]) -> int:
+    if status in ("EMPTY", "COMMUTE"):
+        return EXIT_OK
+    if status == "ABSORB":
+        return EXIT_OK if batch_safe(pairs) else EXIT_ORDER
+    if status == "ORDERED":
+        return EXIT_ORDER
+    if status == "CONFLICT":
+        return EXIT_CONFLICT
+    return EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _S(
+    ident: str,
+    path: str,
+    before: list[str],
+    after: list[str],
+    start: int | None = None,
+    commit: str | None = None,
+) -> Suggest:
+    end = None if start is None or not before else start + len(before) - 1
+    return Suggest(
+        id=ident,
+        path=path,
+        before=before,
+        after=after,
+        start=start,
+        end=end,
+        original_commit_id=commit,
+        recon="test",
+    )
+
+
+def selftest() -> int:
+    fails = 0
+    passed = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal fails, passed
+        if cond:
+            passed += 1
+            print(f"  PASS  {name}")
+        else:
+            fails += 1
+            print(f"  FAIL  {name}" + (f"  {detail}" if detail else ""))
+
+    # 1. disjoint files
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "lib.py", ["y = 1"], ["y = 2"], 1, "c0")
+    v = compose_pair(a, b)
+    check("disjoint-path COMMUTE", v.status == "COMMUTE" and v.batch, f"{v.status} {v.note}")
+
+    # 2. disjoint ranges same file
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["y = 1"], ["y = 2"], 10, "c0")
+    v = compose_pair(a, b)
+    check("disjoint-range COMMUTE", v.status == "COMMUTE" and v.note in ("either-order", "disjoint-range"), f"{v.status} {v.note}")
+
+    # 3. same locus disagreement
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["x = 1"], ["x = 3"], 1, "c0")
+    v = compose_pair(a, b)
+    check("same-range CONFLICT", v.status == "CONFLICT", f"{v.status} {v.note}")
+
+    # 4. equal
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    v = compose_pair(a, b)
+    check("equal ABSORB batch", v.status == "ABSORB" and v.batch and v.note == "equal", f"{v.status} {v.note} batch={v.batch}")
+
+    # 5. nested absorb: outer rewrite already has the inner fix
+    outer = _S(
+        "big",
+        "app.py",
+        ["def add(a, b):", "    return a + b", "    # todo"],
+        ["def add(a, b):", "    return a + b + bias()", "    # todo"],
+        1,
+        "c0",
+    )
+    inner = _S("tiny", "app.py", ["    return a + b"], ["    return a + b + bias()"], 2, "c0")
+    v = compose_pair(outer, inner)
+    check("nested ABSORB", v.status == "ABSORB" and v.absorber == "big" and not v.batch, f"{v.status} {v.absorber} {v.note}")
+
+    # 6. chain ORDERED
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["x = 2"], ["x = 3"], 1, "c0")
+    v = compose_pair(a, b)
+    check("chain ORDERED ab", v.status == "ORDERED" and v.order == "ab", f"{v.status} {v.order} {v.note}")
+
+    # 7. empty suggestion = delete, disjoint
+    a = _S("del", "doc.html", ["w"], [], 221, "c0")
+    b = _S("typo", "doc.html", ["outside"], ["outside"], 218, "c0")
+    # b is a no-op; use a real edit
+    b = _S("typo", "doc.html", ['lies outwith your'], ['lies outside your'], 218, "c0")
+    v = compose_pair(a, b)
+    check("delete × neighbor COMMUTE", v.status == "COMMUTE", f"{v.status} {v.note}")
+
+    # 8. overlapping context still COMMUTE (shared blank kept)
+    a = _S(
+        "prod",
+        "lib.rs",
+        ["pub fn add(a: i32, b: i32) -> i32 {", "    a + b", "}", ""],
+        ["pub fn add(a: i32, b: i32) -> i32 {", "    a + b + bias()", "}", ""],
+        1,
+        "c0",
+    )
+    b = _S(
+        "oracle",
+        "lib.rs",
+        ["", "#[cfg(test)]", "mod tests {", "    use super::*;", "}"],
+        ["", "#[cfg(test)]", "mod tests {", "    use super::*;", "    #[test]", "    fn t() {}", "}"],
+        4,
+        "c0",
+    )
+    v = compose_pair(a, b)
+    check("context-overlap COMMUTE", v.status == "COMMUTE", f"{v.status} {v.note} order={v.order}")
+
+    # 9. unrelated commits, different befores → COMMUTE note
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["z = 9"], ["z = 8"], 1, "c1")
+    v = compose_pair(a, b)
+    check(
+        "cross-commit COMMUTE not batch",
+        v.status == "COMMUTE" and v.note == "unrelated-commit" and not v.batch,
+        f"{v.status} {v.note} batch={v.batch}",
+    )
+
+    # 10. unicode path
+    a = _S("a", "tests/加算.rs", ["fn 加算() {}"], ["fn 加算() { 1 }"], 1, "c0")
+    b = _S("b", "src/lib.rs", ["fn add() {}"], ["fn add() { 2 }"], 1, "c0")
+    v = compose_pair(a, b)
+    check("unicode disjoint COMMUTE", v.status == "COMMUTE", v.status)
+
+    # 11. GitHub body reconstruction: range, not all-plus
+    obj = {
+        "id": 1,
+        "path": "command/pr.go",
+        "side": "RIGHT",
+        "original_line": 347,
+        "diff_hunk": (
+            "@@ -339,7 +342,11 @@ func show(number ...string) error {\n"
+            " func pullRequestForCurrentBranch() (*github.PullRequest, error) {\n"
+            " \tproject := project()\n"
+            " \tclient := github.NewClient(project.Host)\n"
+            "-\theadWithOwner := fmt.Sprintf(\"%s:%s\", project.Owner, currentBranch())\n"
+            "+\tcurrentBranch, err := context.CurrentBranch()\n"
+            "+\tif err != nil {\n"
+            "+\t\treturn &github.PullRequest{}, err"
+        ),
+        "body": "```suggestion\r\n\t\treturn nil, err\r\n```",
+    }
+    ss = obj_to_suggests(obj)
+    check("recon one claim", len(ss) == 1, str(len(ss)))
+    if ss:
+        check(
+            "recon is commented line not all-plus",
+            ss[0].before == ["\t\treturn &github.PullRequest{}, err"],
+            str(ss[0].before),
+        )
+        check("recon after", ss[0].after == ["\t\treturn nil, err"], str(ss[0].after))
+        check("recon method range", ss[0].recon == "range", ss[0].recon)
+
+    # 12. empty fence = delete
+    obj = {
+        "id": 2,
+        "path": "doc/code.html",
+        "original_line": 221,
+        "diff_hunk": "@@ -1,1 +1,1 @@\n+w",
+        "body": "```suggestion\r\n```",
+    }
+    ss = obj_to_suggests(obj)
+    check("empty suggestion is delete", bool(ss) and ss[0].after == [] and ss[0].before == ["w"], str(ss[0].after if ss else None))
+
+    # 13. markdown stream
+    md = (
+        "# src/add.py:2\n\n```\n    return a - b\n```\n"
+        "```suggestion\n    return a + b\n```\n"
+    )
+    md_s = parse_markdown_stream(md)
+    check("markdown parse", len(md_s) == 1 and md_s[0].after == ["    return a + b"], str(md_s))
+
+    # 14. unified diff hunks
+    patch = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b + bias()\n"
+        "diff --git a/tests/test_add.py b/tests/test_add.py\n"
+        "--- a/tests/test_add.py\n+++ b/tests/test_add.py\n"
+        "@@ -1,2 +1,2 @@\n def test_add():\n-    assert add(1,1)==2\n+    assert add(1,1)==2 + bias()\n"
+    )
+    ps = parse_patch_suggests(patch)
+    check("patch two hunks", len(ps) == 2, str(len(ps)))
+    if len(ps) == 2:
+        v = compose_pair(ps[0], ps[1])
+        check("oracle×prod COMMUTE", v.status == "COMMUTE" and v.note == "disjoint-path", f"{v.status} {v.note}")
+
+    # 15. emit commute concatenates
+    a = _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0")
+    b = _S("b", "app.py", ["y = 1"], ["y = 2"], 10, "c0")
+    v = compose_pair(a, b)
+    em = emit_pair(v, a, b)
+    check(
+        "emit has both hunks",
+        em.count("\n@@ ") == 2 and "-x = 1" in em and "-y = 1" in em,
+        em,
+    )
+
+    # 16. jsonl load
+    raw = '{"path":"mod.py","before":["TIMEOUT = 30"],"after":["TIMEOUT = 60"],"id":"r1","start_line":1,"line":1}\n{"path":"mod.py","before":["retries = 3"],"after":["retries = 5"],"id":"r2","start_line":2,"line":2}\n'
+    loaded = load_stream(raw, "jsonl")
+    check("jsonl two", len(loaded) == 2, str(len(loaded)))
+    if len(loaded) == 2:
+        v = compose_pair(loaded[0], loaded[1])
+        check("jsonl COMMUTE", v.status == "COMMUTE", f"{v.status} {v.note}")
+
+    # 17. zip multiline drop-blank (start_line–line)
+    zobj = {
+        "id": 720912639,
+        "path": "src/archive/zip/reader.go",
+        "side": "RIGHT",
+        "original_line": 792,
+        "original_start_line": 791,
+        "diff_hunk": (
+            "@@ -789,6 +788,8 @@ func (r *Reader) Open(name string) (fs.File, error) {\n"
+            " \tif e.isDir {\n"
+            " \t\treturn &openDir{e, r.openReadDir(name), 0}, nil\n"
+            " \t}\n"
+            "+\n"
+            "+\te.file.readDataDescriptor()"
+        ),
+        "body": "```suggestion\r\n\te.file.readDataDescriptor()\r\n```",
+    }
+    zs = obj_to_suggests(zobj)
+    check(
+        "zip range is two lines",
+        bool(zs) and zs[0].before == ["", "\te.file.readDataDescriptor()"] and zs[0].after == ["\te.file.readDataDescriptor()"],
+        str(zs[0].before if zs else None),
+    )
+
+    # 18. pairwise worst
+    st, pairs, _meta = pairwise(
+        [
+            _S("a", "a.py", ["1"], ["2"], 1, "c"),
+            _S("b", "b.py", ["1"], ["2"], 1, "c"),
+            _S("c", "a.py", ["1"], ["9"], 1, "c"),
+        ]
+    )
+    check("pairwise worst CONFLICT", st == "CONFLICT", st)
+    check("pairwise 3", len(pairs) == 3, str(len(pairs)))
+
+    # 19. v0.2: default pairwise stays inside original_commit_id
+    grouped = [
+        _S("a", "app.py", ["x = 1"], ["x = 2"], 1, "c0"),
+        _S("b", "app.py", ["y = 1"], ["y = 2"], 10, "c0"),
+        _S("c", "app.py", ["z = 1"], ["z = 9"], 1, "c1"),
+    ]
+    st, pairs, meta = pairwise(grouped)
+    check("same-commit only one pair", len(pairs) == 1, str(len(pairs)))
+    check("skipped cross-commit", meta["skipped"] == 2, str(meta))
+    check("grouped COMMUTE", st == "COMMUTE" and pairs[0].note == "either-order", f"{st} {pairs[0].note if pairs else None}")
+    st, pairs, meta = pairwise(grouped, all_commits=True)
+    check("all-commits restores 3", len(pairs) == 3 and meta["skipped"] == 0, str(len(pairs)))
+    check("cross-commit not batch", any(p.note == "unrelated-commit" and not p.batch for p in pairs), str([(p.note, p.batch) for p in pairs]))
+
+    # 20. jsonl without commit ids still pair (empty key)
+    naked = [
+        _S("r1", "mod.py", ["TIMEOUT = 30"], ["TIMEOUT = 60"], 1, None),
+        _S("r2", "mod.py", ["retries = 3"], ["retries = 5"], 2, None),
+    ]
+    st, pairs, meta = pairwise(naked)
+    check("missing-commit still COMMUTE", st == "COMMUTE" and len(pairs) == 1, f"{st} {len(pairs)}")
+
+    print(f"selftest: {passed} passed, {fails} failed")
+    return 0 if fails == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+HELP = f"""spar {VERSION} — two review suggestions are a patch algebra
+
+Usage:
+  spar FILE                    pairwise compose a review stream
+  spar A B                     compose patch A with patch B
+  gh api repos/o/r/pulls/N/comments | spar
+  spar --patch oracle.patch prod.patch
+  spar --emit A B              print the composed unified diff
+  spar --all-commits FILE      pairwise across original_commit_id (v0.1)
+  spar --selftest
+
+A and B are GitHub comment JSON/JSONL, markdown ```suggestion fences,
+or unified diffs. The before-image of a GitHub comment is the commented
+range of diff_hunk, not every + line.
+
+spar does not occupy a tree. That is plea. The question is whether the
+two patches commute, conflict, or one absorbs the other.
+
+Statuses:
+  COMMUTE   either order, same after-image (GitHub batch-safe)
+  ABSORB    one suggestion already contains the other (drop the inner)
+  ORDERED   only one order applies (chain)
+  CONFLICT  same locus disagrees, or neither order applies
+
+Exit: 0 COMMUTE/EQUAL/EMPTY, 1 ABSORB-nested/ORDERED, 2 CONFLICT, 3 error.
+      --report-only forces 0.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="spar", add_help=False)
+    p.add_argument("files", nargs="*")
+    p.add_argument("--patch", action="store_true", help="treat files as unified diffs")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--explain", action="store_true")
+    p.add_argument("--interesting", action="store_true")
+    p.add_argument(
+        "--all-commits",
+        action="store_true",
+        help="pairwise across original_commit_id (mixed-PR harvest)",
+    )
+    p.add_argument("--emit", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--help", "-h", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ns = parse_args(argv if argv is not None else sys.argv[1:])
+    if ns.help:
+        sys.stdout.write(HELP)
+        return 0
+    if ns.version:
+        print(VERSION)
+        return 0
+    if ns.selftest:
+        return selftest()
+
+    files = list(ns.files)
+    if not files:
+        files = ["-"]
+    if len(files) > 2:
+        print("spar: expected at most two inputs", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        loaded: list[list[Suggest]] = []
+        for f in files:
+            if ns.patch and f != "-":
+                text = Path(f).read_text(encoding="utf-8")
+                loaded.append(parse_patch_suggests(text, source=f))
+            elif ns.patch and f == "-":
+                loaded.append(parse_patch_suggests(sys.stdin.read(), source="stdin"))
+            else:
+                loaded.append(load_path(f))
+    except OSError as e:
+        print(f"spar: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if any(x is None for x in loaded):
+        return EXIT_ERROR
+    if not any(loaded):
+        print("spar: no suggestions", file=sys.stderr)
+        return EXIT_ERROR
+
+    right: list[Suggest] | None
+    meta: dict = {"commits": 0, "skipped": 0, "singles": 0}
+    if len(loaded) == 1:
+        left = loaded[0]
+        right = None
+        status, pairs, meta = pairwise(left, all_commits=ns.all_commits)
+        emit_src = (left[0], left[1]) if len(left) == 2 else None
+    else:
+        left, right = loaded[0], loaded[1]
+        status, pairs = compose_patches(left, right)
+        emit_src = (left[0], right[0]) if len(left) == 1 and len(right) == 1 else None
+
+    if ns.emit:
+        if emit_src is None:
+            # patch-level: emit every left+right hunk that is not absorbed/conflicted
+            if right is None:
+                print("spar: --emit needs two suggestions or two patches", file=sys.stderr)
+                return EXIT_ERROR
+            if status == "CONFLICT":
+                print("spar: CONFLICT; not emitting", file=sys.stderr)
+                return EXIT_CONFLICT
+            keep: list[Suggest] = []
+            absorbed = {v.b if v.absorber == v.a else v.a for v in pairs if v.status == "ABSORB" and v.absorber not in (None, "*")}
+            # When absorber is left id, drop right of that pair, etc.
+            drop: set[str] = set()
+            for v in pairs:
+                if v.status == "ABSORB" and v.absorber and v.absorber != "*":
+                    if v.absorber == v.a:
+                        drop.add(v.b)
+                    elif v.absorber == v.b:
+                        drop.add(v.a)
+            keep = [s for s in left + right if s.id not in drop]
+            sys.stdout.write(emit_suggests(keep))
+            return 0 if ns.report_only else status_exit(status, pairs)
+        em = emit_pair(compose_pair(emit_src[0], emit_src[1]), emit_src[0], emit_src[1])
+        if not em:
+            print("spar: CONFLICT; not emitting", file=sys.stderr)
+            return EXIT_CONFLICT
+        sys.stdout.write(em)
+        return 0 if ns.report_only else status_exit(status, pairs)
+
+    if ns.json:
+        sys.stdout.write(
+            json.dumps(report_dict(status, pairs, left, right, meta), indent=2, ensure_ascii=False) + "\n"
+        )
+    elif ns.tsv:
+        sys.stdout.write(format_tsv(pairs))
+    elif ns.porcelain:
+        sys.stdout.write(format_porcelain(status, pairs, meta))
+    else:
+        sys.stdout.write(format_human(status, pairs, ns.interesting, meta))
+        if ns.explain:
+            for s in left + (right or []):
+                sys.stdout.write(
+                    f"  claim  {s.id}  {s.path}:{s.start or '-'}  "
+                    f"recon={s.recon}  before={len(s.before)} after={len(s.after)}\n"
+                )
+
+    if ns.report_only:
+        return 0
+    return status_exit(status, pairs)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

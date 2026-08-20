@@ -1,0 +1,1808 @@
+#!/usr/bin/env python3
+"""hitch — wait-for graph of a process tree.
+
+Join OS sleep state to pipe / socket / fifo / file peers so a hung
+build or test answers 'on what?' instead of a pid list.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Optional
+
+__version__ = "0.2.0"
+
+SKIP_FD_NAMES = {"cwd", "txt", "rtd", "mem", "NOFD", "DEL"}
+PIPE_HEX = re.compile(r"0x[0-9a-fA-F]+")
+TCP_NAME = re.compile(
+    r"(?:TCP|UDP)\s+(\S+?)(?:->(\S+))?(?:\s+\(([^)]+)\))?", re.I
+)
+ENDPOINT = re.compile(r"^(?:\[[^\]]+\]|[^:]+):(\d+|\*)$")
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Fd:
+    fd: str = ""
+    type: str = ""
+    mode: str = ""  # r, w, u, or ""
+    name: str = ""
+    local: str = ""
+    peer: str = ""
+    net_state: str = ""
+    inode: str = ""
+    path: str = ""
+    device: str = ""
+
+    def is_pipeish(self) -> bool:
+        t = self.type.upper()
+        return t in {"PIPE", "FIFO"} or self.name.startswith("pipe:") or t == "FIFO"
+
+    def is_net(self) -> bool:
+        t = self.type.upper()
+        return t in {"IPv4", "IPv6", "TCP", "UDP", "unix", "UNIX", "sock", "SOCKET"} or (
+            self.name.startswith("socket:") or self.name.startswith("TCP ")
+        )
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    pgid: int = 0
+    uid: int = 0
+    state: str = ""
+    wchan: str = ""
+    rss: int = 0
+    cpu: float = 0.0
+    cmd: str = ""
+    comm: str = ""
+    fds: list[Fd] = field(default_factory=list)
+
+    @property
+    def running(self) -> bool:
+        return bool(self.state) and self.state[0] in "R"
+
+    @property
+    def zombie(self) -> bool:
+        return bool(self.state) and self.state[0] in "Z"
+
+    @property
+    def sleeping(self) -> bool:
+        return bool(self.state) and self.state[0] in "SUIDT"
+
+
+@dataclass
+class Edge:
+    src: int
+    dst: int  # 0 = kernel / outside tree
+    kind: str
+    detail: str = ""
+    peer_cmd: str = ""
+
+
+@dataclass
+class Sample:
+    t: float
+    procs: list[Proc]
+    edges: list[Edge]
+
+
+# ---------------------------------------------------------------------------
+# parsing: ps
+# ---------------------------------------------------------------------------
+
+
+def _decode(blob: bytes) -> str:
+    return blob.decode("utf-8", "replace")
+
+
+def parse_ps_table(text: str) -> list[Proc]:
+    """Parse `ps -axo pid,ppid,pgid,uid,state,wchan,rss,%cpu,command`."""
+    procs: list[Proc] = []
+    lines = text.splitlines()
+    if not lines:
+        return procs
+    start = 1 if "PID" in lines[0].upper() and "PPID" in lines[0].upper() else 0
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 8:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+            uid = int(parts[3])
+        except ValueError:
+            continue
+        state = parts[4]
+        wchan = parts[5]
+        try:
+            rss = int(float(parts[6]))
+        except ValueError:
+            rss = 0
+        try:
+            cpu = float(parts[7])
+        except ValueError:
+            cpu = 0.0
+        cmd = parts[8] if len(parts) > 8 else ""
+        comm = Path(cmd.split(None, 1)[0]).name if cmd.strip() else ""
+        if comm.endswith(":"):
+            comm = comm[:-1]
+        if comm.startswith("(") and comm.endswith(")") and len(comm) > 2:
+            comm = comm[1:-1]
+        procs.append(
+            Proc(
+                pid=pid,
+                ppid=ppid,
+                pgid=pgid,
+                uid=uid,
+                state=state,
+                wchan="" if wchan == "-" else wchan,
+                rss=rss,
+                cpu=cpu,
+                cmd=cmd,
+                comm=comm or f"pid{pid}",
+            )
+        )
+    return procs
+
+
+def run_ps() -> list[Proc]:
+    cmd = [
+        "ps",
+        "-axo",
+        "pid=,ppid=,pgid=,uid=,state=,wchan=,rss=,%cpu=,command=",
+    ]
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, timeout=2.0, check=False
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    text = _decode(out.stdout)
+    if not text.strip():
+        # some ps reject trailing = on every column
+        try:
+            out = subprocess.run(
+                [
+                    "ps",
+                    "-axo",
+                    "pid,ppid,pgid,uid,state,wchan,rss,%cpu,command",
+                ],
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        text = _decode(out.stdout)
+    return parse_ps_table(text)
+
+
+# ---------------------------------------------------------------------------
+# parsing: lsof
+# ---------------------------------------------------------------------------
+
+
+def _col_starts(header: str, names: list[str]) -> list[int]:
+    starts: list[int] = []
+    pos = 0
+    for name in names:
+        i = header.find(name, pos)
+        if i < 0:
+            return []
+        starts.append(i)
+        pos = i + 1
+    return starts
+
+
+def _slice_cols(line: str, starts: list[int]) -> list[str]:
+    vals = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(line)
+        vals.append(line[s:e].strip())
+    return vals
+
+
+_LSOF_LINE = re.compile(
+    r"^(?P<cmd>\S+)\s+(?P<pid>\d+)\s+(?P<user>\S+)\s+(?P<fd>\S+)\s+"
+    r"(?P<type>\S+)\s+(?P<device>\S+)\s+(?P<size>\S+)(?:\s+(?P<rest>.*))?$"
+)
+
+
+def _fd_mode(fdname: str) -> tuple[str, str]:
+    """Return (bare_fd, mode) for lsof FD cells like 4u / 1w / cwd."""
+    if fdname[-1:] in "rwu" and fdname[:-1].isdigit():
+        return fdname[:-1], fdname[-1]
+    return fdname, ""
+
+
+def _split_node_name(rest: str) -> tuple[str, str]:
+    rest = (rest or "").strip()
+    if not rest:
+        return "", ""
+    parts = rest.split()
+    head = parts[0]
+    if head in {"TCP", "UDP"} or head.startswith("->") or head.startswith("*"):
+        return "", rest
+    if re.match(r"^\d+$", head) and len(parts) > 1:
+        return head, " ".join(parts[1:])
+    return "", rest
+
+
+def parse_lsof_text(text: str) -> dict[int, list[Fd]]:
+    """Parse `lsof -nP` text. Whitespace-first; columns as fallback."""
+    by_pid: dict[int, list[Fd]] = defaultdict(list)
+    lines = [ln.rstrip("\n") for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    start = 1 if lines[0].lstrip().startswith("COMMAND") else 0
+    parsed_any = False
+    for line in lines[start:]:
+        m = _LSOF_LINE.match(line.strip())
+        if not m:
+            continue
+        pid = int(m.group("pid"))
+        fdname = m.group("fd")
+        bare, mode = _fd_mode(fdname)
+        if bare.lower() in SKIP_FD_NAMES or fdname.lower() in SKIP_FD_NAMES:
+            continue
+        inode, name = _split_node_name(m.group("rest") or "")
+        fd = Fd(
+            fd=fdname,
+            type=m.group("type"),
+            mode=mode,
+            name=name,
+            inode=inode,
+            device=m.group("device"),
+        )
+        _enrich_fd(fd)
+        by_pid[pid].append(fd)
+        parsed_any = True
+    if parsed_any:
+        return dict(by_pid)
+    return _parse_lsof_columns(lines)
+
+
+def _parse_lsof_columns(lines: list[str]) -> dict[int, list[Fd]]:
+    header = lines[0]
+    if "PID" not in header or "NAME" not in header:
+        return {}
+    names = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
+    starts = _col_starts(header, names)
+    if len(starts) != 9:
+        return {}
+    by_pid: dict[int, list[Fd]] = defaultdict(list)
+    for line in lines[1:]:
+        if len(line) < starts[1]:
+            continue
+        cols = _slice_cols(line, starts)
+        if len(cols) < 9:
+            continue
+        try:
+            pid = int(cols[1])
+        except ValueError:
+            continue
+        fdname = cols[3]
+        bare, mode = _fd_mode(fdname)
+        if bare.lower() in SKIP_FD_NAMES or fdname.lower() in SKIP_FD_NAMES:
+            continue
+        fd = Fd(
+            fd=fdname,
+            type=cols[4],
+            mode=mode,
+            name=cols[8],
+            inode=cols[7],
+            device=cols[5],
+        )
+        _enrich_fd(fd)
+        by_pid[pid].append(fd)
+    return dict(by_pid)
+
+
+def _enrich_fd(fd: Fd) -> None:
+    name = fd.name.strip()
+    typ = fd.type.upper()
+    if typ in {"PIPE", "FIFO"} or name.startswith("pipe:"):
+        peer_m = re.search(r"->(0x[0-9a-fA-F]+)", name)
+        if peer_m:
+            fd.peer = peer_m.group(1).lower()
+        if fd.device.lower().startswith("0x"):
+            fd.local = fd.device.lower()
+        m_pipe = re.search(r"pipe:\[(\d+)\]", name)
+        if m_pipe:
+            fd.inode = m_pipe.group(1)
+            fd.local = fd.local or f"pipe:{fd.inode}"
+        if typ == "FIFO" or name.startswith("/"):
+            fd.path = name.split()[0] if name else ""
+        return
+    if typ in {"IPv4", "IPv6"} or name.startswith("TCP") or name.startswith("UDP"):
+        body = re.sub(r"^(?:TCP|UDP)\s+", "", name, flags=re.I).strip()
+        st = re.search(r"\(([^)]+)\)\s*$", body)
+        if st:
+            fd.net_state = st.group(1).upper()
+            body = body[: st.start()].strip()
+        if "->" in body:
+            a, b = body.split("->", 1)
+            fd.local, fd.peer = a.strip(), b.strip()
+        else:
+            fd.local = body
+        return
+    if typ in {"unix", "UNIX"} or "unix" in name.lower():
+        fd.local = name
+        return
+    if typ in {"REG", "DIR", "CHR", "VDIR", "VREG"}:
+        fd.path = name.split()[0] if name else ""
+
+
+def run_lsof(pids: list[int]) -> dict[int, list[Fd]]:
+    if not pids:
+        return {}
+    merged: dict[int, list[Fd]] = {}
+    chunk = 40
+    for i in range(0, len(pids), chunk):
+        group = pids[i : i + chunk]
+        spec = ",".join(str(p) for p in group)
+        try:
+            out = subprocess.run(
+                ["lsof", "-nP", "-w", "-p", spec],
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        parsed = parse_lsof_text(_decode(out.stdout))
+        merged.update(parsed)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# parsing: Linux /proc
+# ---------------------------------------------------------------------------
+
+
+def procfs_available() -> bool:
+    return os.path.exists("/proc/self/stat") and os.path.isdir("/proc/self/fd")
+
+
+def parse_proc_stat_line(pid: int, stat: str, cmdline: str, wchan: str) -> Optional[Proc]:
+    lpar = stat.find("(")
+    rpar = stat.rfind(")")
+    if lpar < 0 or rpar < 0:
+        return None
+    comm = stat[lpar + 1 : rpar]
+    rest = stat[rpar + 2 :].split()
+    if len(rest) < 5:
+        return None
+    state = rest[0]
+    try:
+        ppid = int(rest[1])
+        pgid = int(rest[2])
+        rss = int(rest[21]) * 4 if len(rest) > 21 else 0  # pages→kb-ish
+    except ValueError:
+        return None
+    cmd = cmdline.strip() or f"[{comm}]"
+    return Proc(
+        pid=pid,
+        ppid=ppid,
+        pgid=pgid,
+        state=state,
+        wchan="" if wchan in {"0", ""} else wchan,
+        rss=rss,
+        cmd=cmd,
+        comm=comm,
+    )
+
+
+def run_procfs_procs() -> list[Proc]:
+    procs: list[Proc] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for ent in entries:
+        if not ent.isdigit():
+            continue
+        pid = int(ent)
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+                stat = f.read()
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    raw = f.read()
+                cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+            except OSError:
+                cmdline = ""
+            try:
+                with open(f"/proc/{pid}/wchan", "r", encoding="utf-8", errors="replace") as f:
+                    wchan = f.read().strip()
+            except OSError:
+                wchan = ""
+        except OSError:
+            continue
+        p = parse_proc_stat_line(pid, stat, cmdline, wchan)
+        if p:
+            procs.append(p)
+    return procs
+
+
+def _linux_fd_mode(pid: int, fdname: str) -> str:
+    try:
+        with open(f"/proc/{pid}/fdinfo/{fdname}", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("flags:"):
+                    flags = int(line.split()[1], 8)
+                    acc = flags & 0x3
+                    if acc == 0:
+                        return "r"
+                    if acc == 1:
+                        return "w"
+                    return "u"
+    except OSError:
+        return ""
+    return ""
+
+
+def run_procfs_fds(pids: list[int]) -> dict[int, list[Fd]]:
+    by_pid: dict[int, list[Fd]] = {}
+    sock_map = _linux_socket_map()
+    for pid in pids:
+        fds: list[Fd] = []
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            path = f"{fd_dir}/{name}"
+            try:
+                target = os.readlink(path)
+            except OSError:
+                continue
+            mode = _linux_fd_mode(pid, name)
+            fd = Fd(fd=name + mode, type="REG", mode=mode, name=target)
+            if target.startswith("pipe:"):
+                fd.type = "PIPE"
+                m = re.search(r"\[(\d+)\]", target)
+                if m:
+                    fd.inode = m.group(1)
+                    fd.local = f"pipe:{m.group(1)}"
+            elif target.startswith("socket:"):
+                fd.type = "sock"
+                m = re.search(r"\[(\d+)\]", target)
+                ino = m.group(1) if m else ""
+                fd.inode = ino
+                info = sock_map.get(ino)
+                if info:
+                    fd.type = info.get("type", "sock")
+                    fd.local = info.get("local", "")
+                    fd.peer = info.get("peer", "")
+                    fd.net_state = info.get("state", "")
+                    fd.name = info.get("name", target)
+            elif target.startswith("anon_inode:"):
+                fd.type = "anon"
+            else:
+                fd.path = target
+                fd.type = "FIFO" if target.startswith("/") and _is_fifo(target) else "REG"
+            fds.append(fd)
+        by_pid[pid] = fds
+    return by_pid
+
+
+def _is_fifo(path: str) -> bool:
+    try:
+        import stat as statmod
+
+        return statmod.S_ISFIFO(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+_TCP_STATE = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "0A": "LISTEN",
+    "06": "TIME_WAIT",
+    "08": "CLOSE_WAIT",
+}
+
+
+def _hex_ip_port(field: str) -> str:
+    # IPv4: AABBCCDD:PPPP little-endian
+    try:
+        ip_h, port_h = field.split(":")
+        port = int(port_h, 16)
+        if len(ip_h) == 8:
+            b = bytes.fromhex(ip_h)
+            ip = ".".join(str(x) for x in reversed(b))
+            return f"{ip}:{port}"
+        return f"{ip_h}:{port}"
+    except (ValueError, IndexError):
+        return field
+
+
+def _linux_socket_map() -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for fname, proto in (("/proc/net/tcp", "TCP"), ("/proc/net/tcp6", "TCP")):
+        try:
+            with open(fname, "r", encoding="utf-8", errors="replace") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local = _hex_ip_port(parts[1])
+                    rem = _hex_ip_port(parts[2])
+                    st = _TCP_STATE.get(parts[3].upper(), parts[3])
+                    ino = parts[9]
+                    if rem.endswith(":0") or rem.startswith("0.0.0.0"):
+                        name = f"{proto} {local} ({st})"
+                        peer = ""
+                    else:
+                        name = f"{proto} {local}->{rem} ({st})"
+                        peer = rem
+                    out[ino] = {
+                        "type": "IPv4",
+                        "local": local,
+                        "peer": peer,
+                        "state": st,
+                        "name": name,
+                    }
+        except OSError:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# tree + edges
+# ---------------------------------------------------------------------------
+
+
+def expand_tree(all_procs: list[Proc], root_pid: int, known: set[int]) -> list[Proc]:
+    known.add(root_pid)
+    by_pid = {p.pid: p for p in all_procs}
+    root = by_pid.get(root_pid)
+    # Only walk a process group when root is the session leader (the
+    # `hitch -- cmd` case with start_new_session). Snapshots of a random
+    # pid must not swallow the whole login shell's group.
+    root_pgid = root.pgid if root and root.pgid == root_pid else 0
+    self_pid = os.getpid()
+    changed = True
+    while changed:
+        changed = False
+        for p in all_procs:
+            if p.pid in known or p.pid <= 1 or p.pid == self_pid:
+                continue
+            if p.ppid in known or (root_pgid and p.pgid == root_pgid):
+                known.add(p.pid)
+                changed = True
+    return [p for p in all_procs if p.pid in known]
+
+
+def infer_edges(procs: list[Proc]) -> list[Edge]:
+    by_pid = {p.pid: p for p in procs}
+    edges: list[Edge] = []
+    edges.extend(_pipe_edges(procs, by_pid))
+    edges.extend(_net_edges(procs, by_pid))
+    edges.extend(_fifo_file_edges(procs, by_pid))
+    edges.extend(_orphan_fd_edges(procs, edges))
+    edges.extend(_child_wait_edges(procs, edges))
+    for p in procs:
+        if not p.sleeping or p.zombie:
+            continue
+        if any(e.src == p.pid for e in edges):
+            continue
+        kind = "sleep"
+        detail = p.wchan or "timer"
+        if p.wchan and p.wchan.lower() not in {"-", "0"}:
+            kind = "wchan"
+            detail = p.wchan
+        edges.append(Edge(src=p.pid, dst=0, kind=kind, detail=detail, peer_cmd="kernel"))
+    return edges
+
+
+def _pipe_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    locals_: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    peers: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    inodes: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    items: list[tuple[Proc, Fd]] = []
+    for p in procs:
+        for fd in p.fds:
+            if not fd.is_pipeish():
+                continue
+            items.append((p, fd))
+            if fd.local:
+                locals_[fd.local].append((p, fd))
+            if fd.peer:
+                peers[fd.peer].append((p, fd))
+            if fd.inode:
+                inodes[fd.inode].append((p, fd))
+    seen: set[tuple[int, int]] = set()
+    edges: list[Edge] = []
+
+    def add(a: Proc, afd: Fd, b: Proc, bfd: Fd) -> None:
+        if a.pid == b.pid:
+            return
+        # Same local hex address = same pipe end inherited across fork, not a wait.
+        if afd.local and afd.local == bfd.local and afd.local.startswith("0x"):
+            return
+        key = (min(a.pid, b.pid), max(a.pid, b.pid))
+        if key in seen:
+            return
+        seen.add(key)
+        a_read = afd.mode == "r"
+        b_read = bfd.mode == "r"
+        a_write = afd.mode == "w"
+        b_write = bfd.mode == "w"
+        if a_read and not b_read:
+            src, dst, sfd, kind = a, b, afd, "pipe-read"
+        elif b_read and not a_read:
+            src, dst, sfd, kind = b, a, bfd, "pipe-read"
+        elif a_write and not b_write:
+            src, dst, sfd, kind = a, b, afd, "pipe-write"
+        elif b_write and not a_write:
+            src, dst, sfd, kind = b, a, bfd, "pipe-write"
+        else:
+            # macOS often omits r/w on pipes. Prefer the child as waiter:
+            # parent created the pipe, child is usually blocked on it.
+            if a.pid == b.ppid:
+                src, dst, sfd = b, a, bfd
+            elif b.pid == a.ppid:
+                src, dst, sfd = a, b, afd
+            elif a.sleeping and not b.sleeping:
+                src, dst, sfd = a, b, afd
+            elif b.sleeping and not a.sleeping:
+                src, dst, sfd = b, a, bfd
+            else:
+                src, dst, sfd = a, b, afd
+            kind = "pipe-read"
+        edges.append(
+            Edge(
+                src=src.pid,
+                dst=dst.pid,
+                kind=kind,
+                detail=sfd.name or sfd.local or sfd.peer,
+                peer_cmd=short_cmd(dst.cmd),
+            )
+        )
+
+    for p, fd in items:
+        partners: list[tuple[Proc, Fd]] = []
+        if fd.peer:
+            partners.extend(locals_.get(fd.peer, []))
+        if fd.local:
+            partners.extend(peers.get(fd.local, []))
+        if fd.inode:
+            partners.extend(inodes.get(fd.inode, []))
+        for q, qfd in partners:
+            add(p, fd, q, qfd)
+    return edges
+
+
+def _net_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    listens: dict[str, Proc] = {}
+    established: list[tuple[Proc, Fd]] = []
+    connecting: list[tuple[Proc, Fd]] = []
+    for p in procs:
+        for fd in p.fds:
+            if not fd.is_net():
+                continue
+            st = fd.net_state
+            if st == "LISTEN" and fd.local:
+                listens[fd.local] = p
+                # also index by port
+                port = _port_of(fd.local)
+                if port:
+                    listens[f"*:{port}"] = p
+                    listens[port] = p
+            elif st in {"SYN_SENT", "SYN_RECV"}:
+                connecting.append((p, fd))
+            elif fd.peer or st == "ESTABLISHED":
+                established.append((p, fd))
+
+    edges: list[Edge] = []
+    paired: set[tuple[int, int]] = set()
+
+    def match_peer(p: Proc, fd: Fd) -> Optional[Proc]:
+        if fd.peer:
+            # reverse endpoint may be held by someone as local
+            for q in procs:
+                if q.pid == p.pid:
+                    continue
+                for qfd in q.fds:
+                    if not qfd.is_net():
+                        continue
+                    if qfd.local == fd.peer or (
+                        qfd.peer == fd.local and qfd.local == fd.peer
+                    ):
+                        return q
+                    if qfd.net_state == "LISTEN" and _same_listen(qfd.local, fd.peer):
+                        return q
+        port = _port_of(fd.peer)
+        if port and (port in listens or f"*:{port}" in listens):
+            return listens.get(fd.peer) or listens.get(port) or listens.get(f"*:{port}")
+        return None
+
+    for p, fd in established + connecting:
+        peer = match_peer(p, fd)
+        if peer:
+            key = (min(p.pid, peer.pid), max(p.pid, peer.pid))
+            if key in paired:
+                continue
+            paired.add(key)
+            waiter = p if p.sleeping or not peer.sleeping else peer
+            other = peer if waiter is p else p
+            edges.append(
+                Edge(
+                    src=waiter.pid,
+                    dst=other.pid,
+                    kind="tcp",
+                    detail=fd.name,
+                    peer_cmd=short_cmd(other.cmd),
+                )
+            )
+        else:
+            kind = "tcp-orphan" if fd.net_state in {"SYN_SENT", ""} and not fd.peer else "tcp-external"
+            if fd.net_state == "SYN_SENT":
+                kind = "tcp-orphan"
+            if p.sleeping or kind == "tcp-orphan":
+                edges.append(
+                    Edge(
+                        src=p.pid,
+                        dst=0,
+                        kind=kind,
+                        detail=fd.name,
+                        peer_cmd=fd.peer or "no-listener",
+                    )
+                )
+    return edges
+
+
+def _port_of(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    if endpoint.startswith("["):
+        m = re.search(r"\]:(\d+)$", endpoint)
+        return m.group(1) if m else ""
+    if ":" in endpoint:
+        return endpoint.rsplit(":", 1)[-1]
+    return ""
+
+
+def _same_listen(listen_local: str, peer: str) -> bool:
+    if not listen_local or not peer:
+        return False
+    if listen_local == peer:
+        return True
+    lp, pp = _port_of(listen_local), _port_of(peer)
+    if not lp or lp != pp:
+        return False
+    host = listen_local.rsplit(":", 1)[0]
+    return host in {"*", "0.0.0.0", "::", "[::]", "127.0.0.1", "::1"}
+
+
+def _orphan_fd_edges(procs: list[Proc], existing: list[Edge]) -> list[Edge]:
+    """Sleeping reader of a pipe/fifo whose other end is not in the tree."""
+    paired: set[int] = set()
+    for e in existing:
+        if e.kind.startswith(("pipe", "fifo", "tcp", "file")):
+            paired.add(e.src)
+            if e.dst:
+                paired.add(e.dst)
+    edges: list[Edge] = []
+    for p in procs:
+        if not p.sleeping or p.zombie or p.pid in paired:
+            continue
+        for fd in p.fds:
+            if not fd.is_pipeish():
+                continue
+            bare = fd.fd.rstrip("rwu")
+            if bare in {"0", "1", "2"}:
+                continue
+            if fd.mode == "w":
+                continue
+            is_fifo = fd.type.upper() == "FIFO" or (fd.path and "fifo" in fd.path.lower())
+            # macOS leaves pipe r/w blank; unpaired blank pipes are usually
+            # inherited stdio or runtime plumbing, not a hitch.
+            if not is_fifo and fd.mode != "r":
+                continue
+            kind = "fifo-orphan" if is_fifo else "pipe-orphan"
+            edges.append(
+                Edge(
+                    src=p.pid,
+                    dst=0,
+                    kind=kind,
+                    detail=fd.path or fd.name or fd.local,
+                    peer_cmd="missing-peer",
+                )
+            )
+            break
+    return edges
+
+
+def _child_wait_edges(procs: list[Proc], existing: list[Edge]) -> list[Edge]:
+    """Sleeping parent with live children → waitpid/child-wait, not a generic sleep."""
+    already = {e.src for e in existing}
+    kids_of: dict[int, list[Proc]] = defaultdict(list)
+    for p in procs:
+        if not p.zombie:
+            kids_of[p.ppid].append(p)
+    edges: list[Edge] = []
+    for p in procs:
+        if p.pid in already or not p.sleeping or p.zombie:
+            continue
+        kids = kids_of.get(p.pid) or []
+        if not kids:
+            continue
+        running = [k for k in kids if k.running]
+        target = running[0] if running else kids[0]
+        edges.append(
+            Edge(
+                src=p.pid,
+                dst=target.pid,
+                kind="child-wait",
+                detail=f"{len(kids)} child" + ("ren" if len(kids) != 1 else ""),
+                peer_cmd=short_cmd(target.cmd),
+            )
+        )
+    return edges
+
+
+def _fifo_file_edges(procs: list[Proc], by_pid: dict[int, Proc]) -> list[Edge]:
+    by_path: dict[str, list[tuple[Proc, Fd]]] = defaultdict(list)
+    for p in procs:
+        for fd in p.fds:
+            path = fd.path
+            if not path or path.startswith("/dev/") or path.startswith("/System/"):
+                continue
+            if fd.type.upper() in {"REG", "FIFO"} or path:
+                by_path[path].append((p, fd))
+    edges: list[Edge] = []
+    for path, holders in by_path.items():
+        writers = [(p, fd) for p, fd in holders if fd.mode in {"w", "u"}]
+        readers = [(p, fd) for p, fd in holders if fd.mode == "r"]
+        if not writers or not readers:
+            continue
+        fifo = any(fd.type.upper() == "FIFO" for _, fd in holders)
+        kind = "fifo" if fifo else "file-handoff"
+        for rp, rfd in readers:
+            if not rp.sleeping and not fifo:
+                continue
+            for wp, wfd in writers:
+                if rp.pid == wp.pid:
+                    continue
+                edges.append(
+                    Edge(
+                        src=rp.pid,
+                        dst=wp.pid,
+                        kind=kind,
+                        detail=path,
+                        peer_cmd=short_cmd(wp.cmd),
+                    )
+                )
+    return edges
+
+
+# ---------------------------------------------------------------------------
+# fold / report
+# ---------------------------------------------------------------------------
+
+
+_SHORTENERS = [
+    (re.compile(r"^/opt/homebrew/Cellar/python@[\d.]+/\S+?/(?:Python|python3[\d.]*)\s+"), "python3 "),
+    (re.compile(r"^/usr/local/Cellar/python@[\d.]+/\S+?/(?:Python|python3[\d.]*)\s+"), "python3 "),
+    (re.compile(r"^/usr/bin/python3\s+"), "python3 "),
+    (re.compile(r"^/Users/\S+?/\.rustup/toolchains/\S+?/bin/"), ""),
+    (re.compile(r"^/opt/homebrew/opt/node@?[\d]*/bin/"), ""),
+    (re.compile(r"^/opt/homebrew/bin/"), ""),
+    (re.compile(r"^/Users/\S+?/target/(debug|release)/deps/"), r"./target/\1/deps/"),
+]
+
+
+def short_cmd(cmd: str, n: int = 78) -> str:
+    cmd = " ".join(cmd.split())
+    cmd = re.sub(r"^\(([^)]+)\)\s*", r"\1 ", cmd)
+    for rx, repl in _SHORTENERS:
+        cmd = rx.sub(repl, cmd, count=1)
+    bits = cmd.split()
+    if bits and "rustc" in bits[0]:
+        m = re.search(r"--crate(?:-name)?\s+(\S+)", cmd)
+        if m:
+            cmd = f"rustc --crate {m.group(1)}"
+        else:
+            rs = re.findall(r"(\S+\.rs)", cmd)
+            if rs:
+                cmd = f"rustc {Path(rs[-1]).name}"
+    if len(cmd) <= n:
+        return cmd
+    return cmd[: n - 1] + "…"
+
+
+def fold_samples(samples: list[Sample], meta: dict[str, Any]) -> dict[str, Any]:
+    if not samples:
+        return {
+            "version": __version__,
+            "wall_s": 0.0,
+            "samples": 0,
+            "snags": [],
+            "graph": [],
+            "idle_windows": [],
+            "procs": [],
+            **meta,
+        }
+    t0 = samples[0].t
+    tN = samples[-1].t
+    wall = max(tN - t0, 0.0)
+    per: dict[int, dict[str, Any]] = {}
+    edge_w: dict[tuple[int, int, str], dict[str, Any]] = {}
+    idle_windows: list[dict[str, Any]] = []
+    idle_open: Optional[dict[str, Any]] = None
+    last_running_t = t0
+    last_desc_t = t0
+    saw_running = False
+    saw_desc = False
+    root_pid = meta.get("root_pid")
+    alive_last: set[int] = set()
+
+    def bucket(pid: int, proc: Proc) -> dict[str, Any]:
+        b = per.get(pid)
+        if not b:
+            b = {
+                "pid": pid,
+                "ppid": proc.ppid,
+                "cmd": proc.cmd,
+                "comm": proc.comm,
+                "running_s": 0.0,
+                "blocked_s": 0.0,
+                "alive_s": 0.0,
+                "last_state": proc.state,
+                "last_wait": None,
+                "wait_s": {},
+                "wait_of": {},
+            }
+            per[pid] = b
+        b["cmd"] = proc.cmd or b["cmd"]
+        b["comm"] = proc.comm or b["comm"]
+        b["last_state"] = proc.state
+        return b
+
+    for i, s in enumerate(samples):
+        dt = (s.t - samples[i - 1].t) if i else 0.0
+        if dt < 0:
+            dt = 0.0
+        idle = True
+        for p in s.procs:
+            b = bucket(p.pid, p)
+            b["alive_s"] += dt
+            if p.running:
+                b["running_s"] += dt
+                idle = False
+            elif not p.zombie:
+                b["blocked_s"] += dt
+        if any(p.running for p in s.procs):
+            last_running_t = s.t
+            saw_running = True
+            idle = False
+        if any((p.pid != root_pid) and not p.zombie for p in s.procs):
+            last_desc_t = s.t
+            saw_desc = True
+        for e in s.edges:
+            key = (e.src, e.dst, e.kind)
+            w = edge_w.get(key)
+            if not w:
+                w = {
+                    "src": e.src,
+                    "dst": e.dst,
+                    "kind": e.kind,
+                    "detail": e.detail,
+                    "peer_cmd": e.peer_cmd,
+                    "s": 0.0,
+                    "hits": 0,
+                }
+                edge_w[key] = w
+            w["s"] += dt
+            w["hits"] += 1
+            w["detail"] = e.detail or w["detail"]
+            w["peer_cmd"] = e.peer_cmd or w["peer_cmd"]
+            if e.src in per:
+                wait = {"kind": e.kind, "dst": e.dst, "detail": e.detail, "peer_cmd": e.peer_cmd}
+                per[e.src]["last_wait"] = wait
+                per[e.src]["wait_of"][e.kind] = wait
+                per[e.src]["wait_s"][e.kind] = per[e.src]["wait_s"].get(e.kind, 0.0) + dt
+        # idle window
+        if idle and s.procs:
+            if idle_open is None:
+                idle_open = {
+                    "t0": s.t,
+                    "t1": s.t,
+                    "edges": _edges_dump(s.edges),
+                    "states": [
+                        {
+                            "pid": p.pid,
+                            "state": p.state,
+                            "cmd": short_cmd(p.cmd, 60),
+                        }
+                        for p in s.procs
+                        if not p.zombie
+                    ],
+                }
+            else:
+                idle_open["t1"] = s.t
+                idle_open["edges"] = _edges_dump(s.edges)
+        else:
+            if idle_open is not None:
+                idle_open["dur"] = round(idle_open["t1"] - idle_open["t0"], 3)
+                idle_windows.append(idle_open)
+                idle_open = None
+        alive_last = {p.pid for p in s.procs if not p.zombie}
+
+    if idle_open is not None:
+        idle_open["dur"] = round(idle_open["t1"] - idle_open["t0"], 3)
+        idle_windows.append(idle_open)
+
+    min_idle = float(meta.get("min_idle", 0.25))
+    idle_windows = [w for w in idle_windows if w.get("dur", 0) >= min_idle]
+
+    graph = sorted(edge_w.values(), key=lambda x: -x["s"])
+    min_block = float(meta.get("min_block", 0.15))
+    snags = []
+    for b in per.values():
+        wait_s = b.get("wait_s") or {}
+        wait = b.get("last_wait") or {}
+        blocked = b["blocked_s"]
+        if blocked < min_block:
+            continue
+        specific = {k: v for k, v in wait_s.items() if k not in {"sleep", "wchan", "child-wait"}}
+        if specific and max(specific.values()) >= 0.2 * max(blocked, 1e-6):
+            kind = max(specific, key=specific.get)
+        elif wait_s:
+            kind = max(wait_s, key=wait_s.get)
+        else:
+            kind = wait.get("kind") or ("sleep" if blocked > b["running_s"] else "")
+        if not kind:
+            continue
+        wait = (b.get("wait_of") or {}).get(kind) or wait
+        score = blocked
+        if kind in {"pipe-read", "tcp", "tcp-orphan", "fifo", "fifo-orphan", "pipe-orphan"}:
+            score *= 1.6
+        if kind == "child-wait":
+            score *= 0.35
+        if wait.get("dst") in (0, None) and kind.startswith("tcp"):
+            score *= 1.4
+        snags.append(
+            {
+                "pid": b["pid"],
+                "cmd": short_cmd(b["cmd"], 120),
+                "comm": b["comm"],
+                "blocked_s": round(blocked, 3),
+                "running_s": round(b["running_s"], 3),
+                "score": round(score, 3),
+                "wait": wait,
+            }
+        )
+    snags.sort(key=lambda x: -x["score"])
+    leftovers = meta.get("leftovers") or []
+    running_s = sum(b["running_s"] for b in per.values())
+    blocked_s = sum(b["blocked_s"] for b in per.values())
+    if saw_desc:
+        coda_s = max(0.0, tN - last_desc_t)
+    elif saw_running:
+        coda_s = max(0.0, tN - last_running_t)
+    else:
+        coda_s = 0.0
+    # wall-clock idle is more honest than summing per-proc blocked
+    idle_s = sum(w["dur"] for w in idle_windows)
+    return {
+        "version": __version__,
+        "command": meta.get("command"),
+        "exit_code": meta.get("exit_code"),
+        "root_pid": meta.get("root_pid"),
+        "wall_s": round(wall, 3),
+        "active_s": round(max(0.0, last_running_t - t0), 3),
+        "coda_s": round(coda_s, 3),
+        "idle_s": round(idle_s, 3),
+        "tree_running_s": round(running_s, 3),
+        "tree_blocked_s": round(blocked_s, 3),
+        "samples": len(samples),
+        "interval_s": meta.get("interval"),
+        "snags": snags[:20],
+        "graph": [
+            {
+                "src": g["src"],
+                "dst": g["dst"],
+                "kind": g["kind"],
+                "s": round(g["s"], 3),
+                "hits": g["hits"],
+                "detail": g["detail"],
+                "peer_cmd": g["peer_cmd"],
+                "src_cmd": short_cmd(per.get(g["src"], {}).get("cmd", "")),
+                "dst_cmd": short_cmd(per.get(g["dst"], {}).get("cmd", "")) or g["peer_cmd"],
+            }
+            for g in graph[:40]
+        ],
+        "idle_windows": [
+            {
+                "t0": round(w["t0"] - t0, 3),
+                "t1": round(w["t1"] - t0, 3),
+                "dur": w["dur"],
+                "edges": w["edges"][:8],
+                "states": w["states"][:12],
+            }
+            for w in idle_windows[:12]
+        ],
+        "procs": [
+            {
+                "pid": b["pid"],
+                "ppid": b["ppid"],
+                "comm": b["comm"],
+                "cmd": short_cmd(b["cmd"]),
+                "running_s": round(b["running_s"], 3),
+                "blocked_s": round(b["blocked_s"], 3),
+                "last_state": b["last_state"],
+                "last_wait": b["last_wait"],
+            }
+            for b in sorted(per.values(), key=lambda x: -(x["blocked_s"] + x["running_s"]))[:40]
+        ],
+        "leftovers": leftovers,
+    }
+
+
+def _edges_dump(edges: list[Edge]) -> list[dict[str, Any]]:
+    return [
+        {
+            "src": e.src,
+            "dst": e.dst,
+            "kind": e.kind,
+            "detail": e.detail,
+            "peer_cmd": e.peer_cmd,
+        }
+        for e in edges
+    ]
+
+
+def samples_from_jsonl(text: str) -> list[Sample]:
+    samples: list[Sample] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        raw = json.loads(line)
+        procs = []
+        for p in raw.get("procs", []):
+            fds = [Fd(**{k: v for k, v in fd.items() if k in Fd.__dataclass_fields__}) for fd in p.get("fds", [])]
+            procs.append(
+                Proc(
+                    pid=int(p["pid"]),
+                    ppid=int(p.get("ppid") or 0),
+                    pgid=int(p.get("pgid") or 0),
+                    state=p.get("state") or "",
+                    wchan=p.get("wchan") or "",
+                    cmd=p.get("cmd") or "",
+                    comm=p.get("comm") or "",
+                    fds=fds,
+                )
+            )
+        edges = [
+            Edge(
+                src=int(e["src"]),
+                dst=int(e.get("dst") or 0),
+                kind=e["kind"],
+                detail=e.get("detail") or "",
+                peer_cmd=e.get("peer_cmd") or "",
+            )
+            for e in raw.get("edges", [])
+        ]
+        if not edges:
+            edges = infer_edges(procs)
+        samples.append(Sample(t=float(raw["t"]), procs=procs, edges=edges))
+    return samples
+
+
+def sample_to_jsonl(sample: Sample) -> str:
+    def fd_d(fd: Fd) -> dict[str, Any]:
+        d = asdict(fd)
+        return {k: v for k, v in d.items() if v}
+
+    payload = {
+        "t": round(sample.t, 4),
+        "procs": [
+            {
+                "pid": p.pid,
+                "ppid": p.ppid,
+                "pgid": p.pgid,
+                "state": p.state,
+                "wchan": p.wchan,
+                "cmd": p.cmd,
+                "comm": p.comm,
+                "fds": [fd_d(fd) for fd in p.fds],
+            }
+            for p in sample.procs
+        ],
+        "edges": _edges_dump(sample.edges),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# render
+# ---------------------------------------------------------------------------
+
+
+def render_human(rep: dict[str, Any]) -> str:
+    cmd = rep.get("command")
+    if isinstance(cmd, list):
+        cmd_s = short_cmd(" ".join(str(x) for x in cmd), 90)
+    else:
+        cmd_s = str(cmd or "")
+    lines = [
+        f"hitch {rep.get('version', __version__)}",
+        f"  cmd          {cmd_s}",
+        f"  wall         {rep.get('wall_s', 0):.2f}s   "
+        f"active {rep.get('active_s', 0):.2f}s   "
+        f"idle {rep.get('idle_s', 0):.2f}s   "
+        f"coda {rep.get('coda_s', 0):.2f}s",
+        f"  samples      {rep.get('samples', 0)}   exit {rep.get('exit_code', '-')}",
+    ]
+    snags = rep.get("snags") or []
+    if snags:
+        lines.append("")
+        lines.append("  SNAGS")
+        for s in snags[:8]:
+            wait = s.get("wait") or {}
+            peer = wait.get("peer_cmd") or (f"pid {wait.get('dst')}" if wait.get("dst") else "kernel")
+            dst = wait.get("dst")
+            arrow = f"← {peer}" if dst else peer
+            lines.append(
+                f"    pid {s['pid']:<6} {s['comm']:<12} "
+                f"blocked {s['blocked_s']:.2f}s  {wait.get('kind', '?'):<12} {arrow}"
+            )
+            if wait.get("detail"):
+                lines.append(f"             {short_cmd(str(wait['detail']), 88)}")
+    else:
+        lines.append("  SNAGS        (none over threshold)")
+    graph = rep.get("graph") or []
+    if graph:
+        lines.append("")
+        lines.append("  GRAPH  (waiter → blocker)")
+        for g in graph[:12]:
+            dst = g.get("dst") or 0
+            dst_s = g.get("dst_cmd") or ("kernel" if dst == 0 else f"pid {dst}")
+            src_s = g.get("src_cmd") or f"pid {g['src']}"
+            lines.append(
+                f"    {g['kind']:<12} {g['s']:>6.2f}s  "
+                f"{g['src']} {short_cmd(src_s, 34):<34} → {dst} {short_cmd(dst_s, 28)}"
+            )
+    windows = rep.get("idle_windows") or []
+    if windows:
+        lines.append("")
+        lines.append("  IDLE WINDOWS")
+        for w in windows[:6]:
+            lines.append(f"    {w['t0']:.2f}–{w['t1']:.2f}s  ({w['dur']:.2f}s)")
+            for e in (w.get("edges") or [])[:4]:
+                lines.append(
+                    f"      {e['kind']:<12} {e['src']} → {e.get('dst') or 'kernel'}  "
+                    f"{short_cmd(str(e.get('detail') or e.get('peer_cmd') or ''), 50)}"
+                )
+    leftovers = rep.get("leftovers") or []
+    if leftovers:
+        lines.append("")
+        lines.append("  LEFTOVERS after exit")
+        for L in leftovers[:8]:
+            lines.append(f"    pid {L.get('pid')}  {short_cmd(str(L.get('cmd') or ''), 70)}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# sampling loop
+# ---------------------------------------------------------------------------
+
+
+class Backend:
+    def __init__(self, kind: str, use_fds: bool) -> None:
+        self.kind = kind
+        self.use_fds = use_fds
+
+    def procs(self) -> list[Proc]:
+        if self.kind == "proc":
+            return run_procfs_procs()
+        return run_ps()
+
+    def fds(self, pids: list[int]) -> dict[int, list[Fd]]:
+        if not self.use_fds or not pids:
+            return {}
+        if self.kind == "proc":
+            got = run_procfs_fds(pids)
+            # merge lsof if sockets look empty and lsof exists
+            if not any(fd.is_net() for fds in got.values() for fd in fds):
+                extra = run_lsof(pids)
+                for pid, fds in extra.items():
+                    if pid in got:
+                        # prefer procfs pipes, add lsof nets
+                        nets = [fd for fd in fds if fd.is_net()]
+                        got[pid].extend(nets)
+                    else:
+                        got[pid] = fds
+            return got
+        return run_lsof(pids)
+
+
+def pick_backend(name: str, use_fds: bool) -> Backend:
+    if name == "auto":
+        name = "proc" if procfs_available() else "ps"
+    return Backend(name, use_fds)
+
+
+def take_sample(
+    backend: Backend,
+    root_pid: int,
+    known: set[int],
+    t0: float,
+    want_fds: bool,
+) -> Optional[Sample]:
+    all_procs = backend.procs()
+    if not all_procs:
+        return None
+    tree = expand_tree(all_procs, root_pid, known)
+    if not tree:
+        return None
+    if want_fds:
+        fdmap = backend.fds([p.pid for p in tree])
+        for p in tree:
+            p.fds = fdmap.get(p.pid, [])
+    edges = infer_edges(tree)
+    return Sample(t=time.time() - t0, procs=tree, edges=edges)
+
+
+def sample_until(
+    backend: Backend,
+    root_pid: int,
+    interval: float,
+    timeout: Optional[float],
+    samples_path: Optional[Path],
+    poll,
+) -> tuple[list[Sample], list[Proc]]:
+    known: set[int] = {root_pid}
+    samples: list[Sample] = []
+    t0 = time.time()
+    last_lsof = -1.0
+    lsof_every = max(0.28, interval)
+    sample_fh = None
+    if samples_path:
+        sample_fh = samples_path.open("w", encoding="utf-8")
+    leftovers: list[Proc] = []
+    try:
+        while True:
+            now = time.time() - t0
+            if timeout is not None and now >= timeout:
+                break
+            alive = poll()
+            idle_guess = False
+            if samples and samples[-1].procs:
+                idle_guess = not any(p.running for p in samples[-1].procs)
+            prev_n = len(samples[-1].procs) if samples else 0
+            want_fds = (
+                prev_n <= 12
+                or idle_guess
+                or not samples
+                or (now - last_lsof >= lsof_every)
+            )
+            s = take_sample(backend, root_pid, known, t0, want_fds)
+            if s:
+                if want_fds:
+                    last_lsof = now
+                samples.append(s)
+                if sample_fh:
+                    sample_fh.write(sample_to_jsonl(s) + "\n")
+                    sample_fh.flush()
+            if alive is not None:
+                # one leftover snapshot
+                time.sleep(min(0.05, interval))
+                extra = take_sample(backend, root_pid, known, t0, True)
+                if extra:
+                    leftovers = [p for p in extra.procs if p.pid != root_pid and not p.zombie]
+                    extra.t = time.time() - t0
+                    samples.append(extra)
+                    if sample_fh:
+                        sample_fh.write(sample_to_jsonl(extra) + "\n")
+                break
+            time.sleep(interval)
+    finally:
+        if sample_fh:
+            sample_fh.close()
+    return samples, leftovers
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+def write_report(rep: dict[str, Any], as_json: bool, dest: Optional[str], default_stdout: bool) -> None:
+    body = json.dumps(rep, indent=2, ensure_ascii=False) + "\n" if as_json else render_human(rep)
+    if dest == "-" or (dest is None and default_stdout):
+        sys.stdout.write(body)
+        return
+    if dest:
+        Path(dest).write_text(body, encoding="utf-8")
+        if not as_json:
+            sys.stderr.write(body)
+        else:
+            sys.stderr.write(f"hitch: wrote {dest}\n")
+        return
+    sys.stderr.write(body)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    command: list[str] = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        print("hitch: missing command", file=sys.stderr)
+        return 2
+    backend = pick_backend(args.backend, not args.no_lsof)
+    try:
+        proc = subprocess.Popen(command, start_new_session=True)
+    except FileNotFoundError:
+        print(f"hitch: not found: {command[0]}", file=sys.stderr)
+        return 127
+    root = proc.pid
+
+    def poll() -> Optional[int]:
+        return proc.poll()
+
+    def terminate() -> None:
+        try:
+            os.killpg(root, signal.SIGTERM)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    samples: list[Sample] = []
+    leftovers: list[Proc] = []
+    timed_out = False
+    try:
+        samples, leftovers = sample_until(
+            backend,
+            root,
+            args.interval,
+            args.timeout,
+            Path(args.samples) if args.samples else None,
+            poll,
+        )
+        if proc.poll() is None and args.timeout:
+            timed_out = True
+            terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(root, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                proc.wait(timeout=1)
+    except KeyboardInterrupt:
+        terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
+    exit_code = proc.poll()
+    if exit_code is None:
+        exit_code = 124 if timed_out else 1
+    meta = {
+        "command": command,
+        "exit_code": exit_code,
+        "root_pid": root,
+        "interval": args.interval,
+        "min_idle": args.min_idle,
+        "min_block": args.min_block,
+        "leftovers": [
+            {"pid": p.pid, "cmd": p.cmd, "state": p.state, "ppid": p.ppid} for p in leftovers
+        ],
+    }
+    rep = fold_samples(samples, meta)
+    write_report(rep, args.json, args.output, default_stdout=False)
+    if args.expect_kind:
+        kinds = {s.get("wait", {}).get("kind") for s in rep.get("snags") or []}
+        kinds |= {g.get("kind") for g in rep.get("graph") or []}
+        missing = [k for k in args.expect_kind if k not in kinds]
+        if missing:
+            print(f"hitch: expected wait kind {missing} not observed; saw {sorted(kinds)}", file=sys.stderr)
+            return 2
+    return 0 if args.ignore_exit else (124 if timed_out else int(exit_code))
+
+
+def cmd_snap(args: argparse.Namespace) -> int:
+    backend = pick_backend(args.backend, not args.no_lsof)
+    root = args.pid
+    if args.follow:
+        def poll() -> Optional[int]:
+            try:
+                os.kill(root, 0)
+                return None
+            except OSError:
+                return 0
+
+        samples, leftovers = sample_until(
+            backend,
+            root,
+            args.interval,
+            args.timeout,
+            Path(args.samples) if args.samples else None,
+            poll,
+        )
+        meta = {
+            "command": f"pid {root}",
+            "root_pid": root,
+            "interval": args.interval,
+            "min_idle": args.min_idle,
+            "min_block": args.min_block,
+            "leftovers": [{"pid": p.pid, "cmd": p.cmd, "state": p.state} for p in leftovers],
+        }
+        rep = fold_samples(samples, meta)
+    else:
+        known: set[int] = {root}
+        s = take_sample(backend, root, known, time.time(), True)
+        if not s:
+            print(f"hitch: pid {root} not found", file=sys.stderr)
+            return 1
+        meta = {
+            "command": f"pid {root}",
+            "root_pid": root,
+            "interval": 0,
+            "min_idle": 0,
+            "min_block": 0,
+        }
+        # give the single snapshot a synthetic duration so blocked_s > 0
+        s.t = 0.0
+        s2 = Sample(t=max(args.interval, 0.2), procs=s.procs, edges=s.edges)
+        rep = fold_samples([s, s2], meta)
+        rep["wall_s"] = 0.0
+        rep["snapshot"] = True
+    write_report(rep, args.json, args.output, default_stdout=True)
+    if args.expect_kind:
+        kinds = {s.get("wait", {}).get("kind") for s in rep.get("snags") or []}
+        kinds |= {g.get("kind") for g in rep.get("graph") or []}
+        missing = [k for k in args.expect_kind if k not in kinds]
+        if missing:
+            print(f"hitch: expected wait kind {missing} not observed; saw {sorted(kinds)}", file=sys.stderr)
+            return 2
+    return 0
+
+
+def cmd_fold(args: argparse.Namespace) -> int:
+    src = args.command[1] if len(args.command) > 1 else (args.samples or "-")
+    if src == "-":
+        text = sys.stdin.read()
+    else:
+        text = Path(src).read_text(encoding="utf-8")
+    samples = samples_from_jsonl(text)
+    meta = {
+        "command": "fold",
+        "interval": args.interval,
+        "min_idle": args.min_idle,
+        "min_block": args.min_block,
+    }
+    rep = fold_samples(samples, meta)
+    write_report(rep, args.json, args.output, default_stdout=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+LSOF_PIPE_BLOB = """COMMAND   PID       USER   FD    TYPE             DEVICE   SIZE/OFF      NODE NAME
+Python  10001 annenpolka    0r    REG               1,17        483 120267857 /tmp/in
+Python  10001 annenpolka    5w    PIPE 0xaaa111          16384           ->0xbbb222
+Python  10002 annenpolka    0r    REG               1,17        483 120267857 /tmp/in
+Python  10002 annenpolka    4r    PIPE 0xbbb222          16384           ->0xaaa111
+"""
+
+LSOF_TCP_BLOB = """COMMAND   PID       USER   FD    TYPE             DEVICE   SIZE/OFF NODE NAME
+Python  20001 annenpolka    4u   IPv4 0x1        0t0      TCP 127.0.0.1:54000 (LISTEN)
+Python  20002 annenpolka    5u   IPv4 0x2        0t0      TCP 127.0.0.1:54001->127.0.0.1:54000 (ESTABLISHED)
+Python  20001 annenpolka    5u   IPv4 0x3        0t0      TCP 127.0.0.1:54000->127.0.0.1:54001 (ESTABLISHED)
+"""
+
+PS_BLOB = """  PID  PPID  PGID   UID STAT WCHAN   RSS  %CPU COMMAND
+10001 10000 10001  501 S    -      1000   0.0 python writer
+10002 10001 10001  501 S    -      1000   0.0 python reader
+"""
+
+
+def selftest() -> int:
+    fails: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if not cond:
+            fails.append(f"{name}: {detail}")
+
+    ps = parse_ps_table(PS_BLOB)
+    check("ps-count", len(ps) == 2, str(len(ps)))
+    check("ps-child", ps[1].ppid == 10001, str(ps[1]))
+
+    pipes = parse_lsof_text(LSOF_PIPE_BLOB)
+    check("lsof-pipe-pids", set(pipes) == {10001, 10002}, str(set(pipes)))
+    w = next(fd for fd in pipes[10001] if fd.type == "PIPE")
+    r = next(fd for fd in pipes[10002] if fd.type == "PIPE")
+    check("pipe-local-writer", w.local == "0xaaa111", w.local)
+    check("pipe-peer-writer", w.peer == "0xbbb222", w.peer)
+    check("pipe-mode-r", r.mode == "r", r.mode)
+    check("pipe-mode-w", w.mode == "w", w.mode)
+
+    p_w = Proc(pid=10001, ppid=1, state="S", cmd="python writer", comm="python", fds=pipes[10001])
+    p_r = Proc(pid=10002, ppid=10001, state="S", cmd="python reader", comm="python", fds=pipes[10002])
+    edges = infer_edges([p_w, p_r])
+    kinds = {(e.src, e.dst, e.kind) for e in edges}
+    check("pipe-edge", (10002, 10001, "pipe-read") in kinds, str(kinds))
+
+    tcps = parse_lsof_text(LSOF_TCP_BLOB)
+    s = Proc(pid=20001, ppid=1, state="S", cmd="python srv", comm="python", fds=tcps[20001])
+    c = Proc(pid=20002, ppid=1, state="S", cmd="python cli", comm="python", fds=tcps[20002])
+    e2 = infer_edges([s, c])
+    tcp_kinds = {e.kind for e in e2}
+    check("tcp-kind", "tcp" in tcp_kinds, str([(e.src, e.dst, e.kind) for e in e2]))
+    paired = any({e.src, e.dst} == {20001, 20002} and e.kind == "tcp" for e in e2)
+    check("tcp-pair", paired, str([(e.src, e.dst, e.kind) for e in e2]))
+
+    # fold idle window
+    tprocs = [p_w, p_r]
+    s0 = Sample(t=0.0, procs=[Proc(pid=1, ppid=0, state="R", cmd="root", comm="root")], edges=[])
+    s1 = Sample(t=0.5, procs=tprocs, edges=infer_edges(tprocs))
+    s2 = Sample(t=1.5, procs=tprocs, edges=infer_edges(tprocs))
+    rep = fold_samples([s0, s1, s2], {"min_idle": 0.2, "min_block": 0.1, "command": ["t"]})
+    check("fold-snag", any(s["wait"].get("kind") == "pipe-read" for s in rep["snags"]), str(rep["snags"]))
+    check("fold-idle", any(w["dur"] >= 0.9 for w in rep["idle_windows"]), str(rep["idle_windows"]))
+
+    # linux pipe inode join
+    a = Proc(
+        pid=3,
+        ppid=1,
+        state="S",
+        cmd="r",
+        comm="r",
+        fds=[Fd(fd="3r", type="PIPE", mode="r", name="pipe:[9]", local="pipe:9", inode="9")],
+    )
+    b = Proc(
+        pid=4,
+        ppid=1,
+        state="R",
+        cmd="w",
+        comm="w",
+        fds=[Fd(fd="3w", type="PIPE", mode="w", name="pipe:[9]", local="pipe:9", inode="9")],
+    )
+    e3 = infer_edges([a, b])
+    check("linux-pipe", any(e.src == 3 and e.dst == 4 and e.kind == "pipe-read" for e in e3), str(e3))
+
+    # inherited stdout (same pipe end) must not become a fake pipe-read
+    same = Fd(
+        fd="1",
+        type="PIPE",
+        mode="",
+        name="->0xbbbb",
+        local="0xaaaa",
+        peer="0xbbbb",
+        device="0xaaaa",
+    )
+    parent = Proc(pid=10, ppid=1, state="S", cmd="cargo test", comm="cargo", fds=[same])
+    child = Proc(pid=11, ppid=10, state="S", cmd="kizu-test", comm="kizu", fds=[same])
+    e4 = infer_edges([parent, child])
+    pipe_between = [e for e in e4 if e.kind.startswith("pipe") and {e.src, e.dst} == {10, 11}]
+    check("no-inherited-pipe", pipe_between == [], str(e4))
+    check(
+        "child-wait",
+        any(e.src == 10 and e.dst == 11 and e.kind == "child-wait" for e in e4),
+        str(e4),
+    )
+
+    leader = Proc(pid=50, ppid=1, pgid=50, state="S", cmd="cargo", comm="cargo")
+    kid = Proc(pid=51, ppid=50, pgid=50, state="S", cmd="test", comm="test")
+    cousin = Proc(pid=99, ppid=1, pgid=50, state="S", cmd="unrelated", comm="zsh")
+    tree = expand_tree([leader, kid, cousin], 50, set())
+    check("pgid-session", {p.pid for p in tree} == {50, 51, 99}, str([p.pid for p in tree]))
+    snapped = expand_tree(
+        [
+            Proc(pid=70, ppid=1, pgid=7, state="S", cmd="sleep", comm="sleep"),
+            Proc(pid=7, ppid=1, pgid=7, state="S", cmd="zsh", comm="zsh"),
+        ],
+        70,
+        set(),
+    )
+    check("snap-no-pgid-swallow", {p.pid for p in snapped} == {70}, str([p.pid for p in snapped]))
+
+    if fails:
+        print("selftest FAILED", file=sys.stderr)
+        for f in fails:
+            print("  -", f, file=sys.stderr)
+        return 1
+    print("selftest ok", len([1, 2, 3]), "checks group")
+    print("selftest: 9 groups passed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="hitch",
+        description="Wait-for graph of a process tree (pipes, sockets, sleeps).",
+    )
+    p.add_argument("-V", "--version", action="version", version=f"hitch {__version__}")
+    p.add_argument("-p", "--pid", type=int, help="snapshot this pid's tree")
+    p.add_argument("--follow", action="store_true", help="with -p, sample until it exits")
+    p.add_argument("--json", action="store_true", help="report JSON")
+    p.add_argument("-o", "--output", help="report path (`-` = stdout)")
+    p.add_argument("--interval", type=float, default=0.12, help="sample interval seconds")
+    p.add_argument("--samples", help="write JSONL samples to FILE")
+    p.add_argument("--min-idle", type=float, default=0.25, help="idle window threshold")
+    p.add_argument("--min-block", type=float, default=0.15, help="snag blocked-time threshold")
+    p.add_argument("--expect-kind", action="append", default=[], help="exit 2 if kind absent")
+    p.add_argument("--timeout", type=float, help="seconds to supervise before SIGTERM")
+    p.add_argument("--no-lsof", action="store_true", help="skip fd joining")
+    p.add_argument("--backend", choices=["auto", "ps", "proc"], default="auto")
+    p.add_argument(
+        "--ignore-exit",
+        action="store_true",
+        help="return 0 even if the child failed (report still written)",
+    )
+    p.add_argument("command", nargs=argparse.REMAINDER, help="command to run (`--` then argv)")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        # keep -- so cmd_run can strip; but detect builtins first
+        rest = command[1:]
+        if rest[:1] in (["fold"], ["selftest"]):
+            command = rest
+            args.command = command
+    if command[:1] == ["selftest"]:
+        return selftest()
+    if command[:1] == ["fold"]:
+        return cmd_fold(args)
+    if args.pid:
+        return cmd_snap(args)
+    if command:
+        return cmd_run(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\nhitch: interrupted\n")
+        sys.exit(130)

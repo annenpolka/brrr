@@ -1,0 +1,35 @@
+OFFBY      offby.swift:2  statusCode == 401
+           same-field neighbor is off by one from the cut
+           CUT    400  offby.swift:9  (off-by-one d=1 field=statusCode)
+
+BRINK      excl.go:4  n > 3
+           exclusive bound; 3 is constructed (last miss)
+           CUT    3  excl.go:8  (exclusive)
+
+BRINK      incl.go:4  n >= 4
+           inclusive bound; 4 is constructed (first/last hit)
+           CUT    4  incl.go:8  (inclusive)
+
+BRINK      range.swift:2  code range [200, 300]
+           half-open range; constructed value sits on an endpoint
+           CUT    199  range.swift:6  (off-by-one)
+           CUT    200  range.swift:6  (inclusive)
+           CUT    299  range.swift:6  (off-by-one)
+           CUT    300  range.swift:6  (exclusive)
+
+SENTINEL   sentinel.py:2  err != -1
+           excluded sentinel sits on the cut
+           CUT    -1  sentinel.py:6  (exact)
+
+SENTINEL   sentinel.py:10  status != 'unknown'
+           excluded sentinel sits on the cut
+           CUT    'unknown'  sentinel.py:14  (exact)
+
+NEIGHBOR   enum_swift.swift:12  case in ['absent', 'unknown', 'none']
+           constructed variant sits next to the accepted set
+           CUT    'present'  enum_swift.swift:11  (neighbor)
+
+NEIGHBOR   neighbor.ts:4  phase === 'done'
+           adjacent enum variant is constructed; the compared-to value is not
+           CUT    'running'  neighbor.ts:11  (neighbor)
+           CUT    'unknown'  neighbor.ts:11  (neighbor)

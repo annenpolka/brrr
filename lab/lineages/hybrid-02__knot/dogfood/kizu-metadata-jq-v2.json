@@ -1,0 +1,236 @@
+{
+  "tool": "knot",
+  "version": "0.2.0",
+  "command": [
+    "cargo metadata --format-version 1 --offline | jq .packages | length"
+  ],
+  "wall_s": 0.255,
+  "exit": 0,
+  "samples": 2,
+  "knot": {
+    "pid": 28754,
+    "comm": "cargo",
+    "cmd": "cargo",
+    "label": "cargo metadata --format-version 1 --offline",
+    "kind": "compute",
+    "incoming_s": 0.227,
+    "running_s": 0.131,
+    "blocked_s": 0.0,
+    "reason": "wait-source of the tree (compute; Python, jq .packages | length waited here; via pipe-empty)",
+    "path": [
+      {
+        "pid": 28752,
+        "cmd": "jq .packages | length",
+        "kind": null
+      },
+      {
+        "pid": 28754,
+        "cmd": "cargo",
+        "kind": "pipe-empty",
+        "s": 0.096
+      }
+    ],
+    "via": [
+      "pipe-empty"
+    ]
+  },
+  "conversation": [
+    {
+      "src": 28742,
+      "dst": 28744,
+      "kind": "child-wait",
+      "s": 0.131,
+      "detail": "3 children",
+      "src_cmd": "bash -c set -o pipefail; '/opt/homebrew/o\u2026",
+      "dst_cmd": "Python",
+      "source": "tree"
+    },
+    {
+      "src": 28744,
+      "dst": 28754,
+      "kind": "child-wait",
+      "s": 0.131,
+      "detail": "1 child",
+      "src_cmd": "Python",
+      "dst_cmd": "cargo",
+      "source": "tree"
+    },
+    {
+      "src": 28752,
+      "dst": 0,
+      "kind": "sleep",
+      "s": 0.131,
+      "detail": "timer",
+      "src_cmd": "jq .packages | length",
+      "dst_cmd": "kernel",
+      "source": "tree"
+    },
+    {
+      "src": 28752,
+      "dst": 28754,
+      "kind": "pipe-empty",
+      "s": 0.096,
+      "detail": "1317847B",
+      "src_cmd": "jq .packages | length",
+      "dst_cmd": "cargo",
+      "source": "meter"
+    }
+  ],
+  "graph": [
+    {
+      "src": 28742,
+      "dst": 28744,
+      "kind": "child-wait",
+      "s": 0.131,
+      "detail": "3 children",
+      "src_cmd": "bash -c set -o pipefail; '/opt/homebrew/o\u2026",
+      "dst_cmd": "Python",
+      "source": "tree"
+    },
+    {
+      "src": 28744,
+      "dst": 28754,
+      "kind": "child-wait",
+      "s": 0.131,
+      "detail": "1 child",
+      "src_cmd": "Python",
+      "dst_cmd": "cargo",
+      "source": "tree"
+    },
+    {
+      "src": 28752,
+      "dst": 0,
+      "kind": "sleep",
+      "s": 0.131,
+      "detail": "timer",
+      "src_cmd": "jq .packages | length",
+      "dst_cmd": "kernel",
+      "source": "tree"
+    },
+    {
+      "src": 28752,
+      "dst": 28754,
+      "kind": "pipe-empty",
+      "s": 0.096,
+      "detail": "1317847B",
+      "src_cmd": "jq .packages | length",
+      "dst_cmd": "cargo",
+      "source": "meter"
+    }
+  ],
+  "stages": [
+    {
+      "i": 0,
+      "argv": [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--offline"
+      ],
+      "label": "cargo metadata --format-version 1 --offline",
+      "exit": 0,
+      "pid": 28754,
+      "wall_s": 0.098377458,
+      "ru_utime": 0.05116,
+      "ru_stime": 0.032191,
+      "cpu_s": 0.083351,
+      "cpu_frac": 0.8472571023333414
+    },
+    {
+      "i": 1,
+      "argv": [
+        "jq",
+        ".packages | length"
+      ],
+      "label": "jq .packages | length",
+      "exit": 0,
+      "pid": 28752,
+      "wall_s": 0.11196475,
+      "ru_utime": 0.012029,
+      "ru_stime": 0.0020399999999999997,
+      "cpu_s": 0.014069,
+      "cpu_frac": 0.1256556192908929
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "bytes": 1317847,
+      "reads": 75,
+      "writes": 78,
+      "read_stall_s": 0.095980667,
+      "write_stall_s": 0.008562916,
+      "both_stall_s": 0.000404501,
+      "copy_s": 0.000202118,
+      "wall_s": 0.105522,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-read",
+      "toward": 0
+    }
+  ],
+  "procs": [
+    {
+      "pid": 28742,
+      "ppid": 28735,
+      "comm": "bash",
+      "cmd": "bash -c set -o pipefail; '/opt/homebrew/opt/python@3.14/bin/python3.14' '/Use\u2026",
+      "running_s": 0.0,
+      "blocked_s": 0.131,
+      "instrument": false,
+      "user_wrapper": true
+    },
+    {
+      "pid": 28744,
+      "ppid": 28742,
+      "comm": "Python",
+      "cmd": "Python",
+      "running_s": 0.0,
+      "blocked_s": 0.131,
+      "instrument": false,
+      "user_wrapper": false
+    },
+    {
+      "pid": 28745,
+      "ppid": 28742,
+      "comm": "Python",
+      "cmd": "python3 knot --meter --log m0.json --buf-size 65536",
+      "running_s": 0.0,
+      "blocked_s": 0.131,
+      "instrument": true,
+      "user_wrapper": false
+    },
+    {
+      "pid": 28746,
+      "ppid": 28742,
+      "comm": "Python",
+      "cmd": "python3 knot --wrap --log s1.json -- jq .packages | length",
+      "running_s": 0.0,
+      "blocked_s": 0.131,
+      "instrument": true,
+      "user_wrapper": false
+    },
+    {
+      "pid": 28752,
+      "ppid": 28746,
+      "comm": "jq",
+      "cmd": "jq .packages | length",
+      "running_s": 0.0,
+      "blocked_s": 0.131,
+      "instrument": false,
+      "user_wrapper": false
+    },
+    {
+      "pid": 28754,
+      "ppid": 28744,
+      "comm": "cargo",
+      "cmd": "cargo",
+      "running_s": 0.131,
+      "blocked_s": 0.0,
+      "instrument": false,
+      "user_wrapper": false
+    }
+  ]
+}

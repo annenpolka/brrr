@@ -1,0 +1,1421 @@
+#!/usr/bin/env python3
+"""haunt — find names that died in git history but still speak in the living tree.
+
+Dead-code tools find living symbols with no references. haunt is the inverse:
+it mines deletions (definitions, paths, flags) and reports remnants that
+survived — docs, tests, CI, comments — after the definition is gone.
+
+    haunt                 # scan current branch
+    haunt main..HEAD      # names that died in this range
+    haunt --json          # machine output
+    haunt --strict        # exit 1 if any HAUNT remains
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import IO, Iterable
+
+VERSION = "0.2.0"
+
+COMMIT_MARK = "--HAUNT-COMMIT--"
+
+SKIP_DIR_PARTS = {
+    ".git",
+    "node_modules",
+    "target",
+    "vendor",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "wheels",
+    ".venv",
+    "venv",
+}
+
+SKIP_BASENAMES = {
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "uv.lock",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+    "license",
+    "license.md",
+    "copying",
+}
+
+SKIP_EXTS = {
+    ".lock",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".ico",
+    ".map",
+    ".min.js",
+    ".min.css",
+    ".wasm",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bin",
+    ".mp4",
+    ".o",
+    ".a",
+    ".so",
+    ".dylib",
+    ".rlib",
+}
+
+OBITUARY_BASENAMES = {
+    "changelog",
+    "changelog.md",
+    "changelog.rst",
+    "changelog.txt",
+    "changes",
+    "changes.md",
+    "history.md",
+    "history",
+    "news.md",
+    "news",
+    "releases.md",
+    "releasing.md",
+}
+
+OBITUARY_LINE = re.compile(
+    r"\b(removed|deleted|renamed|formerly|deprecated|obsolete|no longer|"
+    r"dropped|replaced by|was called|old name)\b",
+    re.I,
+)
+
+IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
+FLAG_RE = re.compile(r"""['"`]--([a-z][a-z0-9-]{3,})['"`]""")
+FLAG_CLAP_RE = re.compile(
+    r"""\blong(?:_about)?\s*[:=]\s*["']([a-z][a-z0-9-]{3,})["']"""
+)
+FLAG_PLAIN_RE = re.compile(r"""--([a-z][a-z0-9-]{3,})""")
+ALIAS_RE = re.compile(r"(?:^|[\s,(])as[ \t]+([A-Za-z_][A-Za-z0-9_]*)(?=\s*[,;)\n]|$)")
+CLAP_ARG_RE = re.compile(
+    r"#\[arg\((?P<inside>[^)]*)\)\](?:[ \t]*\n[ \t]*|[ \t]+)*(?:pub[ \t]+)?(?P<field>[a-z][a-z0-9_]*)\s*:",
+)
+CLAP_LONG_EQ_RE = re.compile(r"""\blong\s*=\s*["']([^"']+)["']""")
+PATHISH_RE = re.compile(
+    r"""(?<![A-Za-z0-9_])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)"""
+)
+ARCHIVAL_KINDS = frozenset({"obituary", "plan", "adr"})
+PROSE_EXTS = {".md", ".rst", ".txt", ".adoc", ".html"}
+
+# Definition rules applied to a single line (without the leading '-' of a diff).
+DEF_RULES: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:async[ \t]+)?(?:unsafe[ \t]+)?"
+            r"(?:const[ \t]+)?fn[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:async[ \t]+)?(?:unsafe[ \t]+)?"
+            r"def[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*(?:(?:pub(?:lic)?|private|internal|open|fileprivate)[ \t]+)?"
+            r"(?:override[ \t]+)?(?:mutating[ \t]+)?func[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*func[ \t]+(?:\([^)]*\)[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*(?:export[ \t]+)?(?:async[ \t]+)?function[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "fn",
+        re.compile(
+            r"^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+            r"[ \t]*=[ \t]*(?:async[ \t]*)?\("
+        ),
+    ),
+    (
+        "fn",
+        re.compile(r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(\)[ \t]*\{"),
+    ),
+    (
+        "class",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:abstract[ \t]+)?"
+            r"(?:final[ \t]+)?class[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "struct",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:struct|record)[ \t]+"
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "enum",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?enum[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "trait",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?"
+            r"(?:trait|protocol|interface)[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "type",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:type|typealias)[ \t]+"
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+    (
+        "const",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:const|static)[ \t]+"
+            r"(?:(?:mut|r#)[ \t]+)?([A-Z][A-Z0-9_]{3,})\b"
+        ),
+    ),
+    (
+        "mod",
+        re.compile(
+            r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+        ),
+    ),
+]
+
+STOPLIST = {
+    "main",
+    "test",
+    "tests",
+    "init",
+    "data",
+    "name",
+    "value",
+    "type",
+    "info",
+    "item",
+    "file",
+    "path",
+    "line",
+    "code",
+    "text",
+    "html",
+    "json",
+    "yaml",
+    "toml",
+    "true",
+    "false",
+    "none",
+    "null",
+    "self",
+    "this",
+    "that",
+    "from",
+    "into",
+    "with",
+    "have",
+    "been",
+    "will",
+    "when",
+    "what",
+    "where",
+    "which",
+    "some",
+    "todo",
+    "fixme",
+    "note",
+    "open",
+    "read",
+    "write",
+    "load",
+    "save",
+    "send",
+    "recv",
+    "drop",
+    "clone",
+    "copy",
+    "hash",
+    "debug",
+    "error",
+    "warn",
+    "info",
+    "trace",
+    "default",
+    "config",
+    "options",
+    "option",
+    "result",
+    "string",
+    "number",
+    "object",
+    "array",
+    "index",
+    "count",
+    "size",
+    "length",
+    "start",
+    "stop",
+    "close",
+    "reset",
+    "clear",
+    "update",
+    "create",
+    "delete",
+    "remove",
+    "insert",
+    "append",
+    "parse",
+    "format",
+    "print",
+    "display",
+    "render",
+    "handle",
+    "process",
+    "run",
+    "exec",
+    "call",
+    "apply",
+    "make",
+    "build",
+    "setup",
+    "teardown",
+    "helper",
+    "utils",
+    "common",
+    "shared",
+    "core",
+    "base",
+    "app",
+    "new",
+    "old",
+    "get",
+    "set",
+    "add",
+    "put",
+    "post",
+    "head",
+    "list",
+    "iter",
+    "next",
+    "prev",
+    "first",
+    "last",
+    "empty",
+    "ok",
+    "err",
+    "fmt",
+    "eq",
+    "cmp",
+    "partialeq",
+    "partialord",
+    "try_from",
+    "try_into",
+    "as_str",
+    "as_ref",
+    "to_string",
+    "to_owned",
+    "from_str",
+    "from_iter",
+    "into_iter",
+    "help",
+    "version",
+    "verbose",
+    "quiet",
+    "force",
+    "output",
+    "input",
+    "color",
+    "yes",
+    "all",
+    "src",
+    "lib",
+    "mod",
+    "pkg",
+    "internal",
+    "public",
+    "private",
+    "impl",
+    "trait",
+    "struct",
+    "enum",
+    "class",
+    "func",
+    "async",
+    "await",
+    "const",
+    "static",
+    "return",
+    "yield",
+    "break",
+    "continue",
+    "import",
+    "export",
+    "require",
+    "module",
+    "package",
+    "function",
+}
+
+STOP_FLAGS = {
+    "help",
+    "version",
+    "verbose",
+    "quiet",
+    "force",
+    "output",
+    "input",
+    "config",
+    "debug",
+    "dry-run",
+    "yes",
+    "color",
+    "no-color",
+    "all",
+    "json",
+    "human",
+    "scope",
+    "path",
+    "file",
+    "mode",
+    "type",
+    "name",
+    "from",
+    "format",
+}
+
+STOP_FILE_BASENAMES = {
+    "main.rs",
+    "lib.rs",
+    "mod.rs",
+    "index.js",
+    "index.ts",
+    "index.tsx",
+    "__init__.py",
+    "main.py",
+    "main.go",
+    "main.swift",
+    "package.json",
+    "cargo.toml",
+    "readme.md",
+    "makefile",
+    "skill.md",
+    "init.sh",
+    "hooks.json",
+    "config.toml",
+    "config.json",
+    "config.yml",
+    "config.yaml",
+}
+
+GENERIC_FILE_BASENAMES = STOP_FILE_BASENAMES | {
+    "justfile",
+    "dockerfile",
+    "license",
+    "cmakelists.txt",
+    "build.gradle",
+    "settings.gradle.kts",
+}
+
+
+@dataclass
+class Death:
+    kind: str
+    name: str
+    commit: str
+    timestamp: int
+    subject: str
+    path: str
+    extra: str = ""  # e.g. rename target
+
+
+@dataclass
+class Remnant:
+    path: str
+    line: int
+    kind: str
+    text: str
+
+
+@dataclass
+class Finding:
+    status: str  # HAUNT | ARCHIVE | DEAD | MOVE
+    death: Death
+    remnants: list[Remnant] = field(default_factory=list)
+    still_defined_in: list[str] = field(default_factory=list)
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run_git(repo: str, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    cmd = ["git", "-C", repo, "-c", "core.quotepath=false", *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if check and proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip() or f"git {' '.join(args)} failed"
+        raise RuntimeError(err)
+    return proc
+
+
+def git_root(start: str) -> str:
+    proc = run_git(start, ["rev-parse", "--show-toplevel"])
+    return proc.stdout.strip()
+
+
+def skip_path(path: str) -> bool:
+    p = path.replace("\\", "/").lower()
+    base = os.path.basename(p)
+    if base in SKIP_BASENAMES:
+        return True
+    _, ext = os.path.splitext(base)
+    if ext in SKIP_EXTS:
+        return True
+    parts = set(p.split("/"))
+    if parts & SKIP_DIR_PARTS:
+        return True
+    if "generated" in base:
+        return True
+    return False
+
+
+def is_obituary_path(path: str) -> bool:
+    base = os.path.basename(path.replace("\\", "/")).lower()
+    if base in OBITUARY_BASENAMES:
+        return True
+    if "changelog" in base:
+        return True
+    return False
+
+
+def remnant_kind(path: str) -> str:
+    p = path.replace("\\", "/").lower()
+    if is_obituary_path(p):
+        return "obituary"
+    parts = p.split("/")
+    if "plans" in parts or p.startswith("plans/"):
+        return "plan"
+    if "adr" in parts:
+        return "adr"
+    if "/.github/" in f"/{p}/" or p.startswith(".github/"):
+        return "ci"
+    if p.endswith((".yml", ".yaml")) and any(
+        x in p for x in ("ci", "workflow", "action", "pipeline", "lint")
+    ):
+        return "ci"
+    if remnant_is_test(p):
+        return "test"
+    if p.endswith(tuple(PROSE_EXTS)) or "/docs/" in f"/{p}/":
+        return "docs"
+    if p.endswith((".json", ".toml", ".ini", ".cfg", ".plist")):
+        return "config"
+    return "code"
+
+
+def is_prose_path(path: str) -> bool:
+    """Markdown/plans/ADRs are obituaries of names, not definition sites."""
+    return remnant_kind(path) in {"docs", "plan", "adr", "obituary"}
+
+
+def is_comment_line(line: str) -> bool:
+    s = line.strip()
+    return s.startswith(("//", "///", "#", "*", "/*", "-- ", ";"))
+
+
+def remnant_is_test(p: str) -> bool:
+    parts = p.split("/")
+    base = parts[-1]
+    if "test" in parts or "tests" in parts or "spec" in parts or "benches" in parts:
+        return True
+    if re.search(r"(?:^|[_-])(?:test|spec)s?(?:[_-]|$)", base):
+        return True
+    if base.endswith(("_test.go", ".test.js", ".test.ts", ".spec.ts", ".spec.js")):
+        return True
+    return False
+
+
+def extract_defs(line: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for kind, pat in DEF_RULES:
+        m = pat.search(line)
+        if not m:
+            continue
+        name = m.group(1)
+        key = (kind, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, name))
+    return out
+
+
+def extract_flags(line: str) -> list[str]:
+    names = set(FLAG_RE.findall(line))
+    names.update(FLAG_CLAP_RE.findall(line))
+    if "argparse" in line or "clap" in line or "flag" in line.lower() or "arg(" in line:
+        names.update(FLAG_PLAIN_RE.findall(line))
+    return sorted(names)
+
+
+def distinctive_symbol(name: str) -> bool:
+    if name.lower() in STOPLIST:
+        return False
+    if len(name) < 4:
+        return False
+    if name.lower() in {"test", "tests"}:
+        return False
+    if name.startswith("test_") or name.startswith("Test"):
+        # test fns are usually updated with the code; only keep very distinctive ones
+        return len(name) >= 16 or name.count("_") >= 3
+    if re.fullmatch(r"[A-Za-z]{4,5}", name) and name.islower():
+        return False  # short common english-ish
+    return True
+
+
+def distinctive_flag(name: str) -> bool:
+    if name in STOP_FLAGS:
+        return False
+    if len(name) < 4:
+        return False
+    return True
+
+
+def distinctive_file(path: str) -> bool:
+    base = os.path.basename(path).lower()
+    if base in GENERIC_FILE_BASENAMES:
+        return False
+    if path.replace("\\", "/").count("/") == 0 and len(base) < 8:
+        return False
+    return True
+
+
+def parse_diff_paths(diff_git_line: str) -> tuple[str, str] | None:
+    # diff --git a/foo b/bar  OR  diff --git "a/foo bar" "b/foo bar"
+    s = diff_git_line[len("diff --git ") :].rstrip()
+    if s.startswith("a/"):
+        # split on " b/" — fails if filename contains " b/"
+        mid = s.find(" b/")
+        if mid == -1:
+            return None
+        a = s[2:mid]
+        b = s[mid + 3 :]
+        return a, b
+    return None
+
+
+def collect_deaths(
+    repo: str,
+    rev_range: str | None,
+    max_commits: int,
+    since: str | None,
+    until: str | None,
+    verbose: bool,
+) -> list[Death]:
+    args = [
+        "log",
+        "-U0",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-merges",
+        f"--format={COMMIT_MARK}%H%n%ct%n%s",
+    ]
+    if max_commits > 0:
+        args.append(f"-n{max_commits}")
+    if since:
+        args.append(f"--since={since}")
+    if until:
+        args.append(f"--until={until}")
+    if rev_range:
+        args.append(rev_range)
+
+    proc = run_git(repo, args)
+    deaths: list[Death] = []
+    # Dedup: keep most recent death per (kind, name)
+    latest: dict[tuple[str, str], int] = {}
+
+    commit = ""
+    ts = 0
+    subject = ""
+    path = ""
+    file_deleted = False
+    file_renamed_from: str | None = None
+    skip = False
+    commits_seen = 0
+
+    def flush_file() -> None:
+        nonlocal file_deleted, file_renamed_from, path, skip
+        if skip:
+            return
+        if file_renamed_from and path:
+            add_death(Death("file", file_renamed_from, commit, ts, subject, file_renamed_from, extra=path))
+        elif file_deleted and path:
+            add_death(Death("file", path, commit, ts, subject, path))
+
+    def add_death(d: Death) -> None:
+        key = (d.kind, d.name)
+        prev = latest.get(key)
+        if prev is not None and d.timestamp <= prev:
+            return
+        latest[key] = d.timestamp
+        deaths.append(d)
+
+    for raw in proc.stdout.splitlines():
+        if raw.startswith(COMMIT_MARK):
+            flush_file()
+            commit = raw[len(COMMIT_MARK) :]
+            ts = 0
+            subject = ""
+            path = ""
+            file_deleted = False
+            file_renamed_from = None
+            skip = False
+            commits_seen += 1
+            continue
+        if commit and ts == 0 and raw.isdigit():
+            ts = int(raw)
+            continue
+        if commit and ts and subject == "" and not raw.startswith("diff --git"):
+            subject = raw
+            continue
+        if raw.startswith("diff --git "):
+            flush_file()
+            parsed = parse_diff_paths(raw)
+            path = parsed[1] if parsed else ""
+            file_deleted = False
+            file_renamed_from = None
+            skip = skip_path(path) if path else True
+            continue
+        if raw.startswith("deleted file mode"):
+            file_deleted = True
+            continue
+        if raw.startswith("rename from "):
+            file_renamed_from = raw[len("rename from ") :]
+            continue
+        if raw.startswith("rename to "):
+            path = raw[len("rename to ") :]
+            continue
+        if skip or not path or not commit:
+            continue
+        if raw.startswith("-") and not raw.startswith("---"):
+            line = raw[1:]
+            # Plans and markdown record history; they are not definition sites.
+            if is_prose_path(path):
+                continue
+            for kind, name in extract_defs(line):
+                if distinctive_symbol(name):
+                    add_death(Death(kind, name, commit, ts, subject, path))
+            for flag in extract_flags(line):
+                if distinctive_flag(flag):
+                    add_death(Death("flag", flag, commit, ts, subject, path))
+
+    flush_file()
+    if verbose:
+        eprint(f"scanned {commits_seen} commits, {len(deaths)} unique deaths")
+
+    # Keep only the latest Death per (kind, name) in the list
+    best: dict[tuple[str, str], Death] = {}
+    for d in deaths:
+        key = (d.kind, d.name)
+        cur = best.get(key)
+        if cur is None or d.timestamp >= cur.timestamp:
+            best[key] = d
+    return list(best.values())
+
+
+@dataclass
+class HeadIndex:
+    defs: dict[tuple[str, str], list[str]]  # (kind,name) -> paths
+    defs_any: dict[str, list[str]]  # name -> paths (any def kind)
+    idents: dict[str, list[Remnant]]  # identifier mentions
+    flags: dict[str, list[Remnant]]
+    files_existing: set[str]
+    raw_lines: dict[str, list[tuple[int, str]]]  # path -> [(lineno, text)]
+    live_flags: set[str] = field(default_factory=set)
+    living_basenames: Counter[str] = field(default_factory=Counter)
+
+
+def tracked_files(repo: str) -> list[str]:
+    proc = run_git(repo, ["ls-files", "-z"])
+    files = [p for p in proc.stdout.split("\0") if p]
+    return files
+
+
+def build_head_index(repo: str, deaths: list[Death], verbose: bool) -> HeadIndex:
+    want_idents: set[str] = set()
+    want_flags: set[str] = set()
+    want_paths: set[str] = set()
+    for d in deaths:
+        if d.kind == "flag":
+            want_flags.add(d.name)
+        elif d.kind == "file":
+            want_paths.add(d.name)
+            want_paths.add(os.path.basename(d.name))
+        else:
+            want_idents.add(d.name)
+
+    idx = HeadIndex(
+        defs=defaultdict(list),
+        defs_any=defaultdict(list),
+        idents=defaultdict(list),
+        flags=defaultdict(list),
+        files_existing=set(),
+        raw_lines={},
+        live_flags=set(),
+        living_basenames=Counter(),
+    )
+    files = tracked_files(repo)
+    indexed = 0
+    for rel in files:
+        norm = rel.replace("\\", "/")
+        idx.files_existing.add(norm)
+        idx.living_basenames[os.path.basename(norm).lower()] += 1
+        if skip_path(norm):
+            continue
+        full = os.path.join(repo, rel)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_size > 2_000_000:
+            continue
+        try:
+            raw = open(full, "rb").read()
+        except OSError:
+            continue
+        if b"\0" in raw[:8192]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        # Keep raw lines only for path-substring search of deleted files
+        if want_paths:
+            idx.raw_lines[norm] = [(i + 1, ln) for i, ln in enumerate(lines)]
+        rkind = remnant_kind(norm)
+        for i, ln in enumerate(lines, 1):
+            for kind, name in extract_defs(ln):
+                idx.defs[(kind, name)].append(norm)
+                idx.defs_any[name].append(norm)
+            for alias in ALIAS_RE.findall(ln):
+                idx.defs[("alias", alias)].append(norm)
+                idx.defs_any[alias].append(norm)
+            if want_idents:
+                for ident in IDENT_RE.findall(ln):
+                    if ident in want_idents:
+                        idx.idents[ident].append(Remnant(norm, i, rkind, ln.strip()[:160]))
+            found_flags = set(FLAG_PLAIN_RE.findall(ln))
+            found_flags.update(FLAG_RE.findall(ln))
+            if want_flags:
+                for fl in found_flags:
+                    if fl in want_flags:
+                        idx.flags[fl].append(Remnant(norm, i, rkind, ln.strip()[:160]))
+            if rkind in {"code", "test", "config", "ci"} and not is_comment_line(ln):
+                idx.live_flags.update(found_flags)
+        if rkind in {"code", "test"}:
+            for m in CLAP_ARG_RE.finditer(text):
+                inside = m.group("inside")
+                field = m.group("field")
+                eq = CLAP_LONG_EQ_RE.search(inside)
+                if eq:
+                    idx.live_flags.add(eq.group(1))
+                elif re.search(r"\blong\b", inside):
+                    idx.live_flags.add(field.replace("_", "-"))
+        indexed += 1
+    if verbose:
+        eprint(f"indexed {indexed} tracked files at HEAD")
+    return idx
+
+
+def classify(deaths: list[Death], idx: HeadIndex, keep_obituary: bool) -> list[Finding]:
+    findings: list[Finding] = []
+    for d in deaths:
+        if d.kind == "file":
+            findings.append(classify_file(d, idx, keep_obituary))
+        elif d.kind == "flag":
+            findings.append(classify_flag(d, idx, keep_obituary))
+        else:
+            findings.append(classify_symbol(d, idx, keep_obituary))
+    findings.sort(key=lambda f: (-len(f.remnants), f.death.kind, f.death.name.lower()))
+    return findings
+
+
+def filter_remnants(rems: list[Remnant], death_path: str, keep_obituary: bool) -> list[Remnant]:
+    out: list[Remnant] = []
+    seen: set[tuple[str, int]] = set()
+    for r in rems:
+        if r.path == death_path and r.kind == "code":
+            # mention in the same file that still exists can be leftover comment; keep
+            pass
+        if not keep_obituary:
+            if r.kind == "obituary":
+                continue
+            if OBITUARY_LINE.search(r.text):
+                continue
+        key = (r.path, r.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def status_for_remnants(rems: list[Remnant]) -> str:
+    if any(r.kind not in ARCHIVAL_KINDS for r in rems):
+        return "HAUNT"
+    return "ARCHIVE"
+
+
+def strong_symbol_remnant(r: Remnant, name: str, kind: str) -> bool:
+    """Drop homonym locals: a leftover fn must look cited, not just spelled."""
+    if r.kind in {"docs", "plan", "adr", "ci", "config", "obituary"}:
+        return True
+    if f"`{name}`" in r.text:
+        return True
+    if f"{name}(" in r.text or f"{name}::" in r.text:
+        return True
+    if re.search(rf"\bas[ \t]+{re.escape(name)}\b", r.text):
+        return True
+    if kind in {"struct", "enum", "class", "trait", "type"}:
+        # PascalCase type mention in a signature is a real leftover.
+        return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", r.text))
+    return False
+
+
+def classify_symbol(d: Death, idx: HeadIndex, keep_obituary: bool) -> Finding:
+    still = idx.defs.get((d.kind, d.name), [])
+    if not still:
+        still = idx.defs_any.get(d.name, [])
+    if still:
+        return Finding("MOVE", d, still_defined_in=sorted(set(still)))
+    rems = filter_remnants(idx.idents.get(d.name, []), d.path, keep_obituary)
+    rems = [r for r in rems if strong_symbol_remnant(r, d.name, d.kind)]
+    if rems:
+        return Finding(status_for_remnants(rems), d, remnants=rems)
+    return Finding("DEAD", d)
+
+
+def classify_flag(d: Death, idx: HeadIndex, keep_obituary: bool) -> Finding:
+    if d.name in idx.live_flags:
+        return Finding("MOVE", d, still_defined_in=["<live-flag>"])
+    rems = filter_remnants(idx.flags.get(d.name, []), d.path, keep_obituary)
+    def_like = [
+        r
+        for r in rems
+        if r.kind in {"code", "config", "test", "ci"}
+        and not is_comment_line(r.text)
+        and (FLAG_RE.search(r.text) or FLAG_CLAP_RE.search(r.text) or "add_argument" in r.text)
+    ]
+    if def_like:
+        return Finding("MOVE", d, still_defined_in=sorted({r.path for r in def_like}))
+    if rems:
+        return Finding(status_for_remnants(rems), d, remnants=rems)
+    return Finding("DEAD", d)
+
+
+def line_mentions_old_path(ln: str, old: str, new: str) -> bool:
+    """A rename destination path often contains the old basename; that is not a leftover."""
+    hay = ln
+    if new:
+        hay = hay.replace(new, " ")
+    return old in hay
+
+
+def classify_file(d: Death, idx: HeadIndex, keep_obituary: bool) -> Finding:
+    # Re-added at the same path.
+    if d.name in idx.files_existing and not d.extra:
+        return Finding("MOVE", d, still_defined_in=[d.name])
+    base = os.path.basename(d.name)
+    base_l = base.lower()
+    use_basename = (
+        distinctive_file(d.name)
+        and base_l not in GENERIC_FILE_BASENAMES
+        and idx.living_basenames.get(base_l, 0) == 0
+        and not d.extra
+    )
+    rems: list[Remnant] = []
+    for path, lines in idx.raw_lines.items():
+        rkind = remnant_kind(path)
+        for lineno, ln in lines:
+            hit = False
+            if line_mentions_old_path(ln, d.name, d.extra):
+                hit = True
+            elif use_basename and re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(base)}(?![A-Za-z0-9_])", ln
+            ):
+                hit = True
+            if hit:
+                rems.append(Remnant(path, lineno, rkind, ln.strip()[:160]))
+    rems = filter_remnants(rems, d.extra or d.path, keep_obituary)
+    if rems:
+        return Finding(status_for_remnants(rems), d, remnants=rems)
+    return Finding("DEAD", d)
+
+
+def iso_date(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def finding_to_json(f: Finding, remnant_limit: int) -> dict[str, object]:
+    d = f.death
+    rems = f.remnants[:remnant_limit]
+    return {
+        "status": f.status,
+        "kind": d.kind,
+        "name": d.name,
+        "died": {
+            "commit": d.commit,
+            "short": d.commit[:8],
+            "date": iso_date(d.timestamp),
+            "subject": d.subject,
+            "path": d.path,
+            "renamed_to": d.extra or None,
+        },
+        "still_defined_in": f.still_defined_in,
+        "remnant_count": len(f.remnants),
+        "remnants": [
+            {"path": r.path, "line": r.line, "kind": r.kind, "text": r.text} for r in rems
+        ],
+    }
+
+
+def print_human(findings: list[Finding], out: IO[str], remnant_limit: int, color: bool) -> None:
+    bold = "\033[1m" if color else ""
+    red = "\033[31m" if color else ""
+    dim = "\033[2m" if color else ""
+    reset = "\033[0m" if color else ""
+    if not findings:
+        print(f"{dim}no haunts{reset}" if color else "no haunts", file=out)
+        return
+    for f in findings:
+        d = f.death
+        extra = f" → {d.extra}" if d.extra else ""
+        header = f"{f.status}  {d.kind}  {d.name}"
+        print(f"{bold}{red}{header}{reset}" if color else header, file=out)
+        print(
+            f"  died {iso_date(d.timestamp)} {d.commit[:8]}  {d.path}{extra}",
+            file=out,
+        )
+        if d.subject:
+            print(f"  {dim}{d.subject}{reset}" if color else f"  {d.subject}", file=out)
+        shown = f.remnants[:remnant_limit]
+        for r in shown:
+            print(f"  still:{r.kind:9} {r.path}:{r.line}  {r.text}", file=out)
+        more = len(f.remnants) - len(shown)
+        if more > 0:
+            print(f"  … {more} more remnants", file=out)
+        print(file=out)
+
+
+def print_tsv(findings: list[Finding], out: IO[str], remnant_limit: int) -> None:
+    print("status\tkind\tname\tcommit\tdate\tpath\tremnant_kind\tremnant", file=out)
+    for f in findings:
+        d = f.death
+        date = iso_date(d.timestamp)
+        if not f.remnants:
+            print(f"{f.status}\t{d.kind}\t{d.name}\t{d.commit[:8]}\t{date}\t{d.path}\t\t", file=out)
+            continue
+        for r in f.remnants[:remnant_limit]:
+            loc = f"{r.path}:{r.line}"
+            print(
+                f"{f.status}\t{d.kind}\t{d.name}\t{d.commit[:8]}\t{date}\t{d.path}\t{r.kind}\t{loc}",
+                file=out,
+            )
+
+
+def want_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="haunt",
+        description="Find deleted names the living tree still talks about.",
+    )
+    p.add_argument("range", nargs="?", help="git revision range, e.g. main..HEAD")
+    p.add_argument("-C", "--repo", default=".", help="repository path")
+    p.add_argument("--since", help="git --since")
+    p.add_argument("--until", help="git --until")
+    p.add_argument("--max-commits", type=int, default=0, help="limit history (0 = all)")
+    p.add_argument(
+        "--kind",
+        default="all",
+        help="comma list: fn,class,struct,enum,trait,type,const,mod,flag,file,all",
+    )
+    p.add_argument("--all", action="store_true", help="include DEAD, MOVE, and ARCHIVE, not only HAUNT")
+    p.add_argument(
+        "--archival",
+        action="store_true",
+        help="also print ARCHIVE (names that linger only in plans/ADRs/changelogs)",
+    )
+    p.add_argument("--json", action="store_true", help="JSON array on stdout")
+    p.add_argument("--tsv", action="store_true", help="TSV on stdout")
+    p.add_argument("--human", action="store_true", help="force human output")
+    p.add_argument("--strict", action="store_true", help="exit 1 if any HAUNT")
+    p.add_argument("--keep-obituary", action="store_true", help="count changelog/obituary mentions")
+    p.add_argument("--limit", type=int, default=8, help="max remnants printed per name")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--self-test", action="store_true", help="run internal fixture tests")
+    p.add_argument("--version", action="version", version=f"haunt {VERSION}")
+    return p.parse_args(argv)
+
+
+def filter_kinds(deaths: list[Death], kind_spec: str) -> list[Death]:
+    if kind_spec.strip() in {"", "all"}:
+        return deaths
+    want = {k.strip() for k in kind_spec.split(",") if k.strip()}
+    return [d for d in deaths if d.kind in want]
+
+
+def scan(args: argparse.Namespace) -> tuple[list[Finding], int]:
+    try:
+        repo = git_root(os.path.abspath(args.repo))
+    except RuntimeError as exc:
+        eprint(f"haunt: not a git repository: {exc}")
+        return [], 2
+    try:
+        deaths = collect_deaths(
+            repo,
+            args.range,
+            args.max_commits,
+            args.since,
+            args.until,
+            args.verbose,
+        )
+    except RuntimeError as exc:
+        eprint(f"haunt: git log failed: {exc}")
+        return [], 2
+    deaths = filter_kinds(deaths, args.kind)
+    if args.verbose:
+        eprint(f"{len(deaths)} deaths after kind filter")
+    idx = build_head_index(repo, deaths, args.verbose)
+    findings = classify(deaths, idx, keep_obituary=args.keep_obituary)
+    return findings, 0
+
+
+def emit(findings: list[Finding], args: argparse.Namespace) -> None:
+    if args.all:
+        shown = findings
+    else:
+        shown = [
+            f
+            for f in findings
+            if f.status == "HAUNT" or (args.archival and f.status == "ARCHIVE")
+        ]
+    if args.json:
+        blob = [finding_to_json(f, args.limit) for f in shown]
+        json.dump(blob, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return
+    if args.tsv or (not args.human and not sys.stdout.isatty() and not args.json):
+        print_tsv(shown, sys.stdout, args.limit)
+        return
+    print_human(shown, sys.stdout, args.limit, want_color(args.color))
+
+
+# ---------------------------------------------------------------------------
+# Self-test fixture
+# ---------------------------------------------------------------------------
+
+
+def git_in(repo: str, args: list[str], env: dict[str, str] | None = None) -> None:
+    base = {
+        "GIT_AUTHOR_NAME": "haunt",
+        "GIT_AUTHOR_EMAIL": "haunt@test.local",
+        "GIT_COMMITTER_NAME": "haunt",
+        "GIT_COMMITTER_EMAIL": "haunt@test.local",
+        "GIT_AUTHOR_DATE": "2024-01-01T00:00:00",
+        "GIT_COMMITTER_DATE": "2024-01-01T00:00:00",
+    }
+    if env:
+        base.update(env)
+    proc = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **base},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed:\n{proc.stderr or proc.stdout}"
+        )
+
+
+def write(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def build_fixture(root: str) -> None:
+    git_in(root, ["init", "-q", "-b", "main"])
+    git_in(root, ["config", "user.name", "haunt"])
+    git_in(root, ["config", "user.email", "haunt@test.local"])
+
+    write(
+        f"{root}/src/parser.py",
+        "def parse_legacy_widget(src):\n    return src\n\ndef parse_ok(src):\n    return src\n",
+    )
+    write(
+        f"{root}/src/cli.py",
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--legacy-widget', action='store_true')\n"
+        "p.add_argument('--keep-me', action='store_true')\n",
+    )
+    write(f"{root}/scripts/deploy_legacy.sh", "#!/bin/sh\necho deploy\n")
+    write(
+        f"{root}/README.md",
+        "# demo\n\nUse `parse_legacy_widget` or `--legacy-widget`.\n"
+        "See scripts/deploy_legacy.sh.\n"
+        "Also `parse_ok` stays.\n",
+    )
+    write(f"{root}/CHANGELOG.md", "# changes\n")
+    write(f"{root}/src/keep.py", "def keep_forever():\n    return 1\n")
+    write(f"{root}/src/we ird file.py", "def not_haunted_yet():\n    return 0\n")
+    write(f"{root}/.gitignore", "nested/\n")
+    write(f"{root}/src/health.rs", "pub enum WatcherHealth {\n    Ok,\n}\n")
+    write(f"{root}/src/alias.py", "def fake_app():\n    return 1\n")
+    write(f"{root}/src/only_plan.py", "def only_in_plan_helper():\n    return 1\n")
+    write(f"{root}/plans/v1.md", "The entry point is `only_in_plan_helper`.\n")
+    write(f"{root}/gone/SKILL.md", "# gone skill\n")
+    write(f"{root}/keep/SKILL.md", "# keep skill\n")
+    write(f"{root}/gone/init.sh", "#!/bin/sh\ntrue\n")
+    write(f"{root}/keep/init.sh", "#!/bin/sh\ntrue\n")
+    write(f"{root}/docs/refs.md", "See gone/SKILL.md for the old skill.\n")
+    write(f"{root}/src/pred.py", "def predicateRejected():\n    return 1\n")
+    write(
+        f"{root}/tests/test_pred.py",
+        "predicateRejected = {'matched': False}\nprint(predicateRejected)\n",
+    )
+    write(f"{root}/moved.md", "# moved\n")
+
+    git_in(
+        root,
+        [
+            "add",
+            "src/parser.py",
+            "src/cli.py",
+            "scripts/deploy_legacy.sh",
+            "README.md",
+            "CHANGELOG.md",
+            "src/keep.py",
+            "src/we ird file.py",
+            ".gitignore",
+            "src/health.rs",
+            "src/alias.py",
+            "src/only_plan.py",
+            "plans/v1.md",
+            "gone/SKILL.md",
+            "keep/SKILL.md",
+            "gone/init.sh",
+            "keep/init.sh",
+            "docs/refs.md",
+            "src/pred.py",
+            "tests/test_pred.py",
+            "moved.md",
+        ],
+    )
+    git_in(
+        root,
+        ["commit", "-q", "-m", "birth"],
+        env={"GIT_AUTHOR_DATE": "2024-01-01T00:00:00", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00"},
+    )
+
+    # Delete the load-bearing things but leave README talking about them.
+    write(f"{root}/src/parser.py", "def parse_ok(src):\n    return src\n")
+    write(
+        f"{root}/src/cli.py",
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--keep-me', action='store_true')\n",
+    )
+    os.remove(f"{root}/scripts/deploy_legacy.sh")
+    os.remove(f"{root}/gone/SKILL.md")
+    os.remove(f"{root}/gone/init.sh")
+    os.remove(f"{root}/src/only_plan.py")
+    os.remove(f"{root}/src/pred.py")
+    write(f"{root}/src/health.rs", "pub struct WatcherHealth {\n    pub ok: bool,\n}\n")
+    write(
+        f"{root}/src/alias.py",
+        "def app_with_files():\n    return 1\n\nfrom helpers import app_with_files as fake_app\n",
+    )
+    write(
+        f"{root}/CHANGELOG.md",
+        "# changes\n\nRemoved parse_legacy_widget and --legacy-widget.\n",
+    )
+    git_in(root, ["mv", "moved.md", "docs/moved.md"])
+    write(
+        f"{root}/README.md",
+        open(f"{root}/README.md", encoding="utf-8").read() + "See docs/moved.md.\n",
+    )
+    git_in(root, ["add", "-A"])
+    git_in(
+        root,
+        ["commit", "-q", "-m", "drop legacy parser"],
+        env={"GIT_AUTHOR_DATE": "2024-06-01T00:00:00", "GIT_COMMITTER_DATE": "2024-06-01T00:00:00"},
+    )
+
+    # True MOVE: rename a function AND update all mentions.
+    write(f"{root}/src/keep.py", "def keep_forever_v2():\n    return 1\n")
+    git_in(root, ["add", "src/keep.py"])
+    git_in(
+        root,
+        ["commit", "-q", "-m", "rename keep_forever"],
+        env={"GIT_AUTHOR_DATE": "2024-07-01T00:00:00", "GIT_COMMITTER_DATE": "2024-07-01T00:00:00"},
+    )
+
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    with tempfile.TemporaryDirectory(prefix="haunt-selftest-") as tmp:
+        build_fixture(tmp)
+        ns = argparse.Namespace(
+            repo=tmp,
+            range=None,
+            max_commits=0,
+            since=None,
+            until=None,
+            verbose=False,
+            kind="all",
+            keep_obituary=False,
+        )
+        deaths = collect_deaths(tmp, None, 0, None, None, False)
+        names = {(d.kind, d.name) for d in deaths}
+        expect(("fn", "parse_legacy_widget") in names, f"missing fn death, got {names}")
+        expect(("flag", "legacy-widget") in names, f"missing flag death, got {names}")
+        expect(any(d.kind == "file" and d.name.endswith("deploy_legacy.sh") for d in deaths), "missing file death")
+        expect(("fn", "keep_forever") in names, "missing renamed fn death")
+        expect(("enum", "WatcherHealth") in names, f"missing enum death, got {names}")
+        expect(("fn", "fake_app") in names, "missing fake_app death")
+        expect(("fn", "only_in_plan_helper") in names, "missing plan-only fn death")
+
+        idx = build_head_index(tmp, deaths, False)
+        findings = classify(deaths, idx, keep_obituary=False)
+        haunts = {(f.death.kind, f.death.name): f for f in findings if f.status == "HAUNT"}
+        archives = {(f.death.kind, f.death.name) for f in findings if f.status == "ARCHIVE"}
+        moves = {(f.death.kind, f.death.name) for f in findings if f.status == "MOVE"}
+        deads = {(f.death.kind, f.death.name) for f in findings if f.status == "DEAD"}
+
+        expect(("fn", "parse_legacy_widget") in haunts, f"parse_legacy_widget should HAUNT, haunts={set(haunts)}")
+        f = haunts.get(("fn", "parse_legacy_widget"))
+        if f:
+            kinds = {r.kind for r in f.remnants}
+            expect("docs" in kinds, f"expected docs remnant, got {[(r.kind, r.path) for r in f.remnants]}")
+            expect("obituary" not in kinds, f"changelog leaked: {f.remnants}")
+
+        expect(("flag", "legacy-widget") in haunts, "flag should HAUNT via README")
+        expect(
+            any(k == "file" and n.endswith("deploy_legacy.sh") for (k, n) in haunts),
+            f"deleted script path should HAUNT, haunts={set(haunts)}",
+        )
+        expect(("fn", "keep_forever") in deads or ("fn", "keep_forever") not in haunts, "renamed keep_forever should not HAUNT")
+        expect(("fn", "parse_ok") not in haunts, "living parse_ok should not haunt")
+
+        expect(("enum", "WatcherHealth") in moves, f"kind-shift enum→struct should MOVE, moves={moves}")
+        expect(("fn", "fake_app") in moves, f"import alias should MOVE, moves={moves}")
+        expect(("fn", "only_in_plan_helper") in archives, f"plan-only mention should ARCHIVE, archives={archives}")
+        expect(("fn", "predicateRejected") not in haunts, "homonym local must not HAUNT")
+        expect(
+            any(k == "file" and n.endswith("gone/SKILL.md") for (k, n) in haunts),
+            f"full path gone/SKILL.md should HAUNT via docs/refs.md, haunts={set(haunts)}",
+        )
+        expect(
+            not any(k == "file" and n.endswith("gone/init.sh") for (k, n) in haunts),
+            "generic basename init.sh must not HAUNT sibling keep/init.sh",
+        )
+        expect(("flag", "keep-me") not in haunts, "live flag --keep-me must not HAUNT")
+        expect(
+            not any(k == "file" and n.endswith("moved.md") for (k, n) in haunts),
+            "rename destination docs/moved.md must not count as leftover of moved.md",
+        )
+
+        # --keep-obituary should surface changelog
+        findings2 = classify(deaths, idx, keep_obituary=True)
+        f2 = next(f for f in findings2 if f.death.name == "parse_legacy_widget" and f.death.kind == "fn")
+        expect(any(r.kind == "obituary" for r in f2.remnants), "keep-obituary should count CHANGELOG")
+
+        birth = run_git(tmp, ["rev-list", "--max-parents=0", "HEAD"]).stdout.strip().split()[0]
+        deaths_range = collect_deaths(tmp, birth, 1, None, None, False)
+        expect(len(deaths_range) == 0, f"birth commit should have 0 deaths, got {deaths_range}")
+
+    if failures:
+        eprint("self-test FAILED:")
+        for msg in failures:
+            eprint("  -", msg)
+        return 1
+    eprint("self-test ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.self_test:
+        return self_test()
+    findings, err = scan(args)
+    if err:
+        return err
+    emit(findings, args)
+    haunts = [f for f in findings if f.status == "HAUNT"]
+    if args.verbose:
+        eprint(
+            f"{len(haunts)} haunts, "
+            f"{sum(1 for f in findings if f.status=='ARCHIVE')} archival, "
+            f"{sum(1 for f in findings if f.status=='DEAD')} dead, "
+            f"{sum(1 for f in findings if f.status=='MOVE')} moves"
+        )
+    if args.strict and haunts:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

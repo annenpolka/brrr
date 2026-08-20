@@ -1,0 +1,1748 @@
+#!/usr/bin/env python3
+"""orbit — the effective world of *this* binary, as a dumpable/diffable object.
+
+Not `env`. Not `ldd`. Not `which`. The name on PATH is a guise; the payload
+that will actually run, the libraries *this copy* will load, the env vars the
+image names, and the SIP/hardened-runtime filter that silently strips DYLD_*
+are the orbit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+
+VERSION = "0.2"
+
+RESTRICTED_PREFIXES = (
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/usr/libexec/",
+    "/System/",
+)
+
+DYLD_VARS = (
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_PRINT_LIBRARIES",
+    "DYLD_PRINT_LIBRARIES_POST_LAUNCH",
+    "DYLD_PRINT_RPATHS",
+    "DYLD_PRINT_TO_FILE",
+    "DYLD_PRINT_TO_STDERR",
+    "DYLD_ROOT_PATH",
+    "DYLD_SHARED_REGION",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_PRINT_OPTS",
+    "DYLD_PRINT_ENV",
+    "DYLD_PRINT_APIS",
+    "DYLD_PRINT_WARNINGS",
+    "DYLD_PRINT_STATISTICS",
+    "DYLD_PRINT_SEGMENTS",
+    "DYLD_PRINT_BINDINGS",
+    "DYLD_PRINT_INITIALIZERS",
+)
+
+ENV_TOKEN_RE = re.compile(rb"[A-Z][A-Z0-9_]{3,}")
+
+NAMED_PREFIXES = (
+    "PYTHON",
+    "PYVENV",
+    "NODE_",
+    "NVM_",
+    "NPM_",
+    "PNPM_",
+    "BUN_",
+    "DENO_",
+    "RUST",
+    "CARGO_",
+    "JAVA_",
+    "JDK_",
+    "DYLD_",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_RUN_PATH",
+    "LD_DEBUG",
+    "LD_AUDIT",
+    "SSL_",
+    "GIT_",
+    "XDG_",
+    "VIRTUAL_ENV",
+    "CONDA",
+    "PYENV",
+    "UV_",
+    "PIP_",
+    "LC_",
+    "DEVELOPER_",
+    "SDKROOT",
+    "REQUESTS_",
+    "CURL_",
+    "OPENSSL_",
+    "KIZU_",
+    "ORBIT_",
+    "TOOL_",
+    "HOMEBREW_",
+    "CARGO_HOME",
+    "RUSTUP_",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "CLICOLOR",
+    "LS_",
+    "TERM_",
+)
+
+ALWAYS_ENV = {
+    "PATH",
+    "HOME",
+    "SHELL",
+    "USER",
+    "LANG",
+    "TERM",
+    "TMPDIR",
+    "PWD",
+    "EDITOR",
+    "VISUAL",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+}
+
+BORING_ENV = {
+    "TEXT",
+    "DATA",
+    "DATA_CONST",
+    "LINKEDIT",
+    "PAGEZERO",
+    "CSTRING",
+    "CONST",
+    "GOT",
+    "BSS",
+    "STUBS",
+    "HEADER",
+    "VERSION",
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "NONE",
+    "HTTP",
+    "HTTPS",
+    "JSON",
+    "UTF8",
+    "UTF16",
+    "ASCII",
+    "LLVM",
+    "TODO",
+    "FIXME",
+    "NOTE",
+    "MAX",
+    "MIN",
+    "SIZE",
+    "TYPE",
+    "NAME",
+    "FILE",
+    "LINE",
+    "SELF",
+    "INFO",
+    "DEBUG",
+    "ERROR",
+    "WARN",
+    "TRACE",
+    "FATAL",
+    "DARWIN_EXTSN",
+    "LA_SYMBOL_PTR",
+    "MOD_INIT_FUNC",
+    "THREAD_VARS",
+    "THREAD_DATA",
+    "THREAD_BSS",
+    "UNWIND_INFO",
+    "EH_FRAME",
+}
+
+GLUE_PREFIXES = tuple(
+    sorted(
+        (p for p in NAMED_PREFIXES if len(p) >= 3),
+        key=len,
+        reverse=True,
+    )
+)
+
+SYSTEM_LIB_PREFIXES = (
+    "/usr/lib/",
+    "/System/",
+    "/Library/Apple/",
+)
+
+
+class OrbitError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    cmd: list[str],
+    *,
+    timeout: float = 8.0,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", "not found: " + cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+
+
+def overlay_env(
+    base: Mapping[str, str], extra: list[str] | None
+) -> dict[str, str]:
+    out = dict(base)
+    for item in extra or []:
+        if "=" not in item:
+            raise OrbitError(f"--env expects KEY=VAL, got {item!r}")
+        key, val = item.split("=", 1)
+        if val == "" and item.endswith("="):
+            out.pop(key, None)
+        else:
+            out[key] = val
+    return out
+
+
+def path_hits(name: str, path_var: str) -> list[str]:
+    hits: list[str] = []
+    seen: set[str] = set()
+    for dir_ in path_var.split(os.pathsep):
+        if not dir_:
+            continue
+        cand = Path(dir_) / name
+        try:
+            ok = cand.is_file() and os.access(cand, os.X_OK)
+        except OSError:
+            ok = False
+        if not ok:
+            continue
+        resolved = str(cand)
+        if resolved not in seen:
+            seen.add(resolved)
+            hits.append(resolved)
+    return hits
+
+
+def choose_command(requested: str, path_var: str) -> str:
+    if "/" in requested or requested.startswith("."):
+        p = Path(requested).expanduser()
+        if not p.exists():
+            raise OrbitError(f"not found: {requested}", 1)
+        return str(p.absolute())
+    hits = path_hits(requested, path_var)
+    if not hits:
+        raise OrbitError(f"not on PATH: {requested}", 1)
+    return hits[0]
+
+
+def symlink_chain(path: str) -> list[dict[str, str]]:
+    hops: list[dict[str, str]] = []
+    cur = Path(path)
+    seen: set[str] = set()
+    for _ in range(32):
+        key = str(cur)
+        if key in seen:
+            hops.append({"path": key, "kind": "cycle", "target": ""})
+            break
+        seen.add(key)
+        if not cur.is_symlink():
+            break
+        try:
+            target = os.readlink(cur)
+        except OSError as exc:
+            hops.append({"path": str(cur), "kind": "symlink-error", "target": str(exc)})
+            break
+        hops.append({"path": str(cur), "kind": "symlink", "target": target})
+        nxt = Path(target)
+        if not nxt.is_absolute():
+            nxt = cur.parent / nxt
+        cur = nxt
+    return hops
+
+
+def real_file(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
+
+
+def parse_shebang(path: str) -> tuple[str, list[str]] | None:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if not head.startswith(b"#!"):
+        return None
+    line = head.split(b"\n", 1)[0][2:].decode("utf-8", "replace").strip()
+    if not line:
+        return None
+    parts = line.split()
+    return parts[0], parts[1:]
+
+
+def file_kind(path: str) -> str:
+    code, out, err = run(["file", "-b", path])
+    text = (out or err).strip()
+    low = text.lower()
+    if "mach-o" in low and "universal" in low:
+        return "macho-universal"
+    if "mach-o" in low:
+        return "macho"
+    if "elf" in low:
+        return "elf"
+    if parse_shebang(path):
+        return "shebang"
+    if "script" in low or "text" in low:
+        return "text"
+    return "other"
+
+
+def sha_identity(path: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    h = hashlib.sha256()
+    h.update(str(st.st_size).encode())
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(65536)
+            h.update(chunk)
+            if st.st_size > 65536:
+                f.seek(max(0, st.st_size - 65536))
+                h.update(f.read(65536))
+    except OSError:
+        pass
+    return h.hexdigest()[:16]
+
+
+def stat_brief(path: str) -> dict[str, Any]:
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return {"error": str(exc)}
+    mode = st.st_mode
+    return {
+        "size": st.st_size,
+        "mode": oct(stat.S_IMODE(mode)),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "mtime": int(st.st_mtime),
+        "ino": st.st_ino,
+        "dev": st.st_dev,
+        "setuid": bool(mode & stat.S_ISUID),
+        "setgid": bool(mode & stat.S_ISGID),
+    }
+
+
+# --- Mach-O via otool -------------------------------------------------------
+
+
+def parse_otool_l(path: str) -> dict[str, Any]:
+    code, out, err = run(["otool", "-l", path], timeout=20)
+    if code != 0:
+        return {"error": (err or out).strip() or f"otool exit {code}"}
+    dylibs: list[str] = []
+    rpaths: list[str] = []
+    interp = ""
+    cmd = ""
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("cmd "):
+            cmd = line.split(None, 1)[1]
+            continue
+        if cmd in {"LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB"}:
+            if line.startswith("name "):
+                name = line[5:].strip()
+                name = re.sub(r"\s*\(offset \d+\)\s*$", "", name)
+                dylibs.append(name)
+        elif cmd == "LC_RPATH":
+            if line.startswith("path "):
+                p = line[5:].strip()
+                p = re.sub(r"\s*\(offset \d+\)\s*$", "", p)
+                rpaths.append(p)
+        elif cmd == "LC_LOAD_DYLINKER":
+            if line.startswith("name "):
+                interp = re.sub(r"\s*\(offset \d+\)\s*$", "", line[5:].strip())
+    # fat binaries list each LC twice
+    uniq_dylibs: list[str] = []
+    seen_d: set[str] = set()
+    for d in dylibs:
+        if d not in seen_d:
+            seen_d.add(d)
+            uniq_dylibs.append(d)
+    uniq_rpaths: list[str] = []
+    seen_r: set[str] = set()
+    for r in rpaths:
+        if r not in seen_r:
+            seen_r.add(r)
+            uniq_rpaths.append(r)
+    return {"dylibs": uniq_dylibs, "rpaths": uniq_rpaths, "interp": interp}
+
+
+def expand_rpath(raw: str, *, loader_dir: str, exec_dir: str) -> str:
+    out = raw
+    out = out.replace("@loader_path", loader_dir)
+    out = out.replace("@executable_path", exec_dir)
+    return out
+
+
+def resolve_dylib(
+    name: str,
+    *,
+    loader: str,
+    rpaths: list[str],
+) -> str | None:
+    loader_dir = str(Path(loader).parent)
+    if name.startswith("@rpath/"):
+        rest = name[len("@rpath/") :]
+        for raw in rpaths:
+            exp = expand_rpath(raw, loader_dir=loader_dir, exec_dir=loader_dir)
+            cand = Path(exp) / rest
+            if cand.is_file():
+                return str(cand)
+        return None
+    if name.startswith("@loader_path/") or name.startswith("@executable_path/"):
+        exp = expand_rpath(name, loader_dir=loader_dir, exec_dir=loader_dir)
+        p = Path(exp)
+        return str(p) if p.is_file() else None
+    p = Path(name)
+    if p.is_file():
+        return str(p)
+    # relative to loader, last chance
+    cand = Path(loader_dir) / name
+    if cand.is_file():
+        return str(cand)
+    return None
+
+
+def is_system_lib(path: str) -> bool:
+    return any(path.startswith(p) for p in SYSTEM_LIB_PREFIXES)
+
+
+def classify_dylib(name: str, resolved: str | None) -> tuple[str | None, str, bool]:
+    """Return (resolved, status, system) where status is ok|missing|shared."""
+    if resolved:
+        return resolved, "ok", is_system_lib(resolved)
+    if is_system_lib(name) and name.startswith("/"):
+        return name, "shared", True
+    return None, "missing", is_system_lib(name)
+
+
+# --- codesign / SIP ---------------------------------------------------------
+
+
+def codesign_info(path: str) -> dict[str, Any]:
+    code, out, err = run(["codesign", "-dv", path], timeout=12)
+    text = err or out
+    info: dict[str, Any] = {
+        "ok": code == 0,
+        "identifier": "",
+        "adhoc": False,
+        "platform": False,
+        "runtime": False,
+        "linker_signed": False,
+        "flags_raw": "",
+        "format": "",
+    }
+    for line in text.splitlines():
+        if line.startswith("Identifier="):
+            info["identifier"] = line.split("=", 1)[1].strip()
+        elif line.startswith("Format="):
+            info["format"] = line.split("=", 1)[1].strip()
+        elif line.startswith("CodeDirectory"):
+            m = re.search(r"flags=([0-9a-fx]+)\(([^)]*)\)", line)
+            if m:
+                info["flags_raw"] = m.group(1)
+                flags = m.group(2).lower()
+                info["adhoc"] = "adhoc" in flags
+                info["runtime"] = "runtime" in flags
+                info["linker_signed"] = "linker-signed" in flags
+        elif line.startswith("Signature="):
+            if "adhoc" in line.lower():
+                info["adhoc"] = True
+        elif line.startswith("Platform identifier="):
+            info["platform"] = True
+    return info
+
+
+def path_restricted(path: str) -> bool:
+    real = real_file(path)
+    if real in {"/bin", "/sbin"} or real in ("/usr/bin", "/usr/sbin"):
+        return True
+    return any(real.startswith(p) for p in RESTRICTED_PREFIXES) and not real.startswith(
+        "/usr/local/"
+    )
+
+
+def is_restricted(path: str, sign: Mapping[str, Any], st: Mapping[str, Any]) -> bool:
+    if st.get("setuid") or st.get("setgid"):
+        return True
+    if sign.get("platform") or sign.get("runtime"):
+        return True
+    if path_restricted(path):
+        return True
+    return False
+
+
+# --- env names from image ---------------------------------------------------
+
+
+def interesting_env_name(name: str) -> bool:
+    if not name or name in BORING_ENV:
+        return False
+    if name.endswith("_") or name.startswith("__") or name.endswith("__"):
+        return False
+    if any(
+        s in name
+        for s in (
+            "BINDING",
+            "CONTEXT_AWARE",
+            "EXTERNAL_REFERENCE",
+            "BUILTIN_MODULE",
+        )
+    ):
+        return False
+    if name in ALWAYS_ENV or name in DYLD_VARS:
+        return True
+    if name.startswith("DYLD_"):
+        return False
+    if name.startswith(NAMED_PREFIXES):
+        return True
+    return False
+
+
+def explode_env_token(token: str) -> list[str]:
+    token = token.strip("_")
+    if not token:
+        return []
+    starts: list[int] = []
+    i = 0
+    while i < len(token):
+        hit = None
+        for p in GLUE_PREFIXES:
+            if token.startswith(p, i):
+                hit = p
+                break
+        if hit:
+            starts.append(i)
+            i += len(hit)
+        else:
+            i += 1
+    if len(starts) <= 1:
+        return [token] if interesting_env_name(token) else []
+    parts: list[str] = []
+    for a, b in zip(starts, starts[1:] + [len(token)]):
+        part = token[a:b]
+        if interesting_env_name(part):
+            parts.append(part)
+    return parts
+
+
+def extract_env_names(path: str, *, limit: int = 80_000_000) -> list[str]:
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            data = f.read(limit if size > limit else size)
+    except OSError:
+        return []
+    found: set[str] = set()
+    for m in ENV_TOKEN_RE.finditer(data):
+        token = m.group().decode("ascii")
+        for part in explode_env_token(token):
+            found.add(part)
+    return sorted(found)
+
+
+# --- proxies ----------------------------------------------------------------
+
+
+def looks_like_rustup(real: str, requested_base: str) -> bool:
+    return Path(real).name == "rustup" and requested_base not in {"rustup", "rustup-init"}
+
+
+def looks_like_xcselect(sign: Mapping[str, Any], dylibs: list[str]) -> bool:
+    ident = str(sign.get("identifier") or "")
+    if "xcode_select" in ident or "xcselect" in ident:
+        return True
+    return any("libxcselect" in d for d in dylibs)
+
+
+def follow_rustup(
+    rustup_bin: str, tool: str, *, cwd: str, env: Mapping[str, str]
+) -> str | None:
+    code, out, err = run([rustup_bin, "which", tool], cwd=cwd, env=env)
+    if code != 0:
+        return None
+    line = out.strip().splitlines()
+    if not line:
+        return None
+    cand = line[-1].strip()
+    return cand if cand and Path(cand).exists() else None
+
+
+def follow_xcrun(tool: str, *, cwd: str, env: Mapping[str, str]) -> str | None:
+    code, out, err = run(["xcrun", "--find", tool], cwd=cwd, env=env)
+    if code != 0:
+        return None
+    cand = out.strip().splitlines()
+    if not cand:
+        return None
+    path = cand[-1].strip()
+    return path if path and Path(path).exists() else None
+
+
+def env_interpreter_target(args: list[str]) -> str | None:
+    """After #!/usr/bin/env, skip env(1) flags and return the command name."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in {"-S", "--split-string", "-i", "--ignore-environment", "-P", "-v", "-0"}:
+            i += 1
+            if a in {"-P"} and i < len(args):
+                i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return None
+
+
+# --- snapshot ---------------------------------------------------------------
+
+
+@dataclass
+class Hop:
+    path: str
+    kind: str
+    detail: str = ""
+
+
+@dataclass
+class Dylib:
+    name: str
+    resolved: str | None
+    status: str  # ok | missing | shared
+    system: bool
+
+    @property
+    def missing(self) -> bool:
+        return self.status == "missing"
+
+
+@dataclass
+class EnvFact:
+    name: str
+    named: bool
+    sources: list[str]
+    value: str | None
+    sip: str  # keep | STRIP | n/a
+
+
+@dataclass
+class Orbit:
+    requested: str
+    chosen: str
+    real: str
+    payload: str
+    guise: str
+    proxy: str
+    kind: str
+    arch: str
+    interp: str
+    cwd: str
+    path_used: str
+    path_hits: list[str]
+    chain: list[Hop]
+    dylibs: list[Dylib]
+    rpaths: list[dict[str, str]]
+    env: list[EnvFact]
+    sign: dict[str, Any]
+    restricted: bool
+    sha: str
+    stat: dict[str, Any]
+    configs: dict[str, str]
+    warnings: list[str] = field(default_factory=list)
+    scan_dylibs: bool = True
+    version: str = VERSION
+    entry: str = ""
+    entry_restricted: bool = False
+    entry_sign: dict[str, Any] = field(default_factory=dict)
+
+    def payload_kind(self) -> str:
+        return file_kind(self.payload) if self.payload else self.kind
+
+
+def lipo_archs(path: str) -> str:
+    code, out, _ = run(["lipo", "-archs", path])
+    if code == 0 and out.strip():
+        return " ".join(out.split())
+    return ""
+
+
+def adjacent_configs(payload: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    p = Path(payload)
+    venv_root = p.parent.parent if p.parent.name in {"bin", "Scripts"} else None
+    if venv_root is not None:
+        cfg = venv_root / "pyvenv.cfg"
+        if cfg.is_file():
+            found[str(cfg)] = "present"
+    for extra in (
+        p.parent / "python._pth",
+        p.parent / (p.name + "._pth"),
+        p.parent / "sitecustomize.py",
+    ):
+        if extra.is_file():
+            found[str(extra)] = "present"
+    return found
+
+
+def entry_sip(path: str, shebang: tuple[str, list[str]] | None) -> tuple[str, dict[str, Any], bool]:
+    """First Mach-O the kernel will load for this invocation."""
+    candidates: list[str] = []
+    if shebang:
+        interp, _args = shebang
+        ip = Path(interp)
+        if not ip.is_absolute():
+            ip = Path(path).parent / ip
+        if ip.exists():
+            candidates.append(str(ip))
+    candidates.append(path)
+    for c in candidates:
+        k = file_kind(c)
+        if k.startswith("macho"):
+            sg = codesign_info(c)
+            st = stat_brief(c)
+            return c, sg, is_restricted(c, sg, st)
+    return path, {}, False
+
+
+def harvest_env(
+    o: Orbit,
+    environ: Mapping[str, str],
+    *,
+    scan_dylibs: bool,
+    scan_limit: int,
+) -> None:
+    targets: list[tuple[str, str]] = [("payload", o.payload)]
+    if o.guise and real_file(o.guise) != real_file(o.payload):
+        targets.append(("guise", o.guise))
+    for hop in o.chain:
+        if hop.kind in {"shebang", "rustup", "xcselect"} and hop.path:
+            targets.append((hop.kind, hop.path))
+    if scan_dylibs:
+        for d in o.dylibs:
+            if d.status == "ok" and d.resolved and not d.system:
+                targets.append(("dylib", d.resolved))
+    sources: dict[str, list[str]] = {}
+    seen: set[tuple[str, str]] = set()
+    for label, path in targets:
+        if not path or not Path(path).exists():
+            continue
+        real = real_file(path)
+        key = (label, real)
+        if key in seen:
+            continue
+        seen.add(key)
+        src = label if label != "dylib" else "dylib:" + real
+        for n in extract_env_names(path, limit=scan_limit):
+            bucket = sources.setdefault(n, [])
+            if src not in bucket:
+                bucket.append(src)
+    sip_on = o.restricted or o.entry_restricted
+    watch = set(sources)
+    for v in DYLD_VARS:
+        if v in environ or sip_on:
+            watch.add(v)
+    for v in ("VIRTUAL_ENV", "RUSTUP_TOOLCHAIN", "DEVELOPER_DIR", "PYTHONPATH", "NODE_PATH"):
+        if v in environ or v in sources:
+            watch.add(v)
+    facts: list[EnvFact] = []
+    for name in sorted(watch):
+        sip = "n/a"
+        if name.startswith("DYLD_"):
+            sip = "STRIP" if sip_on else "keep"
+        facts.append(
+            EnvFact(
+                name=name,
+                named=name in sources,
+                sources=sources.get(name, []),
+                value=environ.get(name),
+                sip=sip,
+            )
+        )
+    o.env = facts
+    o.scan_dylibs = scan_dylibs
+
+
+def adopt_proxy(
+    inner: Orbit,
+    *,
+    requested: str,
+    chosen: str,
+    hits: list[str],
+    guise: str,
+    warnings: list[str],
+    chain: list[Hop],
+    proxy: str,
+    depth: int,
+    entry: str,
+    entry_sign: dict[str, Any],
+    entry_restricted: bool,
+    environ: Mapping[str, str],
+    scan_dylibs: bool,
+    scan_limit: int,
+) -> Orbit:
+    if depth == 0:
+        inner.requested = requested
+        inner.chosen = chosen
+        inner.path_hits = hits
+        inner.real = real_file(chosen)
+        inner.guise = guise
+        inner.entry = entry
+        inner.entry_sign = entry_sign
+        inner.entry_restricted = entry_restricted
+        inner.restricted = entry_restricted
+        inner.configs = {**adjacent_configs(chosen), **inner.configs}
+        inner.warnings = warnings + inner.warnings
+        inner.proxy = proxy if not inner.proxy else f"{proxy}|{inner.proxy}"
+        inner.chain = chain + [h for h in inner.chain if h not in chain]
+        harvest_env(inner, environ, scan_dylibs=scan_dylibs, scan_limit=scan_limit)
+        return inner
+    inner.proxy = proxy if not inner.proxy else f"{proxy}|{inner.proxy}"
+    inner.warnings = warnings + inner.warnings
+    inner.chain = chain + [h for h in inner.chain if h not in chain]
+    return inner
+
+
+def snapshot(
+    requested: str,
+    *,
+    cwd: str,
+    environ: Mapping[str, str],
+    scan_dylibs: bool = True,
+    scan_limit: int = 80_000_000,
+    follow: bool = True,
+    depth: int = 0,
+    chain: list[Hop] | None = None,
+    lookup_path: str | None = None,
+) -> Orbit:
+    if depth > 10:
+        raise OrbitError("proxy/shebang chain too deep")
+    exec_path = environ.get("PATH", "")
+    name_path = lookup_path if (lookup_path is not None and depth == 0) else exec_path
+    path_var = name_path
+    if depth == 0:
+        chosen = choose_command(requested, name_path)
+        hits = (
+            path_hits(requested, name_path)
+            if "/" not in requested and not requested.startswith(".")
+            else [chosen]
+        )
+    else:
+        chosen = requested
+        if not Path(chosen).exists():
+            raise OrbitError(f"not found: {chosen}", 1)
+        hits = [chosen]
+    chain = list(chain or [])
+    for hop in symlink_chain(chosen):
+        item = Hop(hop["path"], hop["kind"], hop.get("target", ""))
+        if item not in chain:
+            chain.append(item)
+    guise = real_file(chosen)
+    payload = guise
+    proxy = ""
+    warnings: list[str] = []
+    kind = file_kind(guise)
+    sign = codesign_info(guise) if kind.startswith("macho") else {}
+    macho = parse_otool_l(guise) if kind.startswith("macho") else {}
+    dylib_names: list[str] = list(macho.get("dylibs") or [])
+    rpath_raw: list[str] = list(macho.get("rpaths") or [])
+    interp = str(macho.get("interp") or "")
+
+    shebang = parse_shebang(guise)
+    entry, entry_sign, entry_restricted = entry_sip(guise, shebang)
+    if shebang:
+        interp_path, sargs = shebang
+        chain.append(Hop(guise, "shebang", " ".join([interp_path, *sargs])))
+        target: str | None
+        base = Path(interp_path).name
+        if base == "env":
+            cmd_name = env_interpreter_target(sargs)
+            if not cmd_name:
+                warnings.append("shebang env with no command")
+                target = None
+            elif "/" in cmd_name:
+                target = cmd_name
+            else:
+                try:
+                    target = choose_command(cmd_name, exec_path)
+                except OrbitError as exc:
+                    warnings.append(str(exc))
+                    target = None
+        else:
+            ip = Path(interp_path)
+            if not ip.is_absolute():
+                ip = Path(guise).parent / ip
+            target = str(ip)
+        if follow and target:
+            if not Path(target).exists():
+                warnings.append(f"missing interpreter: {target}")
+            else:
+                proxy = "shebang"
+                inner = snapshot(
+                    target,
+                    cwd=cwd,
+                    environ=environ,
+                    scan_dylibs=scan_dylibs,
+                    scan_limit=scan_limit,
+                    follow=follow,
+                    depth=depth + 1,
+                    chain=chain,
+                    lookup_path=lookup_path,
+                )
+                return adopt_proxy(
+                    inner,
+                    requested=requested,
+                    chosen=chosen,
+                    hits=hits,
+                    guise=guise,
+                    warnings=warnings,
+                    chain=chain,
+                    proxy="shebang",
+                    depth=depth,
+                    entry=entry,
+                    entry_sign=entry_sign,
+                    entry_restricted=entry_restricted,
+                    environ=environ,
+                    scan_dylibs=scan_dylibs,
+                    scan_limit=scan_limit,
+                )
+
+    if follow and kind.startswith("macho") and looks_like_rustup(guise, Path(requested).name):
+        tool = Path(chosen).name
+        if tool == "rustup":
+            tool = Path(requested).name
+        nxt = follow_rustup(guise, tool, cwd=cwd, env=environ)
+        if nxt:
+            proxy = "rustup"
+            chain.append(Hop(guise, "rustup", nxt))
+            inner = snapshot(
+                nxt,
+                cwd=cwd,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                scan_limit=scan_limit,
+                follow=follow,
+                depth=depth + 1,
+                chain=chain,
+                lookup_path=lookup_path,
+            )
+            return adopt_proxy(
+                inner,
+                requested=requested,
+                chosen=chosen,
+                hits=hits,
+                guise=guise,
+                warnings=warnings,
+                chain=chain,
+                proxy="rustup",
+                depth=depth,
+                entry=entry,
+                entry_sign=entry_sign,
+                entry_restricted=entry_restricted,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                scan_limit=scan_limit,
+            )
+        warnings.append("rustup proxy but `rustup which` failed")
+
+    if follow and kind.startswith("macho") and looks_like_xcselect(sign, dylib_names):
+        tool = Path(requested).name if depth == 0 else Path(chosen).name
+        nxt = follow_xcrun(tool, cwd=cwd, env=environ)
+        if nxt:
+            proxy = "xcselect"
+            chain.append(Hop(guise, "xcselect", nxt))
+            inner = snapshot(
+                nxt,
+                cwd=cwd,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                scan_limit=scan_limit,
+                follow=follow,
+                depth=depth + 1,
+                chain=chain,
+                lookup_path=lookup_path,
+            )
+            return adopt_proxy(
+                inner,
+                requested=requested,
+                chosen=chosen,
+                hits=hits,
+                guise=guise,
+                warnings=warnings,
+                chain=chain,
+                proxy="xcselect",
+                depth=depth,
+                entry=entry,
+                entry_sign=entry_sign,
+                entry_restricted=entry_restricted,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                scan_limit=scan_limit,
+            )
+        warnings.append("xcselect shim but xcrun --find failed")
+
+    # facts about the payload image (guise, if no further proxy)
+    payload = guise
+    kind = file_kind(payload)
+    sign = codesign_info(payload) if kind.startswith("macho") else sign
+    macho = parse_otool_l(payload) if kind.startswith("macho") else macho
+    dylib_names = list(macho.get("dylibs") or [])
+    rpath_raw = list(macho.get("rpaths") or [])
+    interp = str(macho.get("interp") or interp)
+    rpaths = [
+        {
+            "raw": raw,
+            "expanded": expand_rpath(
+                raw, loader_dir=str(Path(payload).parent), exec_dir=str(Path(payload).parent)
+            ),
+        }
+        for raw in rpath_raw
+    ]
+    dylibs: list[Dylib] = []
+    for name in dylib_names:
+        resolved = resolve_dylib(name, loader=payload, rpaths=rpath_raw)
+        resolved, status, system = classify_dylib(name, resolved)
+        dylibs.append(
+            Dylib(name=name, resolved=resolved, status=status, system=system)
+        )
+
+    st = stat_brief(payload)
+    payload_restricted = (
+        is_restricted(payload, sign, st) if kind.startswith("macho") else False
+    )
+    restricted = entry_restricted if depth == 0 else payload_restricted
+
+    arch = lipo_archs(payload) if kind.startswith("macho") else ""
+    configs = adjacent_configs(payload)
+    if chosen != payload:
+        configs = {**adjacent_configs(chosen), **configs}
+
+    o = Orbit(
+        requested=requested,
+        chosen=chosen,
+        real=real_file(chosen),
+        payload=payload,
+        guise=real_file(chosen) if depth == 0 else guise,
+        proxy=proxy,
+        kind=kind,
+        arch=arch,
+        interp=interp,
+        cwd=cwd,
+        path_used=path_var,
+        path_hits=hits,
+        chain=chain,
+        dylibs=dylibs,
+        rpaths=rpaths,
+        env=[],
+        sign=sign or {},
+        restricted=restricted,
+        sha=sha_identity(payload),
+        stat=st,
+        configs=configs,
+        warnings=warnings,
+        scan_dylibs=scan_dylibs,
+        entry=entry if depth == 0 else payload,
+        entry_restricted=entry_restricted if depth == 0 else payload_restricted,
+        entry_sign=entry_sign if depth == 0 else (sign or {}),
+    )
+    if depth == 0:
+        harvest_env(o, environ, scan_dylibs=scan_dylibs, scan_limit=scan_limit)
+    return o
+
+
+# --- format -----------------------------------------------------------------
+
+
+def orbit_to_json(o: Orbit) -> dict[str, Any]:
+    return {
+        "version": o.version,
+        "requested": o.requested,
+        "chosen": o.chosen,
+        "real": o.real,
+        "guise": o.guise,
+        "payload": o.payload,
+        "proxy": o.proxy,
+        "kind": o.kind,
+        "arch": o.arch,
+        "interp": o.interp,
+        "cwd": o.cwd,
+        "restricted": o.restricted,
+        "entry": o.entry,
+        "entry_restricted": o.entry_restricted,
+        "entry_sign": o.entry_sign,
+        "sha": o.sha,
+        "stat": o.stat,
+        "sign": o.sign,
+        "path_hits": o.path_hits,
+        "chain": [asdict(h) for h in o.chain],
+        "rpaths": o.rpaths,
+        "dylibs": [asdict(d) for d in o.dylibs],
+        "env": [asdict(e) for e in o.env],
+        "configs": o.configs,
+        "warnings": o.warnings,
+        "scan_dylibs": o.scan_dylibs,
+    }
+
+
+def load_orbit_json(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "payload" not in data or "requested" not in data:
+        raise OrbitError(f"not an orbit dump: {path}")
+    return data
+
+
+def canonical_records(data: dict[str, Any]) -> list[tuple[str, str]]:
+    recs: list[tuple[str, str]] = []
+
+    def add(k: str, v: object) -> None:
+        if v is None or v == "":
+            recs.append((k, "-"))
+        elif isinstance(v, bool):
+            recs.append((k, "yes" if v else "no"))
+        else:
+            recs.append((k, str(v)))
+
+    add("requested", data.get("requested"))
+    add("chosen", data.get("chosen"))
+    add("guise", data.get("guise"))
+    add("payload", data.get("payload"))
+    add("proxy", data.get("proxy") or "-")
+    add("kind", data.get("kind"))
+    add("arch", data.get("arch"))
+    add("interp", data.get("interp"))
+    add("restricted", bool(data.get("restricted")))
+    add("entry", data.get("entry"))
+    add("entry_restricted", bool(data.get("entry_restricted")))
+    add("sha", data.get("sha"))
+    sign = data.get("sign") or {}
+    add("sign.identifier", sign.get("identifier"))
+    add("sign.adhoc", bool(sign.get("adhoc")))
+    add("sign.platform", bool(sign.get("platform")))
+    add("sign.runtime", bool(sign.get("runtime")))
+    for i, hit in enumerate(data.get("path_hits") or []):
+        add(f"path.hit.{i}", hit)
+    for i, hop in enumerate(data.get("chain") or []):
+        add(f"chain.{i}", f"{hop.get('kind')}:{hop.get('path')}->{hop.get('detail')}")
+    for i, rp in enumerate(data.get("rpaths") or []):
+        add(f"rpath.{i}", f"{rp.get('raw')}=>{rp.get('expanded')}")
+    for d in data.get("dylibs") or []:
+        key = "dylib." + (d.get("name") or "")
+        stt = d.get("status") or ("missing" if d.get("missing") else "ok")
+        if stt == "missing":
+            add(key, "MISSING")
+        elif stt == "shared":
+            add(key, "shared-cache")
+        else:
+            add(key, d.get("resolved") or "-")
+    for e in data.get("env") or []:
+        name = e.get("name")
+        named = "named" if e.get("named") else "unnamed"
+        sip = e.get("sip") or "n/a"
+        val = e.get("value")
+        val_s = "(unset)" if val is None else val
+        add(f"env.{name}", f"{named} sip={sip} value={val_s}")
+        if e.get("sources"):
+            add(f"env.{name}.from", ",".join(e["sources"]))
+    for pth, stt in sorted((data.get("configs") or {}).items()):
+        add("config." + pth, stt)
+    for i, w in enumerate(data.get("warnings") or []):
+        add(f"warn.{i}", w)
+    recs.sort()
+    return recs
+
+
+def format_porcelain(data: dict[str, Any]) -> str:
+    lines = [f"{k}\t{v}" for k, v in canonical_records(data)]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _short(path: str, width: int = 72) -> str:
+    home = os.path.expanduser("~")
+    if path.startswith(home + os.sep):
+        path = "~" + path[len(home) :]
+    if len(path) <= width:
+        return path
+    return path[:20] + "…" + path[-(width - 21) :]
+
+
+def format_human(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    req = data.get("requested")
+    lines.append(f"orbit  {req}")
+    lines.append(f"  chosen     {_short(str(data.get('chosen')))}")
+    lines.append(f"  guise      {_short(str(data.get('guise')))}")
+    lines.append(f"  payload    {_short(str(data.get('payload')))}")
+    lines.append(f"  proxy      {data.get('proxy') or '-'}")
+    kind = data.get("kind") or "-"
+    arch = data.get("arch") or ""
+    lines.append(f"  kind       {kind}  {arch}".rstrip())
+    if data.get("interp"):
+        lines.append(f"  interp     {data.get('interp')}")
+    rest = "RESTRICTED" if data.get("restricted") else "unrestricted"
+    sign = data.get("sign") or {}
+    ident = sign.get("identifier") or "-"
+    bits = []
+    if sign.get("platform"):
+        bits.append("platform")
+    if sign.get("runtime"):
+        bits.append("hardened")
+    if sign.get("adhoc"):
+        bits.append("adhoc")
+    if sign.get("linker_signed"):
+        bits.append("linker-signed")
+    lines.append(f"  sign       {ident}  {rest}  {' '.join(bits)}".rstrip())
+    entry = data.get("entry") or ""
+    if entry and os.path.realpath(entry) != os.path.realpath(str(data.get("payload") or entry)):
+        lines.append(
+            f"  entry      {_short(str(entry))}  "
+            f"{'RESTRICTED' if data.get('entry_restricted') else 'unrestricted'}"
+        )
+    hits = data.get("path_hits") or []
+    if hits:
+        lines.append("  PATH hits")
+        for i, h in enumerate(hits):
+            mark = "  ← chosen" if i == 0 and data.get("chosen") == h else ""
+            shadow = "  (shadowed)" if i > 0 else mark
+            lines.append(f"    {i} {_short(h)}{shadow}")
+    chain = data.get("chain") or []
+    if chain:
+        lines.append("  chain")
+        for hop in chain:
+            lines.append(
+                f"    {hop.get('kind'):<10} {_short(str(hop.get('path')))} → { _short(str(hop.get('detail') or ''))}"
+            )
+    dylibs = data.get("dylibs") or []
+
+    def dstatus(d: dict[str, Any]) -> str:
+        return str(d.get("status") or ("missing" if d.get("missing") else "ok"))
+
+    missing = [d for d in dylibs if dstatus(d) == "missing"]
+    shared = [d for d in dylibs if dstatus(d) == "shared"]
+    first_party = [
+        d
+        for d in dylibs
+        if dstatus(d) == "ok" and not d.get("system")
+    ]
+    lines.append(
+        f"  dylibs     {len(dylibs)}  first-party {len(first_party)}  "
+        f"missing {len(missing)}  shared-cache {len(shared)}"
+    )
+    for d in missing:
+        lines.append(f"    MISSING   {d.get('name')}")
+    for d in first_party[:12]:
+        lines.append(f"    {_short(str(d.get('resolved') or d.get('name')))}")
+    if len(first_party) > 12:
+        lines.append(f"    … {len(first_party) - 12} more")
+    rpaths = data.get("rpaths") or []
+    if rpaths:
+        lines.append("  rpath")
+        for rp in rpaths:
+            lines.append(f"    {rp.get('raw')}  =>  {_short(str(rp.get('expanded')))}")
+    named = [e for e in (data.get("env") or []) if e.get("named")]
+    stripped = [
+        e
+        for e in (data.get("env") or [])
+        if e.get("sip") == "STRIP" and e.get("value") is not None
+    ]
+    lines.append(f"  env named  {len(named)}")
+    for e in named[:20]:
+        val = e.get("value")
+        val_s = "(unset)" if val is None else _short(str(val), 40)
+        sip = f"  sip={e.get('sip')}" if e.get("sip") in {"STRIP", "keep"} and e["name"].startswith("DYLD_") else ""
+        lines.append(f"    {e['name']:<28} {val_s}{sip}")
+    if len(named) > 20:
+        lines.append(f"    … {len(named) - 20} more")
+    if stripped:
+        lines.append("  sip STRIP  (set in this environment, ignored for this binary)")
+        for e in stripped:
+            lines.append(f"    {e['name']}={_short(str(e.get('value')), 40)}")
+    configs = data.get("configs") or {}
+    if configs:
+        lines.append("  config")
+        for pth, stt in sorted(configs.items()):
+            lines.append(f"    {stt:<8} {_short(pth)}")
+    for w in data.get("warnings") or []:
+        lines.append(f"  warn       {w}")
+    lines.append(f"  verdict    {verdict(data)}")
+    return "\n".join(lines) + "\n"
+
+
+def verdict(data: dict[str, Any]) -> str:
+    bits: list[str] = []
+    proxy = data.get("proxy") or ""
+    guise = data.get("guise")
+    payload = data.get("payload")
+    if proxy and guise != payload:
+        bits.append(f"{proxy} guise→payload")
+    if data.get("restricted"):
+        bits.append("DYLD_* stripped")
+    missing = sum(
+        1
+        for d in (data.get("dylibs") or [])
+        if (d.get("status") or ("missing" if d.get("missing") else "ok")) == "missing"
+    )
+    if missing:
+        bits.append(f"{missing} dylib missing — this copy will not load")
+    hits = data.get("path_hits") or []
+    if len(hits) > 1:
+        bits.append(f"{len(hits)} PATH hits, first wins")
+    named_set = [
+        e["name"]
+        for e in (data.get("env") or [])
+        if e.get("named") and e.get("value") is not None
+    ]
+    named_unset = [
+        e["name"]
+        for e in (data.get("env") or [])
+        if e.get("named") and e.get("value") is None
+    ]
+    if named_set:
+        bits.append(f"{len(named_set)} named env set")
+    elif named_unset:
+        bits.append("names env vars but none of them are set")
+    if not bits:
+        bits.append("payload is the guise; no silent env filter")
+    return "; ".join(bits)
+
+
+def diff_records(
+    left: dict[str, Any], right: dict[str, Any], *, ignore: set[str]
+) -> list[tuple[str, str, str]]:
+    lmap = dict(canonical_records(left))
+    rmap = dict(canonical_records(right))
+
+    def skip(k: str) -> bool:
+        if k in ignore:
+            return True
+        for pref in ignore:
+            if pref.endswith(".") and k.startswith(pref):
+                return True
+            if k == pref:
+                return True
+        if k in {"requested", "chosen"}:
+            return True
+        return False
+
+    keys = sorted(set(lmap) | set(rmap))
+    out: list[tuple[str, str, str]] = []
+    for k in keys:
+        if skip(k):
+            continue
+        lv = lmap.get(k, "∅")
+        rv = rmap.get(k, "∅")
+        if lv != rv:
+            out.append((k, lv, rv))
+    return out
+
+
+def format_diff(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    rows: list[tuple[str, str, str]],
+) -> str:
+    lines = [
+        f"orbit diff  {left.get('requested')}  vs  {right.get('requested')}",
+        f"  L payload  {_short(str(left.get('payload')))}",
+        f"  R payload  {_short(str(right.get('payload')))}",
+        f"  L proxy    {left.get('proxy') or '-'}",
+        f"  R proxy    {right.get('proxy') or '-'}",
+        f"  diffs      {len(rows)}",
+    ]
+    if not rows:
+        lines.append("  verdict    same orbit")
+        return "\n".join(lines) + "\n"
+    for k, lv, rv in rows:
+        lines.append(f"  {k}")
+        lines.append(f"    L  {_short(lv, 90)}")
+        lines.append(f"    R  {_short(rv, 90)}")
+    # summary
+    kinds = set()
+    for k, _, _ in rows:
+        if k.startswith("dylib."):
+            kinds.add("dylib")
+        elif k.startswith("env."):
+            kinds.add("env")
+        elif k.startswith("sign.") or k == "restricted":
+            kinds.add("sip")
+        elif k in {"payload", "guise", "sha", "kind", "arch"}:
+            kinds.add("identity")
+        elif k == "proxy" or k.startswith("chain."):
+            kinds.add("proxy")
+    lines.append("  verdict    " + ", ".join(sorted(kinds)) + " differ")
+    return "\n".join(lines) + "\n"
+
+
+def operand_to_orbit(
+    spec: str,
+    *,
+    cwd: str,
+    environ: Mapping[str, str],
+    scan_dylibs: bool,
+    follow: bool,
+    lookup_path: str | None = None,
+) -> dict[str, Any]:
+    p = Path(spec)
+    if p.is_file():
+        try:
+            if p.stat().st_size < 4_000_000:
+                head = p.read_text(encoding="utf-8", errors="ignore")[:32]
+                if head.lstrip().startswith("{"):
+                    return load_orbit_json(str(p))
+        except OSError:
+            pass
+    o = snapshot(
+        spec,
+        cwd=cwd,
+        environ=environ,
+        scan_dylibs=scan_dylibs,
+        follow=follow,
+        lookup_path=lookup_path,
+    )
+    return orbit_to_json(o)
+
+
+# --- selftest ---------------------------------------------------------------
+
+
+def selftest() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    # rpath expansion
+    expect(
+        expand_rpath("@loader_path/../lib", loader_dir="/opt/app/bin", exec_dir="/x")
+        == "/opt/app/bin/../lib",
+        "rpath expand",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bin_a = root / "a"
+        bin_b = root / "b"
+        bin_a.mkdir()
+        bin_b.mkdir()
+        tool_a = bin_a / "tool"
+        tool_b = bin_b / "tool"
+        tool_a.write_text("#!/usr/bin/env python3\nprint('A')\n# TOOL_A_ENV_VAR\n")
+        tool_b.write_text("#!/usr/bin/env python3\nprint('B')\n# TOOL_B_ENV_VAR\n")
+        tool_a.chmod(0o755)
+        tool_b.chmod(0o755)
+        gamma = root / "gamma"
+        gamma.write_text("#!/usr/bin/env python3\nprint('gamma')\n# ORBIT_FIXTURE_VAR\n")
+        gamma.chmod(0o755)
+        beta = root / "beta"
+        beta.write_text("#!./gamma\nprint('beta')\n")
+        beta.chmod(0o755)
+        missing = root / "missing"
+        missing.write_text("#!/no/such/orbit-interp\n")
+        missing.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = str(bin_a) + os.pathsep + str(bin_b) + os.pathsep + env.get("PATH", "")
+        left = snapshot("tool", cwd=td, environ=env, follow=True)
+        expect(left.chosen == str(tool_a), f"PATH first wins: {left.chosen}")
+        expect(len(left.path_hits) >= 2, "both PATH hits")
+        env2 = dict(env)
+        env2["PATH"] = str(bin_b) + os.pathsep + str(bin_a)
+        right = snapshot("tool", cwd=td, environ=env2, follow=True)
+        expect(right.chosen == str(tool_b), f"PATH reverse: {right.chosen}")
+        rows = diff_records(orbit_to_json(left), orbit_to_json(right), ignore={"cwd"})
+        expect(any(k == "payload" or k == "guise" for k, _, _ in rows), "diff sees PATH swap")
+
+        names = extract_env_names(str(gamma))
+        expect("ORBIT_FIXTURE_VAR" in names, f"extract env from script: {names[:8]}")
+
+        chained = snapshot(str(beta), cwd=td, environ=env, follow=True)
+        expect(
+            chained.proxy.startswith("shebang"),
+            f"relative shebang proxy: {chained.proxy}",
+        )
+        expect(
+            Path(chained.payload).name in {"python3", "python3.14", "python", Path(sys.executable).name}
+            or "python" in Path(chained.payload).name,
+            f"shebang payload is python: {chained.payload}",
+        )
+
+        miss = snapshot(str(missing), cwd=td, environ=env, follow=True)
+        expect(
+            any("missing interpreter" in w for w in miss.warnings),
+            f"missing interp warning: {miss.warnings}",
+        )
+
+        blob = root / "blob.bin"
+        blob.write_bytes(b"\0PYTHONPATH\0DYLD_INSERT_LIBRARIES\0HTTP\0KIZU_SESSION_ID\0")
+        extracted = extract_env_names(str(blob))
+        expect("PYTHONPATH" in extracted, "PYTHONPATH")
+        expect("DYLD_INSERT_LIBRARIES" in extracted, "DYLD_*")
+        expect("KIZU_SESSION_ID" in extracted, "KIZU_*")
+        expect("HTTP" not in extracted, "boring HTTP dropped")
+
+        glued = explode_env_token("KIZU_CONFIGXDG_CONFIG_HOMEKIZU_STATE_DIR")
+        expect("XDG_CONFIG_HOME" in glued, f"explode XDG: {glued}")
+        expect("KIZU_STATE_DIR" in glued, f"explode KIZU_STATE: {glued}")
+        expect(not interesting_env_name("DATA_CONST"), "DATA_CONST boring")
+        expect(not interesting_env_name("R_CD"), "R_CD boring")
+        _, stt, _ = classify_dylib("/usr/lib/libSystem.B.dylib", None)
+        expect(stt == "shared", f"libSystem shared-cache not missing: {stt}")
+
+        expect(
+            any(e.name == "ORBIT_FIXTURE_VAR" for e in chained.env),
+            "shebang hop env harvested",
+        )
+
+        same = diff_records(orbit_to_json(left), orbit_to_json(left), ignore={"cwd"})
+        expect(same == [], f"self-diff empty: {same[:3]}")
+
+        expect(interesting_env_name("PYTHONPATH"), "PYTHONPATH interesting")
+        expect(not interesting_env_name("HTTP"), "HTTP boring")
+        expect(
+            expand_rpath("@executable_path/../lib/libx.dylib", loader_dir="/p/bin", exec_dir="/p/bin")
+            == "/p/bin/../lib/libx.dylib",
+            "executable_path",
+        )
+
+        sip_keep = is_restricted(
+            "/tmp/not-a-system-bin",
+            {"platform": False, "runtime": False},
+            {"setuid": False, "setgid": False},
+        )
+        expect(not sip_keep, "tmp unrestricted")
+        sip_bin = is_restricted(
+            "/bin/ls",
+            {"platform": True, "runtime": False},
+            {"setuid": False, "setgid": False},
+        )
+        expect(sip_bin, "/bin/ls restricted")
+
+    if failures:
+        for f in failures:
+            eprint("selftest FAIL:", f)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+# --- cli --------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="orbit",
+        description="Dump or diff the effective world of *this* binary (guise, payload, dylibs, named env, SIP).",
+    )
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--json", action="store_true", help="JSON dump / JSON diff rows")
+    p.add_argument("--porcelain", action="store_true", help="canonical key<TAB>value")
+    p.add_argument("--cwd", default=None, help="cwd for rustup/xcrun/toolchain files")
+    p.add_argument(
+        "--path",
+        default=None,
+        help="PATH used to bind the *name* only; shebang/env still use the process PATH",
+    )
+    p.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VAL",
+        help="overlay env (empty VAL unsets). Repeatable.",
+    )
+    p.add_argument(
+        "--scan-dylibs",
+        action="store_true",
+        help="harvest env names from first-party dylibs (default on)",
+    )
+    p.add_argument(
+        "--no-scan-dylibs",
+        action="store_true",
+        help="only scan the payload/guise images, not libpython/libnode/…",
+    )
+    p.add_argument("--no-proxy", action="store_true", help="do not follow rustup/xcselect/shebang")
+    p.add_argument(
+        "--ignore",
+        action="append",
+        default=[],
+        help="diff: ignore key prefix (repeatable). cwd is ignored by default.",
+    )
+    p.add_argument(
+        "words",
+        nargs="*",
+        help="dump NAME | diff LEFT RIGHT | paths NAME",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.selftest:
+        return selftest()
+
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    environ = overlay_env(os.environ, args.env)
+    lookup_path = args.path
+    scan_dylibs = not args.no_scan_dylibs
+
+    words = list(args.words)
+    if not words:
+        parser.print_help()
+        return 2
+
+    cmd = words[0]
+    rest = words[1:]
+    if cmd not in {"dump", "diff", "paths"}:
+        rest = words
+        cmd = "dump"
+
+    try:
+        if cmd == "paths":
+            if len(rest) != 1:
+                raise OrbitError("usage: orbit paths NAME")
+            name = rest[0]
+            hits = path_hits(name, lookup_path or environ.get("PATH", ""))
+            if not hits:
+                raise OrbitError(f"not on PATH: {name}", 1)
+            for i, h in enumerate(hits):
+                print(f"{i}\t{h}\t{real_file(h)}")
+            return 0
+
+        if cmd == "dump":
+            if len(rest) != 1:
+                raise OrbitError("usage: orbit dump NAME")
+            data = operand_to_orbit(
+                rest[0],
+                cwd=cwd,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                follow=not args.no_proxy,
+                lookup_path=lookup_path,
+            )
+            if args.json:
+                json.dump(data, sys.stdout, indent=2, sort_keys=True)
+                sys.stdout.write("\n")
+            elif args.porcelain:
+                sys.stdout.write(format_porcelain(data))
+            else:
+                sys.stdout.write(format_human(data))
+            return 0
+
+        if cmd == "diff":
+            if len(rest) != 2:
+                raise OrbitError("usage: orbit diff LEFT RIGHT")
+            left = operand_to_orbit(
+                rest[0],
+                cwd=cwd,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                follow=not args.no_proxy,
+                lookup_path=lookup_path,
+            )
+            right = operand_to_orbit(
+                rest[1],
+                cwd=cwd,
+                environ=environ,
+                scan_dylibs=scan_dylibs,
+                follow=not args.no_proxy,
+                lookup_path=lookup_path,
+            )
+            ignore = set(args.ignore) | {"cwd"}
+            rows = diff_records(left, right, ignore=ignore)
+            if args.json:
+                json.dump(
+                    {
+                        "left": left.get("requested"),
+                        "right": right.get("requested"),
+                        "n": len(rows),
+                        "rows": [{"key": k, "left": lv, "right": rv} for k, lv, rv in rows],
+                    },
+                    sys.stdout,
+                    indent=2,
+                )
+                sys.stdout.write("\n")
+            elif args.porcelain:
+                for k, lv, rv in rows:
+                    print(f"{k}\t{lv}\t{rv}")
+            else:
+                sys.stdout.write(format_diff(left, right, rows))
+            return 0 if not rows else 1
+
+        raise OrbitError(f"unknown command {cmd}")
+    except OrbitError as exc:
+        eprint("orbit:", exc)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1391 @@
+#!/usr/bin/env python3
+"""woof — CI gate: --only prose is comment+text tokens, not a docs/** glob.
+
+weft --only docs frees any class on documentation paths (and any file under
+docs/). woof's --only prose allows comment+text regardless of path: README.md
+at the repo root is in the gate; docs/generated/api.rs does not get a free
+number ply. Markdown fence interiors are projected in the tagged dialect
+so a timeout sample is number ply, not one swallowed string.
+
+Default is the gate, not a dump. stdin is a unified diff. TSV only on --emit.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import signal
+import sys
+import unicodedata
+import unittest
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import Sequence
+
+VERSION = "0.2"
+
+# v0.2: project markdown fence interiors in the tagged dialect.
+# v0.1 left fences as one swallowed string (weft's backtick). snag peels
+# numbers out of that string; woof names the fence as code instead.
+PROJECT_FENCES = True
+
+CLASSES = (
+    "ident",
+    "kw",
+    "number",
+    "string",
+    "comment",
+    "key",
+    "import",
+    "text",
+    "punct",
+    "space",
+)
+CLASS_SET = set(CLASSES)
+NOISE = frozenset({"space"})
+LOCK_BASENAMES = frozenset(
+    {
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.sum",
+        "composer.lock",
+        "Gemfile.lock",
+        "poetry.lock",
+        "Pipfile.lock",
+        "flake.lock",
+        "bun.lock",
+        "bun.lockb",
+    }
+)
+
+KEYWORDS = frozenset(
+    """
+    if else elif for while do return break continue yield
+    fn def function class struct enum impl trait union
+    let var const mut pub async await static
+    import from use export include require package module mod
+    true false none null nil True False None
+    try except catch finally throw raise
+    in is not and or
+    match case switch default
+    type interface where self Self this
+    public private protected internal
+    new delete sizeof typeof instanceof
+    with as of from
+    pass lambda
+    crate super
+    """.split()
+)
+PREPROCESSOR = frozenset(
+    "include define undef ifdef ifndef endif pragma once line error warning".split()
+)
+_IMPORT_HEADS = frozenset({"import", "from", "use", "require", "include", "export", "mod"})
+
+# --only aliases. "prose" (and "docs") is comment+text tokens. Path never
+# frees a number, ident, or string. That is the inversion of weft --only docs.
+ALIAS = {
+    "comments": ("comment",),
+    "comment": ("comment",),
+    "docs": ("comment", "text"),
+    "prose": ("comment", "text"),
+    "code": ("ident", "kw", "number", "string", "key", "import"),
+}
+PROSE_EXTS = frozenset({"md", "mdx", "rst", "txt", "adoc", "markdown"})
+PROSE_BASENAMES = frozenset(
+    {
+        "license",
+        "copying",
+        "authors",
+        "notice",
+        "changelog",
+        "changes",
+        "news",
+        "readme",
+        "agents",
+        "claude",
+    }
+)
+FENCE_LANG_PATH = {
+    "rust": "x.rs",
+    "rs": "x.rs",
+    "python": "x.py",
+    "py": "x.py",
+    "pyi": "x.py",
+    "bash": "x.sh",
+    "sh": "x.sh",
+    "shell": "x.sh",
+    "zsh": "x.sh",
+    "js": "x.js",
+    "javascript": "x.js",
+    "ts": "x.ts",
+    "tsx": "x.tsx",
+    "swift": "x.swift",
+    "json": "x.json",
+    "toml": "x.toml",
+    "yaml": "x.yaml",
+    "yml": "x.yml",
+    "make": "Makefile",
+    "makefile": "Makefile",
+    "c": "x.c",
+    "cpp": "x.cpp",
+    "go": "x.go",
+    "ruby": "x.rb",
+    "rb": "x.rb",
+    "html": "x.html",
+    "css": "x.css",
+}
+
+
+# ---------------------------------------------------------------------------
+# dialects / lexer
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Dialect:
+    name: str
+    line_comment: tuple[str, ...] = ()
+    block_comment: tuple[tuple[str, str], ...] = ()
+    json_keys: bool = False
+    hash_ok: bool = False
+    triple: bool = False
+    prose: bool = False
+
+
+def dialect_for(path: str) -> Dialect:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    ext = name.lower()
+    ext = ext.rsplit(".", 1)[-1] if "." in ext else ext
+    stem = name.lower().rsplit(".", 1)[0] if "." in name else name.lower()
+    if name in {"Makefile", "makefile", "GNUmakefile", "Dockerfile"}:
+        return Dialect("hash", line_comment=("#",), hash_ok=True)
+    if ext in PROSE_EXTS or stem in PROSE_BASENAMES or name.lower() in PROSE_BASENAMES:
+        return Dialect("md", block_comment=(("<!--", "-->"),), prose=True)
+    if ext in {"py", "pyi"}:
+        return Dialect("python", line_comment=("#",), hash_ok=True, triple=True)
+    if ext in {
+        "sh",
+        "bash",
+        "zsh",
+        "rb",
+        "r",
+        "pl",
+        "ps1",
+        "toml",
+        "yml",
+        "yaml",
+        "mak",
+        "mk",
+        "cfg",
+        "ini",
+        "env",
+        "gitignore",
+        "dockerignore",
+    }:
+        return Dialect("hash", line_comment=("#",), hash_ok=True)
+    if ext == "hs":
+        return Dialect("haskell", line_comment=("--",), block_comment=(("{-", "-}"),))
+    if ext in {"lua", "sql"}:
+        return Dialect("dash", line_comment=("--",), block_comment=(("/*", "*/"),))
+    if ext in {"html", "xml", "svg", "xhtml"}:
+        return Dialect("html", block_comment=(("<!--", "-->"),))
+    if ext in {"json"}:
+        return Dialect("json", json_keys=True)
+    if ext in {"jsonc", "json5"}:
+        return Dialect("jsonc", line_comment=("//",), block_comment=(("/*", "*/"),), json_keys=True)
+    if ext in {
+        "rs",
+        "c",
+        "h",
+        "cc",
+        "hh",
+        "cpp",
+        "hpp",
+        "go",
+        "java",
+        "js",
+        "mjs",
+        "cjs",
+        "ts",
+        "tsx",
+        "jsx",
+        "css",
+        "scss",
+        "swift",
+        "kt",
+        "kts",
+        "scala",
+        "cs",
+        "m",
+        "mm",
+        "pkl",
+    }:
+        return Dialect("c", line_comment=("//",), block_comment=(("/*", "*/"),))
+    return Dialect("c", line_comment=("//",), block_comment=(("/*", "*/"),))
+
+
+def dialect_for_fence(lang: str) -> Dialect:
+    key = (lang or "").strip().lower()
+    if not key:
+        return Dialect("c", line_comment=("//",), block_comment=(("/*", "*/"),))
+    return dialect_for(FENCE_LANG_PATH.get(key, f"x.{key}"))
+
+
+@dataclass(frozen=True)
+class Token:
+    cls: str
+    value: str
+    line: int
+    col: int
+
+
+_IDENT = re.compile(r"[A-Za-z_$@][A-Za-z0-9_$@]*")
+_NUMBER = re.compile(
+    r"(?:"
+    r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*"
+    r"|0[bB][01](?:_?[01])*"
+    r"|0[oO][0-7](?:_?[0-7])*"
+    r"|\d+(?:_\d+)*(?:\.\d+(?:_\d+)*)?(?:[eE][+-]?\d+)?"
+    r")"
+)
+
+
+def _starts(src: str, i: int, needle: str) -> bool:
+    return src.startswith(needle, i)
+
+
+def _md_fence_header(src: str, i: int) -> tuple[str, str, int] | None:
+    """If src[i:] is a fence opener, return (marker, lang, header_bytes)."""
+    n = len(src)
+    j = i
+    spaces = 0
+    while j < n and src[j] == " " and spaces < 3:
+        j += 1
+        spaces += 1
+    if j >= n or src[j] not in "`~":
+        return None
+    ch = src[j]
+    k = j
+    while k < n and src[k] == ch:
+        k += 1
+    flen = k - j
+    if flen < 3:
+        return None
+    nl = src.find("\n", k)
+    info_end = nl if nl >= 0 else n
+    info = src[k:info_end]
+    if ch == "`" and "`" in info:
+        return None
+    lang = info.strip().split()[0] if info.strip() else ""
+    header_len = (nl + 1 - i) if nl >= 0 else (n - i)
+    return ch * flen, lang, header_len
+
+
+def _md_fence_close(src: str, start: int, marker: str) -> tuple[int, int]:
+    """Return (close_line_start, after_close). Unclosed → (n, n)."""
+    n = len(src)
+    ch = marker[0]
+    flen = len(marker)
+    i = start
+    while i < n:
+        line_start = i
+        spaces = 0
+        while i < n and src[i] == " " and spaces < 3:
+            i += 1
+            spaces += 1
+        k = i
+        while k < n and src[k] == ch:
+            k += 1
+        if k - i >= flen:
+            rest = src[k : src.find("\n", k) if src.find("\n", k) >= 0 else n]
+            if rest.strip() == "":
+                nl = src.find("\n", k)
+                after = (nl + 1) if nl >= 0 else n
+                return line_start, after
+        nl = src.find("\n", line_start)
+        i = (nl + 1) if nl >= 0 else n
+    return n, n
+
+
+def lex(src: str, dialect: Dialect, start_line: int = 1) -> list[Token]:
+    out: list[Token] = []
+    i = 0
+    n = len(src)
+    line = start_line
+    col = 1
+    line_start = True
+
+    def emit(cls: str, val: str, at_line: int, at_col: int) -> None:
+        if val == "":
+            return
+        out.append(Token(cls, val, at_line, at_col))
+
+    def bump(k: int) -> None:
+        nonlocal i, line, col, line_start
+        for ch in src[i : i + k]:
+            if ch == "\n":
+                line += 1
+                col = 1
+                line_start = True
+            else:
+                col += 1
+                if not ch.isspace():
+                    line_start = False
+        i += k
+
+    while i < n:
+        ch = src[i]
+        sl, sc = line, col
+
+        if dialect.prose and line_start:
+            hdr = _md_fence_header(src, i)
+            if hdr is not None:
+                marker, lang, header_len = hdr
+                body_i = i + header_len
+                close_at, after = _md_fence_close(src, body_i, marker)
+                body = src[body_i:close_at]
+                body_line = line + 1 if header_len else line
+                bump(after - i)
+                if PROJECT_FENCES:
+                    inner = dialect_for_fence(lang)
+                    out.extend(lex(body, inner, body_line))
+                else:
+                    # weft swallow: language tag + body is one string.
+                    emit("string", (lang + "\n" + body) if lang else body, sl, sc)
+                continue
+
+        if ch.isspace():
+            j = i
+            while j < n and src[j].isspace():
+                j += 1
+            emit("space", src[i:j], sl, sc)
+            bump(j - i)
+            continue
+
+        consumed = False
+        for open_, close in dialect.block_comment:
+            if _starts(src, i, open_):
+                j = src.find(close, i + len(open_))
+                if j < 0:
+                    val = src[i:]
+                    emit("comment", _comment_body(val, open_, close), sl, sc)
+                    bump(len(val))
+                else:
+                    val = src[i : j + len(close)]
+                    emit("comment", _comment_body(val, open_, close), sl, sc)
+                    bump(len(val))
+                consumed = True
+                break
+        if consumed:
+            continue
+
+        for mark in dialect.line_comment:
+            if _starts(src, i, mark):
+                if mark == "#" and not dialect.hash_ok:
+                    break
+                j = src.find("\n", i)
+                if j < 0:
+                    j = n
+                raw = src[i:j]
+                emit("comment", raw[len(mark) :].strip(), sl, sc)
+                bump(j - i)
+                consumed = True
+                break
+        if consumed:
+            continue
+
+        if ch == "#" and not dialect.hash_ok:
+            emit("punct", "#", sl, sc)
+            bump(1)
+            continue
+
+        if dialect.triple and _starts(src, i, '"""'):
+            tok, k = _read_triple(src, i, '"""')
+            emit("string", tok, sl, sc)
+            bump(k)
+            continue
+        if dialect.triple and _starts(src, i, "'''"):
+            tok, k = _read_triple(src, i, "'''")
+            emit("string", tok, sl, sc)
+            bump(k)
+            continue
+
+        if ch in ("'", '"', "`"):
+            if dialect.prose and ch == "`":
+                tok, k = _read_inline_tick(src, i)
+            else:
+                tok, k = _read_string(src, i, ch)
+            emit("string", tok, sl, sc)
+            bump(k)
+            continue
+
+        m = _NUMBER.match(src, i)
+        if m and not (i > 0 and (src[i - 1].isalnum() or src[i - 1] in "_$")):
+            emit("number", m.group(0), sl, sc)
+            bump(m.end() - i)
+            continue
+
+        m = _IDENT.match(src, i)
+        if m:
+            val = m.group(0)
+            if dialect.prose:
+                emit("text", val, sl, sc)
+            else:
+                cls = "kw" if val in KEYWORDS else "ident"
+                emit(cls, val, sl, sc)
+            bump(m.end() - i)
+            continue
+
+        if ord(ch) > 127 and unicodedata.category(ch).startswith("L"):
+            j = i + 1
+            while j < n:
+                cj = unicodedata.category(src[j])
+                if cj.startswith("L") or cj in {"Mn", "Mc", "Lm"} or src[j] in "ー々〆ゝゞ":
+                    j += 1
+                else:
+                    break
+            # Code paths: CJK is an identifier (fn 契約). Prose files keep text.
+            emit("text" if dialect.prose else "ident", src[i:j], sl, sc)
+            bump(j - i)
+            continue
+
+        multi = (
+            ">>=",
+            "<<=",
+            "&&=",
+            "||=",
+            "...",
+            "..=",
+            "==",
+            "!=",
+            "<=",
+            ">=",
+            "&&",
+            "||",
+            "->",
+            "=>",
+            "::",
+            "<<",
+            ">>",
+            "++",
+            "--",
+            "+=",
+            "-=",
+            "*=",
+            "/=",
+            "%=",
+            "&=",
+            "|=",
+            "^=",
+            "//",
+        )
+        hit = None
+        for op in multi:
+            if _starts(src, i, op):
+                if op == "//" and "//" in dialect.line_comment:
+                    continue
+                hit = op
+                break
+        if hit:
+            emit("punct", hit, sl, sc)
+            bump(len(hit))
+            continue
+        emit("punct", ch, sl, sc)
+        bump(1)
+
+    tagged = _tag_imports(out)
+    if dialect.json_keys:
+        tagged = _tag_json_keys(tagged)
+    return tagged
+
+
+def _comment_body(raw: str, open_: str, close: str) -> str:
+    s = raw
+    if s.startswith(open_):
+        s = s[len(open_) :]
+    if close and s.endswith(close):
+        s = s[: -len(close)]
+    return s.strip()
+
+
+def _read_string(src: str, i: int, quote: str) -> tuple[str, int]:
+    n = len(src)
+    j = i + 1
+    out = []
+    while j < n:
+        c = src[j]
+        if c == "\\":
+            if j + 1 < n:
+                out.append(src[j : j + 2])
+                j += 2
+                continue
+            out.append(c)
+            j += 1
+            continue
+        if c == quote:
+            return "".join(out), (j + 1 - i)
+        if c == "\n" and quote != "`":
+            return "".join(out), (j - i)
+        out.append(c)
+        j += 1
+    return "".join(out), (n - i)
+
+
+def _read_inline_tick(src: str, i: int) -> tuple[str, int]:
+    """Markdown inline `code`. Does not swallow a fenced block across newlines."""
+    n = len(src)
+    j = i + 1
+    out = []
+    while j < n:
+        c = src[j]
+        if c == "`":
+            return "".join(out), (j + 1 - i)
+        if c == "\n":
+            return "".join(out), (j - i)
+        out.append(c)
+        j += 1
+    return "".join(out), (n - i)
+
+
+def _read_triple(src: str, i: int, quote: str) -> tuple[str, int]:
+    j = i + len(quote)
+    k = src.find(quote, j)
+    if k < 0:
+        return src[j:], (len(src) - i)
+    return src[j:k], (k + len(quote) - i)
+
+
+def _tag_imports(tokens: Sequence[Token]) -> list[Token]:
+    by_line: dict[int, list[int]] = {}
+    for idx, t in enumerate(tokens):
+        by_line.setdefault(t.line, []).append(idx)
+    out = list(tokens)
+    for idxs in by_line.values():
+        heads = [tokens[i] for i in idxs if tokens[i].cls != "space"]
+        if not heads:
+            continue
+        h0 = heads[0]
+        is_import = (h0.cls in {"kw", "ident"} and h0.value in _IMPORT_HEADS) or (
+            h0.cls == "punct" and h0.value == "#" and len(heads) > 1 and heads[1].value in PREPROCESSOR
+        )
+        if not is_import:
+            continue
+        for i in idxs:
+            if out[i].cls == "string":
+                out[i] = Token("import", out[i].value, out[i].line, out[i].col)
+    return out
+
+
+def _tag_json_keys(tokens: Sequence[Token]) -> list[Token]:
+    out = list(tokens)
+    n = len(out)
+    for i, t in enumerate(out):
+        if t.cls != "string":
+            continue
+        j = i + 1
+        while j < n and out[j].cls == "space":
+            j += 1
+        if j < n and out[j].cls == "punct" and out[j].value == ":":
+            out[i] = Token("key", t.value, t.line, t.col)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# unified diff
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Hunk:
+    old_start: int
+    new_start: int
+    rows: list[tuple[str, str]]
+
+
+@dataclass
+class FileDiff:
+    path: str
+    old_path: str
+    hunks: list[Hunk] = field(default_factory=list)
+    status: str = "modified"
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_unified(text: str) -> list[FileDiff]:
+    files: list[FileDiff] = []
+    cur: FileDiff | None = None
+    hunk: Hunk | None = None
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            hunk = None
+            parts = line.split()
+            old = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else (parts[2] if len(parts) > 2 else "")
+            new = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else (parts[3] if len(parts) > 3 else old)
+            cur = FileDiff(path=new or old, old_path=old or new)
+            files.append(cur)
+            i += 1
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            if cur:
+                cur.status = "binary"
+            hunk = None
+            i += 1
+            continue
+        if line.startswith("--- "):
+            oldp = _strip_ab(line[4:])
+            if cur is None:
+                cur = FileDiff(path=oldp, old_path=oldp)
+                files.append(cur)
+            else:
+                cur.old_path = oldp if oldp != "/dev/null" else cur.old_path
+            if oldp == "/dev/null" and cur:
+                cur.status = "added"
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            newp = _strip_ab(line[4:])
+            if cur is None:
+                cur = FileDiff(path=newp, old_path=newp)
+                files.append(cur)
+            else:
+                if newp != "/dev/null":
+                    cur.path = newp
+            if newp == "/dev/null" and cur:
+                cur.status = "deleted"
+            i += 1
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            if cur is None:
+                cur = FileDiff(path="?", old_path="?")
+                files.append(cur)
+            hunk = Hunk(old_start=int(m.group(1)), new_start=int(m.group(3)), rows=[])
+            cur.hunks.append(hunk)
+            i += 1
+            continue
+        if hunk is not None and line[:1] in {" ", "-", "+", "\\"}:
+            tag = line[:1]
+            body = line[1:] if tag != "\\" else line
+            if tag == "\\":
+                i += 1
+                continue
+            hunk.rows.append((tag, body))
+            i += 1
+            continue
+        i += 1
+    return files
+
+
+def _strip_ab(s: str) -> str:
+    s = s.strip()
+    if "\t" in s:
+        s = s.split("\t", 1)[0]
+    if s.startswith("a/") or s.startswith("b/"):
+        return s[2:]
+    return s
+
+
+def hunk_side(hunk: Hunk, minus: bool) -> tuple[str, int]:
+    parts: list[str] = []
+    want = "-" if minus else "+"
+    for tag, body in hunk.rows:
+        if tag == " " or tag == want:
+            parts.append(body)
+    start = hunk.old_start if minus else hunk.new_start
+    return "\n".join(parts), start
+
+
+# ---------------------------------------------------------------------------
+# projection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Edit:
+    path: str
+    line: int
+    cls: str
+    op: str
+    old: str
+    new: str
+    new_line: int = 0
+
+
+def project_edits(old: Sequence[Token], new: Sequence[Token], path: str, classes: Sequence[str]) -> list[Edit]:
+    edits: list[Edit] = []
+    for cls in classes:
+        a = [t for t in old if t.cls == cls]
+        b = [t for t in new if t.cls == cls]
+        edits.extend(_script(a, b, path, cls))
+    return _collapse_moves(edits)
+
+
+def _script(a: Sequence[Token], b: Sequence[Token], path: str, cls: str) -> list[Edit]:
+    if not a and not b:
+        return []
+    sm = SequenceMatcher(a=[t.value for t in a], b=[t.value for t in b], autojunk=False)
+    out: list[Edit] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete":
+            for t in a[i1:i2]:
+                out.append(Edit(path, t.line, cls, "del", t.value, "", 0))
+        elif tag == "insert":
+            for t in b[j1:j2]:
+                out.append(Edit(path, t.line, cls, "ins", "", t.value, t.line))
+        elif tag == "replace":
+            olds = list(a[i1:i2])
+            news = list(b[j1:j2])
+            n = min(len(olds), len(news))
+            one_slot = len(olds) == 1 and len(news) == 1
+            for k in range(n):
+                if olds[k].value == news[k].value:
+                    continue
+                if cls == "number" or one_slot or _similar(olds[k].value, news[k].value, cls):
+                    out.append(Edit(path, news[k].line, cls, "chg", olds[k].value, news[k].value, news[k].line))
+                else:
+                    out.append(Edit(path, olds[k].line, cls, "del", olds[k].value, "", 0))
+                    out.append(Edit(path, news[k].line, cls, "ins", "", news[k].value, news[k].line))
+            for t in olds[n:]:
+                out.append(Edit(path, t.line, cls, "del", t.value, "", 0))
+            for t in news[n:]:
+                out.append(Edit(path, t.line, cls, "ins", "", t.value, t.line))
+    return out
+
+
+def _similar(a: str, b: str, cls: str) -> bool:
+    if cls in {"kw", "punct", "space"}:
+        return False
+    if a == b:
+        return True
+    al, bl = a.lower(), b.lower()
+    if al in bl or bl in al:
+        return True
+    if min(len(a), len(b)) >= 4 and SequenceMatcher(None, al, bl).ratio() >= 0.55:
+        return True
+    return False
+
+
+def _collapse_moves(edits: list[Edit]) -> list[Edit]:
+    unused_ins: dict[tuple[str, str, str], list[int]] = {}
+    ins_list = [e for e in edits if e.op == "ins"]
+    for idx, e in enumerate(ins_list):
+        unused_ins.setdefault((e.path, e.cls, e.new), []).append(idx)
+    used_ins = [False] * len(ins_list)
+    consumed_del = [False] * len(edits)
+    result: list[Edit] = []
+    for i, e in enumerate(edits):
+        if e.op != "del":
+            continue
+        key = (e.path, e.cls, e.old)
+        bucket = unused_ins.get(key) or []
+        found = None
+        while bucket:
+            j = bucket.pop(0)
+            if not used_ins[j]:
+                found = j
+                break
+        if found is None:
+            continue
+        used_ins[found] = True
+        consumed_del[i] = True
+        dest = ins_list[found]
+        result.append(Edit(e.path, e.line, e.cls, "mov", e.old, dest.new, dest.line))
+    ins_used_idx = set(j for j, u in enumerate(used_ins) if u)
+    for i, e in enumerate(edits):
+        if e.op == "del":
+            if not consumed_del[i]:
+                result.append(e)
+        elif e.op == "ins":
+            continue
+        elif e.op in {"chg", "mov"}:
+            result.append(e)
+    ins_cursor = 0
+    for e in edits:
+        if e.op != "ins":
+            continue
+        if ins_cursor not in ins_used_idx:
+            result.append(e)
+        ins_cursor += 1
+    return result
+
+
+def is_lock_path(path: str) -> bool:
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if base in LOCK_BASENAMES:
+        return True
+    if base.endswith(".lock") or base.endswith("-lock.json") or base.endswith(".lockb"):
+        return True
+    return False
+
+
+def edits_from_diff(
+    files: Sequence[FileDiff],
+    *,
+    locks: bool = False,
+) -> list[Edit]:
+    classes = [c for c in CLASSES if c != "space"]
+    out: list[Edit] = []
+    for fd in files:
+        if fd.status == "binary":
+            continue
+        if not locks and is_lock_path(fd.path or fd.old_path):
+            continue
+        dialect = dialect_for(fd.path if fd.path != "/dev/null" else fd.old_path)
+        for h in fd.hunks:
+            old_txt, old_start = hunk_side(h, True)
+            new_txt, new_start = hunk_side(h, False)
+            old_toks = lex(old_txt, dialect, old_start)
+            new_toks = lex(new_txt, dialect, new_start)
+            out.extend(project_edits(old_toks, new_toks, fd.path, classes))
+    return _collapse_moves(out)
+
+
+def edits_from_texts(old: str, new: str, path: str) -> list[Edit]:
+    dialect = dialect_for(path)
+    classes = [c for c in CLASSES if c != "space"]
+    return project_edits(lex(old, dialect, 1), lex(new, dialect, 1), path, classes)
+
+
+# ---------------------------------------------------------------------------
+# gate
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Allowed:
+    classes: tuple[str, ...]
+
+
+def parse_only(spec: str) -> Allowed:
+    if not spec or not spec.strip():
+        raise SystemExit("woof: --only is required (prose, comments, number, ident, …)")
+    out: list[str] = []
+    for part in spec.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if p in {"all"}:
+            out.extend(c for c in CLASSES if c not in NOISE)
+            continue
+        if p in ALIAS:
+            out.extend(ALIAS[p])
+            continue
+        if p not in CLASS_SET:
+            raise SystemExit(
+                f"woof: unknown class {p!r} (want {', '.join(CLASSES)}, prose, comments, code, all)"
+            )
+        out.append(p)
+    seen = set()
+    uniq = []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    if not uniq:
+        raise SystemExit("woof: --only is empty")
+    return Allowed(tuple(uniq))
+
+
+def is_leak(edit: Edit, allowed: Allowed, *, punct: bool) -> bool:
+    """A leak is a ply outside the allow-list. Path never frees it. Moves do not leak."""
+    if edit.op == "mov":
+        return False
+    if edit.cls in NOISE:
+        return False
+    if edit.cls == "punct" and not punct:
+        return False
+    return edit.cls not in set(allowed.classes)
+
+
+def leaks_of(edits: Sequence[Edit], allowed: Allowed, *, punct: bool) -> list[Edit]:
+    out = [e for e in edits if is_leak(e, allowed, punct=punct)]
+    out.sort(key=lambda e: (e.path, e.line, e.cls, e.op))
+    return out
+
+
+def count_classes(edits: Sequence[Edit]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for e in edits:
+        c[e.cls] = c.get(e.cls, 0) + 1
+    return c
+
+
+def render_verdict(leaked: Sequence[Edit], only: str, origin: str, extra: Sequence[str]) -> str:
+    bits = [f"only={only}"]
+    if origin:
+        bits.append(origin)
+    bits.extend(extra)
+    if leaked:
+        bits.append(f"leaked={len(leaked)}")
+        counts = count_classes(leaked)
+        for cls in CLASSES:
+            if counts.get(cls):
+                bits.append(f"{cls}={counts[cls]}")
+        header = "woof FAIL  " + "  ".join(bits)
+        rows = [header]
+        cap = 32
+        for e in leaked[:cap]:
+            rows.append(f"  {_fmt_edit(e)}")
+        if len(leaked) > cap:
+            rows.append(f"  … and {len(leaked) - cap} more")
+        return "\n".join(rows) + "\n"
+    bits.append("leaked=0")
+    return "woof OK  " + "  ".join(bits) + "\n"
+
+
+def _fmt_edit(e: Edit) -> str:
+    if e.op == "chg":
+        body = f"{_esc(e.old)} → {_esc(e.new)}"
+    elif e.op == "del":
+        body = _esc(e.old)
+    else:
+        body = _esc(e.new)
+    return f"{e.path}:{e.line}  {e.cls}  {e.op}  {body}"
+
+
+def _esc(s: str, width: int = 48) -> str:
+    s = s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+    if len(s) > width:
+        return s[: width - 1] + "…"
+    return s
+
+
+def render_tsv(edits: Sequence[Edit]) -> str:
+    rows = ["path\tline\tclass\top\told\tnew"]
+    for e in edits:
+        rows.append(
+            "\t".join(
+                [
+                    e.path,
+                    str(e.line),
+                    e.cls,
+                    e.op,
+                    e.old.replace("\t", "\\t").replace("\n", "\\n"),
+                    e.new.replace("\t", "\\t").replace("\n", "\\n"),
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="woof",
+        description=(
+            "CI gate: a unified diff must stay inside comment+prose tokens. "
+            "--only prose exits 1 if a number, ident, or string leaked — "
+            "even on README.md, even under docs/. Not a docs/** glob. "
+            "TSV only on --emit."
+        ),
+        epilog="Read a unified diff on stdin. Example: git diff | woof --only prose",
+    )
+    p.add_argument("input", nargs="?", help="unified diff file, or - for stdin")
+    p.add_argument(
+        "--only",
+        default="",
+        help="allowed class(es): prose, comments, number, ident, … (required). "
+        "prose/docs = comment+text tokens, not a path glob.",
+    )
+    p.add_argument("--emit", action="store_true", help="print leaked edits as TSV (no dump by default)")
+    p.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    p.add_argument("--punct", action="store_true", help="treat punctuation edits as leaks")
+    p.add_argument("--locks", action="store_true", help="include lockfiles")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="version", version=f"woof {VERSION}")
+    return p
+
+
+def run(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = build_parser()
+    args = p.parse_args(argv)
+    if args.selftest:
+        return 0 if _selftest() else 1
+
+    if not args.only:
+        sys.stderr.write("woof: --only is required (prose, comments, number, ident, …)\n")
+        return 2
+
+    if args.input is None and sys.stdin.isatty():
+        p.print_help()
+        sys.stderr.write("\nwoof: pass a unified diff on stdin, or a file path\n")
+        return 2
+
+    if args.input and args.input != "-":
+        try:
+            raw = open(args.input, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            sys.stderr.write(f"woof: {e}\n")
+            return 2
+        origin = args.input
+    else:
+        raw = sys.stdin.read()
+        origin = "stdin"
+
+    try:
+        allowed = parse_only(args.only)
+    except SystemExit as e:
+        msg = e.args[0] if e.args else str(e)
+        if isinstance(msg, str) and msg.startswith("woof:"):
+            sys.stderr.write(msg + "\n")
+            return 2
+        raise
+
+    files = parse_unified(raw)
+    edits = edits_from_diff(files, locks=args.locks)
+    leaked = leaks_of(edits, allowed, punct=args.punct)
+
+    extra: list[str] = []
+    if files:
+        extra.append(f"files={len(files)}")
+        n_lock = sum(1 for f in files if is_lock_path(f.path or f.old_path))
+        if n_lock and not args.locks:
+            extra.append(f"skipped_lock={n_lock}")
+
+    if args.emit:
+        sys.stdout.write(render_tsv(leaked))
+    elif not args.quiet:
+        sys.stdout.write(render_verdict(leaked, args.only, origin, extra))
+    return 1 if leaked else 0
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def _selftest() -> bool:
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(WoofTests)
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    return result.wasSuccessful()
+
+
+def _ops(edits: Sequence[Edit], cls: str) -> list[tuple[str, str, str]]:
+    return [(e.op, e.old, e.new) for e in edits if e.cls == cls and e.op != "mov"]
+
+
+FENCE_OLD = """# demo
+Copy this into src:
+
+```rust
+let timeout = 30;
+fn retry() {}
+```
+"""
+FENCE_NEW = """# demo
+Copy this into src:
+
+```rust
+let timeout = 60;
+fn retry() {}
+```
+"""
+
+GEN_RS = """diff --git a/docs/generated/api.rs b/docs/generated/api.rs
+--- a/docs/generated/api.rs
++++ b/docs/generated/api.rs
+@@ -1,3 +1,3 @@
+-pub fn fetch_user() { let timeout = 30; }
++pub fn fetch_account() { let timeout = 60; }
+"""
+
+FENCE_DIFF = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,8 @@
+ # demo
+ Copy this into src:
+ 
+ ```rust
+-let timeout = 30;
++let timeout = 60;
+ fn retry() {}
+ ```
+"""
+
+
+class WoofTests(unittest.TestCase):
+    def test_number_only_change(self) -> None:
+        e = edits_from_texts("timeout = 30\n", "timeout = 60\n", "x.rs")
+        self.assertEqual(_ops(e, "number"), [("chg", "30", "60")])
+        self.assertEqual(_ops(e, "ident"), [])
+        self.assertEqual(_ops(e, "comment"), [])
+
+    def test_comment_only_change(self) -> None:
+        e = edits_from_texts("x = 1  // old default\n", "x = 1  // new default\n", "x.rs")
+        self.assertEqual(_ops(e, "comment"), [("chg", "old default", "new default")])
+        self.assertEqual(_ops(e, "number"), [])
+
+    def test_mixed_line_splits_plies(self) -> None:
+        e = edits_from_texts("timeout = 30  // seconds\n", "timeout = 60  // secs\n", "x.rs")
+        self.assertEqual(_ops(e, "number"), [("chg", "30", "60")])
+        self.assertEqual(_ops(e, "comment"), [("chg", "seconds", "secs")])
+        self.assertEqual(_ops(e, "ident"), [])
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertEqual([(x.cls, x.old, x.new) for x in leaked if x.cls == "number"], [("number", "30", "60")])
+
+    def test_comment_only_passes_only_prose(self) -> None:
+        e = edits_from_texts("x = 1 // a\n", "x = 1 // b\n", "x.rs")
+        self.assertEqual(leaks_of(e, parse_only("comments"), punct=False), [])
+        self.assertEqual(leaks_of(e, parse_only("prose"), punct=False), [])
+
+    def test_comment_interior_number_is_still_comment(self) -> None:
+        """snag peels this. woof does not: surface class is comment."""
+        e = edits_from_texts(
+            "let timeout = 30; // timeout 30\n",
+            "let timeout = 30; // timeout 60\n",
+            "x.rs",
+        )
+        self.assertTrue(_ops(e, "comment"))
+        self.assertEqual(_ops(e, "number"), [])
+        self.assertEqual(leaks_of(e, parse_only("prose"), punct=False), [])
+
+    def test_ident_rename_leaks_prose(self) -> None:
+        e = edits_from_texts("fn foo() {}\n", "fn bar() {}\n", "x.rs")
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "ident" for x in leaked))
+
+    def test_cjk_ident_on_code_path_is_ident(self) -> None:
+        e = edits_from_texts("fn 契約() {}\n", "fn 資産() {}\n", "src.rs")
+        self.assertEqual(_ops(e, "ident"), [("chg", "契約", "資産")])
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "ident" and x.old == "契約" for x in leaked))
+
+    def test_cjk_readme_is_text(self) -> None:
+        e = edits_from_texts("契約は蒸留\n", "契約は資産\n", "README.md")
+        self.assertTrue(_ops(e, "text"))
+        self.assertEqual(_ops(e, "ident"), [])
+        self.assertEqual(leaks_of(e, parse_only("prose"), punct=False), [])
+        self.assertTrue(leaks_of(e, parse_only("comments"), punct=False))
+
+    def test_readme_english_word_is_text_not_ident(self) -> None:
+        e = edits_from_texts("timeout is 30 seconds\n", "timeout is 30 seconds (documented)\n", "README.md")
+        self.assertTrue(_ops(e, "text"))
+        self.assertEqual(_ops(e, "ident"), [])
+        self.assertEqual(_ops(e, "number"), [])
+        self.assertEqual(leaks_of(e, parse_only("prose"), punct=False), [])
+
+    def test_readme_body_number_leaks(self) -> None:
+        """Path does not free a number. weft --only docs would OK this README."""
+        e = edits_from_texts("timeout is 30\n", "timeout is 60\n", "README.md")
+        self.assertEqual(_ops(e, "number"), [("chg", "30", "60")])
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "number" for x in leaked))
+
+    def test_docs_generated_rs_number_leaks(self) -> None:
+        """docs/** is not a free pass. This is the path-glob flip."""
+        e = edits_from_texts(
+            "pub fn fetch_user() { let timeout = 30; }\n",
+            "pub fn fetch_account() { let timeout = 60; }\n",
+            "docs/generated/api.rs",
+        )
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "number" and x.old == "30" for x in leaked))
+        self.assertTrue(any(x.cls == "ident" and x.old == "fetch_user" for x in leaked))
+
+    def test_docs_makefile_number_leaks(self) -> None:
+        e = edits_from_texts("TIMEOUT = 30\n", "TIMEOUT = 60\n", "docs/Makefile")
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "number" for x in leaked))
+
+    def test_whitespace_only_hidden(self) -> None:
+        e = edits_from_texts("a=1\n", "a = 1\n", "x.rs")
+        self.assertEqual(leaks_of(e, parse_only("prose"), punct=False), [])
+
+    def test_aliases_have_no_path_glob(self) -> None:
+        self.assertEqual(parse_only("comments").classes, ("comment",))
+        self.assertEqual(parse_only("prose").classes, ("comment", "text"))
+        self.assertEqual(parse_only("docs").classes, ("comment", "text"))
+        self.assertEqual(parse_only("prose").classes, parse_only("docs").classes)
+        self.assertIn("number", parse_only("code").classes)
+
+    def test_skip_lockfile(self) -> None:
+        diff = """diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,2 +1,2 @@
+-version = "0.5.1"
++version = "0.7.0"
+"""
+        files = parse_unified(diff)
+        self.assertEqual(edits_from_diff(files), [])
+        e = edits_from_diff(files, locks=True)
+        self.assertTrue(_ops(e, "string"))
+
+    def test_fence_number_is_number_ply(self) -> None:
+        """v0.2: rust fence 30→60 is a number, not one backtick-string."""
+        e = edits_from_texts(FENCE_OLD, FENCE_NEW, "README.md")
+        self.assertEqual(_ops(e, "number"), [("chg", "30", "60")])
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "number" and x.old == "30" and x.new == "60" for x in leaked))
+        self.assertFalse(any(x.cls == "string" and "timeout" in (x.old + x.new) for x in leaked))
+
+    def test_tilde_fence_number_is_number_ply(self) -> None:
+        old = "# demo\n\n~~~rust\nlet timeout = 30;\n~~~\n"
+        new = "# demo\n\n~~~rust\nlet timeout = 60;\n~~~\n"
+        e = edits_from_texts(old, new, "README.md")
+        leaked = leaks_of(e, parse_only("prose"), punct=False)
+        self.assertTrue(any(x.cls == "number" and x.old == "30" for x in leaked))
+
+    def test_cli_mixed_fails_number(self) -> None:
+        diff = """--- a/src.rs
++++ b/src.rs
+@@ -1 +1 @@
+-timeout = 30; // seconds
++timeout = 60; // secs
+"""
+        rc, out, err = _run_capture(["--only", "prose"], stdin=diff)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("woof FAIL", out)
+        self.assertIn("number", out)
+        self.assertIn("30", out)
+        self.assertIn("60", out)
+        self.assertNotIn("path\tline\tclass", out)
+
+    def test_cli_comment_only_ok(self) -> None:
+        diff = """--- a/src.rs
++++ b/src.rs
+@@ -1 +1 @@
+-x = 1 // a
++x = 1 // b
+"""
+        rc, out, err = _run_capture(["--only", "prose"], stdin=diff)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("woof OK", out)
+
+    def test_cli_docs_generated_api_rs_fails(self) -> None:
+        rc, out, err = _run_capture(["--only", "prose"], stdin=GEN_RS)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("woof FAIL", out)
+        self.assertIn("docs/generated/api.rs", out)
+        self.assertIn("30", out)
+        self.assertIn("60", out)
+
+    def test_cli_docs_alias_is_not_a_path_glob(self) -> None:
+        rc, out, err = _run_capture(["--only", "docs"], stdin=GEN_RS)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("docs/generated/api.rs", out)
+
+    def test_cli_cjk_readme_ok(self) -> None:
+        diff = """--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-契約は蒸留
++契約は資産
+"""
+        rc, out, err = _run_capture(["--only", "prose"], stdin=diff)
+        self.assertEqual(rc, 0, out + err)
+        rc_c, out_c, _ = _run_capture(["--only", "comments"], stdin=diff)
+        self.assertEqual(rc_c, 1, out_c)
+        self.assertIn("text", out_c)
+
+    def test_cli_fence_number_is_number(self) -> None:
+        rc, out, err = _run_capture(["--only", "prose"], stdin=FENCE_DIFF)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("woof FAIL", out)
+        self.assertIn("number", out)
+        self.assertIn("30", out)
+        self.assertIn("60", out)
+        self.assertNotIn("string=", out)
+
+    def test_cli_comment_interior_ok(self) -> None:
+        diff = """--- a/src.rs
++++ b/src.rs
+@@ -1 +1 @@
+-let timeout = 30; // timeout 30
++let timeout = 30; // timeout 60
+"""
+        rc, out, err = _run_capture(["--only", "prose"], stdin=diff)
+        self.assertEqual(rc, 0, out + err)
+
+    def test_cli_requires_only(self) -> None:
+        rc, out, err = _run_capture([])
+        self.assertEqual(rc, 2)
+        self.assertIn("--only", err)
+
+    def test_cli_emit_is_tsv_of_leaks(self) -> None:
+        diff = """--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@
+-timeout = 30; // seconds
++timeout = 60; // secs
+"""
+        rc, out, err = _run_capture(["--only", "prose", "--emit"], stdin=diff)
+        self.assertEqual(rc, 1)
+        self.assertTrue(out.startswith("path\tline\tclass\top\told\tnew\n"))
+        self.assertIn("number\tchg\t30\t60", out)
+        self.assertNotIn("woof FAIL", out)
+        self.assertNotIn("comment", out.split("\n")[1] if "\n" in out else "")
+
+    def test_cli_quiet(self) -> None:
+        diff = """--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@
+-x = 1
++x = 2
+"""
+        rc, out, err = _run_capture(["--only", "prose", "-q"], stdin=diff)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+
+    def test_cli_empty_ok(self) -> None:
+        rc, out, err = _run_capture(["--only", "prose"], stdin="")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("woof OK", out)
+
+    def test_cli_readme_root_counts(self) -> None:
+        diff = """--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-timeout is 30
++timeout is 60
+"""
+        rc, out, err = _run_capture(["--only", "prose"], stdin=diff)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("README.md", out)
+        self.assertIn("30", out)
+
+
+def _run_capture(argv: list[str], stdin: str = "") -> tuple[int, str, str]:
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    so, se = StringIO(), StringIO()
+    old_in = sys.stdin
+    try:
+        sys.stdin = StringIO(stdin)
+        with redirect_stdout(so), redirect_stderr(se):
+            code = run(argv)
+    except SystemExit as e:
+        code = int(e.code) if e.code is not None else 0
+    finally:
+        sys.stdin = old_in
+    return code, so.getvalue(), se.getvalue()
+
+
+if __name__ == "__main__":
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        sys.exit(run())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

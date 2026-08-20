@@ -1,0 +1,1482 @@
+#!/usr/bin/env python3
+"""facet — bind a composite needle to sibling JSON fields of one object.
+
+Not inverse-printf of jq. Not leftover-name. Not a wait-source.
+Greedy byte-cover of a haystack will pair `kizu` with `@0.7.0` from
+`notify-debouncer-full@0.7.0`. Facet requires whole field values, and
+requires those fields to belong to the same JSON object.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+VERSION = "0.2"
+
+IDENT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+# ---------------------------------------------------------------------------
+# JSON with byte offsets
+# ---------------------------------------------------------------------------
+
+
+class ParseError(ValueError):
+    pass
+
+
+@dataclass
+class Span:
+    key: str
+    path: str
+    obj_path: str
+    value: str
+    inner_start: int
+    inner_end: int
+    direct: bool
+    kind: str  # string | number
+
+
+@dataclass
+class Obj:
+    path: str
+    start: int
+    end: int
+    fields: dict[str, Span]
+    stage: int | None = None
+    argv: str | None = None
+
+    def label(self) -> str:
+        for k in ("name", "pkg", "id", "crate", "package"):
+            sp = self.fields.get(k)
+            if sp and sp.value:
+                v = sp.value
+                if k == "id" and len(v) > 48:
+                    v = "…" + v[-40:]
+                return v
+        return ""
+
+
+@dataclass
+class Index:
+    objects: list[Obj]
+    spans: list[Span]
+    n_values: int
+    size: int
+    stage: int | None = None
+    argv: str | None = None
+
+
+def join_path(base: str, key: str) -> str:
+    if IDENT_KEY.match(key):
+        return f"{base}.{key}"
+    return f"{base}[{json.dumps(key, ensure_ascii=False)}]"
+
+
+def join_index(base: str, i: int) -> str:
+    return f"{base}[{i}]"
+
+
+_ESCAPES = {
+    0x22: '"',
+    0x5C: "\\",
+    0x2F: "/",
+    0x62: "\b",
+    0x66: "\f",
+    0x6E: "\n",
+    0x72: "\r",
+    0x74: "\t",
+}
+
+
+class Parser:
+    def __init__(self, data: bytes) -> None:
+        self.s = data
+        self.n = len(data)
+        self.i = 0
+        self.objects: list[Obj] = []
+        self.spans: list[Span] = []
+
+    def err(self, msg: str) -> None:
+        raise ParseError(f"{msg} at byte {self.i}")
+
+    def peek(self) -> int:
+        return self.s[self.i] if self.i < self.n else -1
+
+    def skip_ws(self) -> None:
+        s, n, i = self.s, self.n, self.i
+        while i < n and s[i] in (0x20, 0x09, 0x0A, 0x0D):
+            i += 1
+        self.i = i
+
+    def expect(self, b: int) -> None:
+        if self.peek() != b:
+            self.err(f"expected {bytes([b])!r}")
+        self.i += 1
+
+    def value_kind(self) -> str:
+        c = self.peek()
+        if c == 0x7B:
+            return "object"
+        if c == 0x5B:
+            return "array"
+        if c == 0x22:
+            return "string"
+        if c == 0x74:
+            return "bool"
+        if c == 0x66:
+            return "bool"
+        if c == 0x6E:
+            return "null"
+        if c == 0x2D or (0x30 <= c <= 0x39):
+            return "number"
+        self.err("expected JSON value")
+        return ""
+
+    def parse_string(self) -> tuple[str, int, int]:
+        if self.peek() != 0x22:
+            self.err("expected string")
+        self.i += 1
+        inner_start = self.i
+        out: list[str] = []
+        s, n = self.s, self.n
+        while self.i < n:
+            c = s[self.i]
+            if c == 0x22:
+                inner_end = self.i
+                self.i += 1
+                return "".join(out), inner_start, inner_end
+            if c == 0x5C:
+                self.i += 1
+                if self.i >= n:
+                    self.err("unterminated escape")
+                e = s[self.i]
+                if e == 0x75:
+                    self.i += 1
+                    hex4 = s[self.i : self.i + 4]
+                    if len(hex4) < 4:
+                        self.err("bad unicode escape")
+                    try:
+                        cp = int(hex4, 16)
+                    except ValueError:
+                        self.err("bad unicode escape")
+                    self.i += 4
+                    if 0xD800 <= cp <= 0xDBFF and self.i + 6 <= n and s[self.i : self.i + 2] == b"\\u":
+                        hex4b = s[self.i + 2 : self.i + 6]
+                        try:
+                            low = int(hex4b, 16)
+                        except ValueError:
+                            low = 0
+                        if 0xDC00 <= low <= 0xDFFF:
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                            self.i += 6
+                    out.append(chr(cp))
+                    continue
+                out.append(_ESCAPES.get(e, chr(e)))
+                self.i += 1
+                continue
+            start = self.i
+            while self.i < n and s[self.i] not in (0x22, 0x5C):
+                self.i += 1
+            out.append(s[start : self.i].decode("utf-8"))
+        self.err("unterminated string")
+        return "", 0, 0
+
+    def parse_number(self) -> tuple[str, int, int]:
+        start = self.i
+        s, n = self.s, self.n
+        if self.peek() == 0x2D:
+            self.i += 1
+        if self.peek() < 0:
+            self.err("bad number")
+        if s[self.i] == 0x30:
+            self.i += 1
+        elif 0x31 <= s[self.i] <= 0x39:
+            while self.i < n and 0x30 <= s[self.i] <= 0x39:
+                self.i += 1
+        else:
+            self.err("bad number")
+        if self.i < n and s[self.i] == 0x2E:
+            self.i += 1
+            if self.i >= n or not (0x30 <= s[self.i] <= 0x39):
+                self.err("bad number")
+            while self.i < n and 0x30 <= s[self.i] <= 0x39:
+                self.i += 1
+        if self.i < n and s[self.i] in (0x65, 0x45):
+            self.i += 1
+            if self.i < n and s[self.i] in (0x2B, 0x2D):
+                self.i += 1
+            if self.i >= n or not (0x30 <= s[self.i] <= 0x39):
+                self.err("bad number")
+            while self.i < n and 0x30 <= s[self.i] <= 0x39:
+                self.i += 1
+        return s[start : self.i].decode("ascii"), start, self.i
+
+    def parse_literal(self, lit: bytes) -> None:
+        if self.s[self.i : self.i + len(lit)] != lit:
+            self.err(f"expected {lit!r}")
+        self.i += len(lit)
+
+    def parse_scalar(self) -> tuple[str, int, int, str]:
+        k = self.value_kind()
+        if k == "string":
+            v, a, b = self.parse_string()
+            return v, a, b, "string"
+        if k == "number":
+            v, a, b = self.parse_number()
+            return v, a, b, "number"
+        if k == "bool":
+            start = self.i
+            if self.peek() == 0x74:
+                self.parse_literal(b"true")
+                return "true", start, self.i, "bool"
+            self.parse_literal(b"false")
+            return "false", start, self.i, "bool"
+        if k == "null":
+            start = self.i
+            self.parse_literal(b"null")
+            return "null", start, self.i, "null"
+        self.err("expected scalar")
+        return "", 0, 0, ""
+
+    def parse_object(self, path: str) -> None:
+        start = self.i
+        self.i += 1
+        fields: dict[str, Span] = {}
+        first = True
+        while True:
+            self.skip_ws()
+            if self.peek() == 0x7D:
+                self.i += 1
+                break
+            if not first:
+                self.expect(0x2C)
+                self.skip_ws()
+            first = False
+            key, _, _ = self.parse_string()
+            self.skip_ws()
+            self.expect(0x3A)
+            self.skip_ws()
+            child = join_path(path, key)
+            kind = self.value_kind()
+            if kind in ("string", "number", "bool", "null"):
+                val, a, b, knd = self.parse_scalar()
+                if knd in ("string", "number") and val != "":
+                    sp = Span(key, child, path, val, a, b, True, knd)
+                    fields[key] = sp
+                    self.spans.append(sp)
+            else:
+                self.parse_value(child, path)
+        obj = Obj(path=path, start=start, end=self.i, fields=fields)
+        self.objects.append(obj)
+
+    def parse_array(self, path: str, nearest_obj: str | None) -> None:
+        self.i += 1
+        idx = 0
+        first = True
+        while True:
+            self.skip_ws()
+            if self.peek() == 0x5D:
+                self.i += 1
+                break
+            if not first:
+                self.expect(0x2C)
+                self.skip_ws()
+            first = False
+            self.parse_value(join_index(path, idx), nearest_obj)
+            idx += 1
+
+    def parse_value(self, path: str, nearest_obj: str | None) -> None:
+        self.skip_ws()
+        kind = self.value_kind()
+        if kind == "object":
+            self.parse_object(path)
+            return
+        if kind == "array":
+            self.parse_array(path, nearest_obj)
+            return
+        val, a, b, knd = self.parse_scalar()
+        if nearest_obj and knd in ("string", "number") and val != "":
+            key = path[path.rfind(".") + 1 :] if "." in path else path
+            if "[" in key and key.endswith("]"):
+                pass
+            sp = Span(key, path, nearest_obj, val, a, b, False, knd)
+            self.spans.append(sp)
+
+    def parse_one(self, path: str) -> None:
+        self.skip_ws()
+        self.parse_value(path, None)
+
+
+def index_json(data: bytes) -> Index:
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    p = Parser(data)
+    p.skip_ws()
+    if p.i >= p.n:
+        raise ParseError("empty JSON")
+    p.parse_one("$")
+    p.skip_ws()
+    n_values = 1
+    if p.i < p.n:
+        p2 = Parser(data)
+        p2.objects = []
+        p2.spans = []
+        i = 0
+        while True:
+            p2.skip_ws()
+            if p2.i >= p2.n:
+                break
+            p2.parse_one(f"$[{i}]")
+            i += 1
+        n_values = i
+        p = p2
+    return Index(objects=p.objects, spans=p.spans, n_values=n_values, size=len(data))
+
+
+def looks_like_json(data: bytes) -> bool:
+    i = 0
+    n = len(data)
+    while i < n and data[i] in (0x20, 0x09, 0x0A, 0x0D):
+        i += 1
+    return i < n and data[i] in (0x7B, 0x5B)
+
+
+def span_at(idx: Index, off: int, length: int) -> Span | None:
+    if length <= 0:
+        return None
+    end = off + length
+    best: Span | None = None
+    best_w = 1 << 62
+    for sp in idx.spans:
+        if sp.inner_start <= off and end <= sp.inner_end:
+            w = sp.inner_end - sp.inner_start
+            if w < best_w:
+                best, best_w = sp, w
+    return best
+
+
+def obj_by_path(idx: Index, path: str) -> Obj | None:
+    for o in idx.objects:
+        if o.path == path:
+            return o
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Field cover (same object, whole field values)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Piece:
+    kind: str  # field | glue | from
+    text: str
+    needle_at: int
+    key: str | None = None
+    path: str | None = None
+    obj_path: str | None = None
+    byte: int | None = None
+    obj_label: str | None = None
+
+
+@dataclass
+class Cover:
+    obj_path: str
+    obj_start: int
+    label: str
+    pieces: list[Piece]
+    covered: int
+    n_fields: int
+    stage: int | None = None
+    argv: str | None = None
+    keys: list[str] = field(default_factory=list)
+
+    @property
+    def siblings(self) -> bool:
+        return self.n_fields >= 2
+
+
+def _build_pieces(needle: str, chosen: list[tuple[int, int, Span]]) -> list[Piece]:
+    chosen = sorted(chosen, key=lambda x: x[0])
+    pieces: list[Piece] = []
+    pos = 0
+    for a, b, sp in chosen:
+        if a < pos:
+            continue
+        if a > pos:
+            pieces.append(Piece("glue", needle[pos:a], pos))
+        pieces.append(
+            Piece(
+                "field",
+                needle[a:b],
+                a,
+                key=sp.key,
+                path=sp.path,
+                obj_path=sp.obj_path,
+                byte=sp.inner_start,
+            )
+        )
+        pos = b
+    if pos < len(needle):
+        pieces.append(Piece("glue", needle[pos:], pos))
+    return pieces
+
+
+def cover_object(needle: str, obj: Obj, min_len: int, keys: set[str] | None) -> Cover | None:
+    fields = [
+        sp
+        for sp in obj.fields.values()
+        if sp.kind in ("string", "number")
+        and len(sp.value) >= min_len
+        and (keys is None or sp.key in keys)
+        and sp.value in needle
+    ]
+    if not fields:
+        return None
+    fields.sort(key=lambda sp: (-len(sp.value), sp.inner_start))
+    if len(fields) > 16:
+        fields = fields[:16]
+
+    placements: list[tuple[Span, list[int]]] = []
+    for sp in fields:
+        starts: list[int] = []
+        i = 0
+        while True:
+            j = needle.find(sp.value, i)
+            if j < 0:
+                break
+            starts.append(j)
+            i = j + 1
+        if starts:
+            placements.append((sp, starts))
+    if not placements:
+        return None
+
+    best_cov = -1
+    best_n = -1
+    best_chosen: list[tuple[int, int, Span]] = []
+
+    def rec(i: int, chosen: list[tuple[int, int, Span]]) -> None:
+        nonlocal best_cov, best_n, best_chosen
+        if i == len(placements):
+            cov = sum(b - a for a, b, _ in chosen)
+            n = len(chosen)
+            if cov > best_cov or (cov == best_cov and n > best_n):
+                best_cov, best_n, best_chosen = cov, n, list(chosen)
+            return
+        rec(i + 1, chosen)
+        sp, starts = placements[i]
+        L = len(sp.value)
+        for st in starts:
+            en = st + L
+            overlap = False
+            for a, b, _ in chosen:
+                if not (en <= a or st >= b):
+                    overlap = True
+                    break
+            if overlap:
+                continue
+            chosen.append((st, en, sp))
+            rec(i + 1, chosen)
+            chosen.pop()
+
+    rec(0, [])
+    if best_n <= 0:
+        return None
+    pieces = _build_pieces(needle, best_chosen)
+    keys_used = [sp.key for _, _, sp in sorted(best_chosen, key=lambda x: x[0])]
+    return Cover(
+        obj_path=obj.path,
+        obj_start=obj.start,
+        label=obj.label(),
+        pieces=pieces,
+        covered=best_cov,
+        n_fields=best_n,
+        stage=obj.stage,
+        argv=obj.argv,
+        keys=keys_used,
+    )
+
+
+def cover_key(c: Cover) -> tuple:
+    return (1 if c.siblings else 0, c.covered, c.n_fields, -c.obj_start)
+
+
+def field_cover(
+    needle: str,
+    indexes: list[Index],
+    min_len: int = 1,
+    keys: set[str] | None = None,
+) -> tuple[Cover | None, list[Cover]]:
+    found: list[Cover] = []
+    for idx in indexes:
+        for obj in idx.objects:
+            c = cover_object(needle, obj, min_len, keys)
+            if c is None:
+                continue
+            if c.stage is None:
+                c.stage = idx.stage
+                c.argv = idx.argv
+            found.append(c)
+    if not found:
+        return None, []
+    found.sort(key=cover_key, reverse=True)
+    return found[0], found[1:]
+
+
+def filter_also(cover: Cover, rest: list[Cover]) -> list[Cover]:
+    """Occupancy of the same relation: other sibling covers, or other holders of the same field."""
+    if cover.siblings:
+        cand = [c for c in rest if c.siblings]
+    else:
+        win = tuple(cover.keys)
+        cand = [c for c in rest if tuple(c.keys) == win]
+    seen = {cover.obj_path}
+    out: list[Cover] = []
+    for c in cand:
+        if c.obj_path in seen:
+            continue
+        seen.add(c.obj_path)
+        out.append(c)
+        if len(out) >= 12:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Greedy byte-cover (the skeptic / beck hole)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Greedy:
+    kind: str  # coincidence | same_object | miss | empty
+    pieces: list[Piece]
+    obj_paths: list[str]
+
+
+def greedy_cover(hay: bytes, needle: bytes, min_len: int) -> list[tuple[str, bytes, int | None]]:
+    """Left-to-right longest haystack fragment. kind is from|glue."""
+    if not needle or not hay:
+        return []
+    min_len = max(1, min(min_len, len(needle)))
+    out: list[tuple[str, bytes, int | None]] = []
+    p = 0
+    glue_at: int | None = None
+    n = len(needle)
+    while p < n:
+        found_off: int | None = None
+        frag = b""
+        for L in range(n - p, min_len - 1, -1):
+            cand = needle[p : p + L]
+            off = hay.find(cand)
+            if off >= 0:
+                found_off = off
+                frag = cand
+                break
+        if found_off is None:
+            if glue_at is None:
+                glue_at = p
+            p += 1
+            continue
+        if glue_at is not None:
+            out.append(("glue", needle[glue_at:p], None))
+            glue_at = None
+        out.append(("from", frag, found_off))
+        p += len(frag)
+    if glue_at is not None:
+        out.append(("glue", needle[glue_at:], None))
+    return out
+
+
+def greedy_report(hay: bytes, needle: str, indexes: list[Index], min_len: int) -> Greedy:
+    raw = needle.encode("utf-8")
+    steps = greedy_cover(hay, raw, min_len)
+    if not steps:
+        return Greedy("empty", [], [])
+    pieces: list[Piece] = []
+    objs: list[str] = []
+    at = 0
+    for kind, frag, off in steps:
+        text = frag.decode("utf-8", "replace")
+        if kind == "glue":
+            pieces.append(Piece("glue", text, at))
+            at += len(text)
+            continue
+        sp = None
+        obj_path = None
+        label = None
+        path = None
+        key = None
+        if off is not None:
+            for idx in indexes:
+                sp = span_at(idx, off, len(frag))
+                if sp:
+                    break
+            if sp:
+                obj_path = sp.obj_path
+                path = sp.path
+                key = sp.key
+                for idx in indexes:
+                    o = obj_by_path(idx, sp.obj_path)
+                    if o:
+                        label = o.label()
+                        break
+                objs.append(sp.obj_path)
+        pieces.append(
+            Piece(
+                "from",
+                text,
+                at,
+                key=key,
+                path=path,
+                obj_path=obj_path,
+                byte=off,
+                obj_label=label,
+            )
+        )
+        at += len(text)
+    froms = [p for p in pieces if p.kind == "from"]
+    if not froms:
+        return Greedy("miss", pieces, [])
+    uniq = []
+    for o in objs:
+        if o not in uniq:
+            uniq.append(o)
+    if len(uniq) > 1:
+        return Greedy("coincidence", pieces, uniq)
+    if len(uniq) == 1:
+        echo = False
+        for p in froms:
+            if p.byte is None or not p.text:
+                continue
+            raw = p.text.encode("utf-8")
+            for idx in indexes:
+                sp = span_at(idx, p.byte, len(raw))
+                if sp is None:
+                    continue
+                if sp.value != p.text:
+                    echo = True
+                break
+        if echo:
+            return Greedy("echo", pieces, uniq)
+        return Greedy("same_object", pieces, uniq)
+    return Greedy("miss", pieces, [])
+
+
+# ---------------------------------------------------------------------------
+# Pipeline (enough for cargo metadata | jq)
+# ---------------------------------------------------------------------------
+
+
+def peel_merge_stderr(cmd: str) -> tuple[str, bool]:
+    s = cmd.strip()
+    merge = False
+    while True:
+        t = s.rstrip()
+        if t.endswith("2>&1") and (len(t) == 4 or t[-5].isspace()):
+            s = t[:-4].rstrip()
+            merge = True
+            continue
+        break
+    return s, merge
+
+
+def split_pipeline(src: str) -> list[tuple[str, bool]]:
+    s = src.strip()
+    if not s:
+        raise ValueError("empty pipeline")
+    stages: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    i = 0
+    n = len(s)
+    quote: str | None = None
+    paren = 0
+    brace = 0
+    backtick = False
+
+    def peek(k: int = 1) -> str:
+        j = i + k
+        return s[j] if j < n else ""
+
+    while i < n:
+        c = s[i]
+        if quote:
+            buf.append(c)
+            if quote == "'" and c == "'":
+                quote = None
+            elif quote == '"':
+                if c == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
+                    i += 2
+                    continue
+                if c == '"':
+                    quote = None
+            i += 1
+            continue
+        if backtick:
+            buf.append(c)
+            if c == "\\" and i + 1 < n:
+                buf.append(s[i + 1])
+                i += 2
+                continue
+            if c == "`":
+                backtick = False
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "`":
+            backtick = True
+            buf.append(c)
+            i += 1
+            continue
+        if c == "$" and peek() == "(":
+            paren += 1
+            buf.append("$(")
+            i += 2
+            continue
+        if c == "$" and peek() == "{":
+            brace += 1
+            buf.append("${")
+            i += 2
+            continue
+        if c == "(":
+            paren += 1
+            buf.append(c)
+            i += 1
+            continue
+        if c == ")" and paren:
+            paren -= 1
+            buf.append(c)
+            i += 1
+            continue
+        if c == "{":
+            buf.append(c)
+            i += 1
+            continue
+        if c == "}" and brace:
+            brace -= 1
+            buf.append(c)
+            i += 1
+            continue
+        nested = paren or brace
+        if not nested and c == "|":
+            nxt = peek()
+            if nxt == "|":
+                buf.append("||")
+                i += 2
+                continue
+            cmd = "".join(buf).strip()
+            if not cmd:
+                raise ValueError("empty pipeline stage")
+            if nxt == "&":
+                stages.append((cmd, True))
+                buf = []
+                i += 2
+                continue
+            stages.append((cmd, False))
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    if quote:
+        raise ValueError("unclosed quote in pipeline")
+    cmd = "".join(buf).strip()
+    if cmd:
+        stages.append((cmd, False))
+    if not stages:
+        raise ValueError("empty pipeline")
+    out: list[tuple[str, bool]] = []
+    for cmd, amp in stages:
+        cmd2, merge = peel_merge_stderr(cmd)
+        if not cmd2:
+            raise ValueError("empty pipeline stage after peeling 2>&1")
+        out.append((cmd2, amp or merge))
+    return out
+
+
+@dataclass
+class StageRec:
+    i: int
+    argv: str
+    stdout: bytes
+    stderr: bytes
+    exit: int | None
+    duration_s: float = 0.0
+
+
+def run_pipeline(
+    specs: list[tuple[str, bool]],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = 60.0,
+    forward_stderr: bool = True,
+    stdin_data: bytes | None = None,
+) -> list[StageRec]:
+    recs: list[StageRec] = []
+    data = stdin_data
+    t0 = time.monotonic()
+    deadline = None if timeout is None else t0 + timeout
+    for i, (cmd, merge) in enumerate(specs):
+        remain = None if deadline is None else max(0.05, deadline - time.monotonic())
+        try:
+            p = subprocess.run(
+                ["bash", "-c", cmd],
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                timeout=remain,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(f"pipeline exceeded {timeout}s at stage {i}") from e
+        stdout = p.stdout or b""
+        stderr = p.stderr or b""
+        if forward_stderr and stderr and not merge:
+            try:
+                sys.stderr.buffer.write(stderr)
+                sys.stderr.buffer.flush()
+            except OSError:
+                pass
+        recs.append(
+            StageRec(
+                i=i,
+                argv=cmd,
+                stdout=stdout,
+                stderr=stderr,
+                exit=p.returncode,
+                duration_s=time.monotonic() - t0,
+            )
+        )
+        data = stdout
+        if merge:
+            data = stdout + stderr
+    return recs
+
+
+def index_stages(recs: list[StageRec]) -> list[Index]:
+    out: list[Index] = []
+    for r in recs:
+        if not looks_like_json(r.stdout):
+            continue
+        try:
+            idx = index_json(r.stdout)
+        except ParseError:
+            continue
+        idx.stage = r.i
+        idx.argv = r.argv
+        for o in idx.objects:
+            o.stage = r.i
+            o.argv = r.argv
+        out.append(idx)
+    return out
+
+
+def first_exact(recs: list[StageRec], needle: bytes) -> StageRec | None:
+    for r in recs:
+        if needle in r.stdout or needle in r.stderr:
+            return r
+    return None
+
+
+def needle_from_final(recs: list[StageRec], line: int) -> bytes:
+    if not recs:
+        raise ValueError("no stages")
+    data = recs[-1].stdout
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines = lines[:-1]
+    idx = line - 1 if line >= 0 else len(lines) + line
+    if idx < 0 or idx >= len(lines):
+        raise ValueError(f"no line {line} in final stdout ({len(lines)} lines)")
+    return lines[idx]
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Report:
+    needle: str
+    cover: Cover | None
+    greedy: Greedy
+    also: list[Cover]
+    indexes: list[Index]
+    wrap: StageRec | None = None
+    pipeline: str = ""
+    hay_bytes: int = 0
+
+
+def analyze(
+    needle: str,
+    indexes: list[Index],
+    hay: bytes,
+    *,
+    recs: list[StageRec] | None = None,
+    pipeline: str = "",
+    min_len: int = 1,
+    greedy_min: int = 4,
+    keys: set[str] | None = None,
+) -> Report:
+    cover, rest = field_cover(needle, indexes, min_len=min_len, keys=keys)
+    also = filter_also(cover, rest) if cover is not None else []
+    greedy = greedy_report(hay, needle, indexes, greedy_min)
+    wrap = first_exact(recs, needle.encode("utf-8")) if recs else None
+    return Report(
+        needle=needle,
+        cover=cover,
+        greedy=greedy,
+        also=also,
+        indexes=indexes,
+        wrap=wrap,
+        pipeline=pipeline,
+        hay_bytes=len(hay),
+    )
+
+
+def _short(s: str, n: int = 72) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _obj_tag(path: str, label: str) -> str:
+    if label:
+        return f"{path}  name={label}"
+    return path
+
+
+def format_human(rep: Report) -> str:
+    lines: list[str] = []
+    c = rep.cover
+    if c is None:
+        lines.append("FACET  NONE")
+        lines.append(f"       needle   {rep.needle!r}")
+        if rep.greedy.kind == "coincidence":
+            lines.append("       greedy   COINCIDENCE  (byte-cover crossed objects; no sibling field cover)")
+        return "\n".join(lines) + "\n"
+    kind = "siblings" if c.siblings else "field"
+    tag = _obj_tag(c.obj_path, c.label)
+    lines.append(f"FACET  {kind}  {tag}")
+    lines.append(f"       needle   {rep.needle!r}")
+    lines.append(f"       cover    {c.covered}/{len(rep.needle)}  fields {c.n_fields}  keys {','.join(c.keys)}")
+    if c.stage is not None:
+        lines.append(f"       json     stage {c.stage}  {_short(c.argv or '')}")
+    lines.append("       pieces")
+    for p in c.pieces:
+        if p.kind == "glue":
+            lines.append(f"               glue   {p.text!r}  (needle {p.needle_at})")
+        else:
+            lines.append(
+                f"               field  .{p.key}  {p.text!r}  {p.path}  byte {p.byte}"
+            )
+    if rep.also:
+        nshare = 1 + len(rep.also)
+        if c.siblings:
+            lines.append(f"       also     {len(rep.also)} other sibling object(s)")
+        else:
+            lines.append(f"       also     {nshare} objects share this field")
+        for a in rep.also[:8]:
+            lines.append(f"               {_obj_tag(a.obj_path, a.label)}  .{','.join(a.keys)}")
+        if not c.siblings:
+            lines.append("       note     pass a composite needle to bind one object")
+    g = rep.greedy
+    if g.kind == "coincidence":
+        lines.append("       greedy   COINCIDENCE  (byte-cover crossed objects)")
+        for p in g.pieces:
+            if p.kind == "glue":
+                lines.append(f"               glue   {p.text!r}")
+            else:
+                who = p.obj_path or "?"
+                if p.obj_label:
+                    who = f"{who}  name={p.obj_label}"
+                extra = f"  .{p.key}" if p.key else ""
+                lines.append(f"               from   {p.text!r}  {who}{extra}  byte {p.byte}")
+    elif g.kind == "echo":
+        lines.append("       greedy   ECHO  (same object, derived superstring field)")
+        for p in g.pieces:
+            if p.kind == "glue":
+                lines.append(f"               glue   {p.text!r}")
+            else:
+                who = p.obj_path or "?"
+                extra = f"  .{p.key}" if p.key else ""
+                lines.append(f"               from   {p.text!r}  {who}{extra}  byte {p.byte}")
+        lines.append("       note     derived field contains the spelling; identity is sibling fields")
+    elif g.kind == "same_object":
+        lines.append("       greedy   same object (byte-cover already agreed)")
+    else:
+        lines.append(f"       greedy   {g.kind}")
+    if rep.wrap is not None:
+        exact_in_json = False
+        if c.stage is not None and rep.wrap.i == c.stage:
+            exact_in_json = True
+        if exact_in_json:
+            lines.append(
+                f"       exact    stage {rep.wrap.i}  {_short(rep.wrap.argv)}  (spelling lives in JSON too)"
+            )
+        else:
+            lines.append(
+                f"       wrap     stage {rep.wrap.i}  {_short(rep.wrap.argv)}  (exact spelling assembled here)"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _piece_json(p: Piece) -> dict[str, Any]:
+    return {
+        "kind": p.kind,
+        "text": p.text,
+        "needle_at": p.needle_at,
+        "key": p.key,
+        "path": p.path,
+        "obj": p.obj_path,
+        "byte": p.byte,
+        "obj_name": p.obj_label,
+    }
+
+
+def _cover_json(c: Cover) -> dict[str, Any]:
+    return {
+        "path": c.obj_path,
+        "start": c.obj_start,
+        "name": c.label,
+        "stage": c.stage,
+        "argv": c.argv,
+        "covered": c.covered,
+        "n_fields": c.n_fields,
+        "keys": c.keys,
+        "siblings": c.siblings,
+        "pieces": [_piece_json(p) for p in c.pieces],
+    }
+
+
+def format_json(rep: Report) -> str:
+    c = rep.cover
+    doc = {
+        "needle": rep.needle,
+        "kind": None if c is None else ("siblings" if c.siblings else "field"),
+        "object": None if c is None else _cover_json(c),
+        "pieces": [] if c is None else [_piece_json(p) for p in c.pieces],
+        "also": [_cover_json(a) for a in rep.also],
+        "ambiguous": bool(c is not None and not c.siblings and rep.also),
+        "greedy": {
+            "kind": rep.greedy.kind,
+            "same_object": rep.greedy.kind == "same_object",
+            "coincidence": rep.greedy.kind == "coincidence",
+            "echo": rep.greedy.kind == "echo",
+            "objects": rep.greedy.obj_paths,
+            "pieces": [_piece_json(p) for p in rep.greedy.pieces],
+        },
+        "wrap": None
+        if rep.wrap is None
+        else {"stage": rep.wrap.i, "argv": rep.wrap.argv, "exit": rep.wrap.exit},
+        "pipeline": rep.pipeline,
+        "hay_bytes": rep.hay_bytes,
+        "json_stages": [
+            {"stage": i.stage, "argv": i.argv, "objects": len(i.objects), "bytes": i.size}
+            for i in rep.indexes
+        ],
+    }
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def format_tsv(rep: Report) -> str:
+    cols = ["kind", "object", "keys", "covered", "greedy", "needle"]
+    c = rep.cover
+    row = [
+        "NONE" if c is None else ("siblings" if c.siblings else "field"),
+        "" if c is None else c.obj_path,
+        "" if c is None else ",".join(c.keys),
+        "" if c is None else f"{c.covered}/{len(rep.needle)}",
+        rep.greedy.kind,
+        rep.needle.replace("\t", " "),
+    ]
+    return "\t".join(cols) + "\n" + "\t".join(row) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Selftest
+# ---------------------------------------------------------------------------
+
+# Two packages; composite identity of the first; second's id contains @0.7.0.
+# This is the cargo-metadata hole in miniature.
+FIXTURE = (
+    b'{"packages":['
+    b'{"name":"kizu","version":"0.7.0","id":"path+kizu#0.7.0"},'
+    b'{"name":"notify-debouncer-full","version":"0.7.0","id":"reg#notify-debouncer-full@0.7.0"}'
+    b"]}"
+)
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def selftest() -> int:
+    n_ok = 0
+
+    def check(name: str, fn: Any) -> None:
+        nonlocal n_ok
+        fn()
+        print(f"  ok  {name}")
+        n_ok += 1
+
+    def t_offsets() -> None:
+        doc = b'{"name":"kizu","version":"0.7.0"}'
+        idx = index_json(doc)
+        _assert(len(idx.objects) == 1, idx.objects)
+        o = idx.objects[0]
+        _assert(o.path == "$", o.path)
+        _assert(o.fields["name"].value == "kizu", o.fields)
+        _assert(doc[o.fields["name"].inner_start : o.fields["name"].inner_end] == b"kizu", o.fields["name"])
+        _assert(doc[o.fields["version"].inner_start : o.fields["version"].inner_end] == b"0.7.0", o.fields["version"])
+
+    def t_fixture_siblings() -> None:
+        idx = index_json(FIXTURE)
+        _assert(len(idx.objects) == 3, len(idx.objects))  # root + 2 packages
+        pkgs = [o for o in idx.objects if o.path.startswith("$.packages[")]
+        _assert(len(pkgs) == 2, [o.path for o in pkgs])
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        _assert(cover is not None, "missing cover")
+        assert cover is not None
+        _assert(cover.siblings, cover)
+        _assert(cover.obj_path == "$.packages[0]", cover.obj_path)
+        _assert(cover.label == "kizu", cover.label)
+        _assert(cover.keys == ["name", "version"], cover.keys)
+        texts = [(p.kind, p.text, p.key) for p in cover.pieces]
+        _assert(texts == [("field", "kizu", "name"), ("glue", "@", None), ("field", "0.7.0", "version")], texts)
+
+    def t_greedy_coincidence() -> None:
+        idx = index_json(FIXTURE)
+        g = greedy_report(FIXTURE, "kizu@0.7.0", [idx], 4)
+        _assert(g.kind == "coincidence", g)
+        froms = [p for p in g.pieces if p.kind == "from"]
+        _assert(len(froms) == 2, froms)
+        _assert(froms[0].text == "kizu", froms[0])
+        _assert(froms[0].obj_path == "$.packages[0]", froms[0])
+        _assert(froms[1].text == "@0.7.0", froms[1])
+        _assert(froms[1].obj_path == "$.packages[1]", froms[1])
+        _assert(froms[1].key == "id", froms[1])
+        _assert(froms[1].obj_label == "notify-debouncer-full", froms[1])
+
+    def t_nested_not_siblings() -> None:
+        doc = b'{"name":"kizu","inner":{"version":"0.7.0"}}'
+        idx = index_json(doc)
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        _assert(cover is not None, "missing")
+        assert cover is not None
+        _assert(not cover.siblings, cover)
+        # no same-object pair; a single field is the fallback
+
+    def t_split_array_not_siblings() -> None:
+        doc = b'[{"name":"kizu"},{"version":"0.7.0","id":"x@0.7.0"}]'
+        idx = index_json(doc)
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        _assert(cover is not None, "missing")
+        assert cover is not None
+        _assert(not cover.siblings, cover)
+        g = greedy_report(doc, "kizu@0.7.0", [idx], 4)
+        _assert(g.kind == "coincidence", g)
+
+    def t_same_object_agrees() -> None:
+        doc = b'{"name":"kizu","version":"0.7.0"}'
+        idx = index_json(doc)
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        g = greedy_report(doc, "kizu@0.7.0", [idx], 1)
+        _assert(cover is not None and cover.siblings, cover)
+        # no foreign @0.7.0 token; greedy should not cross objects
+        _assert(g.kind in ("same_object", "miss"), g.kind)
+        if g.kind == "same_object":
+            _assert(g.obj_paths == ["$"], g.obj_paths)
+
+    def t_ndjson() -> None:
+        doc = b'{"name":"kizu","version":"0.7.0"}\n{"name":"other","version":"1.0.0"}\n'
+        idx = index_json(doc)
+        _assert(idx.n_values == 2, idx.n_values)
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        _assert(cover is not None and cover.siblings, cover)
+        assert cover is not None
+        _assert(cover.obj_path == "$[0]", cover.obj_path)
+
+    def t_keys_filter() -> None:
+        doc = b'{"name":"kizu","version":"0.7.0","id":"kizu"}'
+        idx = index_json(doc)
+        cover, _ = field_cover("kizu@0.7.0", [idx], keys={"name", "version"})
+        assert cover is not None
+        _assert(cover.keys == ["name", "version"], cover.keys)
+
+    def t_analyze_fixture() -> None:
+        idx = index_json(FIXTURE)
+        rep = analyze("kizu@0.7.0", [idx], FIXTURE)
+        _assert(rep.cover is not None and rep.cover.siblings, rep.cover)
+        _assert(rep.greedy.kind == "coincidence", rep.greedy)
+        js = json.loads(format_json(rep))
+        _assert(js["kind"] == "siblings", js["kind"])
+        _assert(js["greedy"]["coincidence"] is True, js["greedy"])
+        _assert(js["object"]["path"] == "$.packages[0]", js["object"])
+
+    def t_escaped() -> None:
+        doc = b'{"name":"kizu","note":"a\\"b","version":"0.7.0"}'
+        idx = index_json(doc)
+        _assert(idx.objects[0].fields["note"].value == 'a"b', idx.objects[0].fields["note"])
+        cover, _ = field_cover("kizu@0.7.0", [idx])
+        assert cover is not None
+        _assert(cover.siblings and cover.keys == ["name", "version"], cover.keys)
+
+    def t_split_quotes() -> None:
+        st = split_pipeline("jq -r '.name + \"@\" + .version' | cat")
+        _assert(len(st) == 2, st)
+        _assert("jq" in st[0][0], st)
+
+    def t_pipeline_jq() -> None:
+        if not shutil_which("jq"):
+            print("  skip pipeline jq (no jq)")
+            return
+        recs = run_pipeline(
+            [
+                (f"printf '%s' '{FIXTURE.decode()}'", False),
+                ("jq -r '.packages[] | select(.name==\"kizu\") | .name + \"@\" + .version'", False),
+            ],
+            timeout=10,
+            forward_stderr=False,
+        )
+        _assert(recs[-1].stdout.strip() == b"kizu@0.7.0", recs[-1].stdout)
+        indexes = index_stages(recs)
+        _assert(len(indexes) == 1, indexes)
+        hay_bytes = recs[0].stdout
+        rep = analyze("kizu@0.7.0", indexes, hay_bytes, recs=recs, pipeline="printf | jq")
+        _assert(rep.cover is not None and rep.cover.siblings, rep.cover)
+        _assert(rep.cover.obj_path == "$.packages[0]", rep.cover)
+        _assert(rep.greedy.kind == "coincidence", rep.greedy)
+        _assert(rep.wrap is not None and rep.wrap.i == 1, rep.wrap)
+
+    def t_also_version() -> None:
+        idx = index_json(FIXTURE)
+        cover, rest = field_cover("0.7.0", [idx])
+        _assert(cover is not None and not cover.siblings, cover)
+        assert cover is not None
+        _assert(cover.obj_path == "$.packages[0]", cover.obj_path)
+        also = filter_also(cover, rest)
+        paths = {c.obj_path for c in also}
+        _assert("$.packages[1]" in paths, also)
+        rep = analyze("0.7.0", [idx], FIXTURE)
+        _assert(rep.also and any(a.obj_path == "$.packages[1]" for a in rep.also), rep.also)
+        js = json.loads(format_json(rep))
+        _assert(js["ambiguous"] is True, js)
+
+    def t_echo_derived_id() -> None:
+        idx = index_json(FIXTURE)
+        needle = "notify-debouncer-full@0.7.0"
+        cover, _ = field_cover(needle, [idx])
+        _assert(cover is not None and cover.siblings, cover)
+        assert cover is not None
+        _assert(cover.obj_path == "$.packages[1]", cover.obj_path)
+        _assert(cover.keys == ["name", "version"], cover.keys)
+        g = greedy_report(FIXTURE, needle, [idx], 4)
+        _assert(g.kind == "echo", g)
+        froms = [p for p in g.pieces if p.kind == "from"]
+        _assert(len(froms) == 1 and froms[0].key == "id", froms)
+        rep = analyze(needle, [idx], FIXTURE)
+        js = json.loads(format_json(rep))
+        _assert(js["greedy"]["echo"] is True, js["greedy"])
+        _assert(js["kind"] == "siblings", js["kind"])
+
+    check("json offsets", t_offsets)
+    check("fixture siblings", t_fixture_siblings)
+    check("greedy coincidence", t_greedy_coincidence)
+    check("nested is not siblings", t_nested_not_siblings)
+    check("split array is not siblings", t_split_array_not_siblings)
+    check("tiny object greedy agrees", t_same_object_agrees)
+    check("ndjson", t_ndjson)
+    check("keys filter", t_keys_filter)
+    check("analyze fixture json", t_analyze_fixture)
+    check("escaped string", t_escaped)
+    check("split quoted pipe", t_split_quotes)
+    check("pipeline printf | jq", t_pipeline_jq)
+    check("also occupancy of version", t_also_version)
+    check("echo derived id vs siblings", t_echo_derived_id)
+    print(f"selftest {n_ok}/{n_ok}")
+    return 0
+
+
+def shutil_which(name: str) -> str | None:
+    from shutil import which
+
+    return which(name)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+USAGE = """facet — bind a composite needle to sibling JSON fields of one object.
+
+Beck (byte-cover) will pair kizu@0.7.0 with `kizu` from one package and
+`@0.7.0` from notify-debouncer-full@0.7.0 in another. Facet covers the
+needle with *whole field values of the same JSON object*.
+
+  cargo metadata --format-version 1 --offline | facet -n 'kizu@0.7.0'
+  facet -n 'kizu@0.7.0' --doc meta.json
+  facet -n 'kizu@0.7.0' --sh 'cargo metadata --format-version 1 --offline | jq -r \".packages[] | select(.name==\\\"kizu\\\") | .name + \\\"@\\\" + .version\"'
+
+Not inverse-printf of the jq program. The jq source is not read. The
+object is recovered from the JSON document and the needle.
+
+Exit 0 found, 1 no field cover, 2 usage.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="facet",
+        description=USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("-n", "--needle", help="composite string to cover")
+    p.add_argument("--line", type=int, help="1-based line of final stdout as needle (with --sh)")
+    p.add_argument("--doc", help="JSON document path, or - for stdin")
+    p.add_argument("--sh", dest="sh", help="pipeline; JSON stages are the haystack")
+    p.add_argument("-C", "--cwd", default=None)
+    p.add_argument("--json", action="store_true", dest="json_out")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--keys", help="comma-separated field keys to consider (default: all scalars)")
+    p.add_argument("--min-len", type=int, default=1, help="minimum field value length")
+    p.add_argument("--greedy-min", type=int, default=4, help="greedy byte-cover min fragment (beck default 4)")
+    p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--quiet", "-q", action="store_true")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    return p.parse_args(argv)
+
+
+def _keys(s: str | None) -> set[str] | None:
+    if not s:
+        return None
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    return set(parts) or None
+
+
+def _read_doc(path: str) -> bytes:
+    if path == "-":
+        return sys.stdin.buffer.read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    ns = parse_args(argv)
+    if ns.version:
+        print(f"facet {VERSION}")
+        return 0
+    if ns.selftest:
+        try:
+            return selftest()
+        except AssertionError as e:
+            print(f"selftest FAIL: {e}", file=sys.stderr)
+            return 1
+
+    rest = list(ns.rest or [])
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    if rest and not ns.doc and not ns.sh:
+        ns.doc = rest[0]
+
+    keys = _keys(ns.keys)
+    recs: list[StageRec] | None = None
+    indexes: list[Index] = []
+    hay = b""
+    pipeline = ns.sh or ""
+    needle_b: bytes | None = None
+
+    try:
+        if ns.sh:
+            specs = split_pipeline(ns.sh)
+            recs = run_pipeline(
+                specs,
+                cwd=ns.cwd,
+                timeout=None if ns.timeout <= 0 else ns.timeout,
+                forward_stderr=not ns.quiet,
+            )
+            indexes = index_stages(recs)
+            if indexes:
+                hay = recs[indexes[0].stage or 0].stdout
+            else:
+                hay = recs[0].stdout if recs else b""
+            if ns.line is not None:
+                needle_b = needle_from_final(recs, ns.line)
+        elif ns.doc:
+            hay = _read_doc(ns.doc)
+            if not looks_like_json(hay):
+                print("facet: --doc is not JSON", file=sys.stderr)
+                return 2
+            idx = index_json(hay)
+            indexes = [idx]
+        else:
+            if sys.stdin.isatty():
+                print("facet: provide --doc FILE, --sh PIPELINE, or JSON on stdin", file=sys.stderr)
+                return 2
+            hay = sys.stdin.buffer.read()
+            if not looks_like_json(hay):
+                print("facet: stdin is not JSON", file=sys.stderr)
+                return 2
+            indexes = [index_json(hay)]
+    except TimeoutError as e:
+        print(f"facet: {e}", file=sys.stderr)
+        return 2
+    except (ValueError, OSError, ParseError) as e:
+        print(f"facet: {e}", file=sys.stderr)
+        return 2
+
+    if ns.needle is not None:
+        needle = ns.needle
+    elif needle_b is not None:
+        needle = needle_b.decode("utf-8", "replace")
+    else:
+        print("facet: provide --needle or --line", file=sys.stderr)
+        return 2
+    if not needle:
+        print("facet: empty needle", file=sys.stderr)
+        return 2
+
+    if not indexes:
+        print("facet: no JSON object in the haystack", file=sys.stderr)
+        return 1
+
+    rep = analyze(
+        needle,
+        indexes,
+        hay,
+        recs=recs,
+        pipeline=pipeline,
+        min_len=ns.min_len,
+        greedy_min=ns.greedy_min,
+        keys=keys,
+    )
+    if ns.json_out:
+        sys.stdout.write(format_json(rep))
+    elif ns.tsv:
+        sys.stdout.write(format_tsv(rep))
+    else:
+        sys.stdout.write(format_human(rep))
+    return 0 if rep.cover is not None else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

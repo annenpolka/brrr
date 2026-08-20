@@ -1,0 +1,2500 @@
+#!/usr/bin/env python3
+"""lien — CI gate on leftovers of a change's natal record.
+
+A natal record is a typed binding whose name inflects. Default input is a
+unified diff on stdin (never FILE:LINE). Default output is a CI *check*:
+one dest-line lien per leftover, silent on success, exit 1 if any remain.
+`--explain` is the human natal dump (typed leftover claims and unpaid
+inflected kin, fused at path:line as via=claim|kin|both).
+
+Ancestor kith dumps first and takes a SHA. lien is not a flag on kith:
+`git diff | lien` is the verb. Ember's leftover *claim* drops an unchanged
+value and does not case-fold a short natal (`t1` ↛ `T1`). Erst's unpaid
+*kin* truncates `0.3.0` to `0.3` and skips integer `10` as a common number.
+The object is one record; a dest line is one leftover; CI sees a *current*
+dest-line lien (via=both, live test/code claims), not a ranked dump and
+not kin-only ADR quotes. `--explain` is the union. `--all` CI-prints it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence, TextIO
+
+NAME = "lien"
+VERSION = "0.2.0"
+
+STOP = frozenset(
+    """
+    a an the and or not if else elif for while do done then in of on at to from
+    as is was are were be been being this that these those it its they them their
+    we you he she i true false none null nil some ok err error result value data
+    item items type types name names key keys id ids file files path paths line
+    lines self this super crate pub use mod fn let mut const var val def class
+    struct enum trait impl interface return yield break continue pass try catch
+    except finally throw raise with import export default async await new delete
+    int str bool string list dict map vec option void undefined public private
+    protected static final override where select insert update func function
+    method module package namespace object switch case match when end begin out
+    ref ptr box rc arc dyn argc argv main init get set add put has len size
+    count index min max abs fmt print log info warn warning fatal panic todo
+    fixme xxx int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 usize
+    isize f32 f64 float double char byte bytes boolean ns swift rust python
+    java kotlin go ts js sendable view body some timeinterval nsstring
+    """.split()
+)
+
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".build",
+        "vendor",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".idea",
+        ".vscode",
+        "Pods",
+        "DerivedData",
+        ".next",
+        "coverage",
+        ".cache",
+        "zig-out",
+        ".moon",
+        ".direnv",
+        "zig-cache",
+        ".cargo",
+        "site-packages",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".turbo",
+        "xcuserdata",
+    }
+)
+
+SKIP_SUFFIXES = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".icns",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".wasm",
+        ".so",
+        ".dylib",
+        ".a",
+        ".o",
+        ".pyc",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".mp3",
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".lock",
+        ".bin",
+        ".exe",
+        ".dll",
+        ".class",
+        ".jar",
+        ".rlib",
+        ".rmeta",
+        ".pack",
+        ".idx",
+        ".pbxproj",
+        ".map",
+    }
+)
+
+DOC_SUFFIXES = frozenset({".md", ".mdx", ".rst", ".txt", ".adoc", ".org", ".html"})
+CONFIG_SUFFIXES = frozenset(
+    {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".plist"}
+)
+TEST_HINTS = ("test", "spec", "specs", "fixtures", "golden", "contract")
+
+IDENT_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*")
+KEBAB_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b")
+VERSION_RE = re.compile(r"\bv?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?\b")
+NUMBER_RE = re.compile(
+    r"\b\d+(?:\.\d+){2,}(?:-[A-Za-z0-9.]+)?\b|\b\d+\.\d+\b|\b\d+\b"
+)
+STRING_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
+PAIR_RE = re.compile(
+    r"""(?x)
+    (?P<qkey>["'])?
+    (?P<key>
+        [A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*
+        |
+        [A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+
+    )
+    (?(qkey)(?P=qkey))
+    (?:
+        \s*:\s*[A-Za-z_][A-Za-z0-9_\[\]<>.,\s]*
+        (?==)
+    )?
+    \s*
+    (?P<op>=|:|:=)
+    \s*
+    (?:
+        Some\(\s*(?P<someint>\d+)\s*\)
+        |
+        (?P<q>["'])(?P<str>(?:\\.|[^\\])*?)(?P=q)
+        |
+        (?P<ver>v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)
+        |
+        (?P<float>\d+\.\d+)
+        |
+        (?P<int>\d+)
+        |
+        (?P<bool>true|false|True|False|YES|NO|nil|null|None)
+    )
+    """
+)
+CALENDAR_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?\b"
+    r"|\b\d{4}/\d{2}/\d{2}\b"
+)
+CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+")
+SLOT_RE = re.compile(
+    r"(?:(?:public|private|internal|fileprivate|protected|static|open)\s+)*"
+    r"(?:(?:let|var|const|val)\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]{1,40})?\s*="
+)
+SHORT_NATAL = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ]\d+$")
+LOC_RE = re.compile(r"^(.*?):(\d+)(?::\d+)?$")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+HISTORICAL_RE = re.compile(
+    r"(?i)\b(since|until|before|after|released|changelog|history|was|formerly|"
+    r"deprecated|superseded|old behavior|previous|used to|replaced)\b|"
+    r"^#+\s*v?\d"
+)
+ADAPTER_RE = re.compile(
+    r"""(?:CodingKeys|serde|rename|serializedName|json\s*\(|=\s*["'])""",
+    re.I,
+)
+STYLE_LINE = re.compile(
+    r"(opacity|brightness|saturation|hue|spring|yaw|pitch|colorhue|damping)",
+    re.I,
+)
+THRESHOLD_LINE = re.compile(
+    r"(threshold|閾値|しきい値|score|ema|timeout|retry|delay|version|retries)",
+    re.I,
+)
+
+POLARITY = {
+    "true": "false",
+    "false": "true",
+    "True": "False",
+    "False": "True",
+    "yes": "no",
+    "no": "yes",
+    "on": "off",
+    "off": "on",
+    "enable": "disable",
+    "disable": "enable",
+    "enabled": "disabled",
+    "disabled": "enabled",
+    "allow": "deny",
+    "deny": "allow",
+    "present": "absent",
+    "absent": "present",
+    "start": "stop",
+    "stop": "start",
+}
+
+COMMON_NUMBERS = frozenset({str(i) for i in range(0, 11)} | {"100"})
+
+GENERIC_NAMES = frozenset(
+    {
+        "threshold",
+        "timeout",
+        "delay",
+        "value",
+        "status",
+        "result",
+        "error",
+        "index",
+        "count",
+        "size",
+        "length",
+        "offset",
+        "limit",
+        "flag",
+        "mode",
+        "type",
+        "kind",
+        "name",
+        "path",
+        "file",
+        "line",
+        "item",
+        "data",
+        "config",
+        "option",
+        "param",
+        "args",
+        "state",
+        "score",
+        "weight",
+        "alpha",
+        "radius",
+        "window",
+        "current",
+        "version",
+        "revision",
+        "enabled",
+        "disabled",
+        "present",
+        "absent",
+        "default",
+        "color",
+        "text",
+        "code",
+        "handle",
+        "buffer",
+        "start",
+        "end",
+        "min",
+        "max",
+        "key",
+        "id",
+        "geo",
+        "geometry",
+        "counters",
+        "counter",
+        "reader",
+        "view",
+        "node",
+        "site",
+        "panel",
+    }
+)
+
+VALUE_NAMES = frozenset(
+    {"version", "timeout", "retries", "retry", "threshold", "intent", "port"}
+)
+
+STEM_ALIASES = {
+    "timeout": ("タイムアウト", "time-out"),
+    "retries": ("リトライ", "retry"),
+    "retry": ("リトライ",),
+    "threshold": ("閾値", "しきい値"),
+    "version": ("バージョン",),
+    "intent": ("意図",),
+}
+
+STEM_NOISE = frozenset(
+    """
+    updated update new old tmp temp current next prev raw the my
+    inner outer left right copy clone dummy fake mock test
+    """.split()
+)
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Origin:
+    path: str
+    line: int
+    excerpt: str
+
+
+@dataclass(frozen=True)
+class Natal:
+    """One natal record: inflected identity + typed value."""
+
+    names: tuple[str, ...]
+    adopted: tuple[str, ...]
+    old: str
+    new: str
+    kind: str  # value | rename | polarity | record
+    vtype: str
+    origin: Origin
+    pairs: tuple[str, ...]
+
+    def key(self) -> tuple[str, ...]:
+        return (
+            self.kind,
+            ",".join(self.names),
+            self.old,
+            ",".join(self.adopted),
+            self.new,
+        )
+
+    def label(self) -> str:
+        pair = self.pairs[0] if self.pairs else (self.names[0] if self.names else "?")
+        if self.old and self.new and self.old != self.new:
+            return f"{pair}  {self.old} → {self.new}"
+        if self.old and self.old == self.new:
+            return f"{pair}  {self.old}"
+        if self.pairs:
+            return pair
+        if self.old:
+            return f"{self.names[0] if self.names else '?'}: {self.old} → {self.new}"
+        return pair
+
+
+@dataclass(frozen=True)
+class Hit:
+    natal: Natal
+    path: str
+    line: int
+    claim_kind: str
+    excerpt: str
+    score: int
+    why: tuple[str, ...]
+    via: str  # claim | kin | both
+
+
+@dataclass
+class Leftover:
+    path: str
+    line: int
+    claim_kind: str
+    excerpt: str
+    score: int
+    via: str
+    why: list[str]
+    natals: list[Natal]
+
+
+@dataclass
+class Hunk:
+    old_start: int
+    new_start: int
+    deleted: list[tuple[int, str]] = field(default_factory=list)
+    added: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    status: str
+    hunks: list[Hunk] = field(default_factory=list)
+    old_path: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# git / io
+# ---------------------------------------------------------------------------
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{NAME}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(
+    args: Sequence[str],
+    root: Path,
+    *,
+    check: bool = True,
+    input: bytes | None = None,
+) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        input=input,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        die(f"git {' '.join(args)} failed: {err or proc.returncode}")
+    return proc.stdout
+
+
+def git_ok(root: Path, args: Sequence[str] | None = None) -> bool:
+    if args is None:
+        args = ["rev-parse", "--is-inside-work-tree"]
+        proc = subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == b"true"
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def git_text(root: Path, args: Sequence[str], *, check: bool = True) -> str:
+    return git(list(args), root, check=check).decode("utf-8", "replace")
+
+
+def looks_like_location(spec: str) -> bool:
+    m = LOC_RE.match(spec)
+    if not m:
+        return False
+    path = m.group(1)
+    if path in {".", ".."}:
+        return False
+    if "/" in path or Path(path).suffix or " " in path:
+        return True
+    if re.search(r"\.[A-Za-z0-9]{1,8}$", path):
+        return True
+    return False
+
+
+def is_commit_ish(root: Path, spec: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{spec}^{{commit}}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# tokenize + inflection
+# ---------------------------------------------------------------------------
+
+
+def keep_ident(w: str) -> bool:
+    if SHORT_NATAL.match(w):
+        return True
+    if len(w) < 3:
+        return False
+    if w.lower() in STOP:
+        return not looks_like_symbol(w)
+    if len(w) == 40 and all(c in "0123456789abcdefABCDEF" for c in w):
+        return False
+    return True
+
+
+def looks_like_symbol(tok: str) -> bool:
+    if not tok or len(tok) < 2:
+        return False
+    if "_" in tok or "-" in tok or "/" in tok or "." in tok:
+        return True
+    if re.search(r"[a-z][A-Z]", tok):
+        return True
+    if re.fullmatch(r"[A-Z]{2,}[A-Z0-9]*", tok):
+        return True
+    if re.search(r"\d", tok) and re.search(r"[A-Za-z]", tok):
+        return True
+    return False
+
+
+def ident_parts(name: str) -> tuple[str, ...]:
+    s = name.replace("-", "_")
+    parts: list[str] = []
+    for chunk in s.split("_"):
+        if not chunk:
+            continue
+        bits = re.findall(
+            r"[A-Z]+(?=[A-Z][a-z0-9])|[A-Z]?[a-z]+|[A-Z]+|\d+", chunk
+        )
+        if bits:
+            parts.extend(b.lower() for b in bits if b)
+        else:
+            parts.append(chunk.lower())
+    return tuple(parts) if parts else (name.lower(),)
+
+
+def surfaces(name: str) -> set[str]:
+    parts = list(ident_parts(name))
+    if not parts:
+        return {name}
+    camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
+    pascal = "".join(p.capitalize() for p in parts)
+    snake = "_".join(parts)
+    kebab = "-".join(parts)
+    const = "_".join(p.upper() for p in parts)
+    out = {name, name.lower(), name.upper(), camel, pascal, snake, kebab, const}
+    if SHORT_NATAL.match(name):
+        out.add(name.lower())
+        out.add(name.upper())
+    return {s for s in out if s}
+
+
+def same_inflection(a: str, b: str) -> bool:
+    return ident_parts(a) == ident_parts(b)
+
+
+def stem_related(a: str, b: str) -> bool:
+    pa, pb = ident_parts(a), ident_parts(b)
+    if not pa or not pb:
+        return False
+    if pa == pb:
+        return True
+    if pa == pb[-len(pa) :]:
+        extra = pb[: -len(pa)]
+        word = "".join(pa)
+        if extra and all(p in STEM_NOISE for p in extra):
+            return False
+        return len(pa) > 1 or len(word) >= 6
+    if pb == pa[-len(pb) :]:
+        extra = pa[: -len(pb)]
+        word = "".join(pb)
+        if extra and all(p in STEM_NOISE for p in extra):
+            return False
+        return len(pb) > 1 or len(word) >= 6
+    return False
+
+
+def distinctive_ident(name: str) -> bool:
+    if SHORT_NATAL.match(name):
+        return True
+    parts = ident_parts(name)
+    if len(parts) >= 2:
+        return True
+    if name.lower() in GENERIC_NAMES:
+        return False
+    return len(name) >= 8
+
+
+def slot_idents(text: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in SLOT_RE.finditer(text):
+        w = m.group(1)
+        if not keep_ident(w):
+            continue
+        if w.lower() in seen:
+            continue
+        seen.add(w.lower())
+        found.append(w)
+    return found
+
+
+def extract_idents(line: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in IDENT_RE.finditer(line):
+        tok = m.group(0)
+        if m.start() > 0 and line[m.start() - 1].isalpha():
+            continue
+        if not keep_ident(tok):
+            continue
+        if tok.isnumeric():
+            continue
+        key = tok.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(tok)
+    for m in KEBAB_RE.finditer(line):
+        tok = m.group(0)
+        if tok.lower() in STOP:
+            continue
+        if tok.lower() not in seen:
+            seen.add(tok.lower())
+            found.append(tok)
+    return found
+
+
+def pair_idents(
+    old_ids: Iterable[str],
+    new_ids: Iterable[str],
+    *,
+    one_to_one: bool = True,
+    stem: bool = True,
+) -> list[tuple[str, str]]:
+    old = list(dict.fromkeys(old_ids))
+    new = list(dict.fromkeys(new_ids))
+    new_l = {n.lower() for n in new}
+    abandoned = [o for o in old if o.lower() not in new_l]
+    adopted = [n for n in new if n.lower() not in {o.lower() for o in old}]
+    pairs: list[tuple[str, str]] = []
+    used_o: set[str] = set()
+    used_n: set[str] = set()
+
+    def take(o: str, n: str) -> None:
+        used_o.add(o.lower())
+        used_n.add(n.lower())
+        pairs.append((o, n))
+
+    for o in abandoned:
+        cands = [
+            n
+            for n in adopted
+            if n.lower() not in used_n and same_inflection(o, n) and o.lower() != n.lower()
+        ]
+        if len(cands) == 1:
+            take(o, cands[0])
+
+    if stem:
+        for o in abandoned:
+            if o.lower() in used_o:
+                continue
+            cands = [
+                n for n in adopted if n.lower() not in used_n and stem_related(o, n)
+            ]
+            if len(cands) == 1:
+                take(o, cands[0])
+
+    if one_to_one:
+        left_o = [o for o in abandoned if o.lower() not in used_o]
+        left_n = [n for n in adopted if n.lower() not in used_n]
+        if len(left_o) == 1 and len(left_n) == 1 and distinctive_ident(left_o[0]):
+            take(left_o[0], left_n[0])
+    return pairs
+
+
+def pair_line_idents(old_text: str, new_text: str) -> list[tuple[str, str]]:
+    slots = pair_idents(slot_idents(old_text), slot_idents(new_text), one_to_one=True)
+    if slots:
+        return slots
+    return pair_idents(
+        extract_idents(old_text),
+        extract_idents(new_text),
+        one_to_one=False,
+        stem=False,
+    )
+
+
+def pair_value(m: re.Match[str]) -> str:
+    if m.group("someint") is not None:
+        return m.group("someint")
+    if m.group("str") is not None:
+        return m.group("str")
+    if m.group("ver") is not None:
+        return m.group("ver")
+    if m.group("float") is not None:
+        return m.group("float")
+    if m.group("int") is not None:
+        return m.group("int")
+    if m.group("bool") is not None:
+        return m.group("bool")
+    return ""
+
+
+def extract_pairs(line: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for m in PAIR_RE.finditer(line):
+        key = m.group("key")
+        val = pair_value(m)
+        if key and val != "" and keep_ident(key):
+            out.append((key, val))
+    return out
+
+
+def value_type(val: str) -> str:
+    if not val:
+        return "empty"
+    if val in POLARITY:
+        return "polarity"
+    if VERSION_RE.fullmatch(val) or re.fullmatch(
+        r"v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?", val
+    ):
+        return "version"
+    if re.fullmatch(r"\d+", val):
+        return "integer"
+    if re.fullmatch(r"\d+\.\d+", val):
+        return "float"
+    return "other"
+
+
+def mask_calendar(text: str) -> str:
+    return CALENDAR_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def stem_in_text(stem: str, text: str) -> bool:
+    if not stem:
+        return False
+    if not stem.isascii():
+        return stem in text
+    return (
+        re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(stem) + r"(?![A-Za-z0-9_])",
+            text,
+            re.I,
+        )
+        is not None
+    )
+
+
+def needle_value(needle: str, line: str, vtype: str) -> bool:
+    if not needle:
+        return False
+    hay = line
+    if vtype == "integer" or (vtype == "other" and re.fullmatch(r"\d+", needle)):
+        hay = mask_calendar(line)
+    if vtype == "polarity" or needle in POLARITY:
+        return stem_in_text(needle, hay)
+    if re.fullmatch(r"v?\d+(?:\.\d+)+", needle) or re.fullmatch(r"\d+", needle):
+        # 0.3 is not 0.3.0 (dot then digit). "0.4." as a sentence is 0.4.
+        # Float 0.4 is not version-label v0.4 (sitbone SPEC.md). Version
+        # 0.3.0 still matches prose v0.3.0 (leading v is the same token).
+        if vtype == "float" or re.fullmatch(r"\d+\.\d+", needle):
+            pat = r"(?<![A-Za-z\d.])" + re.escape(needle) + r"(?!\.\d)(?!\d)"
+        else:
+            pat = r"(?<![\d.])" + re.escape(needle) + r"(?!\.\d)(?!\d)"
+        return re.search(pat, hay) is not None
+    return needle in hay
+
+
+def needle_ident(needle: str, line: str) -> bool:
+    if not needle:
+        return False
+    pat = r"(?<![A-Za-z0-9_])" + re.escape(needle) + r"(?![A-Za-z0-9_])"
+    if re.search(pat, line) is not None:
+        return True
+    if needle.lower() != needle:
+        return re.search(pat, line, re.I) is not None
+    return False
+
+
+def quoted_only_hold(text: str, name: str) -> bool:
+    if any(needle_ident(s, text) for s in surfaces(name) if s):
+        # quoted-only means NOT present as a bare ident
+        spans = [(m.start(), m.end()) for m in STRING_RE.finditer(text)]
+
+        def in_span(pos: int) -> bool:
+            return any(a <= pos < b for a, b in spans)
+
+        for s in surfaces(name):
+            pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(s) + r"(?![A-Za-z0-9_])")
+            for m in pat.finditer(text):
+                if not in_span(m.start()):
+                    return False
+        return any(re.search(rf"""['"]{re.escape(s)}['"]""", text) for s in surfaces(name))
+    return any(re.search(rf"""['"]{re.escape(s)}['"]""", text) for s in surfaces(name))
+
+
+def similar(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    al, bl = a.lower(), b.lower()
+    ratio = difflib.SequenceMatcher(None, al, bl).ratio()
+    tok_a = {t for t in re.split(r"[_\-./\s]+", al) if t}
+    tok_b = {t for t in re.split(r"[_\-./\s]+", bl) if t}
+    tok_a.update(x.lower() for x in CAMEL_RE.findall(a))
+    tok_b.update(x.lower() for x in CAMEL_RE.findall(b))
+    jacc = len(tok_a & tok_b) / (len(tok_a | tok_b) or 1)
+    return max(ratio, (ratio + jacc) / 2, jacc)
+
+
+def is_distinctive_value(val: str) -> bool:
+    if not val:
+        return False
+    if VERSION_RE.fullmatch(val):
+        return True
+    if re.fullmatch(r"\d+\.\d+", val):
+        return True
+    if val in POLARITY:
+        return True
+    if len(val) >= 4 and not val.isdigit():
+        return True
+    if val.isdigit() and val not in COMMON_NUMBERS:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# diff parse + natal extract
+# ---------------------------------------------------------------------------
+
+
+def parse_unified_diff(text: str) -> list[FileDiff]:
+    files: list[FileDiff] = []
+    current: FileDiff | None = None
+    hunk: Hunk | None = None
+    old_ln = 0
+    new_ln = 0
+    pending_old: str | None = None
+
+    def flush_hunk() -> None:
+        nonlocal hunk
+        if current is not None and hunk is not None:
+            if hunk.deleted or hunk.added:
+                current.hunks.append(hunk)
+        hunk = None
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            flush_hunk()
+            current = None
+            hunk = None
+            pending_old = None
+            parts = raw.split()
+            old_p = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else ""
+            new_p = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else old_p
+            current = FileDiff(path=new_p or old_p, status="modify", old_path=old_p or None)
+            files.append(current)
+            continue
+        if raw.startswith("rename from ") and current is not None:
+            current.old_path = raw[len("rename from ") :]
+            current.status = "rename"
+            continue
+        if raw.startswith("rename to ") and current is not None:
+            current.path = raw[len("rename to ") :]
+            current.status = "rename"
+            continue
+        if raw.startswith("deleted file") and current is not None:
+            current.status = "delete"
+            continue
+        if raw.startswith("new file") and current is not None:
+            current.status = "add"
+            continue
+        if raw.startswith("--- "):
+            rest = raw[4:]
+            if rest.startswith("a/"):
+                pending_old = rest[2:]
+            elif rest == "/dev/null":
+                pending_old = None
+            continue
+        if raw.startswith("+++ "):
+            rest = raw[4:]
+            if current is None:
+                path = rest[2:] if rest.startswith("b/") else rest
+                current = FileDiff(path=path, status="modify", old_path=pending_old)
+                files.append(current)
+            elif rest.startswith("b/"):
+                current.path = rest[2:]
+            elif rest == "/dev/null":
+                current.status = "delete"
+            continue
+        if raw.startswith("@@"):
+            flush_hunk()
+            m = HUNK_RE.match(raw)
+            if not m:
+                continue
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(3))
+            hunk = Hunk(old_start=old_ln, new_start=new_ln)
+            continue
+        if hunk is None or current is None:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            hunk.deleted.append((old_ln, raw[1:]))
+            old_ln += 1
+        elif raw.startswith("+"):
+            hunk.added.append((new_ln, raw[1:]))
+            new_ln += 1
+        elif raw.startswith(" ") or raw == "":
+            old_ln += 1
+            new_ln += 1
+    flush_hunk()
+    return [f for f in files if f.path and f.path != "/dev/null"]
+
+
+def align_lines(
+    deleted: Sequence[tuple[int, str]], added: Sequence[tuple[int, str]]
+) -> list[tuple[tuple[int, str] | None, tuple[int, str] | None]]:
+    used_add = [False] * len(added)
+    pairs: list[tuple[tuple[int, str] | None, tuple[int, str] | None]] = []
+    add_by_body: dict[str, list[int]] = {}
+    for i, (_, body) in enumerate(added):
+        add_by_body.setdefault(body, []).append(i)
+
+    matched_del = [False] * len(deleted)
+    for di, (_dln, dbody) in enumerate(deleted):
+        bucket = add_by_body.get(dbody)
+        if bucket:
+            ai = bucket.pop(0)
+            used_add[ai] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[ai]))
+            if not bucket:
+                add_by_body.pop(dbody, None)
+
+    for di, (_dln, dbody) in enumerate(deleted):
+        if matched_del[di]:
+            continue
+        best_i = -1
+        best = 0.38
+        dstrip = dbody.strip()
+        dkeys = {k for k, _ in extract_pairs(dbody)}
+        dslots = slot_idents(dbody) or extract_idents(dbody)
+        for ai, (_aln, abody) in enumerate(added):
+            if used_add[ai]:
+                continue
+            score = similar(dstrip, abody.strip())
+            akeys = {k for k, _ in extract_pairs(abody)}
+            if dkeys & akeys:
+                score += 0.25
+            aslots = slot_idents(abody) or extract_idents(abody)
+            if any(
+                same_inflection(a, b) or stem_related(a, b)
+                for a in dslots
+                for b in aslots
+            ):
+                score += 0.22
+            if score > best:
+                best = score
+                best_i = ai
+        if best_i >= 0:
+            used_add[best_i] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[best_i]))
+        else:
+            pairs.append((deleted[di], None))
+
+    for ai, a in enumerate(added):
+        if not used_add[ai]:
+            pairs.append((None, a))
+    return pairs
+
+
+def natal_name_set(name: str) -> tuple[str, ...]:
+    surf = surfaces(name)
+    surf.add(name)
+    return tuple(sorted(surf, key=lambda s: (-len(s), s)))
+
+
+def extract_natals(files: Sequence[FileDiff]) -> list[Natal]:
+    out: list[Natal] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def emit(
+        names: Sequence[str],
+        adopted: Sequence[str],
+        old: str,
+        new: str,
+        kind: str,
+        origin: Origin,
+        pairs: Sequence[str],
+    ) -> None:
+        names_t = tuple(dict.fromkeys(n for n in names if n))
+        adopted_t = tuple(dict.fromkeys(a for a in adopted if a))
+        if not names_t and not old:
+            return
+        if old == new and not adopted_t:
+            return
+        vt = value_type(old) if old else "empty"
+        if kind == "value" and vt == "polarity" and new in POLARITY:
+            kind = "polarity"
+            vt = "polarity"
+        natal = Natal(
+            names=names_t,
+            adopted=adopted_t,
+            old=old,
+            new=new,
+            kind=kind,
+            vtype=vt,
+            origin=origin,
+            pairs=tuple(pairs),
+        )
+        k = natal.key()
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(natal)
+
+    for fd in files:
+        if fd.status == "add":
+            continue
+        for h in fd.hunks:
+            for d, a in align_lines(h.deleted, h.added):
+                if d is None:
+                    continue
+                dln, dbody = d
+                origin = Origin(fd.old_path or fd.path, dln, dbody.strip()[:200])
+                if a is None:
+                    # Unpaired deletions are not natal records. A lint commit
+                    # that also renamed t1→driftDelay would otherwise mint
+                    # PUBLIC/IMPORT/ADR leftovers from every dropped line.
+                    continue
+
+                _aln, abody = a
+                dpairs = extract_pairs(dbody)
+                apair_list = extract_pairs(abody)
+                apairs = dict(apair_list)
+                id_pairs = pair_line_idents(dbody, abody)
+                pair_labels = [f"{o}↔{n}" for o, n in id_pairs]
+                pair_map = {o.lower(): n for o, n in id_pairs}
+
+                consumed_keys: set[str] = set()
+
+                for key, old in dpairs:
+                    new_val = apairs.get(key)
+                    adopted_name = pair_map.get(key.lower())
+                    if adopted_name is None and key not in apairs and len(id_pairs) == 1:
+                        adopted_name = id_pairs[0][1]
+                    if new_val is None and adopted_name:
+                        new_val = apairs.get(adopted_name, old)
+                    if new_val is None:
+                        continue
+                    names = natal_name_set(key)
+                    adopted = natal_name_set(adopted_name) if adopted_name else ()
+                    if adopted_name and adopted_name.lower() != key.lower():
+                        kind = "record" if old != new_val else "rename"
+                    else:
+                        if old == new_val:
+                            continue
+                        kind = "value"
+                    # Common integers need a real name (timeout=10 stays).
+                    if (
+                        kind == "value"
+                        and old in COMMON_NUMBERS
+                        and key.lower() not in VALUE_NAMES
+                        and not looks_like_symbol(key)
+                    ):
+                        continue
+                    if kind == "value" and not (
+                        is_distinctive_value(old)
+                        or is_distinctive_value(new_val)
+                        or key.lower() in VALUE_NAMES
+                    ):
+                        if not (old.isdigit() or re.fullmatch(r"\d+\.\d+", old)):
+                            continue
+                    emit(names, adopted, old, new_val, kind, origin, pair_labels)
+                    consumed_keys.add(key.lower())
+                    if adopted_name:
+                        consumed_keys.add(adopted_name.lower())
+
+                # renamed binding whose keys already paired: MAX_RETRIES=3 → MAX_ATTEMPTS=8
+                if len(dpairs) == 1 and len(apair_list) == 1:
+                    (dk, dv), (ak, av) = dpairs[0], apair_list[0]
+                    if dk.lower() != ak.lower() and dk.lower() not in consumed_keys:
+                        if similar(dk, ak) >= 0.45 or distinctive_ident(dk):
+                            kind = "record" if dv != av else "rename"
+                            emit(
+                                natal_name_set(dk),
+                                natal_name_set(ak),
+                                dv,
+                                av,
+                                kind,
+                                origin,
+                                [f"{dk}↔{ak}"],
+                            )
+                            consumed_keys.add(dk.lower())
+                            consumed_keys.add(ak.lower())
+
+                for old_n, new_n in id_pairs:
+                    if old_n.lower() in consumed_keys:
+                        continue
+                    # Pure rename, value may be unchanged and still natal.
+                    dval = dict(dpairs).get(old_n, "")
+                    aval = apairs.get(new_n, dval)
+                    if not dval:
+                        # steal a lone number from the line
+                        dnums = NUMBER_RE.findall(dbody)
+                        anums = NUMBER_RE.findall(abody)
+                        if len(dnums) == 1:
+                            dval = dnums[0]
+                            aval = anums[0] if len(anums) == 1 else dval
+                    kind = "record" if dval and aval and dval != aval else "rename"
+                    emit(
+                        natal_name_set(old_n),
+                        natal_name_set(new_n),
+                        dval,
+                        aval if aval else dval,
+                        kind,
+                        origin,
+                        [f"{old_n}↔{new_n}"],
+                    )
+                    consumed_keys.add(old_n.lower())
+
+                if not dpairs and not apair_list and not id_pairs:
+                    dnums = NUMBER_RE.findall(dbody)
+                    anums = NUMBER_RE.findall(abody)
+                    if len(dnums) == 1 and len(anums) == 1 and dnums[0] != anums[0]:
+                        shared = [
+                            s
+                            for s in extract_idents(dbody)
+                            if s.lower() not in STOP and len(s) >= 4
+                        ]
+                        name = shared[0] if shared else "value"
+                        emit(
+                            natal_name_set(name),
+                            (),
+                            dnums[0],
+                            anums[0],
+                            "value",
+                            origin,
+                            (),
+                        )
+    return merge_natals(out)
+
+
+def merge_natals(natals: list[Natal]) -> list[Natal]:
+    """A 1-to-N split is one natal record, not two competing renames.
+
+    sitbone e9b0f75: `self.threshold = threshold` greedy-pairs with
+    `self.absentThreshold = absentThreshold` while the init line correctly
+    records threshold↔presentThreshold 0.4→0.45. Concatenation would keep
+    both. The joint object is one record whose adopted set is the split.
+    """
+    if len(natals) <= 1:
+        return natals
+    groups: dict[tuple[str, ...], list[Natal]] = {}
+    order: list[tuple[str, ...]] = []
+    for n in natals:
+        raw = n.pairs[0].split("↔")[0] if n.pairs else (n.names[0] if n.names else n.old)
+        key = ident_parts(raw) or (raw.lower(),)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(n)
+    out: list[Natal] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        valued = [n for n in group if n.old and n.new and n.old != n.new]
+        primary = valued[0] if valued else group[0]
+        adopted = list(primary.adopted)
+        pairs = list(primary.pairs)
+        names = list(primary.names)
+        for n in group:
+            if n is primary:
+                continue
+            for a in n.adopted:
+                if a not in adopted:
+                    adopted.append(a)
+            for p in n.pairs:
+                if p not in pairs:
+                    pairs.append(p)
+            for nm in n.names:
+                if nm not in names:
+                    names.append(nm)
+        kind = primary.kind
+        if primary.old and primary.new and primary.old != primary.new and pairs:
+            kind = "record"
+        out.append(
+            Natal(
+                names=tuple(names),
+                adopted=tuple(adopted),
+                old=primary.old,
+                new=primary.new,
+                kind=kind,
+                vtype=primary.vtype,
+                origin=primary.origin,
+                pairs=tuple(pairs),
+            )
+        )
+    return out
+
+
+def changed_new_lines(files: Sequence[FileDiff]) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    for fd in files:
+        acc = out.setdefault(fd.path, set())
+        for h in fd.hunks:
+            for ln, _ in h.added:
+                acc.add(ln)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# dest scan
+# ---------------------------------------------------------------------------
+
+
+def classify_claim(path: str, line: str) -> str:
+    p = path.replace("\\", "/").lower()
+    stripped = line.lstrip()
+    if any(part in p.split("/") for part in ("test", "tests", "spec", "specs")) or any(
+        h in p for h in TEST_HINTS
+    ):
+        if "assert" in stripped or "expect(" in stripped or "XCT" in stripped:
+            return "assert"
+        return "test"
+    suffix = Path(path).suffix.lower()
+    if suffix in DOC_SUFFIXES or "/docs/" in p or "/adr/" in p or p.endswith("readme"):
+        return "docs"
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+    if stripped.startswith(("//", "#", "///", "//!", "--", "*", "/*", "<!--")):
+        return "comment"
+    if "assert" in stripped or "expect(" in stripped:
+        return "assert"
+    if STRING_RE.search(line) and not PAIR_RE.search(line):
+        return "string"
+    return "code"
+
+
+def path_is_doc_or_test(path: str) -> bool:
+    low = path.replace("\\", "/").lower()
+    base = low.rsplit("/", 1)[-1]
+    if low.endswith(tuple(DOC_SUFFIXES)) or "/docs/" in f"/{low}" or "/adr/" in f"/{low}":
+        return True
+    if "test" in base or "/test" in f"/{low}" or "/tests/" in f"/{low}":
+        return True
+    return False
+
+
+def should_skip_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(p in SKIP_DIRS for p in parts):
+        return True
+    suffix = Path(rel).suffix.lower()
+    if suffix in SKIP_SUFFIXES:
+        return True
+    name = Path(rel).name
+    if name.startswith(".") and name not in {".gitignore", ".env.example"}:
+        if suffix not in {".md", ".toml", ".yml", ".yaml", ".json", ".txt"}:
+            return True
+    return False
+
+
+def list_tree_files(root: Path, rev: str | None) -> list[str]:
+    files: list[str] = []
+    if git_ok(root):
+        if rev is None:
+            out = git(["ls-files", "-z", "-c", "-o", "--exclude-standard"], root)
+        else:
+            out = git(["ls-tree", "-r", "--name-only", "-z", rev], root)
+        files = [p for p in out.decode("utf-8", "replace").split("\0") if p]
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                full = Path(dirpath) / name
+                files.append(str(full.relative_to(root)))
+
+    if rev is None:
+        nested: list[str] = []
+        for dirpath, dirnames, _filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            here = Path(dirpath)
+            if here == root:
+                continue
+            if (here / ".git").exists():
+                rel_base = here.relative_to(root)
+                for inner in list_tree_files(here, None):
+                    nested.append(str(rel_base / inner))
+                dirnames[:] = []
+        files.extend(nested)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in files:
+        if p in seen or should_skip_path(p):
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def read_tree_file(root: Path, rel: str, rev: str | None) -> str | None:
+    if rev is None:
+        path = root / rel
+        if not path.is_file():
+            return None
+        try:
+            if path.stat().st_size > 1_500_000:
+                return None
+            data = path.read_bytes()
+        except OSError:
+            return None
+    else:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"{rev}:{rel}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        data = proc.stdout
+        if len(data) > 1_500_000:
+            return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def name_hit(natal: Natal, text: str) -> tuple[bool, str]:
+    """Return (hit, how) for inflected natal names."""
+    for n in natal.names:
+        if needle_ident(n, text):
+            return True, "ident"
+        if n.lower() != n and n.lower() in text.lower() and needle_ident(n, text):
+            return True, "ident"
+    # surfaces already expanded into natal.names; aliases next
+    primary = natal.names[0] if natal.names else ""
+    for alias in STEM_ALIASES.get(primary.lower(), ()):
+        if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+            return True, "alias"
+    for n in natal.names:
+        for st in ident_parts(n):
+            if len(st) >= 4 and st not in STOP and stem_in_text(st, text):
+                # do not treat adopted ident as old stem (presentThreshold holds threshold)
+                if any(needle_ident(a, text) for a in natal.adopted):
+                    if not needle_ident(n, text):
+                        continue
+                return True, "stem"
+        for alias in STEM_ALIASES.get(n.lower(), ()) + STEM_ALIASES.get(
+            ident_parts(n)[-1] if ident_parts(n) else "", ()
+        ):
+            if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+                return True, "alias"
+    return False, ""
+
+
+def adopted_pays(natal: Natal, text: str) -> bool:
+    return any(needle_ident(a, text) for a in natal.adopted if a)
+
+
+def leftover_pairs_on(line: str) -> dict[str, str]:
+    return dict(extract_pairs(line))
+
+
+def is_homonym(natal: Natal, line: str) -> bool:
+    pairs = leftover_pairs_on(line)
+    for n in natal.names:
+        if n in pairs:
+            bound = pairs[n]
+            if natal.old and bound != natal.old and bound != natal.new:
+                return True
+            if not natal.old and natal.new and bound != natal.new:
+                return True
+    return False
+
+
+def score_hit(
+    natal: Natal,
+    path: str,
+    line: str,
+    claim: str,
+    *,
+    via: str,
+    nearby: str = "",
+    file_has_new: bool = False,
+) -> tuple[int, list[str]]:
+    why: list[str] = []
+    score = 0
+    if path == natal.origin.path:
+        score += 12
+        why.append("same-file")
+
+    has_name, how = name_hit(natal, line)
+    if has_name:
+        score += 40 if how == "ident" else 18
+        why.append("same-line-name" if how == "ident" else f"name-{how}")
+    elif nearby:
+        n_has, n_how = name_hit(natal, nearby)
+        if n_has and natal.kind != "polarity":
+            score += 14
+            why.append("nearby-name")
+            has_name = True
+            how = n_how
+
+    if natal.kind == "polarity" and how != "ident":
+        # polarity leftovers require a same-line name, not a nearby stem
+        if not (has_name and how == "ident"):
+            return 0, []
+
+    if via in {"claim", "both"} and natal.old:
+        vt = natal.vtype if natal.vtype != "empty" else value_type(natal.old)
+        if needle_value(natal.old, line, vt):
+            score += 28
+            why.append("old-value")
+        if natal.new and natal.new != natal.old and needle_value(
+            natal.new, line, value_type(natal.new)
+        ):
+            score -= 20
+            why.append("also-new-value")
+
+    if via in {"kin", "both"}:
+        if adopted_pays(natal, line) and not has_name:
+            score -= 15
+            why.append("also-new-ident")
+
+    generic = any(n.lower() in GENERIC_NAMES for n in natal.names[:4])
+    if generic and claim in {"docs", "code", "comment", "string"}:
+        backticked = any(f"`{n}`" in line for n in natal.names[:6])
+        if not backticked and via == "kin" and natal.old:
+            if not needle_value(natal.old, line, natal.vtype or value_type(natal.old)):
+                if not path_is_doc_or_test(path):
+                    score -= 28
+                    why.append("generic-ident")
+
+    score += {
+        "comment": 18,
+        "docs": 16,
+        "assert": 22,
+        "test": 12,
+        "config": 20,
+        "string": 10,
+        "code": 4,
+    }.get(claim, 0)
+    why.append(f"claim:{claim}")
+
+    if HISTORICAL_RE.search(line.lstrip()):
+        score -= 25
+        why.append("historical")
+    # File-level "already has the new value" is true of migration docs
+    # (ADR-0019 names both 0.4 and 0.45). Only punish code that moved on.
+    if file_has_new and natal.new and claim in {"code", "config"}:
+        score -= 32
+        why.append("file-has-new")
+    if via == "both":
+        score += 16
+        why.append("via-both")
+    if (
+        via == "claim"
+        and natal.vtype in {"float", "version"}
+        and (path_is_doc_or_test(path) or claim in {"docs", "test", "assert", "comment"})
+    ):
+        score += 22
+        why.append("natal-literal")
+    if any(n.lower() == "version" for n in natal.names) and claim == "config":
+        score += 15
+        why.append("version-config")
+    return max(score, 0), why
+
+
+def decide_via(natal: Natal, path: str, line: str, claim: str) -> str | None:
+    """Joint classifier: claim / kin / both / None."""
+    has_name, how = name_hit(natal, line)
+    has_val = False
+    if natal.old:
+        vt = natal.vtype if natal.vtype != "empty" else value_type(natal.old)
+        has_val = needle_value(natal.old, line, vt)
+        # Style-domain floats (opacity 0.4, yaw: 0.4) are not this threshold.
+        if (
+            has_val
+            and vt == "float"
+            and STYLE_LINE.search(line)
+            and not THRESHOLD_LINE.search(line)
+            and how != "ident"
+        ):
+            has_val = False
+
+    paid = adopted_pays(natal, line) and not has_name
+    if paid:
+        # The dest line already holds the adopted ident. Unchanged natal
+        # values (t1=15 → driftDelay=15) are not leftover claims.
+        return None
+
+    if natal.kind == "polarity":
+        if has_name and how == "ident" and has_val:
+            return "both"
+        if has_name and how == "ident":
+            return "kin"
+        return None
+
+    if quoted_only_hold(line, natal.names[0] if natal.names else "") and ADAPTER_RE.search(
+        line
+    ):
+        # CodingKeys adapter: not unpaid docs
+        if not has_val:
+            return None
+
+    generic = any(n.lower() in GENERIC_NAMES for n in natal.names[:3])
+    in_docs = path_is_doc_or_test(path) or claim in {"docs", "test", "assert", "comment"}
+
+    if has_name and has_val:
+        if generic and how == "stem" and not in_docs:
+            # presentThreshold contains threshold; that's the new ident paying
+            if adopted_pays(natal, line):
+                return None
+        return "both"
+
+    if has_name:
+        if generic and not in_docs and how != "ident":
+            return None
+        if generic and not in_docs and how == "ident" and natal.old:
+            # SiteObserver.threshold = 0.7 — generic ident in code, wrong literal
+            if is_homonym(natal, line):
+                return None
+            # ident present but bound to a different value, or unbound
+            pairs = leftover_pairs_on(line)
+            bound = None
+            for n in natal.names:
+                if n in pairs:
+                    bound = pairs[n]
+                    break
+            if bound is not None and natal.old and bound != natal.old:
+                return None
+            if not has_val:
+                return None
+        if adopted_pays(natal, line) and how != "ident":
+            return None
+        return "kin"
+
+    if has_val:
+        # value-only: docs/tests/config, or same-line distinctive name nearby handled later
+        if in_docs or claim in {"config", "string"}:
+            return "claim"
+        # code: only if the natal value is distinctive (version, float, uncommon int)
+        if natal.vtype in {"version", "float"} or is_distinctive_value(natal.old):
+            # still skip random floats in style/opacity lines without natal name
+            if generic or natal.names and natal.names[0].lower() in GENERIC_NAMES:
+                return None
+            return "claim"
+        return None
+    return None
+
+
+def scan(
+    root: Path,
+    rev: str | None,
+    natals: Sequence[Natal],
+    min_score: int,
+    skip_lines: Mapping[str, set[int]],
+) -> list[Hit]:
+    if not natals:
+        return []
+    files = list_tree_files(root, rev)
+    hits: list[Hit] = []
+    seen: set[tuple[str, int, tuple[str, ...]]] = set()
+
+    cheap: list[tuple[Natal, list[str]]] = []
+    for n in natals:
+        needles = [s for s in n.names if s]
+        if n.old:
+            needles.append(n.old)
+        cheap.append((n, needles))
+
+    for rel in files:
+        text = read_tree_file(root, rel, rev)
+        if text is None:
+            continue
+        skip = skip_lines.get(rel, set())
+        lines = text.splitlines()
+        file_new: dict[tuple[str, ...], bool] = {}
+        low = text.lower()
+        for natal, needles in cheap:
+            if not any(
+                (nd.lower() in low) if nd.isascii() else (nd in text) for nd in needles if nd
+            ):
+                continue
+            for i, line in enumerate(lines, start=1):
+                if i in skip or not line.strip():
+                    continue
+                via = decide_via(natal, rel, line, classify_claim(rel, line))
+                if via is None:
+                    continue
+                if is_homonym(natal, line) and via != "kin":
+                    # homonym kills a claim on a different binding; kin-only
+                    # of a distinctive name may still stand
+                    if via == "claim":
+                        continue
+                    if via == "both":
+                        via = "kin"
+                claim = classify_claim(rel, line)
+                fk = natal.key()
+                if fk not in file_new:
+                    if natal.new:
+                        file_new[fk] = needle_value(
+                            natal.new, text, value_type(natal.new)
+                        ) or any(needle_ident(a, text) for a in natal.adopted)
+                    else:
+                        file_new[fk] = False
+                nearby = "\n".join(lines[max(0, i - 3) : i - 1] + lines[i : i + 2])
+                score, why = score_hit(
+                    natal,
+                    rel,
+                    line,
+                    claim,
+                    via=via,
+                    nearby=nearby,
+                    file_has_new=file_new[fk],
+                )
+                if score < min_score:
+                    continue
+                key = (rel, i, natal.key())
+                if key in seen:
+                    continue
+                seen.add(key)
+                excerpt = line.strip()
+                if len(excerpt) > 220:
+                    excerpt = excerpt[:217] + "..."
+                hits.append(
+                    Hit(
+                        natal=natal,
+                        path=rel,
+                        line=i,
+                        claim_kind=claim,
+                        excerpt=excerpt,
+                        score=score,
+                        why=tuple(why),
+                        via=via,
+                    )
+                )
+    hits.sort(key=lambda h: (-h.score, h.path, h.line))
+    return hits
+
+
+def fuse_hits(hits: Sequence[Hit], *, fuse: bool) -> list[Leftover]:
+    if not fuse:
+        return [
+            Leftover(
+                path=h.path,
+                line=h.line,
+                claim_kind=h.claim_kind,
+                excerpt=h.excerpt,
+                score=h.score,
+                via=h.via,
+                why=list(h.why),
+                natals=[h.natal],
+            )
+            for h in hits
+        ]
+    buckets: dict[tuple[str, int], Leftover] = {}
+    order: list[tuple[str, int]] = []
+    for h in hits:
+        k = (h.path, h.line)
+        if k not in buckets:
+            buckets[k] = Leftover(
+                path=h.path,
+                line=h.line,
+                claim_kind=h.claim_kind,
+                excerpt=h.excerpt,
+                score=h.score,
+                via=h.via,
+                why=list(h.why),
+                natals=[h.natal],
+            )
+            order.append(k)
+            continue
+        b = buckets[k]
+        if h.natal not in b.natals:
+            b.natals.append(h.natal)
+        vias = {b.via, h.via}
+        if "both" in vias or ({"claim", "kin"} <= vias):
+            b.via = "both"
+            if "via-both" not in b.why:
+                b.why.append("via-both")
+                b.score += 8
+        elif h.via == "both":
+            b.via = "both"
+        if h.score > b.score:
+            b.score = h.score
+            b.excerpt = h.excerpt
+            b.claim_kind = h.claim_kind
+        for w in h.why:
+            if w not in b.why:
+                b.why.append(w)
+    out = [buckets[k] for k in order]
+    out.sort(key=lambda L: (-L.score, L.path, L.line))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ingest
+# ---------------------------------------------------------------------------
+
+
+def looks_like_unified_diff(text: str) -> bool:
+    if not text.strip():
+        return True
+    return bool(
+        re.search(r"(?m)^(diff --git |--- |index [0-9a-f]+\.\.|@@ )", text)
+    )
+
+
+def decode_diff_bytes(raw: bytes, src: str) -> str:
+    if b"\0" in raw[:8192]:
+        die(f"binary diff ({src})")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        die(f"binary diff ({src}): {e}")
+    return ""
+
+
+def stdin_as_diff() -> tuple[str, str, str, str | None]:
+    raw = sys.stdin.buffer.read()
+    text = decode_diff_bytes(raw, "stdin")
+    if text.strip() and not looks_like_unified_diff(text):
+        preview = text.strip().splitlines()[0][:80]
+        die(f"stdin is not a unified diff (first line: {preview!r})")
+    return text, "diff", "worktree", None
+
+
+def obtain_diff(
+    root: Path, args: argparse.Namespace
+) -> tuple[str, str, str, str | None]:
+    """Return (diff_text, from_label, to_label, search_rev).
+
+    Default is a unified diff on stdin (CI). A SHA is opt-in.
+    """
+    def with_at(
+        text: str, frm: str, to: str, search: str | None
+    ) -> tuple[str, str, str, str | None]:
+        if args.at:
+            return text, frm, to, args.at
+        return text, frm, to, search
+
+    if args.diff is not None:
+        if args.diff == "-":
+            return with_at(*stdin_as_diff())
+        p = Path(args.diff)
+        try:
+            raw = p.read_bytes()
+        except OSError as e:
+            die(f"cannot read {p}: {e}")
+        text = decode_diff_bytes(raw, str(p))
+        return with_at(text, str(p), "worktree", None)
+
+    specs = [s for s in (args.spec, args.spec2) if s]
+    if not specs and not args.staged and not args.wt:
+        if sys.stdin.isatty():
+            die(
+                "pass a unified diff on stdin (CI), "
+                "or --explain COMMIT for a natal dump"
+            )
+        return with_at(*stdin_as_diff())
+
+    if not git_ok(root):
+        die(f"not a git repository: {root} (pass a diff on stdin or run inside a repo)")
+
+    specs = [s for s in (args.spec, args.spec2) if s]
+    if specs and looks_like_location(specs[0]):
+        die(
+            "pass a unified diff on stdin or a commit, not FILE:LINE "
+            "(lien starts from a change; leftovers are the natal record speaking)"
+        )
+
+    if args.staged:
+        raw = git(["diff", "--cached", "--no-color", "--no-ext-diff"], root)
+        return raw.decode("utf-8", "replace"), "HEAD", "index", None
+
+    if args.wt or (not specs):
+        if not specs:
+            # default: HEAD → worktree
+            raw = git(["diff", "HEAD", "--no-color", "--no-ext-diff"], root)
+            return raw.decode("utf-8", "replace"), "HEAD", "worktree", None
+        if specs[0] in {"wt", "WORKTREE", "working-tree"}:
+            raw = git(["diff", "HEAD", "--no-color", "--no-ext-diff"], root)
+            return raw.decode("utf-8", "replace"), "HEAD", "worktree", None
+
+    if len(specs) == 1 and (".." in specs[0]):
+        left, right = specs[0].split("..", 1)
+        right = right.lstrip(".")
+        left = left or "HEAD"
+        right = right or "HEAD"
+        raw = git(["diff", "--no-color", "--no-ext-diff", left, right], root)
+        return raw.decode("utf-8", "replace"), left, right, right
+
+    if len(specs) == 2:
+        a, b = specs
+        raw = git(["diff", "--no-color", "--no-ext-diff", a, b], root)
+        return raw.decode("utf-8", "replace"), a, b, b
+
+    spec = specs[0]
+    if not is_commit_ish(root, spec):
+        die(f"not a commit: {spec}")
+    full = git_text(root, ["rev-parse", spec]).strip()
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{full}^"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    parent = proc.stdout.decode().strip() if proc.returncode == 0 else None
+    if parent:
+        raw = git(["diff", "--no-color", "--no-ext-diff", parent, full], root)
+        frm = parent[:12]
+    else:
+        raw = git(["show", "--format=", "--no-color", "--no-ext-diff", full], root)
+        frm = "empty"
+    # leftovers at HEAD: what the tree still owes after this change
+    search = "HEAD"
+    if args.at:
+        search = args.at
+    return raw.decode("utf-8", "replace"), frm, full[:12], search
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def color_enabled(args: argparse.Namespace, stream: TextIO) -> bool:
+    if args.no_color:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return stream.isatty()
+
+
+def paint(text: str, code: str, on: bool) -> str:
+    if not on:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def print_human(
+    leftovers: Sequence[Leftover],
+    natals: Sequence[Natal],
+    *,
+    frm: str,
+    to: str,
+    root: Path,
+    explain: bool,
+    color: bool,
+) -> None:
+    n = len(leftovers)
+    both = sum(1 for L in leftovers if L.via == "both")
+    claim = sum(1 for L in leftovers if L.via == "claim")
+    kin = sum(1 for L in leftovers if L.via == "kin")
+    header = (
+        f"{NAME}: {n} leftover{'s' if n != 1 else ''}  {frm} → {to}  "
+        f"both={both} claim={claim} kin={kin}"
+    )
+    print(paint(header, "1", color))
+    if not leftovers:
+        if natals:
+            print(f"  {len(natals)} natal record(s); none still speaking (min-score gated).")
+        else:
+            print("  no natal records in this change.")
+        return
+
+    grouped: dict[tuple[str, ...], list[Leftover]] = {}
+    order: list[tuple[str, ...]] = []
+    ungrouped: list[Leftover] = []
+    for L in leftovers:
+        if len(L.natals) == 1:
+            k = L.natals[0].key()
+            if k not in grouped:
+                grouped[k] = []
+                order.append(k)
+            grouped[k].append(L)
+        else:
+            ungrouped.append(L)
+
+    def dump(L: Leftover) -> None:
+        loc = f"{L.path}:{L.line}"
+        via = f"{L.via:<5}"
+        claim = f"{L.claim_kind:<7}"
+        score = f"{L.score:>3}"
+        via_code = "33" if L.via == "both" else ("31" if L.via == "claim" else "35")
+        print(
+            f"  {paint(via, via_code, color)} "
+            f"{paint(score, '36', color)} {paint(claim, '35', color)} "
+            f"{paint(loc, '32', color):<42} {L.excerpt}"
+        )
+        if explain:
+            print(paint(f"         why: {', '.join(L.why)}", "2", color))
+
+    for k in order:
+        group = grouped[k]
+        natal = group[0].natals[0]
+        kind = natal.kind.upper()
+        print()
+        print(
+            paint("NATAL", "33;1", color),
+            paint(natal.label(), "1", color),
+            paint(f"  {natal.origin.path}:{natal.origin.line}", "2", color),
+            paint(kind, "2", color),
+        )
+        for L in group:
+            dump(L)
+
+    if ungrouped:
+        print()
+        print(paint("NATAL  (fused across records)", "33;1", color))
+        for L in ungrouped:
+            labels = "; ".join(n.label() for n in L.natals[:3])
+            print(paint(f"       {labels}", "2", color))
+            dump(L)
+
+
+def print_check(leftovers: Sequence[Leftover]) -> None:
+    """CI object: one dest-line lien, no ranked natal report."""
+    for L in leftovers:
+        if len(L.natals) == 1:
+            natal = L.natals[0].label()
+        else:
+            natal = "; ".join(n.label() for n in L.natals[:2])
+        excerpt = L.excerpt.replace("\n", " ")
+        print(f"{L.path}:{L.line}: {L.via}: {natal}: {excerpt}")
+
+
+def is_ci_lien(L: Leftover) -> bool:
+    """Current unpaid dest-line lien, not the dump union.
+
+    via=both is the joint object. Live test/code/config claims still
+    assert the old fact. Kin-only ADR quotes are --explain. Docs that
+    already name the new value are migration prose, not a CI fail.
+    """
+    if L.via == "both":
+        return True
+    if L.via == "kin":
+        return False
+    if L.claim_kind in {"test", "assert", "code", "comment", "config", "string"}:
+        return True
+    excerpt = L.excerpt
+    if HISTORICAL_RE.search(excerpt.lstrip()):
+        return False
+    for n in L.natals:
+        if n.new and n.new != n.old and needle_value(n.new, excerpt, value_type(n.new)):
+            return False
+    return True
+
+
+def ci_liens(leftovers: Sequence[Leftover]) -> list[Leftover]:
+    return [L for L in leftovers if is_ci_lien(L)]
+
+
+def print_tsv(leftovers: Sequence[Leftover]) -> None:
+    print("score\tvia\tclaim\tpath\tline\tnames\told\tnew\texcerpt")
+    for L in leftovers:
+        n = L.natals[0]
+        names = ",".join(n.names[:4])
+        excerpt = L.excerpt.replace("\t", " ").replace("\n", " ")
+        print(
+            f"{L.score}\t{L.via}\t{L.claim_kind}\t{L.path}\t{L.line}\t"
+            f"{names}\t{n.old}\t{n.new}\t{excerpt}"
+        )
+
+
+def print_json(
+    leftovers: Sequence[Leftover],
+    natals: Sequence[Natal],
+    *,
+    frm: str,
+    to: str,
+    root: Path,
+) -> None:
+    def natal_d(n: Natal) -> dict[str, object]:
+        return {
+            "names": list(n.names),
+            "adopted": list(n.adopted),
+            "old": n.old,
+            "new": n.new,
+            "kind": n.kind,
+            "vtype": n.vtype,
+            "pairs": list(n.pairs),
+            "origin": {
+                "path": n.origin.path,
+                "line": n.origin.line,
+                "excerpt": n.origin.excerpt,
+            },
+        }
+
+    payload = {
+        "from": frm,
+        "to": to,
+        "root": str(root),
+        "version": VERSION,
+        "natals": [natal_d(n) for n in natals],
+        "leftovers": [
+            {
+                "path": L.path,
+                "line": L.line,
+                "claim": L.claim_kind,
+                "excerpt": L.excerpt,
+                "score": L.score,
+                "via": L.via,
+                "why": L.why,
+                "natals": [natal_d(n) for n in L.natals],
+            }
+            for L in leftovers
+        ],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+
+def cmd_self_test() -> int:
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name} {detail}")
+            failures += 1
+
+    check("t1/T1 inflection", same_inflection("t1", "T1"))
+    check("snake/camel", same_inflection("present_threshold", "presentThreshold"))
+    check("t1 is not stem of driftDelay", not same_inflection("t1", "driftDelay"))
+    check("T1 surface of t1", "T1" in surfaces("t1"))
+    check("threshold ⊂ presentThreshold", stem_related("threshold", "presentThreshold"))
+    check("updatedCounters is stem noise", not stem_related("counters", "updatedCounters"))
+
+    pairs = pair_line_idents("t1: TimeInterval = 15", "driftDelay: TimeInterval = 15")
+    check("slot 1:1 t1↔driftDelay", pairs == [("t1", "driftDelay")], str(pairs))
+    pairs = pair_line_idents(
+        "return (.drift(since: now), counters)",
+        "return (.drift(since: now), updatedCounters)",
+    )
+    check("local counters→updatedCounters is not natal", pairs == [], str(pairs))
+    pairs = pair_line_idents(
+        "AXUIElementCopyAttributeValue(window, title)",
+        "AXUIElementCopyAttributeValue(focusedWindow, title)",
+    )
+    check("window↔focusedWindow is not natal", pairs == [], str(pairs))
+
+    rename = """diff --git a/core.py b/core.py
+--- a/core.py
++++ b/core.py
+@@ -1,3 +1,3 @@
+-t1 = 15
+-present_threshold = 0.4
++driftDelay = 15
++presentThreshold = 0.45
+ PORT = 8080
+"""
+    natals = extract_natals(parse_unified_diff(rename))
+    labels = " | ".join(n.label() for n in natals)
+    check(
+        "t1 natal keeps value 15 even though it did not move",
+        any(
+            "t1" in [x.lower() for x in n.names] and n.old == "15" for n in natals
+        ),
+        labels,
+    )
+    check(
+        "t1↔driftDelay pair",
+        any("t1↔driftDelay" in n.pairs for n in natals),
+        labels,
+    )
+    check(
+        "present_threshold 0.4→0.45 is a record",
+        any(
+            n.old == "0.4" and n.new == "0.45" and any("present" in x.lower() for x in n.names)
+            for n in natals
+        ),
+        labels,
+    )
+    check(
+        "intact PORT is not a natal",
+        not any("8080" in (n.old, n.new) or "port" in [x.lower() for x in n.names] for n in natals),
+        labels,
+    )
+
+    # Joint leftover: T1 is 15 — ember misses T1 from lowercase t1; erst
+    # would report kin without typing the 15 as a claim of this record.
+    t1 = next(n for n in natals if any(x.lower() == "t1" for x in n.names))
+    via = decide_via(t1, "docs/how to set (t1).md", "T1 is 15 seconds.", "docs")
+    check("T1 is 15 seconds is via=both", via == "both", str(via))
+    via = decide_via(t1, "core.py", "driftDelay = 15", "code")
+    check("paid driftDelay line is not leftover", via is None, str(via))
+
+    pt = next(n for n in natals if n.old == "0.4")
+    via = decide_via(pt, "deploy/timing.yaml", "present_threshold: 0.4", "config")
+    check("snake leftover of camel bump is via=both", via == "both", str(via))
+
+    jsver = """diff --git a/plugin.json b/plugin.json
+--- a/plugin.json
++++ b/plugin.json
+@@ -1,4 +1,4 @@
+ {
+-  "version": "0.3.0",
++  "version": "0.7.0",
+   "timeout": 10
+ }
+"""
+    jn = extract_natals(parse_unified_diff(jsver))
+    check(
+        "json quoted version is a named natal, full token",
+        any(n.old == "0.3.0" and n.new == "0.7.0" and any(x.lower() == "version" for x in n.names) for n in jn),
+        str([n.label() for n in jn]),
+    )
+    check(
+        "json version is not truncated to 0.3",
+        not any(n.old == "0.3" or n.new == "0.3" for n in jn),
+        str([n.label() for n in jn]),
+    )
+    ver = next(n for n in jn if n.old == "0.3.0")
+    via = decide_via(ver, "README.md", "plugin version 0.3.0, hook timeout 10 seconds.", "docs")
+    check("prose 0.3.0 leftover is a claim (or both)", via in {"claim", "both"}, str(via))
+    check(
+        "integer 10 is not October",
+        not needle_value("10", "shipped 2024-10-01", "integer"),
+    )
+    check(
+        "integer 10 still matches timeout prose",
+        needle_value("10", "timeout default is 10", "integer"),
+    )
+    to_diff = """diff --git a/src/config.py b/src/config.py
+--- a/src/config.py
++++ b/src/config.py
+@@ -1 +1 @@
+-HOOK_TIMEOUT = 10
++HOOK_TIMEOUT = 30
+"""
+    tn = extract_natals(parse_unified_diff(to_diff))
+    ht = next((n for n in tn if n.old == "10"), None)
+    check("HOOK_TIMEOUT natal extracted", ht is not None, str([n.label() for n in tn]))
+    if ht is not None:
+        via = decide_via(ht, "docs/help.md", "timeout default is 10", "docs")
+        check("timeout default is 10 is leftover of HOOK_TIMEOUT", via in {"claim", "both"}, str(via))
+    check(
+        "3 does not match a date-only line",
+        not needle_value("3", "landed 2024-03-01.", "integer"),
+    )
+    check(
+        "0.4 matches a sentence-final 0.4.",
+        needle_value("0.4", "The present_threshold is 0.4.", "float"),
+    )
+    check(
+        "0.3 does not match 0.3.0",
+        not needle_value("0.3", "plugin version 0.3.0", "float"),
+    )
+    check(
+        "float 0.4 is not version-label v0.4",
+        not needle_value("0.4", "v0.4  カメラPresence検出", "float"),
+    )
+    check(
+        "float 0.4 still matches threshold 0.4",
+        needle_value("0.4", "weight 0.50 > threshold 0.4", "float"),
+    )
+    check(
+        "version 0.3.0 still matches prose v0.3.0",
+        needle_value("0.3.0", "plugin v0.3.0", "version"),
+    )
+
+    polar = """diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-ENABLE_CACHE = True
++ENABLE_CACHE = False
+"""
+    pn = extract_natals(parse_unified_diff(polar))
+    check(
+        "polarity True→False named",
+        any(n.kind == "polarity" and n.old in {"True", "true"} for n in pn),
+        str([n.label() for n in pn]),
+    )
+    pol = next(n for n in pn if n.kind == "polarity")
+    via = decide_via(pol, "README.md", "DEBUG is True", "docs")
+    check("nearby True is not this flip", via is None, str(via))
+    via = decide_via(pol, "README.md", "assert ENABLE_CACHE is True", "docs")
+    check("ENABLE_CACHE is True is via=both", via == "both", str(via))
+
+    hyst = """diff --git a/PresenceArbiter.swift b/PresenceArbiter.swift
+--- a/PresenceArbiter.swift
++++ b/PresenceArbiter.swift
+@@ -1,2 +1,3 @@
+-        threshold: Double = 0.4,
++        presentThreshold: Double = 0.45,
++        absentThreshold: Double = 0.35,
+"""
+    hn = extract_natals(parse_unified_diff(hyst))
+    check(
+        "hysteresis hunk pairs threshold↔presentThreshold and 0.4→0.45",
+        any(
+            n.old == "0.4"
+            and n.new == "0.45"
+            and any("threshold" == x.lower() for x in n.names)
+            and any("presentThreshold" == a for a in n.adopted)
+            for n in hn
+        ),
+        str([n.label() for n in hn]),
+    )
+    th = next((n for n in hn if n.old == "0.4"), None)
+    check("extracted 0.4 natal", th is not None, str([n.label() for n in hn]))
+    if th is not None:
+        via = decide_via(
+            th,
+            "docs/adr/0019.md",
+            "既存の `threshold: Double = 0.4` パラメータを削除し",
+            "docs",
+        )
+        check("ADR leftover is via=both", via == "both", str(via))
+        via = decide_via(
+            th,
+            "Sources/SitboneCore/SiteObserver.swift",
+            "private let threshold: Double = 0.7",
+            "code",
+        )
+        check("SiteObserver.threshold=0.7 is a different domain", via is None, str(via))
+        via = decide_via(
+            th,
+            "CLAUDE.md",
+            '@Test("smoothedScore が threshold 0.4 を下回る")',
+            "docs",
+        )
+        check("CLAUDE.md threshold 0.4 is via=both", via == "both", str(via))
+        via = decide_via(
+            th,
+            "Tests/SitboneCoreTests/PresenceArbiterTests.swift",
+            "// 3回目で0.4を下回る",
+            "test",
+        )
+        check("test comment 0.4 is a natal-literal claim", via == "claim", str(via))
+        if via == "claim":
+            sc, why = score_hit(
+                th,
+                "Tests/SitboneCoreTests/PresenceArbiterTests.swift",
+                "// 3回目で0.4を下回る",
+                "test",
+                via="claim",
+            )
+            check("test comment 0.4 clears min-score", sc >= 55, f"{sc} {why}")
+        via = decide_via(
+            th,
+            "Tests/SitboneSensorsTests/GazeDetectorTests.swift",
+            "yaw: 0.4, pitch: 0.0,",
+            "test",
+        )
+        check("yaw: 0.4 is a different domain", via is None, str(via))
+        via = decide_via(
+            th,
+            "SPEC.md",
+            "v0.4  カメラPresence検出",
+            "test",
+        )
+        check("SPEC.md v0.4 is not a leftover claim of 0.4", via is None, str(via))
+
+    split = """diff --git a/PresenceArbiter.swift b/PresenceArbiter.swift
+--- a/PresenceArbiter.swift
++++ b/PresenceArbiter.swift
+@@ -1,4 +1,6 @@
+-    private let threshold: Double
++    private let presentThreshold: Double
++    private let absentThreshold: Double
+     public init(
+-        threshold: Double = 0.4,
++        presentThreshold: Double = 0.45,
++        absentThreshold: Double = 0.35,
+     ) {
+-        self.threshold = threshold
++        self.presentThreshold = presentThreshold
++        self.absentThreshold = absentThreshold
+"""
+    sn = extract_natals(parse_unified_diff(split))
+    check(
+        "1-to-N split is one natal record, not two competing renames",
+        len(sn) == 1,
+        str([n.label() for n in sn]),
+    )
+    if sn:
+        check(
+            "split natal keeps 0.4→0.45",
+            sn[0].old == "0.4" and sn[0].new == "0.45",
+            sn[0].label(),
+        )
+        check(
+            "split natal keeps presentThreshold as adopted",
+            any(a == "presentThreshold" for a in sn[0].adopted),
+            str(sn[0].adopted[:8]),
+        )
+
+    cafe = """diff --git a/x.py b/x.py
+--- a/x.py
++++ b/x.py
+@@ -1 +1 @@
+-café_timeout = 10
++café_timeout = 30
+"""
+    cn = extract_natals(parse_unified_diff(cafe))
+    check(
+        "do not mint _timeout from café_timeout",
+        not any(any(x == "_timeout" for x in n.names) for n in cn),
+        str([n.names for n in cn]),
+    )
+    check("timeout stem is not settimeout", not stem_in_text("timeout", "settimeout(10)"))
+
+    # Fuse proof: claim+kin at one line become both
+    fake_n = Natal(
+        names=("t1", "T1"),
+        adopted=("driftDelay",),
+        old="15",
+        new="15",
+        kind="rename",
+        vtype="integer",
+        origin=Origin("core.py", 1, "t1 = 15"),
+        pairs=("t1↔driftDelay",),
+    )
+    h_claim = Hit(fake_n, "docs/a.md", 3, "docs", "T1 is 15 seconds.", 70, ("old-value",), "claim")
+    h_kin = Hit(fake_n, "docs/a.md", 3, "docs", "T1 is 15 seconds.", 80, ("same-line-name",), "kin")
+    fused = fuse_hits([h_claim, h_kin], fuse=True)
+    check("fuse claim+kin → via=both", len(fused) == 1 and fused[0].via == "both", str(fused))
+    split = fuse_hits([h_claim, h_kin], fuse=False)
+    check("no-fuse is the concatenation (2 rows)", len(split) == 2, str(len(split)))
+
+    check("empty stdin is a legal (no-op) diff", looks_like_unified_diff(""))
+    check(
+        "commit log is not a unified diff",
+        not looks_like_unified_diff("commit deadbeef\nAuthor: x\n"),
+    )
+    check(
+        "diff --git is a unified diff",
+        looks_like_unified_diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"),
+    )
+
+    tool = str(Path(__file__).resolve())
+    proc = subprocess.run(
+        [sys.executable, tool, "--no-color"],
+        input=b"hello world\nnot a diff\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    check("garbage stdin exits 2", proc.returncode == 2, str(proc.returncode))
+    err = proc.stderr.decode("utf-8", "replace")
+    check("garbage stdin names unified diff", "unified diff" in err, err[:200])
+
+    proc = subprocess.run(
+        [sys.executable, tool, "--no-color"],
+        input=b"",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    check("empty stdin check exits 0", proc.returncode == 0, str(proc.returncode))
+    check("empty stdin check is silent", proc.stdout == b"", proc.stdout[:80])
+
+    return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=NAME,
+        description=(
+            "CI gate on leftovers of a change's natal record. Default: read a "
+            "unified diff from stdin, print dest-line liens, exit 1 if any "
+            "remain. --explain is the human natal dump."
+        ),
+    )
+    p.add_argument("spec", nargs="?", help="opt-in: commit, range, or old rev")
+    p.add_argument("spec2", nargs="?", help="new rev (search this tree)")
+    p.add_argument("-C", "--root", default=".", help="repository root")
+    p.add_argument("--diff", metavar="FILE", help="unified diff FILE or '-'")
+    p.add_argument("--staged", action="store_true")
+    p.add_argument("--wt", action="store_true", help="HEAD → worktree")
+    p.add_argument(
+        "--at",
+        metavar="REV",
+        help="search this tree (default: worktree for stdin, HEAD for a commit)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--facts-only", action="store_true", help="print natal records and stop")
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="human natal dump (grouped by record). Default is CI --check",
+    )
+    p.add_argument("--min-score", type=int, default=55)
+    p.add_argument(
+        "--no-fuse",
+        action="store_true",
+        help="concatenation: one row per (line, natal, via)",
+    )
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="CI gate (default): dest-line liens, exit 1 if any remain",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="CI-print the dump union (kin + migration docs), not just current liens",
+    )
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="exit code only (still 1 on leftovers)",
+    )
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"self-test", "--self-test", "selftest", "--selftest"}:
+        return cmd_self_test()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print(f"{NAME} {VERSION}")
+        return 0
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        die(f"root not found: {root}")
+
+    diff_text, frm, to, search_rev = obtain_diff(root, args)
+    files = parse_unified_diff(diff_text)
+    natals = extract_natals(files)
+
+    if args.facts_only:
+        if args.json:
+            print_json([], natals, frm=frm, to=to, root=root)
+        else:
+            print(f"{NAME}: {len(natals)} natal record(s)  {frm} → {to}")
+            for n in natals:
+                print(f"  {n.kind:<8} {n.label()}  ({n.origin.path}:{n.origin.line})")
+        return 0
+
+    if search_rev in {None, "worktree", "index"}:
+        rev: str | None = None
+    else:
+        rev = search_rev
+
+    hits = scan(
+        root,
+        rev,
+        natals,
+        min_score=args.min_score,
+        skip_lines=changed_new_lines(files),
+    )
+    leftovers = fuse_hits(hits, fuse=not args.no_fuse)
+    full_report = bool(args.explain or args.json or args.tsv or args.all)
+    gate = leftovers if full_report else ci_liens(leftovers)
+
+    if args.json:
+        print_json(leftovers, natals, frm=frm, to=to, root=root)
+    elif args.tsv:
+        print_tsv(leftovers)
+    elif args.quiet:
+        pass
+    elif args.explain:
+        print_human(
+            leftovers,
+            natals,
+            frm=frm,
+            to=to,
+            root=root,
+            explain=True,
+            color=color_enabled(args, sys.stdout),
+        )
+    else:
+        # Default is --check: current dest-line liens, no natal dump.
+        print_check(gate)
+    return 1 if gate else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

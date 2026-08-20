@@ -1,0 +1,1470 @@
+#!/usr/bin/env python3
+"""tenure — a path-condition occupies history.
+
+`when` answers, at one snapshot: which nested predicates are in force
+at FILE:LINE. `perch` answers: eras where a user-supplied predicate
+(grep/exists/exec) is true, split again when the witness set changes.
+
+Those two piped (`when | held`) grep the if-text. The if-text lives on
+the guard line; occupancy of a path-condition is the lines that *run
+under* the stack. tenure walks git history, reconstructs stacks, and
+emits eras of “this stack held” plus who sat in it.
+
+The condition frames are the predicate. The functions/files/regions
+that currently have a line in that stack are the holders. Same TRUE,
+different occupants → a new era. `--boolean` downcasts to held.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Sequence
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from whenline.model import Frame, Locus, collapse  # noqa: E402
+from whenline.query import FileIndex, query_file  # noqa: E402
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+SOURCE_EXTS = {
+    ".py",
+    ".pyi",
+    ".rs",
+    ".go",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".swift",
+    ".java",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cs",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".scala",
+    ".php",
+    ".zig",
+}
+
+CONTAINER_KINDS = {
+    "class",
+    "impl",
+    "struct",
+    "enum",
+    "protocol",
+    "extension",
+    "module",
+}
+FN_KINDS = {"fn"}
+
+SKIP_PATH_PARTS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "__pycache__",
+    ".venv",
+}
+
+IDENT_STOP = {
+    "none",
+    "some",
+    "true",
+    "false",
+    "self",
+    "this",
+    "super",
+    "return",
+    "bytes",
+    "byte",
+    "len",
+    "let",
+    "var",
+    "const",
+    "async",
+    "await",
+    "func",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "impl",
+    "pub",
+    "public",
+    "private",
+    "static",
+    "given",
+    "guard",
+    "else",
+    "elif",
+    "then",
+    "with",
+    "from",
+    "import",
+    "null",
+    "undefined",
+    "option",
+    "result",
+    "pathbuf",
+    "string",
+    "str",
+    "int",
+    "bool",
+    "where",
+    "when",
+    "into",
+    "starts_with",
+    "ends_with",
+    "strip_prefix",
+    "strip_suffix",
+    "to_string",
+    "to_str",
+    "clone",
+    "unwrap",
+    "unwrap_or",
+    "as_bytes",
+    "as_str",
+    "is_empty",
+    "is_some",
+    "is_none",
+    "filter",
+    "collect",
+    "default",
+    "copy",
+    "push",
+    "pop",
+}
+
+_DOC_BASENAMES = {
+    "readme",
+    "readme.md",
+    "changelog",
+    "changelog.md",
+    "history.md",
+    "agents.md",
+    "claude.md",
+    "license",
+    "license.md",
+    "notice",
+    "authors",
+    "contributing.md",
+}
+
+
+class TenureError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Sample:
+    sha: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str = "commit"  # commit | worktree | index
+
+    @property
+    def short(self) -> str:
+        if self.kind != "commit":
+            return self.sha
+        return self.sha[:7]
+
+
+@dataclass
+class Era:
+    value: bool
+    start: Sample
+    end: Sample
+    count: int
+    witnesses_start: list[str] = field(default_factory=list)
+    witnesses_end: list[str] = field(default_factory=list)
+    holders: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    split: str = "start"  # start | boolean | holders
+    kind: str = "start"  # birth | death | spread | shrink | move | ghost | hold | absent
+    echoes: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class Report:
+    repo: str
+    predicate: str
+    pin: str
+    end_rev: str
+    first_parent: bool
+    include_now: bool
+    holds_now: bool
+    never_held: bool
+    always_held: bool
+    commits_scanned: int
+    reachable: int
+    probes: int
+    true_commits: int
+    eras: list[Era]
+    boolean_eras: int = 0
+    grain: str = "functions"
+    split_holders: bool = True
+    ghost_now: bool = False
+    with_fn: bool = False
+    cond_frames: list[dict[str, str]] = field(default_factory=list)
+    hint: str | None = None
+    hints: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: str | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        input=input_text,
+        text=True,
+        capture_output=True,
+    )
+
+
+def git(repo: str, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", repo, *args], input_text=input_text)
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    if not os.path.isdir(start):
+        raise TenureError(f"not a directory: {start}")
+    proc = run(["git", "-C", start, "rev-parse", "--show-toplevel"])
+    if proc.returncode != 0:
+        raise TenureError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+def color_enabled(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never" or args.json or args.oneline or args.revs or args.bounds:
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def paint(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def posix_rel(path: str) -> str:
+    return path.replace(os.sep, "/")
+
+
+def fn_name(pred: str) -> str:
+    p = " ".join((pred or "").split())
+    if "(" in p:
+        p = p[: p.index("(")]
+    parts = p.replace("::", " ").split()
+    return parts[-1] if parts else ""
+
+
+def cond_frames(frames: Sequence[Frame], *, with_fn: bool = False) -> list[Frame]:
+    skip = set(CONTAINER_KINDS)
+    if not with_fn:
+        skip |= FN_KINDS
+    return [fr for fr in frames if fr.kind not in skip]
+
+
+def cond_key(frames: Sequence[Frame], *, with_fn: bool = False) -> tuple[tuple[str, str], ...]:
+    return tuple(fr.key() for fr in cond_frames(frames, with_fn=with_fn))
+
+
+def cond_label(key: Sequence[tuple[str, str]]) -> str:
+    if not key:
+        return "(empty stack)"
+    parts = []
+    for kind, pred in key:
+        pred = pred.strip()
+        parts.append(f"{kind} {pred}".strip() if pred else kind)
+    return " | ".join(parts)
+
+
+def function_of(loc: Locus) -> str:
+    if loc.function:
+        name = fn_name(loc.function)
+        if name:
+            return name
+    for fr in reversed(loc.frames):
+        if fr.kind in FN_KINDS:
+            name = fn_name(fr.pred)
+            if name:
+                return name
+    return ""
+
+
+def holder_of(loc: Locus, grain: str) -> str:
+    path = posix_rel(loc.file)
+    if grain == "files":
+        return path
+    if grain == "functions":
+        name = function_of(loc)
+        return f"{path}:{name}" if name else path
+    if grain == "loci":
+        return f"{path}:{loc.line}"
+    if grain == "regions":
+        return f"{path}:{loc.line}"
+    return path
+
+
+def compress_regions(holders: Sequence[str]) -> list[str]:
+    """Merge consecutive path:line holders into path:start-end runs."""
+    by_path: dict[str, list[int]] = {}
+    order: list[str] = []
+    leftover: list[str] = []
+    for h in holders:
+        if ":" not in h:
+            leftover.append(h)
+            continue
+        path, _, rest = h.rpartition(":")
+        if not rest.isdigit():
+            leftover.append(h)
+            continue
+        if path not in by_path:
+            by_path[path] = []
+            order.append(path)
+        by_path[path].append(int(rest))
+    out: list[str] = []
+    for path in order:
+        nums = sorted(set(by_path[path]))
+        start = prev = nums[0]
+        runs: list[tuple[int, int]] = []
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+                continue
+            runs.append((start, prev))
+            start = prev = n
+        runs.append((start, prev))
+        for a, b in runs:
+            out.append(f"{path}:{a}" if a == b else f"{path}:{a}-{b}")
+    out.extend(leftover)
+    return out
+
+
+def seed_tokens(loc: Locus) -> list[str]:
+    """fn name + longest idents from the *condition* frames.
+
+    Common methods (starts_with, clone, …) are stop-listed so a unique
+    given like b_prefix_start seeds the walk, not every starts_with.
+    """
+    out: list[str] = []
+    name = function_of(loc)
+    if name and len(name) >= 2:
+        out.append(name)
+    text = " ".join(fr.pred for fr in cond_frames(loc.frames, with_fn=False))
+    seen = {s.lower() for s in out}
+    ranked = sorted(
+        {m for m in IDENT_RE.findall(text) if len(m) >= 4 and m.lower() not in IDENT_STOP},
+        key=lambda s: (-len(s), s.lower()),
+    )
+    for ident in ranked:
+        if ident.lower() in seen:
+            continue
+        out.append(ident)
+        seen.add(ident.lower())
+        if len(out) >= 3:
+            break
+    return out
+
+
+def relate_keys(
+    echo: tuple[tuple[str, str], ...],
+    target: tuple[tuple[str, str], ...],
+) -> str:
+    """How a non-matching stack in a scanned file relates to the pin."""
+    if not echo:
+        return "mention"
+    if echo == target:
+        return "occupant"
+    n, m = len(echo), len(target)
+    if n > m and echo[n - m :] == target:
+        return "deeper"
+    if n > m and echo[:m] == target:
+        return "deeper"
+    if m > n and target[m - n :] == echo:
+        return "shallower"
+    if m > n and target[:n] == echo:
+        return "shallower"
+    if set(echo) & set(target):
+        return "related"
+    return "mention"
+
+
+def skip_path(path: str) -> bool:
+    parts = posix_rel(path).split("/")
+    return any(p in SKIP_PATH_PARTS for p in parts)
+
+
+def is_source_path(path: str) -> bool:
+    ext = Path(path).suffix.lower()
+    return ext in SOURCE_EXTS and not skip_path(path)
+
+
+def holder_path(holder: str) -> str:
+    if ":" not in holder:
+        return holder
+    path, _, rest = holder.partition(":")
+    # functions grain: path:name — name is not a line span
+    if rest.isdigit() or re.match(r"^\d+-\d+$", rest):
+        return path
+    if "/" in path or "." in path:
+        return path
+    return holder.split(":", 1)[0]
+
+
+def is_doc_holder(holder: str) -> bool:
+    path = holder_path(holder)
+    name = path.rsplit("/", 1)[-1].lower()
+    if name in _DOC_BASENAMES:
+        return True
+    if path == "docs" or path.startswith("docs/") or "/docs/" in path:
+        return True
+    return False
+
+
+def is_test_holder(holder: str) -> bool:
+    path = holder_path(holder)
+    parts = path.split("/")
+    if any(p in {"tests", "test", "Tests", "Spec", "__tests__", "testdata"} for p in parts):
+        return True
+    name = parts[-1] if parts else path
+    lower = name.lower()
+    if lower.startswith("test_") or lower.endswith("_test.py") or lower.endswith("_test.rs"):
+        return True
+    if "test." in lower or lower.endswith("tests.swift") or lower.endswith("test.swift"):
+        return True
+    return False
+
+
+def is_ghost_holder(holder: str) -> bool:
+    return is_doc_holder(holder) or is_test_holder(holder)
+
+
+def classify_era(
+    *,
+    value: bool,
+    split: str,
+    holders: Sequence[str],
+    added: Sequence[str],
+    dropped: Sequence[str],
+) -> str:
+    if not value:
+        return "death" if split == "boolean" else "absent"
+    if split in ("start", "boolean"):
+        return "birth"
+    if added and dropped:
+        return "move"
+    if added and not dropped:
+        return "spread"
+    if dropped and not added:
+        remaining_ghost = bool(holders) and all(is_ghost_holder(h) for h in holders)
+        lost_real = any(not is_ghost_holder(h) for h in dropped)
+        if remaining_ghost and lost_real:
+            return "ghost"
+        return "shrink"
+    return "hold"
+
+
+def count_boolean_eras(values: Sequence[bool]) -> int:
+    if not values:
+        return 0
+    n = 1
+    for i in range(1, len(values)):
+        if values[i] != values[i - 1]:
+            n += 1
+    return n
+
+
+def holder_key(holders: Sequence[str]) -> tuple[str, ...]:
+    return tuple(sorted({h for h in holders if h}))
+
+
+def _uniq(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _union_echoes(groups: Sequence[Sequence[dict[str, str]]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for echo in group:
+            key = (echo.get("holder", ""), echo.get("kind", ""))
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(echo))
+    kind_order = {"deeper": 0, "related": 1, "shallower": 2, "mention": 3}
+    out.sort(
+        key=lambda e: (
+            kind_order.get(e.get("kind") or "", 9),
+            1 if is_test_holder(e.get("holder") or "") else 0,
+            e.get("holder") or "",
+        )
+    )
+    return out
+
+
+def compress(
+    samples: Sequence[Sample],
+    values: Sequence[bool],
+    witnesses: Sequence[Sequence[str]],
+    *,
+    split_holders: bool = True,
+    echoes: Sequence[Sequence[dict[str, str]]] | None = None,
+) -> list[Era]:
+    if not samples:
+        return []
+    echo_rows: Sequence[Sequence[dict[str, str]]] = echoes or [[] for _ in samples]
+    eras: list[Era] = []
+    start = 0
+    for i in range(1, len(samples) + 1):
+        if i < len(samples):
+            same_bool = values[i] == values[start]
+            if same_bool:
+                if not split_holders or not values[i]:
+                    continue
+                if holder_key(witnesses[i]) == holder_key(witnesses[start]):
+                    continue
+        holders = sorted(_uniq(witnesses[start])) if values[start] else []
+        split = "start"
+        added: list[str] = []
+        dropped: list[str] = []
+        if eras:
+            prev = eras[-1]
+            if bool(values[start]) != prev.value:
+                split = "boolean"
+                if values[start]:
+                    added = list(holders)
+                    dropped = list(prev.holders)
+            else:
+                split = "holders"
+                prev_set = set(prev.holders)
+                cur_set = set(holders)
+                added = [h for h in holders if h not in prev_set]
+                dropped = [h for h in prev.holders if h not in cur_set]
+        elif values[start]:
+            added = list(holders)
+        kind = classify_era(
+            value=bool(values[start]),
+            split=split,
+            holders=holders,
+            added=added,
+            dropped=dropped,
+        )
+        era_echoes = _union_echoes(echo_rows[start:i]) if values[start] else []
+        dropped_paths = {holder_path(h) for h in dropped}
+        # A file we just dropped as occupant should not also be a "mention"
+        # echo (kizu git.rs after the move). Keep deeper/related: that's the
+        # production-grew-a-guard signal.
+        era_echoes = [
+            e
+            for e in era_echoes
+            if not (
+                e.get("kind") == "mention"
+                and holder_path(e.get("holder") or "") in dropped_paths
+            )
+        ]
+        eras.append(
+            Era(
+                value=bool(values[start]),
+                start=samples[start],
+                end=samples[i - 1],
+                count=i - start,
+                witnesses_start=list(witnesses[start]),
+                witnesses_end=list(witnesses[i - 1]),
+                holders=holders,
+                added=added,
+                dropped=dropped,
+                split=split,
+                kind=kind,
+                echoes=era_echoes,
+            )
+        )
+        start = i
+    return eras
+
+
+def list_samples(
+    repo: str,
+    *,
+    end_rev: str,
+    rev_range: str | None,
+    first_parent: bool,
+    limit: int | None,
+) -> list[Sample]:
+    spec = rev_range if rev_range else end_rev
+    fmt = "%H%x09%ct%x09%ci%x09%s"
+    cmd = ["log", "--reverse", f"--format={fmt}"]
+    if first_parent:
+        cmd.append("--first-parent")
+    cmd.append(spec)
+    proc = git(repo, *cmd)
+    if proc.returncode != 0:
+        raise TenureError(proc.stderr.strip() or f"cannot walk {spec}")
+    samples: list[Sample] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 3:
+            continue
+        sha, ct, iso = parts[0], parts[1], parts[2]
+        subject = parts[3] if len(parts) > 3 else ""
+        try:
+            timestamp = int(ct)
+        except ValueError:
+            timestamp = 0
+        samples.append(Sample(sha=sha, timestamp=timestamp, iso=iso, subject=subject))
+    if limit is not None and limit >= 0 and len(samples) > limit:
+        samples = samples[-limit:]
+    return samples
+
+
+def worktree_sample(repo: str) -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def count_reachable(repo: str, spec: str) -> int:
+    proc = git(repo, "rev-list", "--count", spec)
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def parse_locus_arg(targets: Sequence[str]) -> tuple[str, int]:
+    if not targets:
+        raise TenureError("usage: tenure FILE:LINE")
+    if len(targets) >= 2 and targets[1].isdigit():
+        return targets[0], int(targets[1])
+    raw = targets[0]
+    # FILE:LINE — last colon-run of digits
+    m = re.search(r":(\d+)$", raw)
+    if m:
+        return raw[: m.start()], int(m.group(1))
+    raise TenureError(f"need FILE:LINE, got {raw!r}")
+
+
+def rel_to_repo(repo: str, path: str) -> str:
+    abs_path = os.path.abspath(path)
+    repo_abs = os.path.abspath(repo)
+    try:
+        rel = os.path.relpath(abs_path, repo_abs)
+    except ValueError:
+        rel = path
+    if rel.startswith(".."):
+        # path might already be repo-relative
+        candidate = path
+        if os.path.exists(os.path.join(repo, candidate)):
+            return posix_rel(candidate)
+        raise TenureError(f"{path} is not inside {repo}")
+    return posix_rel(rel)
+
+
+def read_blob(repo: str, sample: Sample, path: str) -> str | None:
+    if sample.kind == "worktree":
+        fp = os.path.join(repo, path)
+        if not os.path.isfile(fp):
+            return None
+        try:
+            return Path(fp).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    proc = git(repo, "cat-file", "--batch", input_text=f"{sample.sha}:{path}\n")
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    nl = data.find("\n")
+    if nl < 0:
+        return None
+    header = data[:nl]
+    if header.endswith(" missing"):
+        return None
+    parts = header.rsplit(" ", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        size = int(parts[-1])
+    except ValueError:
+        return None
+    body = data[nl + 1 : nl + 1 + size]
+    return body
+
+
+def grep_paths(repo: str, sha: str, seed: str) -> list[str]:
+    proc = git(repo, "grep", "-l", "-F", "-e", seed, sha)
+    if proc.returncode not in (0, 1):
+        return []
+    hits: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        path = line
+        if len(line) >= 41 and line[40] == ":" and SHA_RE.match(line[:40]):
+            path = line[41:]
+        elif ":" in line and SHA_RE.match(line.split(":", 1)[0]):
+            path = line.split(":", 1)[1]
+        path = posix_rel(path)
+        if is_source_path(path):
+            hits.append(path)
+    return hits
+
+
+def worktree_grep_paths(repo: str, seed: str) -> list[str]:
+    proc = git(repo, "grep", "-l", "-F", "-e", seed)
+    if proc.returncode not in (0, 1):
+        return []
+    hits: list[str] = []
+    for line in proc.stdout.splitlines():
+        path = posix_rel(line.strip())
+        if is_source_path(path):
+            hits.append(path)
+    return hits
+
+
+def scan_source(
+    source: str,
+    path: str,
+    target: tuple[tuple[str, str], ...],
+    *,
+    grain: str,
+    with_fn: bool,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Occupants of target, plus echoes: related stacks or token mentions
+    in a file that does *not* occupy the pin."""
+    if not source or not target:
+        return [], []
+    idx = FileIndex(source, path)
+    by_key: dict[tuple[tuple[str, str], ...], list[Locus]] = {}
+    for ln in range(1, idx.nlines + 1):
+        loc = idx.at(ln)
+        if loc.error:
+            continue
+        loc.file = path
+        key = cond_key(loc.frames, with_fn=with_fn)
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(loc)
+
+    holders: list[str] = []
+    seen_h: set[str] = set()
+    if target in by_key:
+        grain_use = "loci" if grain == "regions" else grain
+        for loc in by_key[target]:
+            h = holder_of(loc, grain_use)
+            if h not in seen_h:
+                seen_h.add(h)
+                holders.append(h)
+        if grain == "regions":
+            holders = compress_regions(holders)
+        return holders, []
+
+    echoes: list[dict[str, str]] = []
+    ranked: list[tuple[int, str, tuple[tuple[str, str], ...], Locus]] = []
+    order = {"deeper": 0, "related": 1, "shallower": 2}
+    for key, locs in by_key.items():
+        rel = relate_keys(key, target)
+        if rel in {"mention", "occupant"}:
+            continue
+        ranked.append((order.get(rel, 9), rel, key, locs[0]))
+    ranked.sort(key=lambda row: (row[0], cond_label(row[2])))
+    seen_e: set[str] = set()
+    for _ord, rel, key, loc in ranked[:3]:
+        h = holder_of(loc, "functions")
+        if h in seen_e:
+            continue
+        seen_e.add(h)
+        echoes.append({"holder": h, "kind": rel, "stack": cond_label(key)})
+    if not echoes:
+        echoes.append({"holder": path, "kind": "mention", "stack": ""})
+    return [], echoes
+
+
+def occupants_in_source(
+    source: str,
+    path: str,
+    target: tuple[tuple[str, str], ...],
+    *,
+    grain: str,
+    with_fn: bool,
+) -> list[str]:
+    holders, _echoes = scan_source(source, path, target, grain=grain, with_fn=with_fn)
+    return holders
+
+
+def discover_paths(
+    repo: str,
+    sample: Sample,
+    seeds: Sequence[str],
+    remembered: Iterable[str],
+) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        path = posix_rel(path)
+        if not path or path in seen or skip_path(path):
+            return
+        seen.add(path)
+        paths.append(path)
+
+    for path in remembered:
+        add(path)
+    if sample.kind == "worktree":
+        for seed in seeds:
+            for path in worktree_grep_paths(repo, seed):
+                add(path)
+        return paths
+    for seed in seeds:
+        for path in grep_paths(repo, sample.sha, seed):
+            add(path)
+    return paths
+
+
+def probe_stack(
+    repo: str,
+    samples: Sequence[Sample],
+    *,
+    target: tuple[tuple[str, str], ...],
+    seeds: Sequence[str],
+    pin_path: str,
+    grain: str,
+    with_fn: bool,
+) -> tuple[list[bool], list[list[str]], list[list[dict[str, str]]], int]:
+    values = [False] * len(samples)
+    witnesses: list[list[str]] = [[] for _ in samples]
+    echo_rows: list[list[dict[str, str]]] = [[] for _ in samples]
+    probes = 0
+    remembered = [pin_path] if pin_path else []
+    for i, sample in enumerate(samples):
+        paths = discover_paths(repo, sample, seeds, remembered)
+        holders: list[str] = []
+        occupied_paths: list[str] = []
+        echoes: list[dict[str, str]] = []
+        for path in paths:
+            probes += 1
+            source = read_blob(repo, sample, path)
+            if source is None:
+                continue
+            occ, file_echoes = scan_source(
+                source, path, target, grain=grain, with_fn=with_fn
+            )
+            if occ:
+                occupied_paths.append(path)
+                for h in occ:
+                    if h not in holders:
+                        holders.append(h)
+            else:
+                echoes.extend(file_echoes)
+        if occupied_paths:
+            for path in occupied_paths:
+                if path not in remembered:
+                    remembered.append(path)
+        values[i] = bool(holders)
+        witnesses[i] = holders
+        echo_rows[i] = _union_echoes([echoes])
+    return values, witnesses, echo_rows, probes
+
+
+def _date_span(a: Sample, b: Sample) -> str:
+    da = a.iso[:10] if a.iso else ""
+    db = b.iso[:10] if b.iso else ""
+    if not da and not db:
+        return ""
+    if da == db or not db:
+        return da
+    return f"{da} → {db}"
+
+
+def format_human(report: Report, *, color: bool, show_witnesses: bool) -> str:
+    lines: list[str] = []
+    head = f"# {report.predicate}"
+    if report.reachable > report.commits_scanned:
+        scanned = (
+            f"{report.commits_scanned} of {report.reachable} commit"
+            + ("" if report.reachable == 1 else "s")
+        )
+    else:
+        scanned = (
+            f"{report.commits_scanned} commit"
+            + ("" if report.commits_scanned == 1 else "s")
+        )
+    bits = [
+        os.path.basename(report.repo) or report.repo,
+        scanned,
+        "first-parent" if report.first_parent else "full",
+        f"grain={report.grain}",
+    ]
+    if report.include_now:
+        bits.append("now")
+    if report.with_fn:
+        bits.append("with-fn")
+    lines.append(head + "  (" + ", ".join(bits) + ")")
+    if report.pin:
+        lines.append(f"pin  {report.pin}")
+    if not report.eras:
+        lines.append("  (no commits)")
+        return "\n".join(lines)
+
+    label_w = 5
+    count_w = max(len(str(e.count)) for e in report.eras) + len(" commits")
+    for era in report.eras:
+        raw = "TRUE" if era.value else "FALSE"
+        label = paint(color, "32;1" if era.value else "31", f"{raw:<{label_w}}")
+        unit = "commit" if era.count == 1 else "commits"
+        count = f"{era.count} {unit}".ljust(count_w)
+        if era.start.sha == era.end.sha:
+            span = f"{era.start.short}"
+        else:
+            span = f"{era.start.short}..{era.end.short}"
+        dates = _date_span(era.start, era.end)
+        lines.append(f"{label}  {count}  {span}  {dates}")
+        if era.start.sha != era.end.sha:
+            lines.append(f"       {era.start.short}  {era.start.subject}")
+            lines.append(f"       {era.end.short}  {era.end.subject}")
+        else:
+            lines.append(f"       {era.start.subject}")
+        if show_witnesses and era.value:
+            if report.split_holders:
+                holders = era.holders or _uniq(era.witnesses_start)
+            else:
+                holders = _uniq(list(era.witnesses_start) + list(era.witnesses_end))
+            if holders:
+                shown = holders[:8]
+                extra = f" (+{len(holders) - 8})" if len(holders) > 8 else ""
+                who = "holders" if report.split_holders else "witnesses"
+                lines.append(f"       {who}: " + ", ".join(shown) + extra)
+            if report.split_holders and era.split == "holders":
+                for path in era.added[:8]:
+                    lines.append(f"       + {path}")
+                if len(era.added) > 8:
+                    lines.append(f"       + … {len(era.added) - 8} more")
+                for path in era.dropped[:8]:
+                    lines.append(f"       - {path}")
+                if len(era.dropped) > 8:
+                    lines.append(f"       - … {len(era.dropped) - 8} more")
+            if era.kind == "ghost":
+                lines.append(
+                    "       ghost: production left; the stack still perches in tests/docs"
+                )
+            for echo in (era.echoes or [])[:6]:
+                holder = echo.get("holder") or ""
+                kind = echo.get("kind") or "mention"
+                stack = echo.get("stack") or ""
+                if kind == "mention":
+                    lines.append(f"       echo   {holder}  mention (token, no occupant)")
+                else:
+                    extra = f"  {stack}" if stack else ""
+                    lines.append(f"       echo   {holder}  {kind}{extra}")
+            if len(era.echoes or []) > 6:
+                lines.append(f"       echo   … {len(era.echoes) - 6} more")
+    holder_note = ""
+    if report.split_holders and report.boolean_eras and report.boolean_eras != len(report.eras):
+        extra_splits = len(report.eras) - report.boolean_eras
+        holder_note = f"  boolean={report.boolean_eras}  holder_splits={extra_splits}"
+    summary = (
+        f"now={'TRUE' if report.holds_now else 'FALSE'}  "
+        f"true={report.true_commits}/{report.commits_scanned}  "
+        f"eras={len(report.eras)}{holder_note}  probes={report.probes}"
+    )
+    if report.ghost_now:
+        summary += "  ghost_now=1"
+    lines.append(summary)
+    for warning in report.warnings:
+        lines.append("warning: " + warning)
+    for hint in report.hints or ([report.hint] if report.hint else []):
+        lines.append("hint: " + hint)
+    return "\n".join(lines)
+
+
+def format_oneline(report: Report) -> str:
+    rows = []
+    for era in report.eras:
+        flag = "T" if era.value else "F"
+        if era.start.sha == era.end.sha:
+            span = era.start.short
+        else:
+            span = f"{era.start.short}..{era.end.short}"
+        holders = ",".join(era.holders) if era.value and era.holders else ""
+        split = era.split if era.split != "start" else ""
+        rows.append(
+            f"{flag}\t{era.count}\t{span}\t{_date_span(era.start, era.end)}\t{holders}\t{split}\t{era.kind}"
+        )
+    return "\n".join(rows)
+
+
+def format_bounds(report: Report, *, only_true: bool) -> str:
+    rows = []
+    for era in report.eras:
+        if only_true and not era.value:
+            continue
+        rows.append(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+    return "\n".join(rows)
+
+
+def report_to_json(report: Report) -> dict:
+    def sample_dict(s: Sample) -> dict:
+        return {
+            "sha": s.sha,
+            "short": s.short,
+            "timestamp": s.timestamp,
+            "iso": s.iso,
+            "subject": s.subject,
+            "kind": s.kind,
+        }
+
+    return {
+        "repo": report.repo,
+        "predicate": report.predicate,
+        "pin": report.pin,
+        "end_rev": report.end_rev,
+        "first_parent": report.first_parent,
+        "include_now": report.include_now,
+        "holds_now": report.holds_now,
+        "never_held": report.never_held,
+        "always_held": report.always_held,
+        "commits_scanned": report.commits_scanned,
+        "reachable": report.reachable,
+        "probes": report.probes,
+        "true_commits": report.true_commits,
+        "boolean_eras": report.boolean_eras,
+        "grain": report.grain,
+        "split_holders": report.split_holders,
+        "ghost_now": report.ghost_now,
+        "with_fn": report.with_fn,
+        "cond_frames": report.cond_frames,
+        "eras": [
+            {
+                "value": e.value,
+                "count": e.count,
+                "split": e.split,
+                "kind": e.kind,
+                "start": sample_dict(e.start),
+                "end": sample_dict(e.end),
+                "holders": e.holders,
+                "added": e.added,
+                "dropped": e.dropped,
+                "witnesses_start": e.witnesses_start,
+                "witnesses_end": e.witnesses_end,
+                "echoes": e.echoes,
+            }
+            for e in report.eras
+        ],
+        "hint": report.hint,
+        "hints": report.hints,
+        "warnings": report.warnings,
+    }
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tenure",
+        description=(
+            "Show eras of git history where a path-condition stack holds, "
+            "split again when who occupies it changes. Occupancy of a stack, "
+            "plus the holders. when is the snapshot; perch is occupancy of a "
+            "grep. tenure is occupancy of the stack itself."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  tenure src/git/parse.rs:60
+  tenure -C /path/to/kizu src/git/parse.rs:60
+  tenure --boolean PresenceArbiter.swift:81
+  tenure --grain files src/app.py:12
+  tenure --with-fn src/git/parse.rs:60
+""",
+    )
+    parser.add_argument("targets", nargs="*", help="FILE:LINE or FILE LINE")
+    parser.add_argument("-C", "--repo", default=None, help="repository (default: cwd)")
+    parser.add_argument("--rev", default="HEAD", help="end revision (default: HEAD)")
+    parser.add_argument("--range", dest="rev_range", default=None, help="limit to A..B")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="walk every reachable commit, not only first-parent",
+    )
+    parser.add_argument(
+        "--now",
+        action="store_true",
+        help="append the working tree as a final sample",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="keep only the last N commits")
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument("--oneline", action="store_true", help="T/F count span dates holders")
+    parser.add_argument("--revs", action="store_true", help="print SHAs where the stack holds")
+    parser.add_argument(
+        "--bounds",
+        action="store_true",
+        help="print start_sha end_sha value count for each era",
+    )
+    parser.add_argument(
+        "--true-bounds",
+        action="store_true",
+        help="like --bounds but only TRUE eras",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument(
+        "--no-witnesses",
+        action="store_true",
+        help="do not print holder paths",
+    )
+    parser.add_argument(
+        "--boolean",
+        action="store_true",
+        help="compress only on TRUE/FALSE (ancestor held). ignore holder changes",
+    )
+    parser.add_argument(
+        "--grain",
+        choices=("files", "functions", "regions", "loci"),
+        default="functions",
+        help=(
+            "who counts as a holder: functions (default, file:fn), files, "
+            "consecutive line runs (regions), or path:line (loci)"
+        ),
+    )
+    parser.add_argument(
+        "--with-fn",
+        action="store_true",
+        help="include the enclosing function in the stack identity (tighter pin)",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run internal unit checks and exit",
+    )
+    return parser.parse_args(list(argv))
+
+
+def selftest() -> int:
+    """Pure unit checks: stack identity, region grain, ghost classification."""
+    fails = 0
+
+    def check(name: str, cond: bool) -> None:
+        nonlocal fails
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name}", file=sys.stderr)
+            fails += 1
+
+    src = (
+        "def process(x, ready=True, enabled=True):\n"
+        "    if not ready:\n"
+        "        return None\n"
+        "    if x > 0:\n"
+        "        flag = True\n"
+        "        return 'ok'\n"
+    )
+    idx = FileIndex(src, "src/app.py")
+    loc = idx.at(6)
+    loc.file = "src/app.py"
+    key = cond_key(loc.frames, with_fn=False)
+    check("return line has given+if, not fn", [k[0] for k in key] == ["given", "if"])
+    check("given is ready (negated not ready)", "ready" in key[0][1] and "not ready" not in key[0][1])
+    check("if is x > 0", "x > 0" in key[1][1] or "x>0" in key[1][1].replace(" ", ""))
+    with_fn_key = cond_key(loc.frames, with_fn=True)
+    check("with-fn starts with fn", with_fn_key[0][0] == "fn")
+
+    occ_fn = occupants_in_source(src, "src/app.py", key, grain="functions", with_fn=False)
+    check("functions grain is one holder", occ_fn == ["src/app.py:process"])
+    occ_loc = occupants_in_source(src, "src/app.py", key, grain="loci", with_fn=False)
+    check("loci grain has both body lines", occ_loc == ["src/app.py:5", "src/app.py:6"])
+    occ_reg = occupants_in_source(src, "src/app.py", key, grain="regions", with_fn=False)
+    check("regions merge consecutive lines", occ_reg == ["src/app.py:5-6"])
+
+    samples = [
+        Sample("a" * 40, 1, "2026-01-01", "t0", "commit"),
+        Sample("b" * 40, 2, "2026-01-02", "t1", "commit"),
+        Sample("c" * 40, 3, "2026-01-03", "t2", "commit"),
+    ]
+    values = [True, True, True]
+    wits = [
+        ["src/app.py:process"],
+        ["src/app.py:process", "tests/test_app.py:test_process"],
+        ["tests/test_app.py:test_process"],
+    ]
+    eras = compress(samples, values, wits, split_holders=True)
+    check("three TRUE holder eras", len(eras) == 3 and all(e.value for e in eras))
+    check("spread then ghost", [e.kind for e in eras] == ["birth", "spread", "ghost"])
+    bool_eras = compress(samples, values, wits, split_holders=False)
+    check("--boolean is one TRUE era", len(bool_eras) == 1 and bool_eras[0].kind == "birth")
+
+    ghost = classify_era(
+        value=True,
+        split="holders",
+        holders=["tests/test_app.py:test_process"],
+        added=[],
+        dropped=["src/app.py:process"],
+    )
+    check("production→tests is ghost", ghost == "ghost")
+    shrink = classify_era(
+        value=True,
+        split="holders",
+        holders=["src/app.py:process"],
+        added=[],
+        dropped=["src/other.py:other"],
+    )
+    check("code→code drop is shrink, not ghost", shrink == "shrink")
+
+    old = (("given", "ready"), ("if", "x > 0"))
+    new = (("given", "enabled"), ("given", "ready"), ("if", "x > 0"))
+    check("extra guard is deeper", relate_keys(new, old) == "deeper")
+    check("unrelated is mention", relate_keys((("if", "n == 0"),), old) == "mention")
+
+    deeper_src = (
+        "def process(x, ready=True, enabled=True):\n"
+        "    if not enabled:\n"
+        "        return None\n"
+        "    if not ready:\n"
+        "        return None\n"
+        "    if x > 0:\n"
+        "        flag = True\n"
+        "        return 'ok'\n"
+    )
+    _h, echoes = scan_source(deeper_src, "src/app.py", key, grain="functions", with_fn=False)
+    check("deeper production is not an occupant", _h == [])
+    check(
+        "echo names deeper stack",
+        bool(echoes)
+        and echoes[0]["kind"] == "deeper"
+        and echoes[0]["holder"] == "src/app.py:process"
+        and "enabled" in echoes[0]["stack"],
+    )
+
+    if fails:
+        print(f"selftest FAIL={fails}", file=sys.stderr)
+        return 1
+    print("selftest ok")
+    return 0
+
+
+def build_report(args: argparse.Namespace) -> Report:
+    repo = resolve_repo(args.repo)
+    if args.rev_range is None:
+        probe = git(repo, "rev-parse", "--verify", args.rev)
+        if probe.returncode != 0:
+            raise TenureError(f"no commits at {args.rev} (empty repository?)")
+
+    file_arg, line = parse_locus_arg(args.targets)
+    # Allow pinning a historical path that no longer exists in the worktree
+    # by reading --rev first, then the worktree.
+    pin_path: str
+    source: str | None = None
+    abs_arg = file_arg
+    if not os.path.isabs(file_arg):
+        guess = os.path.join(os.getcwd(), file_arg)
+        if os.path.isfile(guess):
+            abs_arg = guess
+        elif args.repo and os.path.isfile(os.path.join(repo, file_arg)):
+            abs_arg = os.path.join(repo, file_arg)
+    if os.path.isfile(abs_arg):
+        pin_path = rel_to_repo(repo, abs_arg)
+        source = Path(abs_arg).read_text(encoding="utf-8", errors="replace")
+    else:
+        pin_path = posix_rel(file_arg)
+        blob = git(repo, "show", f"{args.rev}:{pin_path}")
+        if blob.returncode != 0:
+            raise TenureError(f"cannot read {pin_path} at {args.rev} or on disk")
+        source = blob.stdout
+
+    loc = query_file(pin_path, line, source=source)
+    loc.file = pin_path
+    if loc.error:
+        raise TenureError(f"{pin_path}:{line}: {loc.error}")
+
+    with_fn = bool(args.with_fn)
+    key = cond_key(loc.frames, with_fn=with_fn)
+    warnings: list[str] = []
+    if not key:
+        with_fn = True
+        key = cond_key(loc.frames, with_fn=True)
+        warnings.append(
+            "pin has no condition frames; falling back to --with-fn "
+            "(the enclosing function is the stack)"
+        )
+    if not key:
+        raise TenureError(f"{pin_path}:{line} has an empty stack")
+
+    seeds = seed_tokens(loc)
+    if not seeds:
+        seeds = [Path(pin_path).stem]
+
+    samples = list_samples(
+        repo,
+        end_rev=args.rev,
+        rev_range=args.rev_range,
+        first_parent=not args.full,
+        limit=args.limit,
+    )
+    if args.now:
+        samples.append(worktree_sample(repo))
+    if not samples:
+        raise TenureError("no commits to scan")
+
+    grain = args.grain
+    split_holders = not args.boolean
+    values, witnesses, echo_rows, probes = probe_stack(
+        repo,
+        samples,
+        target=key,
+        seeds=seeds,
+        pin_path=pin_path,
+        grain=grain,
+        with_fn=with_fn,
+    )
+    eras = compress(
+        samples, values, witnesses, split_holders=split_holders, echoes=echo_rows
+    )
+    commit_pairs = [(s, v) for s, v in zip(samples, values) if s.kind == "commit"]
+    true_commits = sum(1 for _, v in commit_pairs if v)
+    scanned = sum(1 for s in samples if s.kind == "commit")
+    holds_now = bool(values[-1]) if values else False
+    never_held = not any(values)
+    always_held = bool(values) and all(values)
+    boolean_eras = count_boolean_eras(values)
+    ghost_now = bool(eras) and eras[-1].value and eras[-1].kind == "ghost"
+
+    hints: list[str] = []
+    if ghost_now:
+        last = eras[-1]
+        hints.append(
+            "now=TRUE only as a test/doc occupant ("
+            + ", ".join(last.holders[:4])
+            + "); production left this stack"
+        )
+        deeper = [e for e in last.echoes if e.get("kind") == "deeper"]
+        if deeper:
+            d = deeper[0]
+            hints.append(
+                f"{d.get('holder')} now sits in a deeper stack: {d.get('stack')}"
+            )
+    if never_held and not args.full:
+        hints.append(
+            "never held on first-parent. if the pin was born off the mainline, rerun with --full"
+        )
+
+    reachable = count_reachable(repo, args.rev_range or args.rev)
+    pin = f"{pin_path}:{line}"
+    fn = function_of(loc)
+    if fn:
+        pin = f"{pin} in {fn}"
+
+    return Report(
+        repo=repo,
+        predicate=cond_label(key),
+        pin=pin,
+        end_rev=args.rev,
+        first_parent=not args.full,
+        include_now=bool(args.now),
+        holds_now=holds_now,
+        never_held=never_held,
+        always_held=always_held,
+        commits_scanned=scanned,
+        reachable=reachable,
+        probes=probes,
+        true_commits=true_commits,
+        eras=eras,
+        boolean_eras=boolean_eras,
+        grain=grain,
+        split_holders=split_holders,
+        ghost_now=ghost_now,
+        with_fn=with_fn,
+        cond_frames=[{"kind": k, "pred": p} for k, p in key],
+        hints=hints,
+        warnings=warnings,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.selftest:
+        return selftest()
+    try:
+        if not args.targets:
+            raise TenureError("usage: tenure FILE:LINE")
+        report = build_report(args)
+    except TenureError as exc:
+        eprint(f"tenure: {exc}")
+        return exc.code
+
+    if args.quiet:
+        return 0 if report.holds_now else 1
+    if args.json:
+        print(json.dumps(report_to_json(report), ensure_ascii=False, indent=2))
+    elif args.oneline:
+        print(format_oneline(report))
+    elif args.revs:
+        for era in report.eras:
+            if not era.value:
+                continue
+            # print each commit sha in the era would need the samples; bounds instead
+            print(f"{era.start.sha} {era.end.sha}")
+    elif args.bounds:
+        print(format_bounds(report, only_true=False))
+    elif args.true_bounds:
+        print(format_bounds(report, only_true=True))
+    else:
+        print(
+            format_human(
+                report,
+                color=color_enabled(args),
+                show_witnesses=not args.no_witnesses,
+            )
+        )
+    return 0 if report.holds_now else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

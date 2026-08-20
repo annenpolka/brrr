@@ -1,0 +1,2058 @@
+#!/usr/bin/env python3
+"""invert — inverse printf as a Unix filter, with named hole bindings.
+
+Runtime string(s) on argv or stdin. Templates on --templates FILE
+or the other side of the pipe. No repository walk.
+
+Sluice-shaped: discovery is the producer's job (rg, git grep, git log -p).
+Harvested from unfmt-13's empirical misses, not its source: keep hole
+names, match timestamp prefixes as a span, and do not tax many holes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "0.2.0"
+
+SOURCE_EXTS = {
+    ".rs": "rust",
+    ".ts": "js",
+    ".tsx": "js",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".py": "py",
+    ".pyi": "py",
+    ".go": "go",
+    ".swift": "swift",
+    ".c": "c",
+    ".h": "c",
+    ".hh": "c",
+    ".cc": "c",
+    ".cpp": "c",
+    ".cxx": "c",
+    ".hpp": "c",
+    ".java": "java",
+    ".kt": "kt",
+    ".kts": "kt",
+    ".rb": "rb",
+    ".cs": "cs",
+    ".zig": "zig",
+    ".sh": "sh",
+    ".bash": "sh",
+    ".zsh": "sh",
+}
+
+MAX_FILE_BYTES = 2_000_000
+MIN_STATIC_EXACT = 4
+MIN_STATIC_PREFIX = 10
+MIN_STATIC_INFIX = 16
+MIN_STATIC_HOLE = 6
+DEFAULT_MIN_SCORE = 0.34
+DEFAULT_MAX_HITS = 5
+MAX_NOHOLE_CHARS = 280
+SWIFT_CONTINUATION_RE = re.compile(r"\\[ \t]*\n[ \t]*")
+TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|specs?|__tests__|__mocks__)(?:/|$)|"
+    r"\.(?:test|spec)\.|_test\.|_tests\.|Tests/",
+    re.I,
+)
+DATA_LITERAL_RE = re.compile(r"""^\s*[{\[]\s*(?:"|\{|\[|\d)""")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+PRINTF_RE = re.compile(
+    r"%(?:%|[-+0 #]*\d*(?:\.\d+)?(?:hh|h|ll|l|z|j|t|L)?[sdifugGxXeEpc@voOqTwWcS])"
+)
+SKIP_STDIN_RE = re.compile(
+    r"""(?x)
+    ^\s*$
+    |^(Compiling|Checking|Finished|Running|Downloading|Downloaded|
+       Installing|Updating|Fetching|Resolving|Auditing)\b
+    |^test\ result:
+    |^running\ \d+\ tests
+    |^\s*test\ .*\ \.\.\.\ (ok|ignored|FAILED)?
+    |^\[created\ [^\]]+\]\s*$
+    """
+)
+INDEX_RE = re.compile(
+    r"^(?P<path>.*?):(?P<line>\d+):(?P<col>\d+):\s*"
+    r"lang=(?P<lang>\S+)\s+holes=(?P<holes>\d+)\s+"
+    r"(?:static=\d+\s+)?(?P<tmpl>.*)$"
+)
+GREP_RE = re.compile(
+    r"^(?P<path>.+?):(?P<line>\d+):(?:(?P<col>\d{1,4}):)?(?P<text>.*)$"
+)
+PATCH_HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
+HINT = (
+    "invert does not walk a repository. Feed it templates:\n"
+    "  rg -n --type rust 'format!|anyhow!' src | invert 'runtime string'\n"
+    "  rg -l --type rust 'format!' src | invert --files - 'runtime string'\n"
+    "  git -C repo grep -n -e 'format!' -- '*.rs' | invert --chdir repo '…'\n"
+    "  git log -p -S 'failed:' -- src | invert '…'\n"
+    "  invert --templates extracted.txt --any < build.log"
+)
+
+
+@dataclass(frozen=True)
+class Template:
+    path: str
+    line: int
+    col: int
+    lang: str
+    raw: str
+    parts: tuple[str, ...]
+    holes: int
+    origin: str = "line"
+    names: tuple[str, ...] = ()
+    hint_line: int | None = None
+
+    @property
+    def static_len(self) -> int:
+        return sum(len(p) for p in self.parts)
+
+    @property
+    def hole_names(self) -> tuple[str, ...]:
+        if self.names and len(self.names) == self.holes:
+            return self.names
+        return tuple(str(i + 1) for i in range(self.holes))
+
+    @property
+    def display(self) -> str:
+        names = self.hole_names
+        out = []
+        for i, p in enumerate(self.parts):
+            if i:
+                name = names[i - 1] if i - 1 < len(names) else ""
+                out.append("{" + name + "}")
+            out.append(p.replace("\n", "\\n").replace("\t", "\\t"))
+        return "".join(out)
+
+
+@dataclass
+class Hit:
+    template: Template
+    score: float
+    variant: str
+    prefix: str
+    suffix: str
+    bindings: tuple[tuple[str, str], ...] = ()
+    span: tuple[int, int] | None = None
+
+
+@dataclass
+class StreamState:
+    patch_path: str = ""
+    patch_new_line: int = 0
+    seen_diff: bool = False
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def normalize_query(s: str) -> str:
+    """ANSI and wrapping only. Timestamp / level prefixes are a span, not stripped."""
+    s = strip_ansi(s).replace("\r\n", "\n").replace("\r", "\n")
+    return s.strip()
+
+
+def query_variants(q: str, exact: bool = False) -> list[tuple[str, float, str]]:
+    q = normalize_query(q)
+    if not q:
+        return []
+    out = [(q, 0.0, "full")]
+    if exact:
+        return out
+    parts = re.split(r": ", q)
+    if len(parts) > 1:
+        for i in range(1, len(parts)):
+            suf = ": ".join(parts[i:])
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.04 * i, f"suffix:{i}"))
+    for sep, name in ((" — ", "emdash"), (" - ", "dash")):
+        if sep in q:
+            suf = q.split(sep, 1)[1]
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.05, name))
+    seen: set[str] = set()
+    uniq = []
+    for item in out:
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        uniq.append(item)
+    return uniq
+
+
+def unescape_basic(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    escapes = {
+        "n": "\n",
+        "t": "\t",
+        "r": "\r",
+        "0": "\0",
+        "\\": "\\",
+        '"': '"',
+        "'": "'",
+        "`": "`",
+    }
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "(":
+                out.append("\\(")
+                i += 2
+                continue
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "x" and i + 3 < n:
+                try:
+                    out.append(chr(int(s[i + 2 : i + 4], 16)))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _matching_brace(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == '"' or ch == "'":
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _matching_paren(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == '"' or ch == "'":
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _is_format_hole(s: str, i: int) -> int | None:
+    if i >= len(s) or s[i] != "{":
+        return None
+    n = len(s)
+    j = i + 1
+    if j < n and s[j] in '{"[ \n\t':
+        return None
+    if j < n and s[j] == "}":
+        return j + 1
+    if j < n and s[j].isdigit():
+        while j < n and s[j].isdigit():
+            j += 1
+    elif j < n and (s[j].isalpha() or s[j] == "_"):
+        while j < n and (s[j].isalnum() or s[j] in "_."):
+            j += 1
+    # Python conversion flags: {name!r} {name!s} {name!a}
+    if j < n and s[j] == "!":
+        j += 1
+        while j < n and s[j].isalpha():
+            j += 1
+    if j < n and s[j] == ":":
+        k = s.find("}", j)
+        if k < 0:
+            return None
+        return k + 1
+    if j < n and s[j] == "}":
+        return j + 1
+    return None
+
+
+def _brace_hole_name(inner: str) -> str:
+    inner = inner.strip()
+    if not inner:
+        return ""
+    if "!" in inner:
+        inner = inner.split("!", 1)[0]
+    if ":" in inner:
+        inner = inner.split(":", 1)[0]
+    return inner.strip()
+
+
+def _swift_hole_name(inner: str) -> str:
+    """Leading identifier path; Swift Logger `privacy:` is not a name."""
+    s = inner.strip()
+    if not s:
+        return ""
+    m = re.match(
+        r"((?:self\.)?[A-Za-z_][A-Za-z0-9_]*|(?:\#)[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:[.#][A-Za-z_][A-Za-z0-9_]*)*",
+        s,
+    )
+    if m:
+        return m.group(0)
+    return s.split(",", 1)[0].strip()[:48]
+
+
+def _dollar_hole_name(inner: str) -> str:
+    s = inner.strip()
+    if not s:
+        return ""
+    return s
+
+
+def _assign_hole_names(raw: list[str]) -> tuple[str, ...]:
+    n = 1
+    out: list[str] = []
+    for name in raw:
+        if name:
+            out.append(name)
+        else:
+            out.append(str(n))
+            n += 1
+    return tuple(out)
+
+
+def swift_string_value(raw: str) -> str:
+    s = SWIFT_CONTINUATION_RE.sub("", raw)
+    if "\n" not in s:
+        return s
+    if s.startswith("\n"):
+        s = s[1:]
+    lines = s.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty:
+        cut = min(len(ln) - len(ln.lstrip(" \t")) for ln in nonempty)
+        lines = [ln[cut:] if len(ln) >= cut else ln for ln in lines]
+    return "\n".join(lines).strip()
+
+
+def looks_like_data_literal(body: str, holes: int) -> bool:
+    if holes:
+        return False
+    s = body.strip()
+    if len(s) >= MAX_NOHOLE_CHARS:
+        return True
+    if DATA_LITERAL_RE.match(s) and (":" in s or "," in s):
+        return True
+    return False
+
+
+def is_test_path(path: str) -> bool:
+    return bool(TEST_PATH_RE.search(path.replace("\\", "/")))
+
+
+def tokenize_named(s: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    buf: list[str] = []
+    parts: list[str] = []
+    raw_names: list[str] = []
+    i = 0
+    n = len(s)
+
+    def flush() -> None:
+        parts.append("".join(buf))
+        buf.clear()
+
+    while i < n:
+        if s.startswith("{{", i):
+            buf.append("{")
+            i += 2
+            continue
+        if s.startswith("}}", i):
+            buf.append("}")
+            i += 2
+            continue
+        if s.startswith("%%", i):
+            buf.append("%")
+            i += 2
+            continue
+        if s.startswith("${", i):
+            end = _matching_brace(s, i + 1)
+            if end is not None:
+                flush()
+                raw_names.append(_dollar_hole_name(s[i + 2 : end]))
+                i = end + 1
+                continue
+        if s.startswith("\\(", i):
+            end = _matching_paren(s, i + 1)
+            if end is not None:
+                flush()
+                raw_names.append(_swift_hole_name(s[i + 2 : end]))
+                i = end + 1
+                continue
+        if s[i] == "{":
+            end = _is_format_hole(s, i)
+            if end is not None:
+                flush()
+                raw_names.append(_brace_hole_name(s[i + 1 : end - 1]))
+                i = end
+                continue
+        m = PRINTF_RE.match(s, i)
+        if m:
+            if m.group(0) == "%%":
+                buf.append("%")
+                i = m.end()
+                continue
+            flush()
+            raw_names.append("")
+            i = m.end()
+            continue
+        buf.append(s[i])
+        i += 1
+    flush()
+    return tuple(parts), _assign_hole_names(raw_names)
+
+
+def tokenize_template(s: str) -> tuple[tuple[str, ...], int]:
+    parts, names = tokenize_named(s)
+    return parts, len(names)
+
+
+def template_of(
+    path: str,
+    line: int,
+    col: int,
+    lang: str,
+    raw: str,
+    origin: str = "line",
+    parts: tuple[str, ...] | None = None,
+    names: tuple[str, ...] | None = None,
+    hint_line: int | None = None,
+) -> Template:
+    if parts is None or names is None:
+        parts, names = tokenize_named(raw)
+    return Template(
+        path=path,
+        line=line,
+        col=col,
+        lang=lang,
+        raw=raw,
+        parts=parts,
+        holes=len(names),
+        origin=origin,
+        names=names,
+        hint_line=hint_line,
+    )
+
+
+def _line_starts(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _linecol(starts: list[int], index: int) -> tuple[int, int]:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= index:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    line_idx = hi
+    return line_idx + 1, index - starts[line_idx] + 1
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] != "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    n = len(text)
+    i += 2
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        i += 1
+    return min(n, i + 2)
+
+
+def _read_quoted(
+    text: str, i: int, quote: str, interpolations: bool = False
+) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    start = i
+    while i < n:
+        if interpolations and text.startswith("\\(", i):
+            end = _matching_paren(text, i + 1)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1, text[start:i]
+        if ch == "\n" and quote != "`":
+            return None
+        i += 1
+    return None
+
+
+def _read_raw_hash(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    start = i
+    close = '"' + ("#" * hashes)
+    while i < n:
+        if text.startswith(close, i):
+            return i + len(close), text[start:i]
+        i += 1
+    return None
+
+
+def _read_triple(
+    text: str, i: int, quote: str, interpolations: bool = False
+) -> tuple[int, str] | None:
+    delim = quote * 3
+    if not text.startswith(delim, i):
+        return None
+    i += 3
+    start = i
+    n = len(text)
+    while i + 2 < n:
+        if interpolations and text.startswith("\\(", i):
+            end = _matching_paren(text, i + 1)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if text.startswith(delim, i):
+            return i + 3, text[start:i]
+        if text[i] == "\\":
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _read_js_template(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    chunks: list[str] = []
+    last = i
+    depth_expr = 0
+    in_expr = False
+    while i < n:
+        ch = text[i]
+        if not in_expr:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                chunks.append(text[last:i])
+                return i + 1, "".join(chunks)
+            if ch == "$" and i + 1 < n and text[i + 1] == "{":
+                chunks.append(text[last:i])
+                chunks.append("${")
+                i += 2
+                last = i
+                in_expr = True
+                depth_expr = 1
+                continue
+            i += 1
+            continue
+        if ch == "{":
+            depth_expr += 1
+        elif ch == "}":
+            depth_expr -= 1
+            if depth_expr == 0:
+                chunks.append(text[last:i])
+                chunks.append("}")
+                i += 1
+                last = i
+                in_expr = False
+                continue
+        elif ch in ('"', "'", "`"):
+            q = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return None
+
+
+def lang_for(path: str | Path, default: str = "any") -> str:
+    suf = Path(str(path)).suffix.lower()
+    return SOURCE_EXTS.get(suf, default)
+
+
+def looks_like_source_path(s: str) -> bool:
+    name = Path(s).name
+    if name.endswith(tuple(SOURCE_EXTS)):
+        return True
+    if "/" in s or s.startswith("./") or s.startswith("../"):
+        return Path(s).suffix.lower() in SOURCE_EXTS or bool(Path(s).suffix)
+    return False
+
+
+def extract_templates(text: str, lang: str, path: str, origin: str = "file") -> list[Template]:
+    starts = _line_starts(text)
+    n = len(text)
+    i = 0
+    out: list[Template] = []
+    any_lang = lang in {"any", ""}
+    rustish = lang == "rust" or any_lang
+    pyish = lang == "py" or any_lang
+    jsish = lang == "js" or any_lang
+    goish = lang == "go" or any_lang
+    swiftish = lang == "swift" or any_lang
+    hash_comment = lang in {"py", "sh", "rb"}
+
+    def emit(raw_inner: str, at: int, unesc: bool) -> None:
+        body = raw_inner
+        if lang == "swift" or (any_lang and ("\\(" in body or "\\\n" in body)):
+            body = swift_string_value(body)
+        if unesc:
+            body = unescape_basic(body)
+        if not body or body.isspace():
+            return
+        if body.endswith("\r\n"):
+            body = body[:-2]
+        elif body.endswith("\n"):
+            body = body[:-1]
+        if len(body.strip()) < MIN_STATIC_EXACT:
+            return
+        parts, names = tokenize_named(body)
+        holes = len(names)
+        if looks_like_data_literal(body, holes):
+            return
+        if holes == 0 and sum(len(p) for p in parts) < MIN_STATIC_EXACT:
+            return
+        line, col = _linecol(starts, at)
+        out.append(
+            template_of(
+                path=path,
+                line=line,
+                col=col,
+                lang=lang if lang and lang != "any" else lang_for(path),
+                raw=body,
+                origin=origin,
+                parts=parts,
+                names=names,
+            )
+        )
+
+    while i < n:
+        ch = text[i]
+        if hash_comment and ch == "#":
+            i = _skip_line_comment(text, i)
+            continue
+        if lang != "py" and ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i = _skip_line_comment(text, i)
+                continue
+            if text[i + 1] == "*":
+                i = _skip_block_comment(text, i)
+                continue
+        if rustish and ch in {"r", "b", "c"}:
+            j = i
+            if text[j] in {"b", "c"}:
+                j += 1
+            if j < n and text[j] == "r":
+                j += 1
+                got = _read_raw_hash(text, j)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=False)
+                    i = end
+                    continue
+        if pyish and ch.isalpha():
+            j = i
+            while j < n and text[j] in "rRfFbBuU":
+                j += 1
+            if j > i and j < n and text[j] in {'"', "'"}:
+                is_raw = any(c in "rR" for c in text[i:j])
+                if text.startswith(text[j] * 3, j):
+                    got = _read_triple(text, j, text[j], interpolations=False)
+                else:
+                    got = _read_quoted(text, j, text[j], interpolations=False)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=not is_raw)
+                    i = end
+                    continue
+        if (goish or jsish) and ch == "`":
+            if jsish or "${" in text[i : i + 400]:
+                got = _read_js_template(text, i)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=True)
+                    i = end
+                    continue
+            if goish:
+                j = text.find("`", i + 1)
+                if j >= 0:
+                    emit(text[i + 1 : j], i, unesc=False)
+                    i = j + 1
+                    continue
+        if ch in {'"', "'"} and text.startswith(ch * 3, i):
+            got = _read_triple(text, i, ch, interpolations=swiftish or "\\(" in text[i : i + 80])
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        if ch == '"' or (ch == "'" and lang in {"js", "py", "sh", "rb", "go", "java", "kt", "c", "any", ""}):
+            got = _read_quoted(
+                text, i, ch, interpolations=swiftish or text.startswith("\\(", i + 1)
+            )
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        i += 1
+    return out
+
+
+def _align_parts(
+    parts: tuple[str, ...], query: str
+) -> tuple[str, str, list[tuple[int, int]], int, int] | None:
+    """Locate nonempty literals. Returns prefix, suffix, (start,end) per part, span."""
+    loc: list[tuple[int, int]] = []
+    pos = 0
+    first = True
+    prefix = ""
+    span_start = 0
+    for part in parts:
+        if part == "":
+            loc.append((-1, -1))
+            continue
+        idx = query.find(part, pos)
+        if idx < 0:
+            return None
+        if first:
+            prefix = query[:idx]
+            span_start = idx
+            first = False
+        loc.append((idx, idx + len(part)))
+        pos = idx + len(part)
+    if first:
+        return None
+    if parts[0] == "":
+        # leading hole owns the start of the query; not a leftover prefix
+        prefix = ""
+        span_start = 0
+    suffix = query[pos:] if pos <= len(query) else ""
+    span_end = len(query) if parts[-1] == "" else pos
+    return prefix, suffix, loc, span_start, span_end
+
+
+def match_template(
+    tmpl: Template, query: str
+) -> tuple[float, str, str, tuple[tuple[str, str], ...], tuple[int, int]] | None:
+    parts = tmpl.parts
+    names = tmpl.hole_names
+    static = tmpl.static_len
+    if tmpl.holes == 0:
+        body = parts[0] if parts else ""
+        if not body or body.isspace():
+            return None
+        if body == query:
+            return 1.0, "", "", (), (0, len(query))
+        if query.startswith(body) and static >= MIN_STATIC_PREFIX:
+            suffix = query[len(body) :]
+            score = _rank_score(static, query, "", suffix, 0)
+            if score <= 0:
+                return None
+            return score, "", suffix, (), (0, len(body))
+        idx = query.find(body)
+        if idx >= 0 and static >= MIN_STATIC_INFIX:
+            prefix = query[:idx]
+            suffix = query[idx + len(body) :]
+            coverage = static / max(len(query), 1)
+            if coverage < 0.25 and static < 24:
+                return None
+            score = _rank_score(static, query, prefix, suffix, 0)
+            if score <= 0:
+                return None
+            return score, prefix, suffix, (), (idx, idx + len(body))
+        return None
+
+    min_static = MIN_STATIC_HOLE
+    if tmpl.holes >= 2 and any(len(p) >= 4 for p in parts):
+        min_static = 5
+    if static < min_static:
+        return None
+
+    aligned = _align_parts(parts, query)
+    if aligned is None:
+        return None
+    prefix, suffix, loc, span_start, span_end = aligned
+    first_lit = next((p for p in parts if p), "")
+    if first_lit and len(first_lit) < 4 and static < 16:
+        return None
+    if parts[-1] and len(suffix) > max(24, static):
+        return None
+
+    bindings: list[tuple[str, str]] = []
+    n_holes = len(parts) - 1
+    for j in range(n_holes):
+        name = names[j] if j < len(names) else str(j + 1)
+        left = loc[j]
+        right = loc[j + 1]
+        if left[0] >= 0:
+            hole_start = left[1]
+        elif j == 0:
+            hole_start = 0
+        else:
+            hole_start = loc[j - 1][1] if loc[j - 1][0] >= 0 else 0
+        if right[0] >= 0:
+            hole_end = right[0]
+        else:
+            hole_end = len(query)
+        bindings.append((name, query[hole_start:hole_end]))
+    trailing_hole = parts[-1] == ""
+    if trailing_hole:
+        suffix = ""
+
+    score = _rank_score(static, query, prefix, suffix, tmpl.holes)
+    return score, prefix, suffix, tuple(bindings), (span_start, span_end)
+
+
+def _rank_score(
+    static: int, query: str, prefix: str, suffix: str, holes: int
+) -> float:
+    """Reward query coverage and literal uniqueness. Do not tax holes.
+
+    A 7-hole Logger line that explains the whole paste beats a 1-hole
+    `error: {}` and a short static fragment that happens to be a substring.
+    """
+    qn = max(len(query), 1)
+    leftover = len(prefix) + len(suffix)
+    explained = max(qn - leftover, 0) / qn
+    uniqueness = min(static / qn, 1.0)
+    hole_reward = 0.03 * min(holes, 7)
+    score = 0.55 * explained + 0.32 * uniqueness + hole_reward + 0.10 * min(static / 40.0, 1.0)
+    if leftover == 0 and holes == 0 and static == len(query):
+        score = max(score, 1.0)
+    # Short static fragments as a substring of a longer paste are decoys.
+    # Holed templates already have MIN_STATIC_HOLE; do not apply that floor.
+    if leftover and holes == 0 and static < MIN_STATIC_INFIX:
+        return 0.0
+    return min(score, 1.25)
+
+
+def score_query(tmpl: Template, query: str, exact: bool = False) -> Hit | None:
+    best: Hit | None = None
+    for variant, penalty, tag in query_variants(query, exact=exact):
+        got = match_template(tmpl, variant)
+        if got is None:
+            continue
+        score, prefix, suffix, bindings, span = got
+        if exact and (prefix or suffix):
+            continue
+        if score <= 0:
+            continue
+        score = max(0.0, score - penalty)
+        via = "span" if prefix and tag == "full" else tag
+        if best is None or score > best.score:
+            best = Hit(
+                template=tmpl,
+                score=score,
+                variant=via,
+                prefix=prefix,
+                suffix=suffix,
+                bindings=bindings,
+                span=span,
+            )
+    return best
+
+
+def search(
+    templates: list[Template],
+    query: str,
+    min_score: float,
+    limit: int,
+    exact: bool = False,
+) -> list[Hit]:
+    q = normalize_query(query)
+    if not q:
+        return []
+    hits: list[Hit] = []
+    for tmpl in templates:
+        hit = score_query(tmpl, q, exact=exact)
+        if hit is None or hit.score < min_score:
+            continue
+        if tmpl.hint_line is not None:
+            dist = abs(tmpl.line - tmpl.hint_line)
+            if dist == 0:
+                hit.score += 0.06
+            elif dist < 8:
+                hit.score += 0.02
+        hits.append(hit)
+    hits.sort(
+        key=lambda h: (
+            -h.score,
+            is_test_path(h.template.path),
+            -h.template.static_len,
+            -h.template.holes,
+            h.template.path,
+            h.template.line,
+        )
+    )
+    return hits[:limit]
+
+
+def format_hit(query: str, hit: Hit) -> str:
+    t = hit.template
+    lines = [
+        f"{t.path}:{t.line}:{t.col}: score={hit.score:.2f} lang={t.lang} "
+        f"holes={t.holes} via={hit.variant} from={t.origin}",
+        f"  query: {normalize_query(query)}",
+        f"  tmpl:  {t.display}",
+    ]
+    for name, value in hit.bindings:
+        lines.append(f"  {{{name}}} = {value}")
+    if hit.prefix:
+        lines.append(f"  prefix: {hit.prefix}")
+    if hit.span:
+        lines.append(f"  span={hit.span[0]}-{hit.span[1]}")
+    if hit.variant != "full" or (hit.suffix and t.holes == 0):
+        extra = []
+        if hit.variant != "full":
+            extra.append(f"via {hit.variant}")
+        if hit.suffix and t.holes == 0:
+            extra.append(f"suffix={hit.suffix!r}")
+        if extra:
+            lines.append("  note:  " + "; ".join(extra))
+    return "\n".join(lines)
+
+
+def hit_json(query: str, hit: Hit) -> dict:
+    t = hit.template
+    return {
+        "path": t.path,
+        "line": t.line,
+        "col": t.col,
+        "lang": t.lang,
+        "holes": t.holes,
+        "score": round(hit.score, 4),
+        "via": hit.variant,
+        "from": t.origin,
+        "template": t.display,
+        "raw": t.raw,
+        "query": normalize_query(query),
+        "prefix": hit.prefix,
+        "suffix": hit.suffix,
+        "span": list(hit.span) if hit.span else None,
+        "bindings": [{"name": n, "value": v} for n, v in hit.bindings],
+    }
+
+
+def iter_stdin_queries(text: str) -> list[str]:
+    queries = []
+    for line in text.splitlines():
+        line = strip_ansi(line).rstrip()
+        if SKIP_STDIN_RE.match(line):
+            continue
+        cleaned = normalize_query(line)
+        if len(cleaned) < MIN_STATIC_HOLE:
+            continue
+        queries.append(line)
+    return queries
+
+
+def die_no_walk(path: str | Path) -> None:
+    print(f"invert: refusing to walk directory: {path}", file=sys.stderr)
+    print(HINT, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def fragment_to_template(text: str, path: str, line: int, lang: str) -> Template | None:
+    body = text.strip()
+    if body.endswith("\\"):
+        body = body[:-1].rstrip()
+    if body.startswith(("+", "-", " ")) and not body.startswith(("---", "+++")):
+        # leftover patch marker; callers usually strip already
+        pass
+    if not body or len(body) < MIN_STATIC_EXACT:
+        return None
+    if "\\(" in body or "\n" in body:
+        body = swift_string_value(body)
+    if "\\" in body:
+        body = unescape_basic(body)
+    if body.endswith("\n"):
+        body = body[:-1]
+    if looks_like_data_literal(body, 0):
+        return None
+    parts, names = tokenize_named(body)
+    holes = len(names)
+    if looks_like_data_literal(body, holes):
+        return None
+    if holes == 0 and sum(len(p) for p in parts) < MIN_STATIC_EXACT:
+        return None
+    return template_of(
+        path=path or "-",
+        line=max(line, 1),
+        col=1,
+        lang=lang if lang and lang != "any" else lang_for(path),
+        raw=body,
+        origin="fragment",
+        parts=parts,
+        names=names,
+    )
+
+
+def templates_from_text(
+    text: str,
+    path: str,
+    lang: str,
+    line: int = 1,
+    origin: str = "line",
+) -> list[Template]:
+    found = extract_templates(text, lang or lang_for(path), path or "-", origin=origin)
+    if found:
+        if line > 1 and text.count("\n") == 0:
+            # extract_templates thinks this is a one-line file; rebase to grep/patch line
+            found = [
+                template_of(
+                    path=t.path,
+                    line=line,
+                    col=t.col,
+                    lang=t.lang,
+                    raw=t.raw,
+                    origin=t.origin,
+                    parts=t.parts,
+                    names=t.names,
+                    hint_line=line,
+                )
+                for t in found
+            ]
+        return found
+    frag = fragment_to_template(text, path, line, lang or lang_for(path))
+    return [frag] if frag else []
+
+
+def _file_cache() -> dict[str, list[Template]]:
+    cache = getattr(_file_cache, "_c", None)
+    if cache is None:
+        cache = {}
+        setattr(_file_cache, "_c", cache)
+    return cache
+
+
+def extract_from_file(
+    path: Path,
+    lang: str | None = None,
+    display_path: str | None = None,
+    hint_line: int | None = None,
+) -> list[Template]:
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
+    cache = _file_cache()
+    if key not in cache:
+        try:
+            st = path.stat()
+        except OSError:
+            cache[key] = []
+            return []
+        if st.st_size == 0 or st.st_size > MAX_FILE_BYTES:
+            cache[key] = []
+            return []
+        try:
+            data = path.read_bytes()
+        except OSError:
+            cache[key] = []
+            return []
+        if b"\x00" in data[:8192]:
+            cache[key] = []
+            return []
+        text = data.decode("utf-8", "replace")
+        use_lang = lang or lang_for(path)
+        cache[key] = extract_templates(text, use_lang, key, origin="file")
+    label = display_path or str(path)
+    out: list[Template] = []
+    for t in cache[key]:
+        use_hint = hint_line if hint_line is not None else t.hint_line
+        if t.path == label and t.hint_line == use_hint:
+            out.append(t)
+            continue
+        out.append(
+            template_of(
+                path=label,
+                line=t.line,
+                col=t.col,
+                lang=t.lang,
+                raw=t.raw,
+                origin="file",
+                parts=t.parts,
+                names=t.names,
+                hint_line=use_hint,
+            )
+        )
+    return out
+
+
+def resolve_stream_path(path: str, chdir: Path | None) -> Path | None:
+    if not path or path in {"-", "/dev/null"}:
+        return None
+    candidates = []
+    p = Path(path)
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        if chdir is not None:
+            candidates.append(chdir / path)
+        candidates.append(p)
+    for cand in candidates:
+        try:
+            if cand.is_dir():
+                return None
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def line_incomplete(text: str) -> bool:
+    s = (text or "").rstrip()
+    if s.endswith("\\"):
+        return True
+    if '"""' in s or "'''" in s:
+        return True
+    return False
+
+
+def hydrate(
+    tmpls: list[Template],
+    path: str,
+    text: str,
+    origin: str,
+    open_mode: str,
+    chdir: Path | None,
+    lang: str,
+) -> list[Template]:
+    """Replace a grep/path record with templates from the named file, if we can open it.
+
+    Patch/raw/index stay stream-pure unless --open always. auto opens files
+    named by grep / rg-json / path records (the producer selected them).
+    """
+    if open_mode == "never":
+        return tmpls
+    if origin in {"patch", "raw", "index", "jsonl", "slurp"} and open_mode != "always":
+        return tmpls
+    if open_mode == "auto" and origin not in {"grep", "rg-json", "files", "fragment", "file"}:
+        if not (tmpls and tmpls[0].origin == "fragment") and not line_incomplete(text):
+            return tmpls
+    resolved = resolve_stream_path(path, chdir)
+    if resolved is None:
+        return tmpls
+    hint_line = None
+    if tmpls:
+        hint_line = tmpls[0].line
+    opened = extract_from_file(
+        resolved,
+        None if lang in {"", "any", None} else lang,
+        display_path=path,
+        hint_line=hint_line,
+    )
+    return opened if opened else tmpls
+
+
+def ingest_path_line(
+    raw: str, default_lang: str, chdir: Path | None = None
+) -> list[Template] | None:
+    s = raw.strip()
+    if not s:
+        return []
+    probe = Path(s) if Path(s).is_absolute() else ((chdir / s) if chdir is not None else Path(s))
+    try:
+        if probe.is_dir() or Path(s).is_dir():
+            die_no_walk(probe if probe.is_dir() else Path(s))
+    except OSError:
+        pass
+    resolved = resolve_stream_path(s, chdir)
+    if resolved is None:
+        return None
+    if not (lang_for(resolved, default="") or default_lang not in {"", "any"}):
+        return None
+    return extract_from_file(
+        resolved,
+        None if default_lang in {"", "any"} else default_lang,
+        display_path=s,
+    )
+
+
+def parse_json_record(line: str) -> list[Template] | None:
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    # rg --json
+    if obj.get("type") == "match" and isinstance(obj.get("data"), dict):
+        data = obj["data"]
+        path_obj = data.get("path") or {}
+        path = path_obj.get("text") or path_obj.get("absolute") or ""
+        line_no = int(data.get("line_number") or 1)
+        text = (data.get("lines") or {}).get("text") or ""
+        return templates_from_text(text.rstrip("\n"), path, lang_for(path), line_no, origin="rg-json")
+    if obj.get("type") in {"begin", "end", "summary", "context"}:
+        return []
+    raw = obj.get("raw") or obj.get("template") or obj.get("text") or obj.get("tmpl")
+    if raw is None:
+        return None
+    path = str(obj.get("path") or "-")
+    line_no = int(obj.get("line") or 1)
+    col = int(obj.get("col") or 1)
+    lang = str(obj.get("lang") or lang_for(path))
+    body = str(raw)
+    if obj.get("template") and not obj.get("raw"):
+        body = str(obj["template"])
+    parts, names = tokenize_named(body)
+    return [
+        template_of(
+            path=path,
+            line=line_no,
+            col=col,
+            lang=lang,
+            raw=body,
+            origin="jsonl",
+            parts=parts,
+            names=names,
+        )
+    ]
+
+
+def _patch_path_from_header(line: str) -> str:
+    # diff --git a/foo.rs b/foo.rs
+    parts = line.split()
+    if len(parts) >= 4:
+        b = parts[3]
+        return b[2:] if b.startswith("b/") else b
+    return ""
+
+
+def ingest_line(
+    line: str,
+    state: StreamState,
+    default_lang: str,
+    force: str,
+    origin_label: str,
+    open_mode: str = "auto",
+    chdir: Path | None = None,
+) -> list[Template]:
+    raw = line.rstrip("\n")
+    if raw.endswith("\r"):
+        raw = raw[:-1]
+    if not raw:
+        return []
+
+    if force == "raw":
+        frag = fragment_to_template(raw, origin_label, 1, default_lang)
+        return [frag] if frag else []
+
+    if force in {"jsonl", "rg-json"} or (force == "auto" and raw[:1] == "{"):
+        got = parse_json_record(raw)
+        if got is not None:
+            if got and got[0].origin == "rg-json":
+                return hydrate(
+                    got, got[0].path, raw, "rg-json", open_mode, chdir, default_lang
+                )
+            return got
+        if force in {"jsonl", "rg-json"}:
+            return []
+
+    if force in {"auto", "index"}:
+        m = INDEX_RE.match(raw)
+        if m:
+            body = m.group("tmpl")
+            parts, names = tokenize_named(body)
+            return [
+                template_of(
+                    path=m.group("path"),
+                    line=int(m.group("line")),
+                    col=int(m.group("col")),
+                    lang=m.group("lang"),
+                    raw=body,
+                    origin="index",
+                    parts=parts,
+                    names=names,
+                )
+            ]
+
+    # unified diff headers / hunks — keep state even in auto
+    if force in {"auto", "patch"}:
+        if raw.startswith("diff --git "):
+            state.seen_diff = True
+            state.patch_path = _patch_path_from_header(raw)
+            return []
+        if raw.startswith("+++ "):
+            rest = raw[4:]
+            if rest.startswith("b/"):
+                rest = rest[2:]
+            if rest != "/dev/null":
+                state.patch_path = rest
+            return []
+        if raw.startswith("--- "):
+            return []
+        mh = PATCH_HUNK_RE.match(raw)
+        if mh:
+            state.patch_new_line = int(mh.group(2))
+            return []
+        if raw.startswith("+") and not raw.startswith("+++"):
+            text = raw[1:]
+            path = state.patch_path or origin_label
+            line_no = state.patch_new_line or 1
+            state.patch_new_line = line_no + 1
+            tmpls = templates_from_text(
+                text, path, default_lang or lang_for(path), line_no, origin="patch"
+            )
+            return hydrate(tmpls, path, text, "patch", open_mode, chdir, default_lang)
+        if raw.startswith("-") and not raw.startswith("---"):
+            return []
+        if state.seen_diff and raw.startswith(" "):
+            text = raw[1:]
+            path = state.patch_path or origin_label
+            line_no = state.patch_new_line or 1
+            state.patch_new_line = line_no + 1
+            tmpls = templates_from_text(
+                text, path, default_lang or lang_for(path), line_no, origin="patch"
+            )
+            return hydrate(tmpls, path, text, "patch", open_mode, chdir, default_lang)
+
+    if force in {"auto", "files"}:
+        as_path = ingest_path_line(raw, default_lang, chdir=chdir)
+        if as_path is not None:
+            return as_path
+
+    if force in {"auto", "grep"}:
+        m = GREP_RE.match(raw)
+        if m:
+            path = m.group("path")
+            exists = resolve_stream_path(path, chdir) is not None
+            if force == "grep" or looks_like_source_path(path) or exists:
+                line_no = int(m.group("line"))
+                text = m.group("text")
+                tmpls = templates_from_text(
+                    text, path, default_lang or lang_for(path), line_no, origin="grep"
+                )
+                return hydrate(tmpls, path, text, "grep", open_mode, chdir, default_lang)
+
+    if force == "grep":
+        return []
+
+    frag = fragment_to_template(raw, origin_label, 1, default_lang)
+    out = [frag] if frag else []
+    return hydrate(out, origin_label, raw, "fragment", open_mode, chdir, default_lang)
+
+
+def ingest_stream(
+    text: str,
+    default_lang: str,
+    force: str,
+    origin_label: str,
+    slurp: bool,
+    nul: bool,
+    open_mode: str = "auto",
+    chdir: Path | None = None,
+) -> list[Template]:
+    if slurp:
+        lang = default_lang if default_lang and default_lang != "any" else lang_for(origin_label)
+        return extract_templates(text, lang, origin_label or "-", origin="slurp")
+    records = text.split("\0") if nul else text.splitlines()
+    state = StreamState()
+    out: list[Template] = []
+    seen: set[tuple] = set()
+    for rec in records:
+        if not rec:
+            continue
+        for t in ingest_line(
+            rec, state, default_lang, force, origin_label, open_mode=open_mode, chdir=chdir
+        ):
+            key = (t.path, t.line, t.col, t.display)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+    return out
+
+
+def load_template_spec(
+    spec: str,
+    default_lang: str,
+    force: str,
+    slurp: bool,
+    nul: bool,
+    stdin_holder: dict,
+    open_mode: str = "auto",
+    chdir: Path | None = None,
+) -> list[Template]:
+    if spec == "-":
+        if stdin_holder.get("used"):
+            print("invert: stdin already consumed (templates vs queries)", file=sys.stderr)
+            raise SystemExit(2)
+        stdin_holder["used"] = True
+        text = sys.stdin.read()
+        return ingest_stream(
+            text, default_lang, force, "-", slurp=slurp, nul=nul, open_mode=open_mode, chdir=chdir
+        )
+    path = Path(spec)
+    if path.is_dir():
+        die_no_walk(path)
+    if not path.exists():
+        print(f"invert: templates not found: {path}", file=sys.stderr)
+        raise SystemExit(2)
+    # A source file given as --templates is a slurp, not a line stream.
+    if lang_for(path, default="") and force == "auto" and not slurp:
+        return extract_from_file(path, None if default_lang in {"", "any"} else default_lang)
+    data = path.read_bytes()
+    if b"\x00" in data[:8192] and not nul:
+        print(f"invert: binary template file: {path} (try -0)", file=sys.stderr)
+        raise SystemExit(2)
+    text = data.decode("utf-8", "replace")
+    return ingest_stream(
+        text,
+        default_lang,
+        force,
+        str(path),
+        slurp=slurp,
+        nul=nul,
+        open_mode=open_mode,
+        chdir=chdir,
+    )
+
+
+def load_files_spec(
+    spec: str,
+    default_lang: str,
+    nul: bool,
+    stdin_holder: dict,
+    chdir: Path | None = None,
+) -> list[Template]:
+    if spec == "-":
+        if stdin_holder.get("used"):
+            print("invert: stdin already consumed", file=sys.stderr)
+            raise SystemExit(2)
+        stdin_holder["used"] = True
+        text = sys.stdin.buffer.read()
+        parts = text.split(b"\0") if nul else text.splitlines()
+        paths = [p.decode("utf-8", "surrogateescape").strip() for p in parts if p.strip()]
+    else:
+        p = Path(spec)
+        if p.is_dir():
+            die_no_walk(p)
+        if p.is_file() and lang_for(p, default=""):
+            return extract_from_file(p, None if default_lang in {"", "any"} else default_lang)
+        print(f"invert: --files expects a path list or a source file, not {spec}", file=sys.stderr)
+        raise SystemExit(2)
+    out: list[Template] = []
+    for raw in paths:
+        if not raw:
+            continue
+        resolved = resolve_stream_path(raw, chdir)
+        if resolved is None:
+            probe = Path(raw) if Path(raw).is_absolute() else ((chdir / raw) if chdir else Path(raw))
+            try:
+                if probe.is_dir():
+                    die_no_walk(probe)
+            except OSError:
+                pass
+            print(f"invert: not a file: {raw}", file=sys.stderr)
+            continue
+        if resolved.is_dir():
+            die_no_walk(resolved)
+        out.extend(
+            extract_from_file(
+                resolved,
+                None if default_lang in {"", "any"} else default_lang,
+                display_path=raw,
+            )
+        )
+    return out
+
+
+def format_index(t: Template) -> str:
+    return (
+        f"{t.path}:{t.line}:{t.col}: lang={t.lang} holes={t.holes} "
+        f"static={t.static_len} {t.display}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="invert",
+        description="Inverse printf as a filter. Templates in, runtime string(s) out with named hole bindings. No tree walk.",
+        epilog=HINT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("messages", nargs="*", help="runtime message(s); '-' reads queries from stdin")
+    p.add_argument(
+        "-e",
+        "--message",
+        action="append",
+        default=[],
+        metavar="MSG",
+        help="runtime message (repeatable; use for strings that look like flags)",
+    )
+    p.add_argument(
+        "-t",
+        "--templates",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="template stream (FILE, or - for stdin). Repeatable.",
+    )
+    p.add_argument(
+        "--files",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="stream of source paths to extract from (FILE or -). Not a walk.",
+    )
+    p.add_argument(
+        "--from",
+        dest="from_fmt",
+        default="auto",
+        choices=["auto", "grep", "raw", "jsonl", "rg-json", "index", "patch", "files"],
+        help="how to parse the template stream (default: auto)",
+    )
+    p.add_argument("--lang", default="any", help="language hint for extraction (default: from path)")
+    p.add_argument("--slurp", action="store_true", help="treat the template stream as one source blob")
+    p.add_argument(
+        "--open",
+        dest="open_mode",
+        default="auto",
+        choices=["auto", "always", "never"],
+        help="open files named by grep/path records (auto: default; never: line-only; always: even patches)",
+    )
+    p.add_argument(
+        "-C",
+        "--chdir",
+        default=None,
+        metavar="DIR",
+        help="resolve relative paths in the stream against DIR (does not walk DIR)",
+    )
+    p.add_argument("-0", "--null", action="store_true", help="NUL-separated template records / --files paths")
+    p.add_argument("-n", "--max", type=int, default=DEFAULT_MAX_HITS, help="max hits per message")
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=DEFAULT_MIN_SCORE,
+        help=f"minimum score (default {DEFAULT_MIN_SCORE})",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument(
+        "--extract",
+        action="store_true",
+        help="print extracted templates and exit (re-readable as --from index / --json)",
+    )
+    p.add_argument("-q", "--quiet", action="store_true", help="exit status only")
+    p.add_argument("--any", action="store_true", help="succeed if any query matches")
+    p.add_argument(
+        "--exact",
+        action="store_true",
+        help="refuse leftover prefix/suffix (timestamp wrappers miss)",
+    )
+    p.add_argument("--selftest", action="store_true", help="run built-in tests")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def run_selftest() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    parts, holes = tokenize_template("git diff single file failed: {}")
+    expect(holes == 1 and parts == ("git diff single file failed: ", ""), f"rust {{}}: {parts} {holes}")
+
+    parts, names = tokenize_named("unparseable `diff --git` header: {rest}")
+    expect(len(names) == 1 and names[0] == "rest" and parts[0].startswith("unparseable"), f"named: {parts} {names}")
+
+    parts, names = tokenize_named("Duplicate event ID: ${snapshot.id}")
+    expect(names == ("snapshot.id",) and parts == ("Duplicate event ID: ", ""), f"js: {parts} {names}")
+
+    parts, names = tokenize_named(
+        "session started profile=\\(self.activeProfile.name, privacy: .private)"
+    )
+    expect(
+        names == ("self.activeProfile.name",) and parts[0] == "session started profile=",
+        f"swift: {parts} {names}",
+    )
+
+    parts, names = tokenize_named("unknown dialect {name!r} at line {n}")
+    expect(names == ("name", "n"), f"py !r: {names}")
+
+    parts, holes = tokenize_template("open %s: %v")
+    expect(holes == 2 and parts == ("open ", ": ", ""), f"printf: {parts} {holes}")
+
+    parts, holes = tokenize_template('{"ok": true}')
+    expect(holes == 0, f"json braces should not be holes: {parts} {holes}")
+
+    parts, holes = tokenize_template("progress {0:.2f}%")
+    expect(holes == 1 and parts == ("progress ", "%"), f"fmt spec: {parts} {holes}")
+
+    rust = """
+        return Err(anyhow!("git diff single file failed: {}", stderr.trim()));
+        // decoy: git diff single file failed: should not be extracted from comment
+        let _ = format!("diff --git a/{display} b/{display}\\n");
+    """
+    tmpls = extract_templates(rust, "rust", "diff.rs")
+    kinds = {t.display for t in tmpls}
+    expect(any("git diff single file failed: {1}" == d for d in kinds), f"extract rust: {kinds}")
+    expect(
+        any(t.holes == 2 and t.display == "diff --git a/{display} b/{display}" for t in tmpls),
+        f"named twice: {kinds}",
+    )
+    expect(all("decoy" not in t.raw for t in tmpls), "comment leaked")
+
+    go = template_of("p.go", 1, 1, "go", "open %s: %v")
+    hit = score_query(go, "open /tmp/x: permission denied")
+    expect(hit is not None and hit.score >= 0.34, f"short printf: {hit}")
+    expect(
+        hit is not None and hit.bindings == (("1", "/tmp/x"), ("2", "permission denied")),
+        f"printf binds: {hit.bindings if hit else None}",
+    )
+
+    t = template_of("a.rs", 1, 1, "rust", "git diff single file failed: {}")
+    hit = score_query(t, "git diff single file failed: fatal: not a git repository")
+    expect(hit is not None and hit.score >= 0.5, f"score filled: {hit}")
+    expect(
+        hit is not None and hit.bindings == (("1", "fatal: not a git repository"),),
+        f"unnamed bind: {hit.bindings if hit else None}",
+    )
+
+    grep_line = (
+        "src/git.rs:2:    Err(format!(\"git diff single file failed: {}\", stderr.trim()))"
+    )
+    got = ingest_stream(grep_line + "\n", "any", "auto", "-", slurp=False, nul=False)
+    expect(
+        any(t.display == "git diff single file failed: {1}" and t.line == 2 for t in got),
+        f"grep ingest: {[t.display for t in got]}",
+    )
+
+    raw_line = "user {} not found\n"
+    got = ingest_stream(raw_line, "any", "raw", "tmpls", slurp=False, nul=False)
+    expect(got and got[0].holes == 1 and got[0].parts[0] == "user ", f"raw ingest: {got}")
+
+    idx = "src/user.py:2:20: lang=py holes=1 static=16 user {} not found\n"
+    got = ingest_stream(idx, "any", "auto", "-", slurp=False, nul=False)
+    expect(got and got[0].origin == "index" and got[0].holes == 1, f"index ingest: {got}")
+
+    rgj = json.dumps(
+        {
+            "type": "match",
+            "data": {
+                "path": {"text": "src/events.ts"},
+                "line_number": 5,
+                "lines": {"text": '  throw new Error(`Duplicate event ID: ${id}`);\n'},
+            },
+        }
+    )
+    got = ingest_stream(rgj + "\n", "any", "auto", "-", slurp=False, nul=False)
+    expect(
+        any(t.holes == 1 and t.raw.startswith("Duplicate") and t.line == 5 for t in got),
+        f"rg-json ingest: {[t.raw for t in got]}",
+    )
+
+    patch = (
+        "diff --git a/src/git.rs b/src/git.rs\n"
+        "--- a/src/git.rs\n"
+        "+++ b/src/git.rs\n"
+        "@@ -1,3 +1,3 @@\n"
+        "+    Err(format!(\"git diff single file failed: {}\", e));\n"
+    )
+    got = ingest_stream(patch, "any", "auto", "-", slurp=False, nul=False)
+    expect(
+        any(t.display == "git diff single file failed: {1}" and t.origin == "patch" for t in got),
+        f"patch ingest: {[(t.display, t.origin, t.path) for t in got]}",
+    )
+    expect(any(t.path == "src/git.rs" for t in got), f"patch path: {[t.path for t in got]}")
+
+    frag = "                cumulative save failed path=\\(path, privacy: .private) \\"
+    got = ingest_stream(frag + "\n", "swift", "raw", "store.swift", slurp=False, nul=False)
+    expect(
+        got and got[0].holes == 1 and got[0].display.startswith("cumulative save failed path="),
+        f"fragment continuation: {got[0].display if got else None}",
+    )
+
+    js = 'throw new Error(`Duplicate event ID: ${snapshot.id}`);\nconst x = "Event id must not be empty";\n'
+    tmpls = extract_templates(js, "js", "eq.ts")
+    expect(any(t.holes == 1 and t.raw.startswith("Duplicate") for t in tmpls), f"js tmpl: {[t.raw for t in tmpls]}")
+
+    py = 'raise KeyError(f"user {uid} not found")\n'
+    tmpls = extract_templates(py, "py", "u.py")
+    expect(
+        any(t.holes == 1 and t.names == ("uid",) and t.parts[0] == "user " for t in tmpls),
+        f"py f: {[(t.raw, t.names) for t in tmpls]}",
+    )
+    hit = score_query(tmpls[0], "user 42 not found")
+    expect(
+        hit is not None and hit.bindings == (("uid", "42"),),
+        f"py bind: {hit.bindings if hit else None}",
+    )
+
+    swift_src = (
+        'Logger.dataStore.error("""\n'
+        "            cumulative save failed path=\\(path) \\\n"
+        "            error=\\(err)\n"
+        '            """)\n'
+    )
+    tmpls = extract_templates(swift_src, "swift", "JSONSessionStore.swift")
+    expect(
+        any(t.display == "cumulative save failed path={path} error={err}" for t in tmpls),
+        f"swift flatten: {[t.display for t in tmpls]}",
+    )
+
+    seven = (
+        "transition \\(oldPhase.rawValue, privacy: .public) → "
+        "\\(newPhase.rawValue, privacy: .public) "
+        "reason=\\(reason.name, privacy: .public) "
+        "idle=\\(idle, privacy: .public)s "
+        "deserted=\\(counters.deserted.value, privacy: .public) "
+        "driftRecovered=\\(counters.driftRecovered.value, privacy: .public) "
+        "awayRecovered=\\(counters.awayRecovered.value, privacy: .public)"
+    )
+    parts, names = tokenize_named(seven)
+    expect(len(names) == 7, f"7-hole names: {names}")
+    expect(
+        names[0] == "oldPhase.rawValue" and names[4] == "counters.deserted.value",
+        f"7-hole ident: {names}",
+    )
+    seven_t = template_of("SitboneCore.swift", 554, 35, "swift", seven)
+    seven_q = (
+        "transition focused → idle reason=timeout idle=12s "
+        "deserted=0 driftRecovered=0 awayRecovered=0"
+    )
+    hit = score_query(seven_t, seven_q)
+    expect(hit is not None and hit.score >= 0.5, f"7-hole score: {hit}")
+    expect(
+        hit is not None
+        and dict(hit.bindings).get("oldPhase.rawValue") == "focused"
+        and dict(hit.bindings).get("idle") == "12"
+        and dict(hit.bindings).get("counters.awayRecovered.value") == "0",
+        f"7-hole binds: {hit.bindings if hit else None}",
+    )
+
+    ranked = search(
+        [
+            Template("packages/rules/src/execution.test.ts", 1, 1, "js", "code", ("code",), 0),
+            Template("packages/rules/src/execution.ts", 2, 1, "js", "code", ("code",), 0),
+        ],
+        "code",
+        min_score=0.3,
+        limit=5,
+    )
+    expect(
+        ranked and ranked[0].template.path.endswith("execution.ts"),
+        f"prod before test: {[h.template.path for h in ranked]}",
+    )
+
+    qv = query_variants("ctx: git apply --reverse failed: boom")
+    expect(any(v[0].startswith("git apply") for v in qv), f"variants: {qv}")
+
+    import io
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            _err, sys.stderr = sys.stderr, io.StringIO()
+            try:
+                ingest_path_line(td, "any")
+            finally:
+                sys.stderr = _err
+            expect(False, "dir should refuse")
+        except SystemExit as e:
+            expect(e.code == 2, f"dir exit {e.code}")
+
+        src = Path(td) / "log.swift"
+        src.write_text(
+            'Logger.dataStore.error("""\n'
+            "            cumulative save failed path=\\(path) \\\n"
+            "            error=\\(err)\n"
+            '            """)\n'
+        )
+        grep = "log.swift:2:            cumulative save failed path=\\(path) \\"
+        got = ingest_stream(
+            grep + "\n",
+            "swift",
+            "grep",
+            "-",
+            slurp=False,
+            nul=False,
+            open_mode="auto",
+            chdir=Path(td),
+        )
+        expect(
+            any(t.display == "cumulative save failed path={path} error={err}" for t in got),
+            f"hydrate multiline via --chdir: {[t.display for t in got]}",
+        )
+        got_never = ingest_stream(
+            grep + "\n",
+            "swift",
+            "grep",
+            "-",
+            slurp=False,
+            nul=False,
+            open_mode="never",
+            chdir=Path(td),
+        )
+        expect(
+            got_never
+            and got_never[0].holes == 1
+            and "error={err}" not in got_never[0].display,
+            f"--open never stays a fragment: {[t.display for t in got_never]}",
+        )
+
+    nested = (
+        'Logger.coreSession.info(\n'
+        '    "camera presence \\(self.isCameraEnabled ? "enabled" : "disabled", privacy: .public)"\n'
+        ')\n'
+    )
+    tmpls = extract_templates(nested, "swift", "SitboneCore.swift")
+    expect(
+        any(
+            t.holes == 1 and t.raw.startswith("camera presence") and "enabled" in t.raw
+            for t in tmpls
+        ),
+        f"nested swift quotes: {[t.raw for t in tmpls]}",
+    )
+    cam = next((t for t in tmpls if t.raw.startswith("camera presence")), None)
+    if cam is not None:
+        hit = score_query(cam, "camera presence enabled")
+        expect(
+            hit is not None and dict(hit.bindings).get("self.isCameraEnabled") == "enabled",
+            f"camera bind: {hit.bindings if hit else None}",
+        )
+
+    spawn = template_of("revert.rs", 46, 18, "rust", "failed to spawn `git apply --reverse`")
+    hit = score_query(
+        spawn, "2026-08-19T23:50:01Z ERROR failed to spawn `git apply --reverse`"
+    )
+    expect(hit is not None and hit.score >= 0.34, f"prefix span score: {hit}")
+    expect(
+        hit is not None and "2026-08-19T23:50:01Z" in hit.prefix and "ERROR" in hit.prefix,
+        f"prefix reported: {hit.prefix if hit else None}",
+    )
+    expect(hit is not None and hit.variant == "span", f"via span: {hit.variant if hit else None}")
+    exact_hit = score_query(
+        spawn,
+        "2026-08-19T23:50:01Z ERROR failed to spawn `git apply --reverse`",
+        exact=True,
+    )
+    expect(exact_hit is None, f"--exact refuses prefix: {exact_hit}")
+
+    if failures:
+        for f in failures:
+            print(f"FAIL: {f}", file=sys.stderr)
+        print(f"{len(failures)} selftest failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"invert {VERSION}")
+        return 0
+    if args.selftest:
+        return run_selftest()
+
+    chdir: Path | None = None
+    if args.chdir is not None:
+        chdir = Path(args.chdir)
+        if not chdir.is_dir():
+            print(f"invert: --chdir not a directory: {chdir}", file=sys.stderr)
+            return 2
+
+    stdin_holder = {"used": False}
+    templates: list[Template] = []
+
+    have_msgs_on_argv = bool(args.messages) or bool(args.message)
+    read_query_stdin = (
+        args.messages == ["-"] or "-" in args.messages
+    )
+    implicit_templates = (
+        not args.templates
+        and not args.files
+        and not sys.stdin.isatty()
+        and not read_query_stdin
+        and (have_msgs_on_argv or args.extract)
+    )
+
+    if implicit_templates:
+        args.templates = ["-"]
+
+    if not args.templates and not args.files:
+        print("invert: no templates (pipe a stream, or pass --templates FILE / --files FILE)", file=sys.stderr)
+        print(HINT, file=sys.stderr)
+        return 2
+
+    for spec in args.templates:
+        templates.extend(
+            load_template_spec(
+                spec,
+                args.lang,
+                args.from_fmt,
+                slurp=args.slurp,
+                nul=args.null,
+                stdin_holder=stdin_holder,
+                open_mode=args.open_mode,
+                chdir=chdir,
+            )
+        )
+    for spec in args.files:
+        templates.extend(
+            load_files_spec(
+                spec, args.lang, nul=args.null, stdin_holder=stdin_holder, chdir=chdir
+            )
+        )
+
+    if args.extract:
+        if args.json:
+            payload = [
+                {
+                    "path": t.path,
+                    "line": t.line,
+                    "col": t.col,
+                    "lang": t.lang,
+                    "holes": t.holes,
+                    "template": t.display,
+                    "raw": t.raw,
+                    "static": t.static_len,
+                    "from": t.origin,
+                }
+                for t in templates
+            ]
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            for t in templates:
+                print(format_index(t))
+        return 0
+
+    messages: list[str] = []
+    messages.extend(args.message)
+    for m in args.messages:
+        if m == "-":
+            continue
+        messages.append(m)
+    if (read_query_stdin or (not messages and not sys.stdin.isatty())) and not stdin_holder.get("used"):
+        stdin_holder["used"] = True
+        messages.extend(iter_stdin_queries(sys.stdin.read()))
+    elif not messages:
+        print("invert: no message (pass args, -e, or pipe queries with --templates FILE)", file=sys.stderr)
+        return 2
+
+    if not templates and not args.quiet:
+        extra = " (--chdir does not scan the directory)" if chdir is not None else ""
+        print(f"invert: 0 templates ingested{extra}", file=sys.stderr)
+
+    any_hit = False
+    all_hit = True
+    json_rows: list[dict] = []
+
+    for msg in messages:
+        hits = search(
+            templates, msg, min_score=args.min_score, limit=args.max, exact=args.exact
+        )
+        if hits:
+            any_hit = True
+        else:
+            all_hit = False
+        if args.quiet:
+            continue
+        if args.json:
+            json_rows.append(
+                {
+                    "query": normalize_query(msg),
+                    "matches": [hit_json(msg, h) for h in hits],
+                }
+            )
+            continue
+        if not hits:
+            print(f"— no template for: {normalize_query(msg)}")
+            continue
+        for h in hits:
+            print(format_hit(msg, h))
+            print()
+
+    if args.json and not args.quiet:
+        json.dump(json_rows, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+
+    if args.any or (not have_msgs_on_argv and len(messages) > 1):
+        return 0 if any_hit else 1
+    return 0 if all_hit else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1644 @@
+#!/usr/bin/env python3
+"""plea — occupancy of a review-suggestion stream against HEAD.
+
+sate occupies a git range / unified diff. plea occupies *review claims*.
+Input is a stream of review comments (GitHub JSON/JSONL, markdown
+```suggestion fences). A GitHub comment's before-image is the *commented
+range* of `diff_hunk`, not every `+` line of the hunk.
+
+Fates (same occupancy kernel as a hunk, different object):
+
+  APPLIED     after-image is in the tree; before-image is gone   (TAKEN)
+  PENDING     before-image is in the tree; after-image is absent (OPEN)
+  MIXED       both change-cores are tangled in the same region
+  DUPLEX      both images exist as independent blocks
+  SUPERSEDED  neither image; the world moved on                 (STALE)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Iterator
+
+VERSION = "0.2.0"  # 0.1 whole-file; 0.2 locus disambiguates DUPLEX
+
+FATES = ("APPLIED", "PENDING", "MIXED", "DUPLEX", "SUPERSEDED")
+SKIP_FATES = ("SKIP", "EMPTY", "NOFILE")
+ALIAS = {
+    "APPLIED": "TAKEN",
+    "PENDING": "OPEN",
+    "SUPERSEDED": "STALE",
+    "MIXED": "MIXED",
+    "DUPLEX": "DUPLEX",
+}
+
+EXIT_APPLIED = 0
+EXIT_PENDING = 1
+EXIT_SPLIT = 2
+EXIT_ERROR = 3
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+GENERIC_RE = re.compile(
+    r"^[\s{}\[\]().,:;]*$"
+    r"|^\s*(else:?|end|pass|break|continue|return|fi|then|do|done|"
+    r"end\.?|\);?|//|/\*|\*/|#)\s*$",
+    re.I,
+)
+PATH_LINE_RE = re.compile(
+    r"^(?:(?:path|file|filename)\s*:\s*)?+"
+    r"(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?\s*$"
+)
+HEADING_PATH_RE = re.compile(
+    r"^#{1,6}\s+`?(?P<path>(?:[\w./-]+/)*[\w./-]+\.[A-Za-z0-9+]+)`?"
+    r"(?::(?P<a>\d+)(?:-(?P<b>\d+))?)?"
+)
+HTML_PATH_RE = re.compile(
+    r"""<!--\s*(?:filepath|path|file)\s*:\s*([^\s>]+)""",
+    re.I,
+)
+IN_TICK_PATH_RE = re.compile(
+    r"""(?:commented on|in)\s+`([^`]+\.[A-Za-z0-9+]+)`""",
+    re.I,
+)
+
+Norm = Callable[[str], str]
+
+
+# ---------------------------------------------------------------------------
+# claims
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Claim:
+    id: str
+    path: str
+    before: list[str]
+    after: list[str]
+    side: str = "RIGHT"
+    start: int | None = None
+    end: int | None = None
+    commit_id: str | None = None
+    original_commit_id: str | None = None
+    in_reply_to: str | None = None
+    body: str = ""
+    recon: str = ""
+    source: str = ""
+    kind: str = "suggestion"  # suggestion | quote
+
+
+@dataclass
+class Verdict:
+    fate: str
+    path: str
+    claim: str
+    method: str
+    header: str = ""
+    kind: str = "suggestion"
+    before_hits: int = 0
+    after_hits: int = 0
+    near_before: float = 0.0
+    near_after: float = 0.0
+    near_line: int | None = None
+    note: str = ""
+    collide: list[str] = field(default_factory=list)
+    echo: list[str] = field(default_factory=list)
+    moved_to: str | None = None
+    sandwich: str | None = None
+    recon: str = ""
+    start: int | None = None
+    end: int | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "fate": self.fate,
+            "alias": ALIAS.get(self.fate, self.fate),
+            "path": self.path,
+            "claim": self.claim,
+            "method": self.method,
+            "header": self.header,
+            "kind": self.kind,
+            "before_hits": self.before_hits,
+            "after_hits": self.after_hits,
+            "near_before": round(self.near_before, 3),
+            "near_after": round(self.near_after, 3),
+            "near_line": self.near_line,
+            "note": self.note,
+            "collide": self.collide,
+            "echo": self.echo,
+            "moved_to": self.moved_to,
+            "sandwich": self.sandwich,
+            "recon": self.recon,
+            "start": self.start,
+            "end": self.end,
+        }
+
+
+# ---------------------------------------------------------------------------
+# reconstruction — the sate --suggest bug lives here
+# ---------------------------------------------------------------------------
+
+def _strip_cr(s: str) -> str:
+    return s.replace("\r", "")
+
+
+def parse_diff_hunk(diff_hunk: str) -> tuple[int, int, list[tuple[str, str]]] | None:
+    text = _strip_cr(diff_hunk)
+    lines = text.splitlines()
+    if not lines:
+        return None
+    header_i = 0
+    while header_i < len(lines) and not lines[header_i].startswith("@@"):
+        header_i += 1
+    if header_i >= len(lines):
+        return None
+    m = HUNK_RE.match(lines[header_i])
+    if not m:
+        return None
+    old_start = int(m.group(1))
+    new_start = int(m.group(3))
+    tagged: list[tuple[str, str]] = []
+    for L in lines[header_i + 1 :]:
+        if L.startswith("\\"):
+            continue
+        if not L:
+            tagged.append((" ", ""))
+            continue
+        tag = L[0]
+        if tag in " +-":
+            tagged.append((tag, L[1:]))
+        else:
+            tagged.append((" ", L))
+    return old_start, new_start, tagged
+
+
+def _in_range(loc: int, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+    return lo <= loc <= hi
+
+
+def lines_in_range(
+    tagged: list[tuple[str, str]],
+    old_start: int,
+    new_start: int,
+    side: str,
+    start: int,
+    end: int,
+) -> list[str]:
+    old_ln, new_ln = old_start, new_start
+    out: list[str] = []
+    right = side in ("RIGHT", "NEW", "+")
+    for tag, text in tagged:
+        if tag == "+":
+            if right and _in_range(new_ln, start, end):
+                out.append(text)
+            new_ln += 1
+        elif tag == "-":
+            if not right and _in_range(old_ln, start, end):
+                out.append(text)
+            old_ln += 1
+        else:
+            loc = new_ln if right else old_ln
+            if _in_range(loc, start, end):
+                out.append(text)
+            old_ln += 1
+            new_ln += 1
+    return out
+
+
+def side_new_lines(tagged: list[tuple[str, str]], side: str) -> list[str]:
+    if side in ("LEFT", "OLD", "-"):
+        return [t for tag, t in tagged if tag in " -"]
+    return [t for tag, t in tagged if tag in " +"]
+
+
+def extract_suggestions(body: str) -> list[list[str]]:
+    if not body:
+        return []
+    body = _strip_cr(body)
+    out: list[list[str]] = []
+    for m in SUGGEST_RE.finditer(body):
+        raw = m.group(1)
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        out.append(raw.splitlines())
+    return out
+
+
+def _as_lines(val) -> list[str] | None:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [_strip_cr(str(x)).rstrip("\n") for x in val]
+    if isinstance(val, str):
+        return _strip_cr(val).splitlines()
+    return None
+
+
+def _first(*vals):
+    for v in vals:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def reconstruct_before(obj: dict) -> tuple[list[str], str, int | None, int | None]:
+    """Return (before_lines, method, start, end)."""
+    explicit = _as_lines(obj.get("before"))
+    if explicit is not None:
+        start = _as_int(obj.get("start_line") or obj.get("original_start_line"))
+        end = _as_int(obj.get("line") or obj.get("original_line"))
+        return explicit, "explicit", start, end
+
+    side = str(obj.get("side") or obj.get("start_side") or "RIGHT").upper()
+    end = _as_int(
+        _first(obj.get("line"), obj.get("original_line"), obj.get("originalLine"))
+    )
+    start = _as_int(
+        _first(
+            obj.get("start_line"),
+            obj.get("original_start_line"),
+            obj.get("startLine"),
+            obj.get("originalStartLine"),
+            end,
+        )
+    )
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    parsed = parse_diff_hunk(diff_hunk) if diff_hunk else None
+    if parsed and start is not None and end is not None:
+        old_start, new_start, tagged = parsed
+        got = lines_in_range(tagged, old_start, new_start, side, start, end)
+        if got:
+            return got, "range", start, end
+        # truncated hunk / off-by-line: last N new-side lines
+        n = max(1, abs(end - start) + 1)
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return side_lines[-n:], "hunk-tail", start, end
+    if parsed:
+        old_start, new_start, tagged = parsed
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return [side_lines[-1]], "hunk-last", start, end
+    return [], "none", start, end
+
+
+def _as_int(v) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def obj_to_claims(obj: dict, source: str = "json") -> list[Claim]:
+    path = obj.get("path") or obj.get("filename") or obj.get("file") or ""
+    if not path:
+        return []
+    cid = str(
+        _first(obj.get("id"), obj.get("html_url"), obj.get("url"), path) or path
+    )
+    afters = _as_lines(obj.get("after"))
+    body = obj.get("body") or obj.get("comment") or obj.get("suggestion") or ""
+    sug = extract_suggestions(body) if isinstance(body, str) else []
+    if afters is not None:
+        images = [afters]
+        kind = "suggestion"
+    elif sug:
+        images = sug
+        kind = "suggestion"
+    else:
+        return []
+    before, recon, start, end = reconstruct_before(obj)
+    side = str(obj.get("side") or "RIGHT").upper()
+    in_reply = obj.get("in_reply_to_id") or obj.get("in_reply_to")
+    commit = obj.get("commit_id") or obj.get("commitId")
+    orig = obj.get("original_commit_id") or obj.get("originalCommitId")
+    out: list[Claim] = []
+    for i, after in enumerate(images):
+        ident = cid if len(images) == 1 else f"{cid}#{i + 1}"
+        out.append(
+            Claim(
+                id=str(ident),
+                path=str(path),
+                before=list(before),
+                after=list(after),
+                side=side,
+                start=start,
+                end=end,
+                commit_id=str(commit) if commit else None,
+                original_commit_id=str(orig) if orig else None,
+                in_reply_to=str(in_reply) if in_reply else None,
+                body=body if isinstance(body, str) else "",
+                recon=recon,
+                source=source,
+                kind=kind,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# stream ingest
+# ---------------------------------------------------------------------------
+
+def _iter_json_objs(text: str) -> Iterator[dict]:
+    text = text.strip()
+    if not text:
+        return
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            if isinstance(data, dict):
+                if "comments" in data and isinstance(data["comments"], list):
+                    for o in data["comments"]:
+                        if isinstance(o, dict):
+                            yield o
+                    return
+                yield data
+                return
+            if isinstance(data, list):
+                for o in data:
+                    if isinstance(o, dict):
+                        yield o
+                return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line[0] != "{":
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(o, dict):
+            yield o
+
+
+def parse_markdown_stream(text: str, source: str = "markdown") -> list[Claim]:
+    text = _strip_cr(text)
+    claims: list[Claim] = []
+    path = ""
+    start: int | None = None
+    end: int | None = None
+    pending_quote: list[str] | None = None
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    seq = 0
+
+    def remember_path(p: str, a: str | None, b: str | None) -> None:
+        nonlocal path, start, end
+        path = p
+        start = int(a) if a else None
+        end = int(b) if b else start
+
+    while i < n:
+        L = lines[i]
+        hm = HEADING_PATH_RE.match(L.strip())
+        if hm:
+            remember_path(hm.group("path"), hm.group("a"), hm.group("b"))
+            i += 1
+            continue
+        html = HTML_PATH_RE.search(L)
+        if html:
+            path = html.group(1)
+            i += 1
+            continue
+        tick = IN_TICK_PATH_RE.search(L)
+        if tick:
+            path = tick.group(1)
+            i += 1
+            continue
+        pm = PATH_LINE_RE.match(L.strip().strip("`"))
+        if pm and not L.strip().startswith("```"):
+            remember_path(pm.group("path"), pm.group("a"), pm.group("b"))
+            i += 1
+            continue
+        stripped = L.strip()
+        if stripped.startswith("```") and not stripped.startswith("```suggestion"):
+            lang = stripped[3:].strip()
+            i += 1
+            block: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if lang.lower() in ("", "text", "code", "diff"):
+                pending_quote = block
+            continue
+        if stripped.startswith("```suggestion"):
+            i += 1
+            after: list[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                after.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            if not path:
+                i += 1 if i < n else 0
+                continue
+            seq += 1
+            before = pending_quote if pending_quote is not None else []
+            recon = "markdown-quote" if before else "markdown"
+            claims.append(
+                Claim(
+                    id=f"md{seq}:{path}",
+                    path=path,
+                    before=list(before),
+                    after=list(after),
+                    start=start,
+                    end=end,
+                    recon=recon,
+                    source=source,
+                )
+            )
+            pending_quote = None
+            continue
+        i += 1
+    return claims
+
+
+def load_stream(text: str, source: str = "stream") -> list[Claim]:
+    text = text.lstrip("\ufeff")
+    claims: list[Claim] = []
+    stripped = text.lstrip()
+    looks_json = stripped[:1] in "[{"
+    if looks_json:
+        for obj in _iter_json_objs(text):
+            claims.extend(obj_to_claims(obj, source=source))
+        if claims:
+            return claims
+    # markdown / mixed
+    md = parse_markdown_stream(text, source=source)
+    if md:
+        return md
+    # last chance: jsonl mixed with prose
+    for obj in _iter_json_objs(text):
+        claims.extend(obj_to_claims(obj, source=source))
+    return claims
+
+
+def load_path(path: Path) -> list[Claim]:
+    if str(path) == "-":
+        return load_stream(sys.stdin.read(), source="stdin")
+    return load_stream(path.read_text(encoding="utf-8"), source=str(path))
+
+
+# ---------------------------------------------------------------------------
+# occupancy matcher (hunk kernel, suggestion-sized)
+# ---------------------------------------------------------------------------
+
+def ident(s: str) -> str:
+    return s
+
+
+def space_norm(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).rstrip()
+
+
+def apply_norm(lines: list[str], norm: Norm) -> list[str]:
+    return [norm(L) for L in lines]
+
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    first = needle[0]
+    start = 0
+    length = len(hay)
+    while start < length:
+        try:
+            j = hay.index(first, start)
+        except ValueError:
+            break
+        if hay[j : j + n] == needle:
+            hits.append(j)
+        start = j + 1
+    return hits
+
+
+def is_subseq(hay: list[str], needle: list[str]) -> bool:
+    if not needle:
+        return False
+    it = iter(hay)
+    try:
+        for x in needle:
+            while next(it) != x:
+                pass
+        return True
+    except StopIteration:
+        return False
+
+
+def significant(lines: list[str]) -> list[str]:
+    out = []
+    for L in lines:
+        s = L.strip()
+        if len(s) < 8:
+            continue
+        if GENERIC_RE.match(L) or GENERIC_RE.match(s):
+            continue
+        out.append(L)
+    if out:
+        return out
+    return [L for L in lines if L.strip()]
+
+
+def best_overlap(hay: list[str], needle: list[str], hint: int | None = None) -> tuple[float, int]:
+    if not needle:
+        return 1.0, 0
+    if not hay:
+        return 0.0, 0
+    n = len(needle)
+    if n > len(hay):
+        hits = sum(1 for a, b in zip(needle, hay) if a == b)
+        return hits / n, 0
+    cands: set[int] = set()
+    max_start = len(hay) - n
+    if hint is not None:
+        base = max(0, min(hint, max_start))
+        for d in range(0, 80):
+            cands.add(max(0, base - d))
+            cands.add(min(max_start, base + d))
+    ranked = sorted(enumerate(needle), key=lambda iv: len(iv[1]), reverse=True)[:4]
+    for idx, line in ranked:
+        if len(line.strip()) < 4:
+            continue
+        start = 0
+        while True:
+            try:
+                j = hay.index(line, start)
+            except ValueError:
+                break
+            cands.add(max(0, min(j - idx, max_start)))
+            start = j + 1
+    if not cands:
+        step = max(1, n // 2)
+        cands.update(range(0, max_start + 1, step))
+    best_r, best_p = -1.0, 0
+    for p in cands:
+        window = hay[p : p + n]
+        hits = sum(1 for a, b in zip(needle, window) if a == b)
+        r = hits / n
+        if r > best_r:
+            best_r, best_p = r, p
+            if r == 1.0:
+                break
+    return max(0.0, best_r), best_p
+
+
+FUZZ_RATIO = 0.85
+
+
+def overlaps_locus(
+    hit: int,
+    n: int,
+    start: int | None,
+    end: int | None,
+    slack: int = 2,
+) -> bool:
+    """True if the block [hit, hit+n) overlaps the commented 1-indexed range.
+
+    Slack is a couple of lines for off-by-one headers, not a hunt through
+    the rest of the function. Unknown locus → every hit counts (file-wide).
+    """
+    if start is None and end is None:
+        return True
+    a = start if start is not None else end
+    b = end if end is not None else start
+    if a is None:
+        return True
+    file_lo = min(a, b) - 1 - slack
+    file_hi = max(a, b) + slack
+    return hit < file_hi and (hit + n) > file_lo
+
+
+def unexplained(
+    small_hits: list[int], big_hits: list[int], small: list[str], big: list[str]
+) -> list[int]:
+    if not small or not big_hits or not big:
+        return list(small_hits)
+    offsets = find_all(big, small)
+    explained: set[int] = set()
+    for bp in big_hits:
+        if not offsets:
+            if small == big:
+                explained.add(bp)
+        for off in offsets:
+            explained.add(bp + off)
+    return [p for p in small_hits if p not in explained]
+
+
+def classify_claim(
+    file_lines: list[str] | None,
+    claim: Claim,
+    norm: Norm,
+    fuzz: bool = False,
+) -> Verdict:
+    path = claim.path
+    header = f"@@ suggestion {claim.id} @@"
+
+    def V(fate: str, method: str, note: str = "", **kw) -> Verdict:
+        v = Verdict(
+            fate=fate,
+            path=path,
+            claim=claim.id,
+            method=method,
+            header=header,
+            kind=claim.kind,
+            note=note,
+            recon=claim.recon,
+            start=claim.start,
+            end=claim.end,
+        )
+        for k, val in kw.items():
+            setattr(v, k, val)
+        return v
+
+    if not claim.path:
+        return V("SKIP", "no-path")
+    if not claim.before and not claim.after:
+        return V("SKIP", "empty-claim")
+    if claim.before and claim.after and claim.before == claim.after:
+        return V("SKIP", "noop")
+
+    if file_lines is None:
+        if claim.after and not claim.before:
+            return V("PENDING", "missing-create")
+        if claim.before and not claim.after:
+            return V("APPLIED", "missing-delete")
+        return V("SUPERSEDED", "missing-file")
+
+    hay = apply_norm(file_lines, norm)
+    before = apply_norm(claim.before, norm)
+    after = apply_norm(claim.after, norm)
+    minus = before
+    plus = after
+    sig_minus = significant(minus)
+    sig_plus = significant(plus)
+
+    before_hits = find_all(hay, before) if before else []
+    after_hits = find_all(hay, after) if after else []
+    hint = max(0, (claim.end or claim.start or 1) - 1)
+    nb, pb = best_overlap(hay, before, hint) if before else (0.0, 0)
+    na, pa = best_overlap(hay, after, hint) if after else (0.0, 0)
+    near_line = (pa if na >= nb else pb) + 1
+    extra = dict(
+        before_hits=len(before_hits),
+        after_hits=len(after_hits),
+        near_before=nb,
+        near_after=na,
+        near_line=near_line,
+    )
+
+    # delete
+    if before and not after:
+        if before_hits:
+            return V("PENDING", "exact-before", **extra)
+        if sig_minus and is_subseq(hay, sig_minus):
+            return V("PENDING", "del-subseq", **extra)
+        return V("APPLIED", "deleted", **extra)
+
+    # add (no before reconstructed)
+    if after and not before:
+        if after_hits:
+            return V("APPLIED", "exact-after", **extra)
+        if sig_plus and is_subseq(hay, sig_plus):
+            return V("APPLIED", "add-subseq", **extra)
+        return V("PENDING", "missing-after", **extra)
+
+    # exact blocks
+    if after_hits and before_hits:
+        leftover_before = unexplained(before_hits, after_hits, before, after)
+        leftover_after = unexplained(after_hits, before_hits, after, before)
+        if leftover_before and leftover_after:
+            lb = [
+                h
+                for h in leftover_before
+                if overlaps_locus(h, len(before), claim.start, claim.end)
+            ]
+            la = [
+                h
+                for h in leftover_after
+                if overlaps_locus(h, len(after), claim.start, claim.end)
+            ]
+            # Review comments have a locus. A generic after-image that already
+            # exists later in the same function (cli/cli `return nil, err`) is
+            # not DUPLEX of *this* plea.
+            if lb and not la:
+                return V(
+                    "PENDING",
+                    "exact-before-locus",
+                    note=f"before@{lb[:3]} after-elsewhere@{leftover_after[:3]}",
+                    **extra,
+                )
+            if la and not lb:
+                return V(
+                    "APPLIED",
+                    "exact-after-locus",
+                    note=f"after@{la[:3]} before-elsewhere@{leftover_before[:3]}",
+                    **extra,
+                )
+            if lb and la:
+                return V(
+                    "DUPLEX",
+                    "exact-both-locus",
+                    note=f"before@{lb[:3]} after@{la[:3]}",
+                    **extra,
+                )
+            return V(
+                "DUPLEX",
+                "exact-both-off-locus",
+                note=f"before@{leftover_before[:3]} after@{leftover_after[:3]}",
+                **extra,
+            )
+        if after_hits and not leftover_before:
+            return V("APPLIED", "exact-after", **extra)
+        if before_hits and not leftover_after:
+            return V("PENDING", "exact-before", **extra)
+        return V("DUPLEX", "exact-both", **extra)
+    if after_hits:
+        return V("APPLIED", "exact-after", **extra)
+    if before_hits:
+        return V("PENDING", "exact-before", **extra)
+
+    minus_sub = is_subseq(hay, sig_minus) if sig_minus else False
+    plus_sub = is_subseq(hay, sig_plus) if sig_plus else False
+    sig_minus_hits = find_all(hay, sig_minus) if sig_minus else []
+    sig_plus_hits = find_all(hay, sig_plus) if sig_plus else []
+
+    if sig_plus_hits and sig_minus_hits:
+        if abs((sig_plus_hits[0] - sig_minus_hits[0])) > max(len(sig_plus), len(sig_minus), 3):
+            return V("DUPLEX", "core-both-apart", **extra)
+        return V("MIXED", "core-both-near", **extra)
+    if sig_plus_hits and not minus_sub:
+        return V("APPLIED", "core-plus", **extra)
+    if sig_minus_hits and not plus_sub:
+        return V("PENDING", "core-minus", **extra)
+    if plus_sub and minus_sub:
+        return V("MIXED", "subseq-both", **extra)
+    if plus_sub and not minus_sub:
+        return V("APPLIED", "subseq-plus", **extra)
+    if minus_sub and not plus_sub:
+        return V("PENDING", "subseq-minus", **extra)
+
+    if fuzz:
+        if na >= FUZZ_RATIO and nb < 0.5:
+            return V("APPLIED", f"fuzz-after:{na:.2f}", **extra)
+        if nb >= FUZZ_RATIO and na < 0.5:
+            return V("PENDING", f"fuzz-before:{nb:.2f}", **extra)
+        if sig_plus or sig_minus:
+            p_ratio = (
+                sum(1 for L in sig_plus if L in hay) / len(sig_plus) if sig_plus else 0.0
+            )
+            m_ratio = (
+                sum(1 for L in sig_minus if L in hay) / len(sig_minus) if sig_minus else 0.0
+            )
+            if p_ratio >= 0.5 and m_ratio >= 0.5:
+                return V("MIXED", f"fuzz-cores:{m_ratio:.2f}/{p_ratio:.2f}", **extra)
+
+    # bag of change-cores: one + and one − landed independently (classic MIXED)
+    if sig_plus or sig_minus:
+        p_hit = sum(1 for L in sig_plus if L in hay)
+        m_hit = sum(1 for L in sig_minus if L in hay)
+        if p_hit and m_hit:
+            return V(
+                "MIXED",
+                "line-bag",
+                note=f"plus={p_hit}/{len(sig_plus)} minus={m_hit}/{len(sig_minus)}",
+                **extra,
+            )
+        if p_hit and not m_hit:
+            return V("APPLIED", "line-plus", **extra)
+        if m_hit and not p_hit:
+            return V("PENDING", "line-minus", **extra)
+
+    return V("SUPERSEDED", "neither", **extra)
+
+
+# ---------------------------------------------------------------------------
+# tree IO
+# ---------------------------------------------------------------------------
+
+def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True)
+
+
+def is_git_repo(root: Path) -> bool:
+    proc = git(["rev-parse", "--is-inside-work-tree"], root)
+    return proc.returncode == 0 and proc.stdout.decode().strip() == "true"
+
+
+def read_tree_file(root: Path, path: str, against: str | None) -> list[str] | None:
+    if not path:
+        return None
+    if against is None:
+        p = root / path
+        try:
+            data = p.read_bytes()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, OSError):
+            return None
+        if b"\0" in data[:8192]:
+            return None
+        return data.decode("utf-8", "replace").splitlines()
+    proc = git(["show", f"{against}:{path}"], root)
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def default_against(root: Path, explicit: str | None, worktree: bool) -> str | None:
+    if worktree:
+        return None
+    if explicit is not None:
+        return explicit
+    if is_git_repo(root):
+        return "HEAD"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# stream topology: collide / echo
+# ---------------------------------------------------------------------------
+
+def loci_overlap(a: Claim, b: Claim) -> bool:
+    if a.path != b.path:
+        return False
+    if (
+        a.start is not None
+        and a.end is not None
+        and b.start is not None
+        and b.end is not None
+    ):
+        lo_a, hi_a = (a.start, a.end) if a.start <= a.end else (a.end, a.start)
+        lo_b, hi_b = (b.start, b.end) if b.start <= b.end else (b.end, b.start)
+        if not (hi_a < lo_b or hi_b < lo_a):
+            return True
+    sa = set(significant(a.before))
+    sb = set(significant(b.before))
+    if sa and sb and sa & sb:
+        return True
+    return False
+
+
+def annotate_stream(claims: list[Claim], verdicts: list[Verdict]) -> None:
+    by_id = {c.id: c for c in claims}
+    for i, va in enumerate(verdicts):
+        ca = by_id.get(va.claim)
+        if ca is None:
+            continue
+        for j, vb in enumerate(verdicts):
+            if i == j:
+                continue
+            cb = by_id.get(vb.claim)
+            if cb is None:
+                continue
+            if not loci_overlap(ca, cb):
+                continue
+            if ca.after == cb.after:
+                if cb.id not in va.echo:
+                    va.echo.append(cb.id)
+            else:
+                if cb.id not in va.collide:
+                    va.collide.append(cb.id)
+        if va.collide and not va.note:
+            va.note = "collide:" + ",".join(va.collide[:4])
+        elif va.echo and not va.note:
+            va.note = "echo:" + ",".join(va.echo[:4])
+
+
+# ---------------------------------------------------------------------------
+# reports
+# ---------------------------------------------------------------------------
+
+def material(verdicts: list[Verdict]) -> list[Verdict]:
+    return [v for v in verdicts if v.fate not in SKIP_FATES]
+
+
+def counted(verdicts: list[Verdict]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for v in verdicts:
+        c[v.fate] = c.get(v.fate, 0) + 1
+    return c
+
+
+def unanimous(verdicts: list[Verdict]) -> str:
+    s = {v.fate for v in material(verdicts)}
+    if not s:
+        return "EMPTY"
+    if len(s) == 1:
+        return next(iter(s))
+    return "SPLIT"
+
+
+def exit_for(uni: str) -> int:
+    if uni in ("APPLIED", "EMPTY"):
+        return EXIT_APPLIED
+    if uni == "PENDING":
+        return EXIT_PENDING
+    return EXIT_SPLIT
+
+
+def format_human(verdicts: list[Verdict], title: str) -> str:
+    uni = unanimous(verdicts)
+    c = counted(verdicts)
+    bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+    n = len(material(verdicts))
+    lines = [f"plea  {title}  n={n}  unanimous={uni}  {bits}"]
+    for v in verdicts:
+        if v.fate in SKIP_FATES:
+            continue
+        alias = ALIAS.get(v.fate, "")
+        loc = f"{v.path}  #{v.claim}"
+        extra = f"  {v.method}"
+        if v.recon:
+            extra += f"  recon={v.recon}"
+        if v.moved_to:
+            extra += f"  moved={v.moved_to}"
+        if v.sandwich:
+            extra += f"  then={v.sandwich}"
+        if v.note:
+            extra += f"  {v.note}"
+        alias_s = f"  {alias}" if alias and alias != v.fate else ""
+        lines.append(f"{v.fate:<11} {loc}{extra}{alias_s}")
+    return "\n".join(lines) + "\n"
+
+
+def format_tsv(verdicts: list[Verdict]) -> str:
+    rows = [
+        "fate\talias\tpath\tclaim\tmethod\trecon\tcollide\techo\tmoved\tnear_line"
+    ]
+    for v in verdicts:
+        if v.fate in SKIP_FATES:
+            continue
+        rows.append(
+            "\t".join(
+                [
+                    v.fate,
+                    ALIAS.get(v.fate, v.fate),
+                    v.path,
+                    str(v.claim),
+                    v.method,
+                    v.recon,
+                    ",".join(v.collide),
+                    ",".join(v.echo),
+                    v.moved_to or "",
+                    "" if v.near_line is None else str(v.near_line),
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def format_json(verdicts: list[Verdict], extra: dict) -> str:
+    payload = {
+        **extra,
+        "unanimous": unanimous(verdicts),
+        "counts": counted(verdicts),
+        "claims": [v.as_dict() for v in verdicts if v.fate not in SKIP_FATES],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# classify a stream against a tree
+# ---------------------------------------------------------------------------
+
+def classify_stream(
+    claims: list[Claim],
+    root: Path,
+    against: str | None,
+    norm: Norm,
+    fuzz: bool = False,
+) -> list[Verdict]:
+    cache: dict[str, list[str] | None] = {}
+    verdicts: list[Verdict] = []
+    for c in claims:
+        if c.path not in cache:
+            cache[c.path] = read_tree_file(root, c.path, against)
+        verdicts.append(classify_claim(cache[c.path], c, norm, fuzz=fuzz))
+    annotate_stream(claims, verdicts)
+    return verdicts
+
+
+def sandwich_claim(
+    claim: Claim,
+    root: Path,
+    now: Verdict,
+    norm: Norm,
+    fuzz: bool,
+) -> None:
+    ref = claim.original_commit_id or claim.commit_id
+    if not ref or not is_git_repo(root):
+        return
+    then_lines = read_tree_file(root, claim.path, ref)
+    then = classify_claim(then_lines, claim, norm, fuzz=fuzz)
+    now.sandwich = then.fate
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _write_tree(root: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+
+def selftest(fuzz: bool = False) -> int:
+    failed = 0
+    passed = 0
+
+    def t(name: str, fn: Callable[[], None]) -> None:
+        nonlocal failed, passed
+        try:
+            fn()
+            passed += 1
+            print(f"  ok  {name}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAIL {name}: {e}", file=sys.stderr)
+
+    def occupy(tree: dict[str, str], claims: list[Claim]) -> list[Verdict]:
+        with tempfile.TemporaryDirectory(prefix="plea-st-") as td:
+            root = Path(td)
+            _write_tree(root, tree)
+            return classify_stream(claims, root, None, ident, fuzz=fuzz)
+
+    # --- reconstruction: cli/cli #333030758 (sate takes all + lines) ---
+    CLI_HUNK = (
+        "@@ -339,7 +342,11 @@ func show(number ...string) error {\n"
+        " func pullRequestForCurrentBranch() (*github.PullRequest, error) {\n"
+        " \tproject := project()\n"
+        " \tclient := github.NewClient(project.Host)\n"
+        "-\theadWithOwner := fmt.Sprintf(\"%s:%s\", project.Owner, currentBranch())\n"
+        "+\tcurrentBranch, err := context.CurrentBranch()\n"
+        "+\tif err != nil {\n"
+        "+\t\treturn &github.PullRequest{}, err"
+    )
+    CLI_BODY = (
+        "It's fine to return nil in place of pointers when an error occurs:\r\n"
+        "```suggestion\r\n"
+        "\t\treturn nil, err\r\n"
+        "```"
+    )
+
+    def recon_cli_range():
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "side": "RIGHT",
+            "line": None,
+            "original_line": 347,
+            "diff_hunk": CLI_HUNK,
+            "body": CLI_BODY,
+        }
+        claims = obj_to_claims(obj)
+        if len(claims) != 1:
+            raise AssertionError(claims)
+        c = claims[0]
+        if c.before != ["\t\treturn &github.PullRequest{}, err"]:
+            raise AssertionError(f"before={c.before!r} (sate would take 3 + lines)")
+        if c.after != ["\t\treturn nil, err"]:
+            raise AssertionError(f"after={c.after!r}")
+        if c.recon != "range":
+            raise AssertionError(c.recon)
+        # sate's all-plus reconstruction
+        plus = [
+            ln[1:]
+            for ln in CLI_HUNK.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        ]
+        if plus == c.before:
+            raise AssertionError("range collapsed to all-plus")
+        if len(plus) < 3:
+            raise AssertionError(plus)
+
+    t("recon-cli-range-not-all-plus", recon_cli_range)
+
+    def cli_locus_not_duplex():
+        # Real layout of pullRequestForCurrentBranch: before at 347, after
+        # already exists at 354. Whole-file occupancy DUPLEXes; locus does not.
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "side": "RIGHT",
+            "original_line": 347,
+            "diff_hunk": CLI_HUNK,
+            "body": CLI_BODY,
+        }
+        claims = obj_to_claims(obj)
+        lines = [""] * 360
+        lines[341] = "func pullRequestForCurrentBranch() (*github.PullRequest, error) {"
+        lines[344] = "\tcurrentBranch, err := context.CurrentBranch()"
+        lines[345] = "\tif err != nil {"
+        lines[346] = "\t\treturn &github.PullRequest{}, err"
+        lines[347] = "\t}"
+        lines[352] = "\tprs, err := client.FetchPullRequests(&project, filterParams, 10, nil)"
+        lines[353] = "\t\treturn nil, err"
+        src = "\n".join(lines) + "\n"
+        v = occupy({"command/pr.go": src}, claims)
+        if unanimous(v) != "PENDING":
+            raise AssertionError(f"{v[0].fate} {v[0].method} {v[0].note}")
+        if v[0].method != "exact-before-locus":
+            raise AssertionError(v[0].method)
+
+    t("cli-generic-after-is-open-not-duplex", cli_locus_not_duplex)
+
+    def recon_multiline_start():
+        # zip/reader.go #720912639 — blank + call, suggestion drops the blank
+        hunk = (
+            "@@ -789,6 +788,8 @@ func (r *Reader) Open(name string) (fs.File, error) {\n"
+            " if e.isDir {\n"
+            " return &openDir{e, r.openReadDir(name), 0}, nil\n"
+            " }\n"
+            "+\n"
+            "+e.file.readDataDescriptor()"
+        )
+        obj = {
+            "id": "zip",
+            "path": "src/archive/zip/reader.go",
+            "side": "RIGHT",
+            "original_line": 792,
+            "original_start_line": 791,
+            "diff_hunk": hunk,
+            "body": "```suggestion\ne.file.readDataDescriptor()\n```",
+        }
+        c = obj_to_claims(obj)[0]
+        if c.before != ["", "e.file.readDataDescriptor()"]:
+            raise AssertionError(c.before)
+        if c.after != ["e.file.readDataDescriptor()"]:
+            raise AssertionError(c.after)
+
+    t("recon-multiline-start-line", recon_multiline_start)
+
+    def recon_empty_suggestion():
+        hunk = (
+            "@@ -202,25 +202,37 @@ <h3 id=\"ImportPaths\">Import paths</h3>\n"
+            " </p>\n"
+            "+\n"
+            "+w"
+        )
+        obj = {
+            "id": "empty",
+            "path": "doc/code.html",
+            "side": "RIGHT",
+            "original_line": 221,
+            "diff_hunk": hunk,
+            "body": "don't think this line is intended haha\n```suggestion\n```",
+        }
+        c = obj_to_claims(obj)[0]
+        if c.before != ["w"]:
+            raise AssertionError(c.before)
+        if c.after != []:
+            raise AssertionError(f"empty suggestion must delete, got {c.after!r}")
+
+    t("recon-empty-suggestion-is-delete", recon_empty_suggestion)
+
+    def recon_newfile_line5():
+        hunk = (
+            "@@ -0,0 +1,23 @@\n"
+            "+// Copyright 2020 The Go Authors. All rights reserved.\n"
+            "+// Use of this source code is governed by a BSD-style\n"
+            "+// license that can be found in the LICENSE file.\n"
+            "+\n"
+            "+// go:build js,wasm windows"
+        )
+        obj = {
+            "id": "build",
+            "path": "src/net/unixsock_readmsg_other.go",
+            "side": "RIGHT",
+            "original_line": 5,
+            "diff_hunk": hunk,
+            "body": "```suggestion\n//go:build (js && wasm) || windows\n```",
+        }
+        c = obj_to_claims(obj)[0]
+        if c.before != ["// go:build js,wasm windows"]:
+            raise AssertionError(c.before)
+        if c.after != ["//go:build (js && wasm) || windows"]:
+            raise AssertionError(c.after)
+
+    t("recon-newfile-line-number", recon_newfile_line5)
+
+    # --- occupancy fates ---
+    def claim(path, before, after, id="c"):
+        return Claim(id=id, path=path, before=before, after=after, recon="explicit")
+
+    def pending_applied():
+        c = claim("a.py", ["x = 1"], ["x = 2"])
+        v = occupy({"a.py": "x = 1\n"}, [c])
+        if unanimous(v) != "PENDING":
+            raise AssertionError(v[0].fate)
+        v = occupy({"a.py": "x = 2\n"}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("occupy-pending-applied", pending_applied)
+
+    def superseded_duplex_mixed():
+        c = claim("a.py", ["    return a - b"], ["    return a + b"])
+        v = occupy({"a.py": "def add(a, b):\n    return a * b\n"}, [c])
+        if unanimous(v) != "SUPERSEDED":
+            raise AssertionError(v[0].fate)
+        both = "def add(a, b):\n    return a - b\n\ndef add(a, b):\n    return a + b\n"
+        v = occupy({"a.py": both}, [c])
+        if unanimous(v) != "DUPLEX":
+            raise AssertionError(v[0].fate)
+        mix = claim("m.py", ["    a = 1", "    b = 2"], ["    a = 10", "    b = 20"])
+        mid = "def f():\n    a = 10\n    b = 2\n    return a + b\n"
+        v = occupy({"m.py": mid}, [mix])
+        if unanimous(v) != "MIXED":
+            raise AssertionError(v[0].fate)
+
+    t("occupy-superseded-duplex-mixed", superseded_duplex_mixed)
+
+    def delete_empty_after():
+        c = claim("d.html", ["w"], [], id="del")
+        v = occupy({"d.html": "<p>\nw\n</p>\n"}, [c])
+        if unanimous(v) != "PENDING":
+            raise AssertionError(v[0].fate)
+        v = occupy({"d.html": "<p>\n</p>\n"}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("occupy-empty-suggestion-delete", delete_empty_after)
+
+    def zip_blank_not_duplex():
+        c = claim(
+            "r.go",
+            ["", "e.file.readDataDescriptor()"],
+            ["e.file.readDataDescriptor()"],
+            id="zip",
+        )
+        # suggestion not taken: blank + call still there
+        src = "if e.isDir {\n\treturn nil\n}\n\ne.file.readDataDescriptor()\nrc, err := e.file.Open()\n"
+        v = occupy({"r.go": src}, [c])
+        if unanimous(v) != "PENDING":
+            raise AssertionError(f"want PENDING got {v[0].fate} {v[0].method}")
+        # taken: blank gone
+        taken = "if e.isDir {\n\treturn nil\n}\ne.file.readDataDescriptor()\nrc, err := e.file.Open()\n"
+        v = occupy({"r.go": taken}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(f"want APPLIED got {v[0].fate} {v[0].method}")
+
+    t("occupy-suffix-after-not-duplex", zip_blank_not_duplex)
+
+    def missing_file():
+        c = claim("gone.py", ["LEGACY = 1"], ["LEGACY = 0"])
+        v = occupy({}, [c])
+        if unanimous(v) != "SUPERSEDED":
+            raise AssertionError(v[0].fate)
+
+    t("occupy-missing-file", missing_file)
+
+    def jsonl_and_cr():
+        text = (
+            '{"path":"mod.py","before":["TIMEOUT = 30"],'
+            '"after":["TIMEOUT = 60"],"id":"r1"}\n'
+            '{"path":"mod.py","before":["retries = 3"],'
+            '"after":["retries = 5"],"id":"r2"}\n'
+        )
+        claims = load_stream(text)
+        if [c.id for c in claims] != ["r1", "r2"]:
+            raise AssertionError(claims)
+        v = occupy({"mod.py": "TIMEOUT = 60\nretries = 3\n"}, claims)
+        fates = [x.fate for x in material(v)]
+        if fates != ["APPLIED", "PENDING"]:
+            raise AssertionError(fates)
+
+    t("ingest-jsonl-taken-open", jsonl_and_cr)
+
+    def markdown_stream():
+        md = (
+            "# src/add.py:2\n"
+            "```\n"
+            "    return a - b\n"
+            "```\n"
+            "```suggestion\n"
+            "    return a + b\n"
+            "```\n"
+        )
+        claims = load_stream(md)
+        if len(claims) != 1 or claims[0].path != "src/add.py":
+            raise AssertionError(claims)
+        if claims[0].before != ["    return a - b"]:
+            raise AssertionError(claims[0].before)
+        if claims[0].after != ["    return a + b"]:
+            raise AssertionError(claims[0].after)
+        v = occupy({"src/add.py": "def add(a, b):\n    return a + b\n"}, claims)
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("ingest-markdown-quote-plus-suggestion", markdown_stream)
+
+    def collide_and_echo():
+        text = (
+            '{"path":"a.py","before":["x = 1"],"after":["x = 2"],"id":"r1","line":1}\n'
+            '{"path":"a.py","before":["x = 1"],"after":["x = 3"],"id":"r2","line":1}\n'
+            '{"path":"a.py","before":["x = 1"],"after":["x = 2"],"id":"r3","line":1}\n'
+        )
+        claims = load_stream(text)
+        v = occupy({"a.py": "x = 1\n"}, claims)
+        by = {x.claim: x for x in v}
+        if "r2" not in by["r1"].collide:
+            raise AssertionError(by["r1"].collide)
+        if "r3" not in by["r1"].echo:
+            raise AssertionError(by["r1"].echo)
+        if unanimous(v) != "PENDING":
+            raise AssertionError(unanimous(v))
+
+    t("stream-collide-and-echo", collide_and_echo)
+
+    def weird_path():
+        c = claim("docs/計画 (1).md", ["alpha"], ["beta"], id="jp")
+        v = occupy({"docs/計画 (1).md": "beta\n"}, [c])
+        if unanimous(v) != "APPLIED":
+            raise AssertionError(v[0].fate)
+
+    t("weird-path-spaces-japanese", weird_path)
+
+    def sandwich_git():
+        with tempfile.TemporaryDirectory(prefix="plea-git-") as td:
+            root = Path(td)
+            git(["init", "-q", "-b", "main"], root)
+            git(["config", "user.name", "plea"], root)
+            git(["config", "user.email", "plea@test"], root)
+            git(["config", "commit.gpgsign", "false"], root)
+            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t0"], root)
+            t0 = git(["rev-parse", "HEAD"], root).stdout.decode().strip()
+            (root / "app.py").write_text("x = 2\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t1"], root)
+            # dirty worktree back to 1 — default against HEAD must still be APPLIED
+            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+            c = Claim(
+                id="bump",
+                path="app.py",
+                before=["x = 1"],
+                after=["x = 2"],
+                original_commit_id=t0,
+                recon="explicit",
+            )
+            against = default_against(root, None, worktree=False)
+            if against != "HEAD":
+                raise AssertionError(against)
+            now = classify_stream([c], root, against, ident)
+            if unanimous(now) != "APPLIED":
+                raise AssertionError(f"HEAD occupancy {now[0].fate} (dirty worktree leaked)")
+            wt = classify_stream([c], root, None, ident)
+            if unanimous(wt) != "PENDING":
+                raise AssertionError(wt[0].fate)
+            sandwich_claim(c, root, now[0], ident, False)
+            if now[0].sandwich != "PENDING":
+                raise AssertionError(now[0].sandwich)
+
+    t("default-against-HEAD-not-worktree", sandwich_git)
+
+    def github_json_array():
+        arr = [
+            {
+                "id": 1,
+                "path": "src/add.py",
+                "side": "RIGHT",
+                "original_line": 2,
+                "diff_hunk": (
+                    "@@ -1,2 +1,2 @@\n"
+                    " def add(a, b):\n"
+                    "-    return a - b\n"
+                    "+    return a + b\n"
+                ),
+                "body": "wrap it\n```suggestion\n    return int(a + b)\n```",
+            }
+        ]
+        claims = load_stream(json.dumps(arr))
+        if claims[0].before != ["    return a + b"]:
+            raise AssertionError(claims[0].before)
+        if claims[0].after != ["    return int(a + b)"]:
+            raise AssertionError(claims[0].after)
+
+    t("ingest-github-array", github_json_array)
+
+    def left_side():
+        obj = {
+            "id": "L",
+            "path": "a.py",
+            "side": "LEFT",
+            "original_line": 2,
+            "diff_hunk": (
+                "@@ -1,3 +1,3 @@\n"
+                " def f():\n"
+                "-    return 1\n"
+                "+    return 2\n"
+                "     # end\n"
+            ),
+            "body": "keep old\n```suggestion\n    return 0\n```",
+        }
+        c = obj_to_claims(obj)[0]
+        if c.before != ["    return 1"]:
+            raise AssertionError(c.before)
+
+    t("recon-left-side-deleted-line", left_side)
+
+    print(f"selftest  {passed} passed  {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+plea — occupancy of a review-suggestion stream against HEAD
+
+A review comment is a before→after image claim. git apply --check does not
+speak this object. GitHub "outdated" is line-identity. sate --suggest takes
+every + line of diff_hunk as the before-image. plea reconstructs the
+*commented range* and occupies the stream.
+
+Usage:
+  plea FILE [FILE ...]       JSON / JSONL / markdown with ```suggestion
+  plea -                     stream on stdin
+  gh api repos/X/Y/pulls/N/comments | plea -C repo
+  plea --selftest
+
+Tree:
+  -C DIR           tree root (default: cwd)
+  --against REF    read files from git REF (default: HEAD if git, else worktree)
+  --worktree       occupy the dirty worktree, not HEAD
+
+Matching:
+  --ignore-space   collapse horizontal whitespace
+  --fuzz           accept windows with ≥0.85 line overlap
+  --sandwich       also classify each claim against its original_commit_id
+
+Output:
+  --json / --tsv / --quiet
+  --report-only    always exit 0
+  --only FATE      hide other fates
+  --pick FATE      synonym of --only (OPEN/TAKEN/STALE aliases accepted)
+
+Exit:
+  0  unanimous APPLIED / TAKEN (or empty)
+  1  unanimous PENDING / OPEN
+  2  SPLIT / MIXED / DUPLEX / SUPERSEDED
+  3  error
+"""
+
+
+def resolve_only(s: str | None) -> set[str] | None:
+    if not s:
+        return None
+    aliases = {
+        "TAKEN": "APPLIED",
+        "OPEN": "PENDING",
+        "STALE": "SUPERSEDED",
+        "GONE": "SUPERSEDED",
+    }
+    out = set()
+    for part in s.split(","):
+        p = part.strip().upper()
+        out.add(aliases.get(p, p))
+    return out
+
+
+def emit(verdicts: list[Verdict], args: argparse.Namespace, extra: dict) -> int:
+    only = resolve_only(args.only or args.pick)
+    if only:
+        verdicts = [v for v in verdicts if v.fate in only or v.fate in SKIP_FATES]
+    title = extra.get("title") or "stdin"
+    if args.json:
+        sys.stdout.write(
+            format_json(verdicts, {k: v for k, v in extra.items() if k != "title"})
+        )
+    elif args.tsv:
+        sys.stdout.write(format_tsv(verdicts))
+    else:
+        if not args.quiet:
+            sys.stdout.write(format_human(verdicts, str(title)))
+        else:
+            uni = unanimous(verdicts)
+            c = counted(verdicts)
+            bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+            sys.stdout.write(f"{uni}\t{bits}\n")
+    code = exit_for(unanimous(verdicts))
+    if args.report_only:
+        return 0
+    return code
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="plea",
+        description="Occupancy of a review-suggestion stream against HEAD",
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("files", nargs="*", help="JSON/JSONL/markdown review streams, or -")
+    p.add_argument("-C", default=".", metavar="DIR", help="tree root")
+    p.add_argument("--against", default=None, metavar="REF", help="git ref (default HEAD)")
+    p.add_argument("--worktree", action="store_true", help="read dirty worktree files")
+    p.add_argument("--ignore-space", action="store_true")
+    p.add_argument("--fuzz", dest="fuzz", action="store_true", default=False)
+    p.add_argument("--no-fuzz", dest="fuzz", action="store_false")
+    p.add_argument("--sandwich", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--only", metavar="FATE[,FATE]")
+    p.add_argument("--pick", metavar="FATE[,FATE]")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(HELP)
+        return 0
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"plea {VERSION}")
+        return 0
+    if args.selftest:
+        return selftest(fuzz=args.fuzz)
+
+    texts: list[tuple[str, str]] = []
+    files = list(args.files)
+    if not files or files == ["-"] or (not files and not sys.stdin.isatty()):
+        if files and files != ["-"] and sys.stdin.isatty():
+            pass
+        elif not files or files == ["-"]:
+            texts.append(("stdin", sys.stdin.read()))
+            files = []
+    for f in files:
+        if f == "-":
+            texts.append(("stdin", sys.stdin.read()))
+        else:
+            texts.append((f, Path(f).read_text(encoding="utf-8")))
+
+    if not texts:
+        sys.stdout.write(HELP)
+        return EXIT_ERROR
+
+    claims: list[Claim] = []
+    for src, text in texts:
+        claims.extend(load_stream(text, source=src))
+
+    if not claims:
+        print("plea: no review suggestions in stream", file=sys.stderr)
+        return 0 if args.report_only else EXIT_APPLIED
+
+    root = Path(args.C).resolve()
+    against = default_against(root, args.against, args.worktree)
+    norm = space_norm if args.ignore_space else ident
+    verdicts = classify_stream(claims, root, against, norm, fuzz=args.fuzz)
+    if args.sandwich:
+        cmap = {c.id: c for c in claims}
+        for v in verdicts:
+            c = cmap.get(v.claim)
+            if c:
+                sandwich_claim(c, root, v, norm, args.fuzz)
+    title = texts[0][0] if len(texts) == 1 else f"{len(texts)} streams"
+    try:
+        return emit(
+            verdicts,
+            args,
+            {
+                "title": title,
+                "tree": str(root),
+                "against": against if against is not None else ":worktree",
+                "n": len(claims),
+            },
+        )
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

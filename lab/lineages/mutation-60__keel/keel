@@ -1,0 +1,2496 @@
+#!/usr/bin/env python3
+"""keel — mint a durable locus token; resolve it onto a later tree.
+
+A file:line is a locator. It dies when the file splits. A keel token is the
+fingerprint (line + identifiers + in-scope neighbors + path hint) plus a
+*repo identity* so a ticket can store the address without the SHA.
+
+The flipped assumption (vs pin v0.5): origin is the project, not the set of
+root SHAs. A shallow / orphan / graft clone of the same repo still resolves.
+A foreign repo fail-closes unless --any-repo.
+
+Kept from v0.4/v0.5:
+  * leftover stubs at the old path are not identity
+  * extract-and-keep is not a move — if the origin function still holds
+    the implementation body, that path is the locus
+  * if origin is a stub, a unique extracted body beats same-basename bait
+    even when the landing is not oldstem/…
+  * unique means unique in both snapshots
+  * a missing --to ref is an error, not a deletion
+  * a truncated token fails closed
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import zlib
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+from urllib.parse import unquote, urlparse
+
+VERSION = "0.6.1"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEF_RE = re.compile(
+    r"""^(\s*)(?:(?:pub(?:\s*\([^)]*\))?|crate|async|unsafe|static|
+         private|protected|public|internal|open|override|fileprivate|
+         export|default)\s+)*
+        (?:fn|def|func|function|class|struct|enum|trait|interface|impl|
+         extension|typedef|type)\b""",
+    re.VERBOSE,
+)
+STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "class", "const", "crate",
+    "def", "else", "enum", "false", "fn", "for", "from", "func", "function",
+    "i", "if", "impl", "import", "in", "int", "let", "mod", "mut", "n",
+    "none", "not", "of", "or", "pub", "return", "self", "static", "str",
+    "struct", "t", "the", "this", "to", "true", "type", "use", "var",
+    "void", "where", "with",
+}
+TRIVIAL_NORMS = {
+    "", "{", "}", "};", "[", "]", "(", ")", "else", "else:", "pass",
+    "break", "continue", "end", "end;", "//", "#", "*/", "/*",
+}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+HARD_MAX_BYTES = 48_000_000
+MAX_TEXT_CHARS = 240
+MAX_NEIGHBOR_CHARS = 140
+MAX_PIN_PLAIN = 64_000
+TIE_EPS = 1e-6
+EXACT_NS_KEEP = 0.15
+STRONG_NS_FLOOR = 0.40
+WITNESS_LEN = 16
+MAX_WITNESSES = 3
+MAX_REMOTES = 6
+FOLLOW_HOPS = 2
+
+PREFIX = "keel1."
+ORIGIN_PREFIX = "keel1:"
+_PIN_BODY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_SCP_RE = re.compile(r"^(?:(?P<user>[^@/]+)@)?(?P<host>[^:/]+):(?P<path>.+)$")
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+@dataclass(frozen=True)
+class KeelId:
+    """Stable repo identity: project remotes + tip witnesses, not root SHAs."""
+
+    remotes: tuple[str, ...] = ()
+    witnesses: tuple[str, ...] = ()
+
+    def encode(self) -> Optional[str]:
+        if not self.remotes and not self.witnesses:
+            return None
+        r = ",".join(self.remotes[:MAX_REMOTES])
+        w = ",".join(self.witnesses[:MAX_WITNESSES])
+        return f"{ORIGIN_PREFIX}r:{r};w:{w}"
+
+    @classmethod
+    def decode(cls, raw: Optional[str]) -> Optional["KeelId"]:
+        if not raw or not isinstance(raw, str):
+            return None
+        if not raw.startswith(ORIGIN_PREFIX):
+            return None
+        body = raw[len(ORIGIN_PREFIX) :]
+        remotes: list[str] = []
+        witnesses: list[str] = []
+        r_part = ""
+        w_part = ""
+        if body.startswith("r:"):
+            if ";w:" in body:
+                r_part, w_part = body[2:].split(";w:", 1)
+            else:
+                r_part = body[2:]
+        elif ";w:" in body:
+            r_part, w_part = body.split(";w:", 1)
+        else:
+            return None
+        remotes = [x for x in r_part.split(",") if x]
+        witnesses = [x.lower() for x in w_part.split(",") if _SHA_RE.match(x.lower())]
+        return cls(tuple(remotes), tuple(witnesses))
+
+
+@dataclass
+class Fingerprint:
+    path: str
+    line: int
+    text: str
+    tokens: list[str] = field(default_factory=list)
+    unique: list[str] = field(default_factory=list)
+    before: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)
+    anchors: list[str] = field(default_factory=list)
+    col: Optional[int] = None
+    origin: Optional[str] = None
+
+    def payload(self) -> dict:
+        d: dict = {"v": 3, "p": self.path, "n": self.line, "t": self.text}
+        if self.tokens:
+            d["k"] = self.tokens
+        if self.unique:
+            d["u"] = self.unique
+        if self.before:
+            d["b"] = self.before
+        if self.after:
+            d["a"] = self.after
+        if self.anchors:
+            d["g"] = self.anchors
+        if self.col is not None:
+            d["c"] = self.col
+        if self.origin:
+            d["o"] = self.origin
+        return d
+
+    @classmethod
+    def from_payload(cls, d: dict) -> "Fingerprint":
+        if not isinstance(d, dict) or d.get("v") not in (1, 2, 3):
+            raise ValueError("unsupported keel version")
+        text = d.get("t")
+        path = d.get("p")
+        line = d.get("n")
+        if not isinstance(text, str) or not isinstance(path, str) or not isinstance(line, int):
+            raise ValueError("keel missing path/line/text")
+        origin = d.get("o")
+        return cls(
+            path=canon_path(path),
+            line=line,
+            text=text,
+            tokens=_str_list(d.get("k")),
+            unique=_str_list(d.get("u")),
+            before=_str_list(d.get("b")),
+            after=_str_list(d.get("a")),
+            anchors=_str_list(d.get("g")),
+            col=d.get("c") if isinstance(d.get("c"), int) else None,
+            origin=origin if isinstance(origin, str) and origin else None,
+        )
+
+
+@dataclass
+class Hit:
+    fp: Fingerprint
+    name: Optional[str]
+    token: str
+    status: str
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+    gap_path: Optional[str] = None
+    gap_line: Optional[int] = None
+    alts: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass
+class Scored:
+    score: float
+    path: str
+    line: int
+    text: str
+    ns: float
+    exact: bool
+    body_ns: float = 0.0
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    git_names: dict[str, str] = field(default_factory=dict)
+    origin: Optional[str] = None
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        keyed = {canon_path(p): lines for p, lines in self.files.items()}
+        self.files = keyed
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+
+def _str_list(val: object) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    return [x for x in val if isinstance(x, str)]
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    try:
+        cur = start.resolve()
+    except OSError:
+        return None
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/") if p.startswith("/") and not p.startswith("//") else p
+
+
+def canon_path(path: str) -> str:
+    return unicodedata.normalize("NFC", posix_rel(path))
+
+
+def path_forms(path: str) -> set[str]:
+    raw = posix_rel(path)
+    return {raw, unicodedata.normalize("NFC", raw), unicodedata.normalize("NFD", raw)}
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def clip(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def decode_bytes(data: bytes, *, required: bool = False, path: str = "") -> Optional[str]:
+    if b"\x00" in data[:8192]:
+        if required:
+            die(f"keel: binary file cannot be fingerprinted: {path or '?'}")
+        return None
+    if len(data) > HARD_MAX_BYTES:
+        if required:
+            die(
+                f"keel: file exceeds {HARD_MAX_BYTES} bytes: {path or '?'} "
+                f"({len(data)} bytes)"
+            )
+        print(
+            f"keel: skipping huge file {path} ({len(data)} bytes)",
+            file=sys.stderr,
+        )
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def verify_git_ref(root: Path, ref: str) -> str:
+    cp = git(root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{object}}"], check=False)
+    sha = cp.stdout.decode("ascii", "replace").strip()
+    if cp.returncode != 0 or not sha:
+        die(f"keel: unknown ref: {ref}")
+    return sha
+
+
+def _strip_dot_git(path: str) -> str:
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path.rstrip("/")
+
+
+def normalize_remote(url: str) -> Optional[str]:
+    """Project identity for a remote. Local paths are not stored (clones rewrite them)."""
+    url = unquote(url.strip())
+    if not url:
+        return None
+    if url.startswith("file://") or url.startswith("file:"):
+        return None
+    if url.startswith("/") or url.startswith(".") or url.startswith("~"):
+        return None
+    # Windows drive / UNC: local.
+    if re.match(r"^[A-Za-z]:[\\/]", url) or url.startswith("\\\\"):
+        return None
+    if "://" in url:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return None
+        path = _strip_dot_git(parsed.path.lstrip("/"))
+        if not path:
+            return host
+        return f"{host}/{path}".lower()
+    m = _SCP_RE.match(url)
+    if m and "/" not in m.group("host"):
+        host = m.group("host").lower()
+        path = _strip_dot_git(m.group("path").lstrip("/"))
+        if not path:
+            return host
+        return f"{host}/{path}".lower()
+    return None
+
+
+def raw_remote_urls(root: Path) -> list[str]:
+    raw = git_ok(root, ["config", "--get-regexp", r"^remote\..*\.url$"])
+    urls: list[str] = []
+    if raw:
+        for line in raw.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                urls.append(parts[1].strip())
+        return urls
+    raw = git_ok(root, ["remote", "-v"]) or ""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] not in seen:
+            seen.add(parts[1])
+            out.append(parts[1])
+    return out
+
+
+def network_remotes(root: Path) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in raw_remote_urls(root):
+        n = normalize_remote(url)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out[:MAX_REMOTES]
+
+
+def inherited_network_remotes(root: Path, hops: int = FOLLOW_HOPS) -> list[str]:
+    """Project remotes of this repo, plus remotes of a local origin hop.
+
+    `git clone --depth 1 /path` is not shallow (git ignores --depth).
+    `git clone --depth 1 file:///path` is. Dest origin is then file://,
+    which is not a project remote. The project's github/ssh remote lives
+    one hop away on the cloned-from repo.
+    """
+    seen_paths: set[str] = set()
+    seen_r: set[str] = set()
+    found: list[str] = []
+
+    def walk(cur: Path, left: int) -> None:
+        try:
+            key = str(cur.resolve())
+        except OSError:
+            key = str(cur)
+        if key in seen_paths or left < 0:
+            return
+        seen_paths.add(key)
+        for n in network_remotes(cur):
+            if n not in seen_r:
+                seen_r.add(n)
+                found.append(n)
+        if left == 0:
+            return
+        for url in raw_remote_urls(cur):
+            local = local_git_from_url(cur, url)
+            if local is not None:
+                walk(local, left - 1)
+
+    walk(root, hops)
+    return found[:MAX_REMOTES]
+
+
+def _commit_prefix(root: Path, rev: str) -> Optional[str]:
+    raw = git_ok(root, ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"])
+    if not raw:
+        return None
+    sha = raw.strip().splitlines()[0].strip().lower()
+    if len(sha) < WITNESS_LEN:
+        return None
+    return sha[:WITNESS_LEN]
+
+
+def repo_keel(root: Optional[Path], ref: Optional[str] = None) -> Optional[str]:
+    """Identity of the repository as a project, not as a history shape.
+
+    Remotes (normalized host/path) survive shallow / orphan / graft.
+    Tip witnesses (HEAD and --from/--to) let the same object store match
+    even with no remotes. Roots are not stored: a depth-1 clone's only
+    'root' is HEAD, which is a different SHA from the true root.
+    """
+    if root is None:
+        return None
+    remotes = inherited_network_remotes(root)
+    witnesses: list[str] = []
+    seen: set[str] = set()
+    for rev in (ref, "HEAD"):
+        if not rev:
+            continue
+        w = _commit_prefix(root, rev)
+        if w and w not in seen:
+            seen.add(w)
+            witnesses.append(w)
+        if len(witnesses) >= MAX_WITNESSES:
+            break
+    kid = KeelId(tuple(remotes), tuple(witnesses))
+    return kid.encode()
+
+
+def object_exists(root: Path, sha_prefix: str) -> bool:
+    if not sha_prefix or not _SHA_RE.match(sha_prefix.lower()):
+        return False
+    cp = git(
+        root,
+        ["cat-file", "-e", sha_prefix.lower() + "^{object}"],
+        check=False,
+    )
+    return cp.returncode == 0
+
+
+def local_git_from_url(root: Path, url: str) -> Optional[Path]:
+    url = url.strip()
+    path: Optional[Path] = None
+    if url.startswith("file://"):
+        parsed = urlparse(url)
+        raw = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc not in {".", "localhost"}:
+            raw = f"//{parsed.netloc}{raw}"
+        path = Path(raw)
+    elif url.startswith("file:"):
+        path = Path(unquote(url[5:]))
+    elif url.startswith("/") or url.startswith("."):
+        path = Path(url)
+    elif url.startswith("~"):
+        path = Path(os.path.expanduser(url))
+    else:
+        return None
+    if not path.is_absolute():
+        path = root / path
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    if path.name == ".git":
+        path = path.parent
+    if (path / ".git").exists():
+        return path
+    return None
+
+
+def keels_match(
+    pin: Optional[KeelId],
+    dest: Optional[KeelId],
+    dest_root: Optional[Path] = None,
+) -> bool:
+    if pin is None or dest is None:
+        return True
+    if pin.remotes and dest.remotes and set(pin.remotes) & set(dest.remotes):
+        return True
+    if pin.witnesses and dest.witnesses and set(pin.witnesses) & set(dest.witnesses):
+        return True
+    if dest_root is not None:
+        if any(object_exists(dest_root, w) for w in pin.witnesses):
+            return True
+        if _follow_local_match(pin, dest_root, hops=FOLLOW_HOPS, seen=None):
+            return True
+    return False
+
+
+def _follow_local_match(
+    pin: KeelId, root: Path, hops: int, seen: Optional[set[str]]
+) -> bool:
+    if hops <= 0:
+        return False
+    if seen is None:
+        seen = set()
+    try:
+        key = str(root.resolve())
+    except OSError:
+        key = str(root)
+    if key in seen:
+        return False
+    seen.add(key)
+    for url in raw_remote_urls(root):
+        n = normalize_remote(url)
+        if n and n in pin.remotes:
+            return True
+        local = local_git_from_url(root, url)
+        if local is None:
+            continue
+        hop_remotes = network_remotes(local)
+        if pin.remotes and set(pin.remotes) & set(hop_remotes):
+            return True
+        if any(object_exists(local, w) for w in pin.witnesses):
+            return True
+        if _follow_local_match(pin, local, hops - 1, seen):
+            return True
+    return False
+
+
+def origins_match(
+    pin_origin: Optional[str],
+    dest_origin: Optional[str],
+    dest_root: Optional[Path] = None,
+) -> bool:
+    """Same project? Missing origin (gitless dir) is allowed. Else keel identity."""
+    if not pin_origin or not dest_origin:
+        return True
+    pin = KeelId.decode(pin_origin)
+    dest = KeelId.decode(dest_origin)
+    if pin is None or dest is None:
+        return pin_origin == dest_origin
+    return keels_match(pin, dest, dest_root)
+
+
+def load_git_paths(root: Path, ref: Optional[str]) -> list[tuple[str, str]]:
+    if ref is None:
+        cp = git(root, ["ls-files", "-z"], check=False)
+        label = "worktree"
+    else:
+        verify_git_ref(root, ref)
+        cp = git(root, ["ls-tree", "-r", "--name-only", "-z", ref], check=False)
+        label = ref
+    if cp.returncode != 0:
+        err = cp.stderr.decode("utf-8", "replace").strip() or "git list failed"
+        die(f"keel: cannot list {label}: {err}")
+    raw = cp.stdout.decode("utf-8", "surrogateescape")
+    out: list[tuple[str, str]] = []
+    for p in raw.split("\0"):
+        if not p or should_skip_path(p):
+            continue
+        out.append((canon_path(p), p))
+    return out
+
+
+def read_git_file(
+    root: Path,
+    ref: Optional[str],
+    git_name: str,
+    *,
+    required: bool = False,
+) -> Optional[list[str]]:
+    if ref is None:
+        return read_fs_file(root / git_name, required=required, display=git_name)
+    try:
+        cp = git(root, ["show", f"{ref}:{git_name}"], check=True)
+    except subprocess.CalledProcessError:
+        if required:
+            die(f"keel: cannot read {ref}:{git_name}")
+        return None
+    text = decode_bytes(cp.stdout, required=required, path=git_name)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def walk_dir_files(root: Path) -> Iterator[tuple[str, Path]]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield canon_path(rel), full
+
+
+def read_fs_file(fp: Path, *, required: bool = False, display: str = "") -> Optional[list[str]]:
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        if required:
+            die(f"keel: cannot read {display or fp}")
+        return None
+    text = decode_bytes(data, required=required, path=display or str(fp))
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    untracked: bool,
+    label: str,
+    empty_ok: bool = False,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    git_names: dict[str, str] = {}
+    origin: Optional[str] = None
+    if directory is not None:
+        if not directory.is_dir():
+            die(f"keel: not a directory: {directory}")
+        nested = discover_repo(directory)
+        if nested is not None:
+            origin = repo_keel(nested)
+        for path, full in walk_dir_files(directory):
+            lines = read_fs_file(full, display=path)
+            if lines is not None:
+                files[path] = lines
+        if not files and not empty_ok:
+            die(f"keel: destination snapshot is empty: {directory}")
+        snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+        snap.index()
+        return snap
+    if git_root is None:
+        die("keel: not a git repository (use --repo or --from-dir/--to-dir)")
+    origin = repo_keel(git_root, ref)
+    pairs = load_git_paths(git_root, ref)
+    if ref is None and untracked:
+        extra = git_ok(git_root, ["ls-files", "-o", "--exclude-standard", "-z"]) or ""
+        for p in extra.split("\0"):
+            if p and not should_skip_path(p):
+                pairs.append((canon_path(p), p))
+    for nfc, git_name in pairs:
+        lines = read_git_file(git_root, ref, git_name)
+        if lines is not None:
+            files[nfc] = lines
+            git_names[nfc] = git_name
+    snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+    snap.index()
+    return snap
+
+
+def inject_file(snap: Snapshot, path: str, lines: list[str], git_name: Optional[str] = None) -> str:
+    key = canon_path(path)
+    snap.files[key] = lines
+    if git_name:
+        snap.git_names[key] = git_name
+    snap.index()
+    return key
+
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    forms = path_forms(raw)
+    nfc = canon_path(raw)
+    known_map = {canon_path(k): k for k in known}
+    if nfc in known_map:
+        return known_map[nfc]
+    for f in forms:
+        if f in known_map:
+            return known_map[f]
+    best = None
+    for kp in known_map:
+        if any(nfc.endswith("/" + f) or kp.endswith("/" + f) for f in forms):
+            if nfc.endswith("/" + kp) or kp.endswith("/" + nfc):
+                if best is None or len(kp) > len(best):
+                    best = kp
+        if nfc.endswith("/" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    return best
+
+
+def parse_locator(text: str, known: Iterable[str]) -> tuple[str, int, Optional[int]]:
+    if is_keel_token(text):
+        die("keel mint: that looks like a keel token; use resolve")
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        die(f"keel: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    bound = bind_path(rest, known)
+    path = bound or canon_path(rest)
+    if not path:
+        die(f"keel: missing path in {text}")
+    return path, line, col
+
+
+def is_keel_token(s: str) -> bool:
+    s = s.strip()
+    if not s.startswith(PREFIX):
+        return False
+    body = s[len(PREFIX) :]
+    return len(body) >= 12 and bool(_PIN_BODY_RE.fullmatch(body))
+
+
+def encode_pin(fp: Fingerprint) -> str:
+    raw = json.dumps(fp.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    packed = zlib.compress(raw, 9)
+    return PREFIX + base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+def decode_pin(token: str) -> Fingerprint:
+    token = token.strip()
+    if not is_keel_token(token):
+        raise ValueError("not a keel token")
+    b64 = token[len(PREFIX) :]
+    pad = "=" * (-len(b64) % 4)
+    try:
+        packed = base64.urlsafe_b64decode(b64 + pad)
+        raw = zlib.decompress(packed)
+    except Exception as e:
+        raise ValueError(f"corrupt keel: {e}") from e
+    if len(raw) > MAX_PIN_PLAIN:
+        raise ValueError("keel payload too large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt keel json: {e}") from e
+    return Fingerprint.from_payload(data)
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def is_def_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "//", "/*", "*", "///", "--", "!", "{", "}")):
+        return False
+    return bool(DEF_RE.match(line.rstrip()))
+
+
+def is_comment_or_attr(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith(("#", "//", "/*", "*", "///", "--", "@", "#[", "#[derive"))
+
+
+def is_docstring_line(line: str) -> bool:
+    s = line.lstrip()
+    for q in ('"""', "'''"):
+        if s.startswith(q) or s.startswith("r" + q) or s.startswith("f" + q):
+            return True
+    return False
+
+
+def is_body_line(line: str) -> bool:
+    if normalize(line) in TRIVIAL_NORMS:
+        return False
+    if is_def_line(line) or is_comment_or_attr(line) or is_docstring_line(line):
+        return False
+    return True
+
+
+def collect_neighbors(lines: list[str], idx: int, ctx: int) -> tuple[list[str], list[str]]:
+    here = lines[idx - 1]
+    here_indent = indent_of(here)
+    here_is_def = is_def_line(here)
+    before: list[str] = []
+    j = idx - 1
+    while j >= 1 and len(before) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j -= 1
+            continue
+        if here_is_def and is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        if here_is_def and indent_of(raw) > here_indent and not is_comment_or_attr(raw):
+            j -= 1
+            continue
+        before.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j -= 1
+    before.reverse()
+    after: list[str] = []
+    j = idx + 1
+    while j <= len(lines) and len(after) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j += 1
+            continue
+        if is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        after.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j += 1
+    return before, after
+
+
+def lookup_lines(src: Snapshot, path: str) -> tuple[str, list[str]]:
+    nfc = canon_path(path)
+    if nfc in src.files:
+        return nfc, src.files[nfc]
+    for form in path_forms(path):
+        key = canon_path(form)
+        if key in src.files:
+            return key, src.files[key]
+    hits = [p for p in src.files if p == nfc or p.endswith("/" + nfc)]
+    if len(hits) == 1:
+        return hits[0], src.files[hits[0]]
+    if not hits:
+        raise SystemExit(f"keel mint: source path not in snapshot: {path}")
+    raise SystemExit(f"keel mint: source path ambiguous: {path}")
+
+
+def mint_fingerprint(
+    src: Snapshot, path: str, line: int, col: Optional[int], ctx: int, force: bool
+) -> Fingerprint:
+    path, src_lines = lookup_lines(src, path)
+    if line < 1 or line > len(src_lines):
+        raise SystemExit(f"keel mint: line {line} out of range ({path} has {len(src_lines)} lines)")
+    raw = src_lines[line - 1]
+    if normalize(raw) in TRIVIAL_NORMS and not force:
+        raise SystemExit(f"keel mint: line is too trivial to fingerprint: {path}:{line}")
+    toks = tokens(raw)
+    ranked = sorted(set(toks), key=lambda t: (-len(t), t.lower()))[:8]
+    unique = []
+    for tok in ranked:
+        if src.token_df.get(tok, 99) == 1 and len(tok) >= 4:
+            unique.append(tok)
+    before, after = collect_neighbors(src_lines, line, ctx)
+    skip = set(ranked)
+    nearby: list[tuple[int, str]] = []
+    for i, src_raw in enumerate(src_lines, start=1):
+        if i == line or not is_def_line(src_raw):
+            continue
+        for tok in tokens(src_raw):
+            if tok in skip or len(tok) < 4:
+                continue
+            if src.token_df.get(tok, 99) == 1:
+                nearby.append((abs(i - line), tok))
+                break
+    nearby.sort()
+    anchors: list[str] = []
+    seen_anchor: set[str] = set()
+    for _, tok in nearby:
+        if tok in seen_anchor:
+            continue
+        anchors.append(tok)
+        seen_anchor.add(tok)
+        if len(anchors) >= 4:
+            break
+    return Fingerprint(
+        path=path,
+        line=line,
+        text=clip(raw, MAX_TEXT_CHARS),
+        tokens=ranked,
+        unique=unique,
+        before=before,
+        after=after,
+        anchors=anchors,
+        col=col,
+        origin=src.origin,
+    )
+
+
+def is_stem_split(src: str, dst: str) -> bool:
+    src, dst = canon_path(src), canon_path(dst)
+    stem, _ = os.path.splitext(src)
+    return dst.startswith(stem + "/")
+
+
+def path_score(src: str, dst: str) -> float:
+    src, dst = canon_path(src), canon_path(dst)
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    s_stem, s_ext = os.path.splitext(src)
+    score = 0.0
+    if dst.startswith(s_stem + "/") or is_stem_split(src, dst):
+        score += 0.88
+    elif s_base == d_base:
+        score += 0.42
+    else:
+        s_stem_base = os.path.splitext(s_base)[0]
+        if s_stem_base and os.path.splitext(d_base)[0] == s_stem_base:
+            score += 0.28
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.04
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.12 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def neighbor_window_score(fp: Fingerprint, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    neigh = fp.before + fp.after
+    if not neigh or ctx <= 0:
+        return 0.0
+    lo = max(1, dst_i - ctx)
+    hi = min(len(dst_lines), dst_i + ctx)
+    window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+    hits = sum(1 for n in neigh if normalize(n) in window)
+    return hits / len(neigh)
+
+
+def enclosing_function_lines(lines: list[str], idx: int) -> list[str]:
+    if idx < 1 or idx > len(lines):
+        return []
+    raw = lines[idx - 1]
+    start = idx
+    start_indent = indent_of(raw)
+    if not is_def_line(raw):
+        found = False
+        j = idx - 1
+        while j >= 1:
+            cand = lines[j - 1]
+            if is_def_line(cand) and indent_of(cand) <= indent_of(raw):
+                start = j
+                start_indent = indent_of(cand)
+                found = True
+                break
+            j -= 1
+        if not found:
+            return list(lines)
+    end = len(lines)
+    j = start + 1
+    while j <= len(lines):
+        cand = lines[j - 1]
+        if is_def_line(cand) and indent_of(cand) <= start_indent:
+            end = j - 1
+            break
+        j += 1
+    return lines[start - 1 : end]
+
+
+def body_window_score(fp: Fingerprint, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    body = [normalize(x) for x in (fp.before + fp.after) if is_body_line(x)]
+    if not body:
+        return neighbor_window_score(fp, dst_lines, dst_i, ctx)
+    scope = enclosing_function_lines(dst_lines, dst_i)
+    if not scope:
+        return 0.0
+    window = {normalize(x) for x in scope}
+    here = normalize(dst_lines[dst_i - 1]) if 1 <= dst_i <= len(dst_lines) else ""
+    window.discard(here)
+    hits = sum(1 for n in body if n in window)
+    return hits / len(body)
+
+
+def dest_unique_token(fp: Fingerprint, draw: str, dst: Snapshot) -> bool:
+    if not fp.unique:
+        return False
+    dt = set(tokens(draw))
+    return any(u in dt and dst.token_df.get(u, 99) == 1 for u in fp.unique)
+
+
+def score_pin(
+    fp: Fingerprint,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+    dst: Snapshot,
+) -> tuple[float, float, bool]:
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_window_score(fp, dst_lines, dst_i, ctx)
+    ps = path_score(fp.path, dst_path)
+    exact = fp.text == draw or normalize(fp.text) == normalize(draw)
+    if exact:
+        n = normalize(fp.text)
+        unique_line = n not in TRIVIAL_NORMS and len(dst.by_norm.get(n, ())) == 1
+        uniq_tok = dest_unique_token(fp, draw, dst)
+        if unique_line:
+            return 1.0, ns, True
+        if uniq_tok:
+            return 1.0, ns, True
+        same_path = canon_path(fp.path) == canon_path(dst_path)
+        if same_path and ns >= 0.5:
+            return 1.0, ns, True
+        return min(0.999, 0.58 + 0.32 * ns + 0.10 * ps), ns, True
+    lr = line_ratio(fp.text, draw)
+    ts = token_score(fp.text, draw)
+    ub = 0.0
+    if fp.unique:
+        dt = set(tokens(draw))
+        hits = sum(1 for u in fp.unique if u in dt and dst.token_df.get(u, 99) == 1)
+        if fp.unique:
+            ub = 0.08 * hits / len(fp.unique)
+    return min(1.0, W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps + ub), ns, False
+
+
+def candidates_for_pin(fp: Fingerprint, dst: Snapshot) -> list[tuple[str, int]]:
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(canon_path(path), line)] = None
+
+    n = normalize(fp.text)
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    for tok in list(fp.unique) + [t for t in fp.tokens if t not in fp.unique]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred: list[str] = []
+    nfc = canon_path(fp.path)
+    if nfc in dst.files:
+        preferred.append(nfc)
+    stem = os.path.splitext(nfc)[0]
+    base = os.path.basename(nfc)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base):
+            preferred.append(p)
+    for p in preferred:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(fp: Fingerprint, dst_path: Optional[str], dst_raw: str, dst_line: Optional[int], score: float) -> str:
+    if dst_path is None or dst_line is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    same_text = normalize(fp.text) == normalize(dst_raw) or line_ratio(fp.text, dst_raw) >= 0.96
+    if same_text and canon_path(fp.path) == canon_path(dst_path):
+        if fp.line == dst_line:
+            return "same"
+        return "shifted"
+    if same_text:
+        return "moved"
+    return "edited"
+
+
+def describe_hole(fp: Fingerprint, dst: Snapshot) -> tuple[Optional[str], Optional[int], str]:
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    for raw in reversed(fp.before):
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            prev_hit = locs[0]
+            break
+    for raw in fp.after:
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            next_hit = locs[0]
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return prev_hit[0], min(hi, lo + 1), f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return (
+            next_hit[0],
+            next_hit[1],
+            f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}",
+        )
+    if prev_hit:
+        return prev_hit[0], prev_hit[1], f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return next_hit[0], next_hit[1], f"next context at {next_hit[0]}:{next_hit[1]}"
+    surviving: list[str] = []
+    gap_path = None
+    gap_line = None
+    for tok in fp.anchors:
+        locs = dst.by_token.get(tok, [])
+        if len(locs) == 1:
+            p, i = locs[0]
+            surviving.append(f"{tok} at {p}:{i}")
+            if gap_path is None:
+                gap_path, gap_line = p, i
+    if surviving:
+        return gap_path, gap_line, "surviving anchors: " + "; ".join(surviving[:4])
+    return None, None, "no candidates"
+
+
+def origin_exact(fp: Fingerprint, exacts: list[Scored]) -> Optional[Scored]:
+    same = [s for s in exacts if canon_path(s.path) == canon_path(fp.path) and s.exact]
+    if len(same) != 1:
+        return None
+    return same[0]
+
+
+def origin_holds_body(fp: Fingerprint, exacts: list[Scored]) -> Optional[Scored]:
+    hit = origin_exact(fp, exacts)
+    if hit is None:
+        return None
+    if hit.body_ns >= 1.0 - TIE_EPS:
+        return hit
+    return None
+
+
+def is_basename_copy(src: str, dst: str) -> bool:
+    return os.path.basename(canon_path(src)) == os.path.basename(canon_path(dst))
+
+
+def origin_is_stub(fp: Fingerprint, exacts: list[Scored]) -> bool:
+    return origin_exact(fp, exacts) is not None and origin_holds_body(fp, exacts) is None
+
+
+def module_forms(path: str) -> list[str]:
+    nfc = canon_path(path)
+    stem, _ = os.path.splitext(nfc)
+    parts = [p for p in stem.split("/") if p]
+    forms = [nfc, stem, stem.replace("/", ".")]
+    if len(parts) >= 2:
+        forms.append(".".join(parts[-2:]))
+        forms.append("/".join(parts[-2:]))
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in forms:
+        if len(f) < 3 or f in seen:
+            continue
+        seen.add(f)
+        out.append(f)
+    return out
+
+
+def leftover_names_extract(
+    fp: Fingerprint, exacts: list[Scored], strong: list[Scored], dst: Snapshot
+) -> Optional[Scored]:
+    if not origin_is_stub(fp, exacts):
+        return None
+    origin = origin_exact(fp, exacts)
+    if origin is None:
+        return None
+    lines = dst.files.get(origin.path) or []
+    blob = "\n".join(enclosing_function_lines(lines, origin.line))
+    if not blob.strip():
+        return None
+    hits: list[Scored] = []
+    for s in strong:
+        if canon_path(s.path) == canon_path(fp.path):
+            continue
+        if any(form in blob for form in module_forms(s.path)):
+            hits.append(s)
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _pick_exact(fp: Fingerprint, exacts: list[Scored], dst: Snapshot) -> Optional[Scored]:
+    if not exacts:
+        return None
+    kept = origin_holds_body(fp, exacts)
+    if kept is not None:
+        return kept
+    if len(exacts) == 1:
+        return exacts[0]
+    best_ns = max(s.ns for s in exacts)
+    strong = [s for s in exacts if s.ns >= best_ns - EXACT_NS_KEEP]
+    if best_ns >= STRONG_NS_FLOOR:
+        strong = [s for s in strong if s.ns >= STRONG_NS_FLOOR]
+    if len(strong) == 1:
+        return strong[0]
+    if len(strong) > 1:
+        splits = [s for s in strong if is_stem_split(fp.path, s.path)]
+        if len(splits) == 1:
+            return splits[0]
+        named = leftover_names_extract(fp, exacts, strong, dst)
+        if named is not None:
+            return named
+        if origin_is_stub(fp, exacts):
+            extracts = [
+                s
+                for s in strong
+                if canon_path(s.path) != canon_path(fp.path)
+                and not is_basename_copy(fp.path, s.path)
+            ]
+            if len(extracts) == 1:
+                return extracts[0]
+        return None
+    return max(exacts, key=lambda s: (s.ns, s.score, -len(s.path)))
+
+
+def resolve_fingerprint(fp: Fingerprint, dst: Snapshot, ctx: int, debug: bool) -> Hit:
+    cands = candidates_for_pin(fp, dst)
+    scored: list[Scored] = []
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc, ns, exact = score_pin(fp, dpath, dlines, dline, ctx, dst)
+        body_ns = body_window_score(fp, dlines, dline, ctx)
+        scored.append(Scored(sc, dpath, dline, dlines[dline - 1], ns, exact, body_ns))
+    token = encode_pin(fp)
+    if debug and scored:
+        top = max(scored, key=lambda s: s.score)
+        print(
+            f"# debug {fp.path}:{fp.line} -> {top.path}:{top.line} score={top.score:.3f} cands={len(scored)}",
+            file=sys.stderr,
+        )
+    if not scored:
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            score=0.0,
+            note=note,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+
+    exacts = [s for s in scored if s.exact]
+    picked: Optional[Scored] = None
+    ambiguous_alts: list[Scored] = []
+    if len(exacts) > 1:
+        picked = _pick_exact(fp, exacts, dst)
+        if picked is None:
+            best_ns = max(s.ns for s in exacts)
+            ambiguous_alts = [
+                s
+                for s in exacts
+                if s.ns >= best_ns - EXACT_NS_KEEP
+                and (best_ns < STRONG_NS_FLOOR or s.ns >= STRONG_NS_FLOOR)
+            ]
+            if len(ambiguous_alts) < 2:
+                ambiguous_alts = exacts
+    if picked is None and not ambiguous_alts:
+        scored.sort(key=lambda s: (-s.score, s.path, s.line))
+        top = scored[0].score
+        ties = [s for s in scored if abs(s.score - top) <= TIE_EPS and s.score >= RESOLVE_THRESHOLD]
+        if len(ties) > 1:
+            ambiguous_alts = ties
+        else:
+            picked = scored[0]
+
+    if ambiguous_alts:
+        ambiguous_alts.sort(key=lambda s: (s.path, s.line))
+        locs = "; ".join(f"{s.path}:{s.line}" for s in ambiguous_alts[:8])
+        best = max(s.score for s in ambiguous_alts)
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="ambiguous",
+            score=best,
+            note=f"{len(ambiguous_alts)} copies: {locs}",
+            alts=[(s.path, s.line) for s in ambiguous_alts],
+        )
+
+    assert picked is not None
+    skipped_note = ""
+    if len(exacts) > 1:
+        bits: list[str] = []
+        origin_won = canon_path(picked.path) == canon_path(fp.path)
+        for s in exacts:
+            if s.path == picked.path and s.line == picked.line:
+                continue
+            if canon_path(s.path) == canon_path(fp.path):
+                bits.append(f"leftover stub {s.path}:{s.line}")
+            elif origin_won and is_basename_copy(fp.path, s.path):
+                bits.append(f"basename bait {s.path}:{s.line}")
+            elif origin_won and (
+                is_stem_split(fp.path, s.path) or s.body_ns >= STRONG_NS_FLOOR
+            ):
+                bits.append(f"extracted copy {s.path}:{s.line}")
+            elif is_stem_split(fp.path, s.path):
+                bits.append(f"extracted copy {s.path}:{s.line}")
+            elif is_basename_copy(fp.path, s.path):
+                bits.append(f"basename bait {s.path}:{s.line}")
+            elif not origin_won:
+                bits.append(f"extracted copy {s.path}:{s.line}")
+            else:
+                bits.append(f"{s.path}:{s.line}")
+        if bits:
+            skipped_note = "skipped " + "; ".join(bits[:4])
+    status = classify(fp, picked.path, picked.text, picked.line, picked.score)
+    if status == "deleted":
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        if skipped_note:
+            note = note + "; " + skipped_note
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            dest_path=picked.path,
+            dest_line=picked.line,
+            score=picked.score,
+            note=note,
+            dest_text=picked.text,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "shifted":
+        note = "same file, line number drifted"
+    if skipped_note:
+        note = (note + "; " if note else "") + skipped_note
+    return Hit(
+        fp=fp,
+        name=None,
+        token=token,
+        status=status,
+        dest_path=picked.path,
+        dest_line=picked.line,
+        score=picked.score,
+        note=note,
+        dest_text=picked.text,
+    )
+
+
+def format_from(fp: Fingerprint) -> str:
+    col = f":{fp.col}" if fp.col is not None else ""
+    return f"{fp.path}:{fp.line}{col}"
+
+
+def format_to(hit: Hit) -> str:
+    if hit.status == "ambiguous" and hit.alts:
+        return ",".join(f"{p}:{n}" for p, n in hit.alts)
+    if hit.dest_path is None or hit.dest_line is None or hit.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{hit.fp.col}" if hit.fp.col is not None else ""
+    return f"{hit.dest_path}:{hit.dest_line}{col}"
+
+
+def print_human_hit(hit: Hit) -> None:
+    src = format_from(hit.fp)
+    dst = format_to(hit)
+    if hit.status == "deleted":
+        dst = "(deleted)"
+    extra = f"  {hit.note}" if hit.note else ""
+    label = f"{hit.name}  " if hit.name else ""
+    print(f"{label}{src:40} → {dst:40} {hit.status:11} {hit.score:5.2f}{extra}")
+
+
+def print_porcelain_hit(hit: Hit) -> None:
+    note = hit.note.replace("\t", " ").replace("\n", " ")
+    name = hit.name or "-"
+    print(f"{hit.status}\t{name}\t{format_from(hit.fp)}\t{format_to(hit)}\t{hit.score:.3f}\t{note}")
+
+
+def print_json_hit(hit: Hit) -> None:
+    obj = {
+        "keel": hit.token,
+        "name": hit.name,
+        "from": {"path": hit.fp.path, "line": hit.fp.line, "col": hit.fp.col},
+        "to": (
+            None
+            if hit.dest_path is None or hit.status in {"deleted", "unresolved", "ambiguous"}
+            else {"path": hit.dest_path, "line": hit.dest_line, "col": hit.fp.col}
+        ),
+        "status": hit.status,
+        "score": round(hit.score, 4),
+        "note": hit.note,
+        "text": hit.fp.text,
+        "dest_text": hit.dest_text or None,
+        "origin": hit.fp.origin,
+    }
+    if hit.gap_path is not None:
+        obj["gap"] = {"path": hit.gap_path, "line": hit.gap_line}
+    if hit.alts:
+        obj["candidates"] = [{"path": p, "line": n} for p, n in hit.alts]
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def print_show(fp: Fingerprint, token: str, file=sys.stdout) -> None:
+    print(token, file=file)
+    print(f"  minted: {format_from(fp)}", file=file)
+    print(f"  text:   {fp.text}", file=file)
+    if fp.origin:
+        print(f"  origin: {fp.origin}", file=file)
+        kid = KeelId.decode(fp.origin)
+        if kid is not None:
+            if kid.remotes:
+                print(f"  remotes: {', '.join(kid.remotes)}", file=file)
+            if kid.witnesses:
+                print(f"  witnesses: {', '.join(kid.witnesses)}", file=file)
+    if fp.tokens:
+        print(f"  tokens: {', '.join(fp.tokens)}", file=file)
+    if fp.unique:
+        print(f"  unique: {', '.join(fp.unique)}", file=file)
+    if fp.anchors:
+        print(f"  anchors: {', '.join(fp.anchors)}", file=file)
+    if fp.before:
+        print("  before:", file=file)
+        for line in fp.before:
+            print(f"    - {line}", file=file)
+    if fp.after:
+        print("  after:", file=file)
+        for line in fp.after:
+            print(f"    - {line}", file=file)
+
+
+def parse_pinfile_line(line: str) -> Optional[tuple[Optional[str], str]]:
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    parts = raw.split()
+    token = None
+    name = None
+    for i, part in enumerate(parts):
+        if is_keel_token(part):
+            token = part
+            if i > 0:
+                name = " ".join(parts[:i])
+            break
+    if token is None:
+        return None
+    return name, token
+
+
+def load_pinfile(text: str) -> list[tuple[Optional[str], str]]:
+    out: list[tuple[Optional[str], str]] = []
+    for line in text.splitlines():
+        parsed = parse_pinfile_line(line)
+        if parsed:
+            out.append(parsed)
+    return out
+
+
+def append_pinfile(path: Path, name: Optional[str], token: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{name}\t{token}\n" if name else f"{token}\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def add_common(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--repo", "-C", type=Path, default=None, help="git repository (default: discover from cwd)")
+    sp.add_argument("--json", action="store_true", help="NDJSON output")
+    sp.add_argument("--porcelain", action="store_true", help="TSV output")
+    sp.add_argument("--strict", action="store_true", help="exit 1 if a pin is unresolved or ambiguous")
+    sp.add_argument("--debug", action="store_true", help="scorer traces on stderr")
+    sp.add_argument("--context", type=int, default=3, help="neighbor window (default 3)")
+    sp.add_argument("--untracked", action="store_true", help="include untracked files in worktree snapshots")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="keel",
+        description=(
+            "Mint a durable locus token and resolve it onto a later tree. "
+            "Origin is a stable repo identity (remotes + tip witnesses), not root SHAs."
+        ),
+    )
+    p.add_argument("--version", action="version", version=f"keel {VERSION}")
+    p.add_argument("--selftest", action="store_true", help="run internal checks")
+    sub = p.add_subparsers(dest="cmd")
+
+    m = sub.add_parser("mint", help="capture path:line once as a keel token")
+    add_common(m)
+    m.add_argument("locations", nargs="*", help="path:line (once). omit to read locators from stdin")
+    m.add_argument("--from", dest="from_ref", default=None, help="source git ref to mint from")
+    m.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory (skip git)")
+    m.add_argument("--name", action="append", default=None, help="pinfile name (repeat to match locators)")
+    m.add_argument("--file", type=Path, default=None, help="append minted tokens to a pinfile")
+    m.add_argument("--force", action="store_true", help="mint even if the line looks trivial")
+    m.add_argument("--pretty", action="store_true", help="dump fingerprint to stderr")
+
+    r = sub.add_parser("resolve", help="land a stored token on --to / --to-dir; no path:line")
+    add_common(r)
+    r.add_argument("pins", nargs="*", help="keel1.… tokens (or names if --file). omit to read a pinfile on stdin")
+    r.add_argument("--to", dest="to_ref", default=None, help="destination git ref (must exist if given)")
+    r.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    r.add_argument("--file", type=Path, default=None, help="pinfile of stored tokens")
+    r.add_argument(
+        "--any-repo",
+        action="store_true",
+        help="allow resolving onto a repository with a different keel identity",
+    )
+
+    s = sub.add_parser("show", help="decode a token without resolving")
+    s.add_argument("pins", nargs="+", help="keel1.… tokens")
+    s.add_argument("--json", action="store_true", help="JSON payload")
+
+    i = sub.add_parser("id", help="print the keel identity of a repository")
+    i.add_argument("--repo", "-C", type=Path, default=None, help="git repository (default: cwd)")
+    i.add_argument("--from", dest="from_ref", default=None, help="include this ref as a witness")
+    i.add_argument("--json", action="store_true", help="JSON output")
+
+    sub.add_parser("selftest", help="internal checks")
+    return p
+
+
+def git_root_from_args(args: argparse.Namespace, need_git: bool) -> Optional[Path]:
+    if not need_git:
+        return None
+    cwd = Path.cwd()
+    start = args.repo if getattr(args, "repo", None) is not None else cwd
+    git_root = discover_repo(start)
+    if args.repo is not None:
+        git_root = args.repo.resolve()
+        if not (git_root / ".git").exists() and not (git_root / ".git").is_file():
+            print(f"keel: {git_root} is not a git repo", file=sys.stderr)
+            raise SystemExit(2)
+    return git_root
+
+
+def emit_hit(hit: Hit, args: argparse.Namespace) -> None:
+    if args.json:
+        print_json_hit(hit)
+    elif args.porcelain:
+        print_porcelain_hit(hit)
+    else:
+        print_human_hit(hit)
+
+
+def load_one_into(
+    snap: Snapshot,
+    path: str,
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+) -> Optional[str]:
+    nfc = canon_path(path)
+    if directory is not None:
+        for form in path_forms(path):
+            fp = directory / form
+            if fp.is_file():
+                lines = read_fs_file(fp, required=True, display=form)
+                if lines is not None:
+                    return inject_file(snap, nfc, lines)
+        return None
+    if git_root is None:
+        return None
+    names = load_git_paths(git_root, ref)
+    git_name = None
+    for key, gn in names:
+        if key == nfc or gn in path_forms(path) or canon_path(gn) == nfc:
+            git_name = gn
+            break
+    if git_name is None:
+        for form in path_forms(path):
+            lines = read_git_file(git_root, ref, form, required=False)
+            if lines is not None:
+                return inject_file(snap, nfc, lines, git_name=form)
+        return None
+    lines = read_git_file(git_root, ref, git_name, required=True)
+    if lines is None:
+        return None
+    return inject_file(snap, nfc, lines, git_name=git_name)
+
+
+def cmd_mint(args: argparse.Namespace) -> int:
+    need_git = args.from_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.from_ref:
+        verify_git_ref(git_root, args.from_ref)
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else args.from_ref,
+        directory=args.from_dir,
+        untracked=args.untracked,
+        label=str(args.from_dir or args.from_ref or "worktree"),
+        empty_ok=True,
+    )
+    locations = list(args.locations)
+    if not locations:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["mint", "-h"])
+            return 2
+        for line in sys.stdin.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            locations.append(line)
+    names = list(args.name or [])
+    if names and len(names) not in (1, len(locations)):
+        print("keel mint: --name count must be 1 or match locators", file=sys.stderr)
+        return 2
+    if names and len(names) == 1 and len(locations) > 1:
+        print("keel mint: give one --name per locator", file=sys.stderr)
+        return 2
+    unresolved = False
+    for i, loc in enumerate(locations):
+        try:
+            path, line, col = parse_locator(loc, src.paths)
+            if canon_path(path) not in src.files:
+                loaded = load_one_into(
+                    src,
+                    path,
+                    git_root=git_root,
+                    ref=None if args.from_dir is not None else args.from_ref,
+                    directory=args.from_dir,
+                )
+                if loaded:
+                    path = loaded
+            fp = mint_fingerprint(src, path, line, col, args.context, args.force)
+        except SystemExit as e:
+            msg = str(e)
+            if msg and msg != "2":
+                print(msg if msg.startswith("keel") else f"keel mint: {msg}", file=sys.stderr)
+            unresolved = True
+            continue
+        token = encode_pin(fp)
+        name = names[i] if names else None
+        if args.file is not None:
+            append_pinfile(args.file, name, token)
+        if args.pretty:
+            print_show(fp, token, file=sys.stderr)
+            print(f"{name}\t{token}" if name else token)
+            continue
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "keel": token,
+                        "name": name,
+                        "from": {"path": fp.path, "line": fp.line, "col": fp.col},
+                        "text": fp.text,
+                        "tokens": fp.tokens,
+                        "unique": fp.unique,
+                        "origin": fp.origin,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        elif args.porcelain:
+            n = name or "-"
+            print(f"minted\t{n}\t{format_from(fp)}\t{token}")
+        elif name:
+            print(f"{name}\t{token}")
+        else:
+            print(token)
+    if unresolved:
+        return 1
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    items: list[tuple[Optional[str], str]] = []
+    file_entries: list[tuple[Optional[str], str]] = []
+    if args.file is not None:
+        try:
+            text = args.file.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"keel resolve: cannot read {args.file}: {e}", file=sys.stderr)
+            return 2
+        file_entries = load_pinfile(text)
+        by_name = {n: t for n, t in file_entries if n}
+    else:
+        by_name = {}
+
+    if args.pins:
+        for raw in args.pins:
+            if is_keel_token(raw):
+                items.append((None, raw))
+            elif raw in by_name:
+                items.append((raw, by_name[raw]))
+            elif ":" in raw and not is_keel_token(raw) and re.search(r":\d+$", raw):
+                print(
+                    f"keel resolve: {raw} is a locator; keels are minted tokens, not path:line",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                print(f"keel resolve: not a keel token: {raw}", file=sys.stderr)
+                return 2
+    elif args.file is not None:
+        items = file_entries
+    else:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["resolve", "-h"])
+            return 2
+        items = load_pinfile(sys.stdin.read())
+        if not items:
+            print("keel resolve: stdin had no keel tokens", file=sys.stderr)
+            return 2
+
+    need_git = args.to_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.to_ref:
+        verify_git_ref(git_root, args.to_ref)
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else args.to_ref,
+        directory=args.to_dir,
+        untracked=args.untracked,
+        label=str(args.to_dir or args.to_ref or "worktree"),
+        empty_ok=bool(need_git and args.to_ref),
+    )
+
+    check_root = git_root
+    if check_root is None and args.to_dir is not None:
+        check_root = discover_repo(args.to_dir)
+
+    unresolved = False
+    ambiguous = False
+    for name, token in items:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            print(f"keel resolve: {e}", file=sys.stderr)
+            return 1
+        dest_origin = dst.origin
+        if not getattr(args, "any_repo", False) and not origins_match(
+            fp.origin, dest_origin, dest_root=check_root
+        ):
+            print(
+                f"keel resolve: token belongs to a different repository "
+                f"({fp.origin} vs {dest_origin}); pass --any-repo to override",
+                file=sys.stderr,
+            )
+            return 1
+        hit = resolve_fingerprint(fp, dst, args.context, args.debug)
+        hit.name = name
+        hit.token = token
+        emit_hit(hit, args)
+        if hit.status == "unresolved":
+            unresolved = True
+        if hit.status == "ambiguous":
+            ambiguous = True
+    if args.strict and (unresolved or ambiguous):
+        return 1
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    rc = 0
+    for token in args.pins:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            print(f"keel show: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        if args.json:
+            print(json.dumps({"keel": token, **fp.payload()}, ensure_ascii=False))
+        else:
+            print_show(fp, token)
+    return rc
+
+
+def cmd_id(args: argparse.Namespace) -> int:
+    start = args.repo if args.repo is not None else Path.cwd()
+    root = discover_repo(start) if args.repo is None else start.resolve()
+    if root is None or not ((root / ".git").exists() or (root / ".git").is_file()):
+        print("keel id: not a git repository", file=sys.stderr)
+        return 2
+    if args.repo is not None and not ((root / ".git").exists() or (root / ".git").is_file()):
+        print(f"keel: {root} is not a git repo", file=sys.stderr)
+        return 2
+    origin = repo_keel(root, args.from_ref)
+    if not origin:
+        print("keel id: no identity (empty repo?)", file=sys.stderr)
+        return 1
+    kid = KeelId.decode(origin)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "origin": origin,
+                    "remotes": list(kid.remotes) if kid else [],
+                    "witnesses": list(kid.witnesses) if kid else [],
+                    "repo": str(root),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    print(origin)
+    if kid is not None:
+        print(f"  remotes: {', '.join(kid.remotes) if kid.remotes else '-'}")
+        print(f"  witnesses: {', '.join(kid.witnesses) if kid.witnesses else '-'}")
+    return 0
+
+
+def _snap(files: dict[str, str], label: str = "t", origin: Optional[str] = None) -> Snapshot:
+    parsed = {canon_path(k): v.splitlines() for k, v in files.items()}
+    s = Snapshot(label=label, files=parsed, origin=origin)
+    s.index()
+    return s
+
+
+def _git_init_commit(path: Path, rel: str, body: str, msg: str, remote: Optional[str] = None) -> str:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (path / rel).write_text(body, encoding="utf-8")
+    git(path, ["init", "-q"], check=True)
+    git(path, ["add", rel], check=True)
+    git(
+        path,
+        ["-c", "user.name=keel", "-c", "user.email=keel@example.com", "commit", "-q", "-m", msg],
+        check=True,
+    )
+    if remote:
+        git(path, ["remote", "add", "origin", remote], check=True)
+    sha = git_ok(path, ["rev-parse", "HEAD"])
+    assert sha
+    return sha.strip()
+
+
+def cmd_selftest() -> int:
+    fails = 0
+
+    def check(cond: bool, msg: str) -> None:
+        nonlocal fails
+        if not cond:
+            print(f"selftest FAIL: {msg}", file=sys.stderr)
+            fails += 1
+
+    origin = "keel1:r:github.com/annenpolka/kizu;w:deadbeefcafebabe"
+    fp = Fingerprint(
+        path="src/app.rs",
+        line=529,
+        text="pub fn seen_hunk_fingerprint(",
+        tokens=["seen_hunk_fingerprint"],
+        unique=["seen_hunk_fingerprint"],
+        before=["/// the hunk behaves as if it were unmarked (auto-expand)."],
+        after=["    seen: &BTreeMap<(PathBuf, usize), u64>,"],
+        origin=origin,
+    )
+    token = encode_pin(fp)
+    check(token.startswith(PREFIX), "token prefix")
+    back = decode_pin(token)
+    check(back.path == fp.path and back.text == fp.text, "roundtrip fields")
+    check(back.origin == fp.origin, "origin survives the token")
+    check(encode_pin(back) == token, "canonical re-encode")
+    check(path_score("src/app.rs", "src/app/layout.rs") >= 0.80, "split-dir path affinity")
+    check(
+        path_score("src/calc.py", "src/calc/ops.py") > path_score("src/calc.py", "src/legacy/calc.py"),
+        "stem split beats basename",
+    )
+    check(path_score("src/calc.py", "src/math/ops.py") < 1.0, "rename is not identity")
+    check(normalize("  fn foo  ") == "fn foo", "normalize")
+    check("seen_hunk_fingerprint" in tokens("pub fn seen_hunk_fingerprint("), "tokens")
+    sample = [
+        "def secret_sauce(x):",
+        "    MAGIC = 0xDEADBEEF",
+        "    return x ^ MAGIC",
+        "",
+        "def doomed():",
+        "    return \"this will be deleted\"",
+        "",
+        "def helper_keep():",
+        "    return \"stable helper\"",
+    ]
+    b, a = collect_neighbors(sample, 8, 3)
+    check(not any("doomed" in x for x in b + a), "sibling def is not a neighbor")
+    check(not any("deleted" in x for x in b + a), "previous function body is not a neighbor")
+    check(any("stable helper" in x for x in a), "body after a def is a neighbor")
+    check(is_def_line("pub fn seen_hunk_fingerprint("), "rust pub fn is a def")
+    check(is_def_line("pub(crate) fn edit_insert_str("), "rust vis fn is a def")
+    check(is_def_line("public func transform(_ request: TransformRequest)"), "swift func is a def")
+    check(not is_def_line("/// the hunk behaves"), "doc comment is not a def")
+    try:
+        decode_pin("keel1.not-valid-base64xx")
+        check(False, "corrupt token should raise")
+    except ValueError:
+        check(True, "corrupt token")
+    check(not is_keel_token("keel1.xxxx"), "short junk is not a token")
+    check(not is_keel_token("keel1."), "bare prefix is not a token")
+
+    nfc = canon_path("src/cafe\u0301.py")
+    check(nfc == "src/caf\u00e9.py", "NFD locator canons to NFC")
+    check(canon_path("src/caf\u00e9.py") == nfc, "NFC is stable")
+
+    check(
+        normalize_remote("git@github.com:annenpolka/kizu.git") == "github.com/annenpolka/kizu",
+        "scp remote",
+    )
+    check(
+        normalize_remote("https://github.com/annenpolka/kizu.git") == "github.com/annenpolka/kizu",
+        "https remote",
+    )
+    check(
+        normalize_remote("ssh://git@github.com/annenpolka/kizu.git") == "github.com/annenpolka/kizu",
+        "ssh url remote",
+    )
+    check(normalize_remote("/tmp/local-clone") is None, "local path is not a project remote")
+    check(normalize_remote("file:///tmp/x") is None, "file url is not a project remote")
+
+    ssh = KeelId.decode("keel1:r:github.com/annenpolka/kizu;w:aaaaaaaaaaaaaaaa")
+    https = KeelId.decode("keel1:r:github.com/annenpolka/kizu;w:bbbbbbbbbbbbbbbb")
+    other = KeelId.decode("keel1:r:github.com/annenpolka/voidtrace;w:cccccccccccccccc")
+    check(ssh is not None and https is not None and keels_match(ssh, https), "ssh/https same project")
+    check(ssh is not None and other is not None and not keels_match(ssh, other), "foreign remotes differ")
+
+    src = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            )
+        },
+        origin="keel1:r:;w:aaaaaaaaaaaaaaaa",
+    )
+    minted = mint_fingerprint(src, "src/calc.py", 4, None, 3, False)
+    check("helper_keep" in minted.unique, "helper_keep unique at mint")
+    check(any("stable helper" in x for x in minted.after), "body captured")
+
+    leftover = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.calc.ops import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    "    from src.calc.ops import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+        }
+    )
+    hit = resolve_fingerprint(minted, leftover, 3, False)
+    check(hit.status == "moved", f"leftover stub status {hit.status}")
+    check(
+        hit.dest_path == "src/calc/ops.py",
+        f"leftover stub stole the pin: {hit.dest_path}:{hit.dest_line} {hit.note}",
+    )
+    check("leftover stub" in hit.note, f"note should name the skipped stub: {hit.note}")
+    check("basename bait" in hit.note, f"note should name basename bait: {hit.note}")
+    add_fp = mint_fingerprint(src, "src/calc.py", 1, None, 3, False)
+    add_hit = resolve_fingerprint(add_fp, leftover, 3, False)
+    check(
+        add_hit.dest_path == "src/calc/ops.py",
+        f"add() leftover stub stole the pin: {add_hit.dest_path} {add_hit.note}",
+    )
+
+    kept = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    return \"stable helper\"",
+                ]
+            ),
+        }
+    )
+    keep_hit = resolve_fingerprint(minted, kept, 3, False)
+    check(
+        keep_hit.status in {"same", "shifted"},
+        f"extract-and-keep status {keep_hit.status} {keep_hit.dest_path}",
+    )
+    check(
+        keep_hit.dest_path == "src/calc.py",
+        f"extract-and-keep reported as move to {keep_hit.dest_path}:{keep_hit.dest_line} {keep_hit.note}",
+    )
+    check("basename bait src/calc.py" not in keep_hit.note, f"origin labeled bait: {keep_hit.note}")
+    check("extracted copy" in keep_hit.note, f"note should name the extract: {keep_hit.note}")
+
+    docstub = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.calc.ops import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    from src.calc.ops import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    return a + b",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    src_doc = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    '    """Return the sum of a and b."""',
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            )
+        }
+    )
+    add_doc = mint_fingerprint(src_doc, "src/calc.py", 1, None, 3, False)
+    add_doc_hit = resolve_fingerprint(add_doc, docstub, 3, False)
+    check(
+        add_doc_hit.dest_path == "src/calc/ops.py",
+        f"docstring leftover stole add(): {add_doc_hit.dest_path} {add_doc_hit.note}",
+    )
+
+    noisy = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    """kept docs"""',
+                    "    # noisy",
+                    "    # noisy",
+                    "    # noisy",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/calc/ops.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    noisy_src = _snap({"src/calc.py": "def helper_keep():\n    return \"stable helper\"\n"})
+    noisy_fp = mint_fingerprint(noisy_src, "src/calc.py", 1, None, 3, False)
+    noisy_hit = resolve_fingerprint(noisy_fp, noisy, 3, False)
+    check(noisy_hit.dest_path == "src/calc.py", f"noisy extract-and-keep moved: {noisy_hit.dest_path}")
+    check("leftover stub src/calc.py" not in noisy_hit.note, f"origin labeled stub: {noisy_hit.note}")
+
+    renamed = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.math.ops import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    "    from src.math.ops import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/math/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    renamed_hit = resolve_fingerprint(minted, renamed, 3, False)
+    check(
+        renamed_hit.dest_path == "src/math/ops.py",
+        f"renamed leftover tied with bait: {renamed_hit.status} {renamed_hit.dest_path} {renamed_hit.note}",
+    )
+
+    keep_renamed = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/math/ops.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    keep_renamed_hit = resolve_fingerprint(minted, keep_renamed, 3, False)
+    check(
+        keep_renamed_hit.dest_path == "src/calc.py",
+        f"renamed extract-and-keep moved: {keep_renamed_hit.dest_path}",
+    )
+
+    same_base = _snap(
+        {
+            "src/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    "    from src.math.calc import helper_keep as impl",
+                    "    return impl()",
+                    "def add(a, b):",
+                    "    from src.math.calc import add as _add",
+                    "    return _add(a, b)",
+                ]
+            ),
+            "src/math/calc.py": "\n".join(
+                [
+                    "def add(a, b):",
+                    "    return a + b",
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+            "src/legacy/calc.py": "\n".join(
+                [
+                    "def helper_keep():",
+                    '    return "stable helper"',
+                ]
+            ),
+        }
+    )
+    same_hit = resolve_fingerprint(minted, same_base, 3, False)
+    check(same_hit.status != "ambiguous", f"same-basename extract tied: {same_hit.status} {same_hit.note}")
+    check(
+        same_hit.dest_path == "src/math/calc.py",
+        f"same-basename extract missed import: {same_hit.dest_path} {same_hit.note}",
+    )
+
+    twins = _snap(
+        {
+            "a/ops.py": "def helper_keep():\n    return \"stable helper\"\n",
+            "z/calc.py": "def helper_keep():\n    return \"stable helper\"\n",
+        }
+    )
+    hit2 = resolve_fingerprint(minted, twins, 3, False)
+    check(hit2.status == "ambiguous", f"identical helpers should be ambiguous, got {hit2.status}")
+
+    foreign = _snap(
+        {"pkg/util.py": "def helper_keep():\n    return \"stable helper\"\n"},
+        origin="keel1:r:github.com/other/util;w:bbbbbbbbbbbbbbbb",
+    )
+    check(not origins_match(minted.origin, foreign.origin), "foreign origin detected")
+    check(origins_match(minted.origin, minted.origin), "same origin ok")
+    check(origins_match(minted.origin, None), "gitless dest allowed")
+
+    v1 = {"v": 1, "p": "src/a.py", "n": 1, "t": "x = 1"}
+    old = Fingerprint.from_payload(v1)
+    check(old.origin is None and old.path == "src/a.py", "v1 payload still decodes")
+
+    # Live git: remotes beat root-SHA identity; foreign store fail-closes.
+    tmp = Path(tempfile.mkdtemp(prefix="keel-selftest-"))
+    try:
+        a = tmp / "a"
+        b = tmp / "b"
+        sha_a = _git_init_commit(
+            a, "src/x.py", "X = 1\n", "a", remote="git@github.com:keel-lab/demo.git"
+        )
+        _git_init_commit(
+            b, "src/x.py", "X = 1\n", "b", remote="https://github.com/other/demo.git"
+        )
+        oa = repo_keel(a)
+        ob = repo_keel(b)
+        check(oa is not None and "github.com/keel-lab/demo" in (oa or ""), f"keel encodes remote: {oa}")
+        check(not origins_match(oa, ob, dest_root=b), f"foreign git repos match? {oa} vs {ob}")
+        # Same project, different history shape: HTTPS remote, extra orphan root.
+        git(a, ["remote", "set-url", "origin", "https://github.com/keel-lab/demo.git"], check=True)
+        oa2 = repo_keel(a)
+        check(origins_match(oa, oa2, dest_root=a), f"ssh vs https of same repo: {oa} vs {oa2}")
+        git(a, ["checkout", "--orphan", "orphan-hist"], check=False)
+        # checkout --orphan may leave the worktree; make a commit then go back.
+        (a / "orphan.txt").write_text("orphan\n", encoding="utf-8")
+        git(a, ["add", "orphan.txt"], check=False)
+        git(
+            a,
+            ["-c", "user.name=keel", "-c", "user.email=keel@example.com", "commit", "-q", "-m", "orphan"],
+            check=False,
+        )
+        git(a, ["checkout", "-q", "-"], check=False)
+        oa3 = repo_keel(a)
+        check(
+            origins_match(oa, oa3, dest_root=a),
+            f"orphan extra root still same keel: {oa} vs {oa3}",
+        )
+        check(object_exists(a, sha_a[:16]), "witness object still in store after orphan")
+        # Depth-1 clone of a later commit: roots differ, remotes / follow match.
+        (a / "src" / "x.py").write_text("X = 2\n", encoding="utf-8")
+        git(a, ["add", "src/x.py"], check=True)
+        git(
+            a,
+            ["-c", "user.name=keel", "-c", "user.email=keel@example.com", "commit", "-q", "-m", "v2"],
+            check=True,
+        )
+        shallow = tmp / "shallow"
+        # Local-path --depth is ignored. file:// is a real graft.
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", "file://" + str(a.resolve()), str(shallow)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        shallow_flag = (git_ok(shallow, ["rev-parse", "--is-shallow-repository"]) or "").strip()
+        check(shallow_flag == "true", f"file:// --depth 1 should be shallow, got {shallow_flag!r}")
+        check(not object_exists(shallow, sha_a[:16]), "shallow must not contain the mint-time parent")
+        o_full = repo_keel(a, sha_a.strip())
+        o_sh = repo_keel(shallow)
+        check(
+            o_sh is not None and "github.com/keel-lab/demo" in o_sh,
+            f"file:// clone should inherit project remotes: {o_sh}",
+        )
+        check(
+            origins_match(o_full, o_sh, dest_root=shallow),
+            f"depth-1 clone should match full repo: {o_full} vs {o_sh}",
+        )
+        check(
+            not origins_match(o_full, ob, dest_root=b),
+            "depth-1 identity must not match a foreign repo",
+        )
+    except Exception as e:
+        check(False, f"git keel identity fixtures: {e}")
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if fails:
+        print(f"selftest: {fails} failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+_VALUE_FLAGS = {
+    "--repo",
+    "-C",
+    "--from",
+    "--from-dir",
+    "--to",
+    "--to-dir",
+    "--file",
+    "--name",
+    "--context",
+}
+_COMMANDS = {"mint", "resolve", "show", "id", "selftest"}
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+    if argv[0] in _COMMANDS or argv[0] in {"-h", "--help", "--version", "--selftest"}:
+        return argv
+    if is_keel_token(argv[0]) or (argv[0] == "-" and len(argv) == 1):
+        return ["resolve", *argv]
+
+    i = 0
+    cmd_at: Optional[int] = None
+    while i < len(argv):
+        a = argv[i]
+        if a in _COMMANDS:
+            cmd_at = i
+            break
+        if is_keel_token(a) or a == "-":
+            return ["resolve", *argv]
+        if a.startswith("--") and "=" in a:
+            i += 1
+            continue
+        if a in _VALUE_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        i += 1
+    if cmd_at is not None and cmd_at != 0:
+        return [argv[cmd_at], *argv[:cmd_at], *argv[cmd_at + 1 :]]
+    if any(is_keel_token(a) for a in argv):
+        return ["resolve", *argv]
+    return argv
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = normalize_argv(argv)
+    args = build_parser().parse_args(argv)
+    if getattr(args, "selftest", False) and not args.cmd:
+        return cmd_selftest()
+    if not args.cmd:
+        build_parser().print_help()
+        return 2
+    if args.cmd == "mint":
+        return cmd_mint(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    if args.cmd == "show":
+        return cmd_show(args)
+    if args.cmd == "id":
+        return cmd_id(args)
+    if args.cmd == "selftest":
+        return cmd_selftest()
+    build_parser().print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

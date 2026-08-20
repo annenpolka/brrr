@@ -1,0 +1,1474 @@
+#!/usr/bin/env python3
+"""crib — occupancy of a new holder of this blob.
+
+held exists SRC is path occupancy. berth --follow exists SRC is rename
+identity (A name gone). ditto emits copy vs follow but does not walk.
+crib occupies COPY: dest is a new path whose blob (or similar dest)
+lived at SRC on A. git mv remains FOLLOW. cp is COPY (both names exist).
+
+Not git diff -C. Not glyph with a copy letter. Not a third ambit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+
+TOOL = "crib"
+COPY_SIM_MIN = 0.5
+RENAME_SIM_MIN = 0.5
+MAX_BLOB = 1_000_000
+HOLDER_PRINT_LIMIT = 8
+
+SKIP_TOKEN_SUFFIXES = (
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bin",
+)
+SKIP_TOKEN_NAMES = {
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+    "gemfile.lock",
+}
+SKIP_TOKEN_PARTS = ("/docs/generated/", "/generated/", ".generated.")
+
+
+class GitError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{TOOL}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_git(
+    repo: str,
+    args: list[str],
+    check: bool = True,
+    input_text: Optional[str] = None,
+    input_bytes: Optional[bytes] = None,
+) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", repo, *args]
+    if input_bytes is not None:
+        r = subprocess.run(cmd, input=input_bytes, capture_output=True)
+    else:
+        r = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
+    if check and r.returncode != 0:
+        raw = r.stderr or r.stdout or b""
+        err = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        raise GitError(err.strip() or f"git {' '.join(args)} failed")
+    return r
+
+
+def resolve_repo(path: str) -> str:
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        die(f"not a git repository: {path}")
+    r = run_git(path, ["rev-parse", "--show-toplevel"], check=False)
+    if r.returncode != 0:
+        die(f"not a git repository: {path}")
+    top = r.stdout.strip()
+    if not top:
+        die(f"not a git repository: {path}")
+    return top
+
+
+def quote(s: str) -> str:
+    if not s:
+        return "''"
+    if all(ch.isalnum() or ch in "._-/@+," for ch in s):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+@dataclass
+class Sample:
+    sha: str
+    short: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str
+    parents: list[str] = field(default_factory=list)
+    value: bool = False
+    witnesses: list[str] = field(default_factory=list)
+
+    def as_json(self) -> dict:
+        return {
+            "sha": self.sha,
+            "short": self.short,
+            "timestamp": self.timestamp,
+            "iso": self.iso,
+            "subject": self.subject,
+            "kind": self.kind,
+        }
+
+
+@dataclass
+class Era:
+    value: bool
+    samples: list[Sample]
+    split: str = "start"
+    kind_name: str = "absent"
+    added: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    origin: Optional[Sample] = None
+    origin_count: int = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.samples)
+
+    @property
+    def start(self) -> Sample:
+        return self.samples[0]
+
+    @property
+    def end(self) -> Sample:
+        return self.samples[-1]
+
+    @property
+    def holders(self) -> list[str]:
+        if not self.value:
+            return []
+        return list(self.start.witnesses)
+
+
+@dataclass
+class Identity:
+    kind: str  # copied | renamed | died | born | changed
+    a_path: Optional[str] = None
+    b_path: Optional[str] = None
+    sha_a: Optional[str] = None
+    sha_b: Optional[str] = None
+    similarity: float = 1.0
+    born_sha: Optional[str] = None
+
+
+@dataclass
+class CopyBond:
+    source: str
+    dest: str
+    source_names: list[str]
+    dest_names: list[str]
+    born_sha: str
+    similarity: float
+    dead: bool = False
+
+
+def day(iso: str) -> str:
+    return iso[:10]
+
+
+def fmt_dates(start: Sample, end: Sample, always_arrow: bool = False) -> str:
+    a, b = day(start.iso), day(end.iso)
+    if a == b and not always_arrow:
+        return a
+    return f"{a} → {b}"
+
+
+def fmt_span(start: Sample, end: Sample) -> str:
+    if start.short == end.short:
+        return start.short
+    return f"{start.short}..{end.short}"
+
+
+def load_commits(
+    repo: str, spec: str, first_parent: bool, limit: Optional[int]
+) -> list[Sample]:
+    args = ["log", "--reverse", "--pretty=format:%H\t%P\t%ct\t%ci\t%s"]
+    if first_parent:
+        args.append("--first-parent")
+    args.append(spec)
+    r = run_git(repo, args, check=False)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if "outside repository" in err:
+            raise GitError(err)
+        if not r.stdout.strip():
+            return []
+        raise GitError(err)
+    samples: list[Sample] = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        sha, parents, ts, iso, subject = parts
+        samples.append(
+            Sample(
+                sha=sha,
+                short=sha[:7],
+                timestamp=int(ts),
+                iso=iso,
+                subject=subject,
+                kind="commit",
+                parents=parents.split() if parents.strip() else [],
+            )
+        )
+    if limit is not None and limit >= 0:
+        samples = samples[-limit:]
+    return samples
+
+
+def reachable_count(repo: str, spec: str) -> int:
+    r = run_git(repo, ["rev-list", "--count", spec], check=False)
+    if r.returncode != 0:
+        return 0
+    try:
+        return int(r.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def now_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        short="WORKTREE",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def index_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="INDEX",
+        short="INDEX",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="staged index",
+        kind="index",
+    )
+
+
+def first_parent_of(sample: Sample) -> Optional[str]:
+    return sample.parents[0] if sample.parents else None
+
+
+def git_blob_sha(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+class TreeCache:
+    """path → blob-sha maps plus blob bytes, keyed by tree-ish."""
+
+    def __init__(self, repo: str) -> None:
+        self.repo = repo
+        self.trees: dict[str, dict[str, str]] = {}
+        self.blobs: dict[str, Optional[bytes]] = {}
+        self.probes = 0
+
+    def tree(self, spec: str) -> dict[str, str]:
+        if spec in self.trees:
+            return self.trees[spec]
+        if spec in ("WORKTREE", ":worktree"):
+            paths = self._load_worktree()
+        elif spec in ("INDEX", ":index"):
+            paths = self._load_index()
+        else:
+            paths = self._load_commit(spec)
+        self.trees[spec] = paths
+        return paths
+
+    def _load_commit(self, sha: str) -> dict[str, str]:
+        rb = run_git(self.repo, ["ls-tree", "-r", "-z", sha], check=False, input_bytes=b"")
+        self.probes += 1
+        if rb.returncode != 0:
+            return {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        paths: dict[str, str] = {}
+        for entry in data.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                meta, path_b = entry.split(b"\t", 1)
+            except ValueError:
+                continue
+            parts = meta.split()
+            if len(parts) < 3:
+                continue
+            obj_type = parts[1].decode("ascii", "replace")
+            sha = parts[2].decode("ascii", "replace")
+            path = path_b.decode("utf-8", "surrogateescape")
+            if obj_type != "blob":
+                continue
+            paths[path] = sha
+        return paths
+
+    def _load_worktree(self) -> dict[str, str]:
+        rb = run_git(
+            self.repo,
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            check=False,
+            input_bytes=b"",
+        )
+        self.probes += 1
+        paths: dict[str, str] = {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        for raw in data.split(b"\0"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", "surrogateescape")
+            abs_path = os.path.join(self.repo, rel)
+            if not os.path.isfile(abs_path):
+                continue
+            try:
+                with open(abs_path, "rb") as fh:
+                    blob = fh.read(MAX_BLOB + 1)
+            except OSError:
+                continue
+            if len(blob) > MAX_BLOB:
+                paths[rel] = "LARGE"
+                continue
+            paths[rel] = git_blob_sha(blob)
+            self.blobs[paths[rel]] = blob
+        return paths
+
+    def _load_index(self) -> dict[str, str]:
+        rb = run_git(
+            self.repo, ["ls-files", "-z", "--cached", "-s"], check=False, input_bytes=b""
+        )
+        self.probes += 1
+        paths: dict[str, str] = {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        for entry in data.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                meta, path_b = entry.split(b"\t", 1)
+            except ValueError:
+                continue
+            parts = meta.split()
+            if len(parts) < 2:
+                continue
+            sha = parts[1].decode("ascii", "replace")
+            path = path_b.decode("utf-8", "surrogateescape")
+            paths[path] = sha
+        return paths
+
+    def blob(self, tree: dict[str, str], path: str) -> Optional[bytes]:
+        sha = tree.get(path)
+        if not sha or sha == "LARGE":
+            return None
+        if sha in self.blobs:
+            return self.blobs[sha]
+        if len(sha) != 40:
+            return None
+        rb = run_git(self.repo, ["cat-file", "--batch"], check=False, input_bytes=f"{sha}\n".encode())
+        self.probes += 1
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        nl = data.find(b"\n")
+        if nl < 0:
+            self.blobs[sha] = None
+            return None
+        header = data[:nl].decode("ascii", "replace")
+        if header.endswith(" missing"):
+            self.blobs[sha] = None
+            return None
+        parts = header.split()
+        if len(parts) < 3:
+            self.blobs[sha] = None
+            return None
+        try:
+            size = int(parts[2])
+        except ValueError:
+            self.blobs[sha] = None
+            return None
+        blob = data[nl + 1 : nl + 1 + size]
+        if size > MAX_BLOB or b"\0" in blob[:8000]:
+            self.blobs[sha] = None
+            return None
+        self.blobs[sha] = blob
+        return blob
+
+
+def skip_token_path(path: str) -> bool:
+    lower = path.lower().replace("\\", "/")
+    base = lower.rsplit("/", 1)[-1]
+    if base in SKIP_TOKEN_NAMES:
+        return True
+    if lower.endswith(SKIP_TOKEN_SUFFIXES):
+        return True
+    for part in SKIP_TOKEN_PARTS:
+        if part in lower:
+            return True
+    return False
+
+
+def line_jaccard(a: bytes, b: bytes) -> float:
+    if a == b:
+        return 1.0
+    la = set(a.splitlines())
+    lb = set(b.splitlines())
+    if not la and not lb:
+        return 1.0
+    if not la or not lb:
+        return 0.0
+    return len(la & lb) / len(la | lb)
+
+
+def path_pair_score(a_path: str, b_path: str) -> tuple:
+    a_base = a_path.rsplit("/", 1)[-1]
+    b_base = b_path.rsplit("/", 1)[-1]
+    a_stem = a_base.rsplit(".", 1)[0] if "." in a_base else a_base
+    b_stem = b_base.rsplit(".", 1)[0] if "." in b_base else b_base
+    same_base = 0 if a_base == b_base else 1
+    same_stem = 0 if a_stem == b_stem else 1
+    return (same_base, same_stem, abs(len(a_path) - len(b_path)), a_path, b_path)
+
+
+def pick_source(sources: list[str], dest: str) -> str:
+    scored = sorted(
+        sources,
+        key=lambda src: (
+            0 if src.rsplit("/", 1)[-1] == dest.rsplit("/", 1)[-1] else 1,
+            -len(os.path.commonprefix([src, dest])),
+            abs(len(src) - len(dest)),
+            src,
+        ),
+    )
+    return scored[0]
+
+
+def ext_of(path: str) -> str:
+    base = path.rsplit("/", 1)[-1]
+    if "." not in base:
+        return ""
+    return base.rsplit(".", 1)[-1].lower()
+
+
+def related_paths(src: str, dest: str) -> bool:
+    se, de = ext_of(src), ext_of(dest)
+    if se and se == de:
+        return True
+    sa = src.split("/")[:-1]
+    sb = dest.split("/")[:-1]
+    return bool(sa and sb and sa[0] == sb[0])
+
+
+def copy_candidate(src: str, dest: str) -> bool:
+    """Dests worth origin-classifying when SRC is the query."""
+    if src == dest:
+        return True
+    if src.rsplit("/", 1)[-1] == dest.rsplit("/", 1)[-1]:
+        return True
+    src_dir = src.rsplit("/", 1)[0] if "/" in src else ""
+    if src_dir and dest.startswith(src_dir + "/"):
+        return True
+    if not src_dir:
+        return related_paths(src, dest)
+    return False
+
+
+def detect_identities(
+    cache: TreeCache,
+    tree_a: dict[str, str],
+    tree_b: dict[str, str],
+) -> list[Identity]:
+    """Same blob still on A and born on B is COPY, not FOLLOW."""
+    only_a = sorted(p for p in tree_a if p not in tree_b)
+    only_b = sorted(p for p in tree_b if p not in tree_a)
+    changed = sorted(p for p in tree_a if p in tree_b and tree_a[p] != tree_b[p])
+    shared = sorted(p for p in tree_a if p in tree_b)
+
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    identities: list[Identity] = []
+
+    def remaining_holders(sha: str) -> list[str]:
+        out: list[str] = []
+        for p in shared:
+            if tree_a.get(p) == sha or tree_b.get(p) == sha:
+                out.append(p)
+        return out
+
+    def take_rename(ap: str, bp: str, sim: float) -> None:
+        used_a.add(ap)
+        used_b.add(bp)
+        identities.append(
+            Identity(
+                kind="renamed",
+                a_path=ap,
+                b_path=bp,
+                sha_a=tree_a.get(ap),
+                sha_b=tree_b.get(bp),
+                similarity=sim,
+            )
+        )
+
+    def take_copy(ap: str, bp: str, sim: float) -> None:
+        used_b.add(bp)
+        identities.append(
+            Identity(
+                kind="copied",
+                a_path=ap,
+                b_path=bp,
+                sha_a=tree_a.get(ap),
+                sha_b=tree_b.get(bp),
+                similarity=sim,
+            )
+        )
+
+    def blob_a(path: str) -> Optional[bytes]:
+        return cache.blob(tree_a, path)
+
+    def blob_b(path: str) -> Optional[bytes]:
+        return cache.blob(tree_b, path)
+
+    # 0. Exact copies: dest born, blob still present on a shared path.
+    for bp in only_b:
+        sha = tree_b[bp]
+        holders = remaining_holders(sha)
+        if not holders:
+            continue
+        take_copy(pick_source(holders, bp), bp, 1.0)
+
+    # 1. Exclusive-side same SHA: follow ONLY if the blob is not still present.
+    a_by_sha: dict[str, list[str]] = {}
+    for p in only_a:
+        a_by_sha.setdefault(tree_a[p], []).append(p)
+    b_by_sha: dict[str, list[str]] = {}
+    for p in only_b:
+        b_by_sha.setdefault(tree_b[p], []).append(p)
+    for sha, a_paths in a_by_sha.items():
+        b_paths = b_by_sha.get(sha) or []
+        if not b_paths:
+            continue
+        remaining_a = [p for p in a_paths if p not in used_a]
+        remaining_b = [p for p in b_paths if p not in used_b]
+        pairs = sorted(
+            ((ap, bp) for ap in remaining_a for bp in remaining_b),
+            key=lambda pair: path_pair_score(pair[0], pair[1]),
+        )
+        for ap, bp in pairs:
+            if ap in used_a or bp in used_b:
+                continue
+            holders = remaining_holders(sha)
+            if holders:
+                take_copy(pick_source(holders, bp), bp, 1.0)
+                continue
+            take_rename(ap, bp, 1.0)
+
+    # 2. Unique basename among leftovers: follow (git mv + edit).
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    a_base: dict[str, list[str]] = {}
+    b_base: dict[str, list[str]] = {}
+    for p in leftover_a:
+        a_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for p in leftover_b:
+        b_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for base, a_paths in a_base.items():
+        b_paths = b_base.get(base) or []
+        if len(a_paths) == 1 and len(b_paths) == 1:
+            ap, bp = a_paths[0], b_paths[0]
+            if ap in used_a or bp in used_b:
+                continue
+            ba, bb = blob_a(ap), blob_b(bp)
+            sim = line_jaccard(ba or b"", bb or b"") if ba is not None and bb is not None else 0.0
+            take_rename(ap, bp, sim)
+
+    # 3. Content similarity among remaining exclusive paths (git mv + edit).
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    scored: list[tuple[float, str, str]] = []
+    for ap in leftover_a:
+        ba = blob_a(ap)
+        if ba is None:
+            continue
+        for bp in leftover_b:
+            bb = blob_b(bp)
+            if bb is None:
+                continue
+            sim = line_jaccard(ba, bb)
+            if sim >= RENAME_SIM_MIN:
+                scored.append((sim, ap, bp))
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    for sim, ap, bp in scored:
+        if ap in used_a or bp in used_b:
+            continue
+        take_rename(ap, bp, sim)
+
+    # 4. Similarity copies against a remaining source. dest-on-B vs source-on-A.
+    leftover_b = [p for p in only_b if p not in used_b]
+    changed_set = set(changed)
+    copy_scored: list[tuple[tuple, str, str, float]] = []
+    for bp in leftover_b:
+        bb = blob_b(bp)
+        if bb is None:
+            continue
+        best_ap: Optional[str] = None
+        best_key: Optional[tuple] = None
+        best_sim = 0.0
+        for ap in shared:
+            if skip_token_path(ap) or not related_paths(ap, bp):
+                continue
+            ba = blob_a(ap)
+            if ba is None:
+                continue
+            sim = line_jaccard(ba, bb)
+            if sim < COPY_SIM_MIN:
+                continue
+            key = (
+                sim,
+                1 if ap in changed_set else 0,
+                1 if ext_of(ap) == ext_of(bp) else 0,
+                len(os.path.commonprefix([ap, bp])),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_ap = ap
+                best_sim = sim
+        if best_ap is not None and best_key is not None:
+            copy_scored.append((best_key, best_ap, bp, best_sim))
+    copy_scored.sort(key=lambda t: t[0], reverse=True)
+    for _key, ap, bp, sim in copy_scored:
+        if bp in used_b:
+            continue
+        take_copy(ap, bp, sim)
+
+    for p in only_a:
+        if p in used_a:
+            continue
+        identities.append(Identity(kind="died", a_path=p, sha_a=tree_a.get(p)))
+    for p in only_b:
+        if p in used_b:
+            continue
+        identities.append(Identity(kind="born", b_path=p, sha_b=tree_b.get(p)))
+    for p in changed:
+        identities.append(
+            Identity(
+                kind="changed",
+                a_path=p,
+                b_path=p,
+                sha_a=tree_a.get(p),
+                sha_b=tree_b.get(p),
+            )
+        )
+    return identities
+
+
+def classify_at(
+    cache: TreeCache,
+    parent_spec: Optional[str],
+    child_spec: str,
+) -> list[Identity]:
+    tree_a = cache.tree(parent_spec) if parent_spec else {}
+    tree_b = cache.tree(child_spec)
+    return detect_identities(cache, tree_a, tree_b)
+
+
+def dest_birth_sha(repo: str, dest: str, tip: str) -> Optional[str]:
+    r = run_git(
+        repo,
+        ["log", "--reverse", "--diff-filter=A", "--pretty=format:%H", tip, "--", dest],
+        check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout.splitlines()[0].strip()
+
+
+def commit_first_parent(repo: str, sha: str) -> Optional[str]:
+    r = run_git(repo, ["rev-parse", f"{sha}^"], check=False)
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    return out or None
+
+
+def origin_copies_for_dests(
+    repo: str,
+    cache: TreeCache,
+    dests: list[str],
+    query: str,
+    tip: str,
+    birth_cache: dict[str, Optional[str]],
+) -> list[Identity]:
+    """Dest born on this walk, copy event off this walk (first-parent merge)."""
+    out: list[Identity] = []
+    for dest in dests:
+        if query != dest and not copy_candidate(query, dest):
+            continue
+        key = f"{tip}\t{dest}"
+        if key not in birth_cache:
+            birth_cache[key] = dest_birth_sha(repo, dest, tip)
+            cache.probes += 1
+        origin = birth_cache[key]
+        if not origin or origin == tip:
+            continue
+        parent = commit_first_parent(repo, origin)
+        oidents = classify_at(cache, parent, origin)
+        for oi in oidents:
+            if oi.kind != "copied" or oi.b_path != dest:
+                continue
+            if query not in (dest, oi.a_path):
+                continue
+            oi.born_sha = origin
+            out.append(oi)
+    return out
+
+
+def apply_identities(
+    bonds: list[CopyBond],
+    identities: list[Identity],
+    child_tree: dict[str, str],
+    born_sha: str,
+) -> list[Identity]:
+    """Update dest/source identities. Copies become bonds. Dest death is permanent."""
+    follows = [i for i in identities if i.kind == "renamed" and i.a_path and i.b_path]
+    copies = [i for i in identities if i.kind == "copied" and i.a_path and i.b_path]
+
+    for ident in follows:
+        old, new = ident.a_path, ident.b_path
+        assert old is not None and new is not None
+        for bond in bonds:
+            if bond.dead:
+                continue
+            if bond.dest == old:
+                bond.dest = new
+                if new not in bond.dest_names:
+                    bond.dest_names.append(new)
+            if bond.source == old:
+                bond.source = new
+                if new not in bond.source_names:
+                    bond.source_names.append(new)
+
+    for bond in bonds:
+        if bond.dead:
+            continue
+        if bond.dest not in child_tree:
+            bond.dead = True
+
+    for ident in copies:
+        src, dst = ident.a_path, ident.b_path
+        assert src is not None and dst is not None
+        if any(not b.dead and b.dest == dst for b in bonds):
+            continue
+        bonds.append(
+            CopyBond(
+                source=src,
+                dest=dst,
+                source_names=[src],
+                dest_names=[dst],
+                born_sha=ident.born_sha or born_sha,
+                similarity=ident.similarity,
+            )
+        )
+    return identities
+
+
+def holders_for(query: str, bonds: list[CopyBond]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for bond in bonds:
+        if bond.dead:
+            continue
+        if query in bond.source_names or query in bond.dest_names:
+            if bond.dest not in seen:
+                seen.add(bond.dest)
+                out.append(bond.dest)
+    return out
+
+
+def matching_bonds(query: str, bonds: list[CopyBond]) -> list[CopyBond]:
+    return [
+        b
+        for b in bonds
+        if query in b.source_names or query in b.dest_names
+    ]
+
+
+def compress(samples: list[Sample], split_holders: bool) -> list[Era]:
+    eras: list[Era] = []
+    for s in samples:
+        if not eras:
+            eras.append(Era(value=s.value, samples=[s], split="start"))
+            continue
+        prev = eras[-1]
+        if prev.value != s.value:
+            eras.append(Era(value=s.value, samples=[s], split="boolean"))
+            continue
+        if split_holders and s.value and list(prev.end.witnesses) != list(s.witnesses):
+            eras.append(Era(value=s.value, samples=[s], split="holders"))
+            continue
+        prev.samples.append(s)
+    return eras
+
+
+def classify_eras(eras: list[Era]) -> None:
+    for i, era in enumerate(eras):
+        prev = eras[i - 1] if i else None
+        prev_h = list(prev.holders) if prev and prev.value else []
+        cur_h = list(era.holders) if era.value else []
+        if era.value:
+            era.added = sorted(set(cur_h) - set(prev_h))
+            era.dropped = sorted(set(prev_h) - set(cur_h))
+        else:
+            era.added = []
+            era.dropped = []
+        if not era.value:
+            era.kind_name = "absent" if prev is None else "death"
+            continue
+        if prev is None or not prev.value:
+            era.kind_name = "birth"
+            continue
+        if era.added and era.dropped:
+            era.kind_name = "move"
+        elif era.added:
+            era.kind_name = "spread"
+        elif era.dropped:
+            era.kind_name = "shrink"
+        else:
+            era.kind_name = "birth"
+
+
+def merge_parents(repo: str, sha: str) -> list[str]:
+    r = run_git(repo, ["rev-list", "--parents", "-n", "1", sha], check=False)
+    if r.returncode != 0:
+        return []
+    parts = r.stdout.strip().split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+def follow_rejected(
+    query: str,
+    identities_by_sha: dict[str, list[Identity]],
+) -> Optional[tuple[str, str]]:
+    """If query was the dest or source of a follow, return (old, new)."""
+    for idents in identities_by_sha.values():
+        for ident in idents:
+            if ident.kind != "renamed":
+                continue
+            if ident.a_path == query or ident.b_path == query:
+                return ident.a_path or query, ident.b_path or query
+    return None
+
+
+def unique_birth(
+    query: str,
+    identities_by_sha: dict[str, list[Identity]],
+) -> bool:
+    for idents in identities_by_sha.values():
+        for ident in idents:
+            if ident.kind == "born" and ident.b_path == query:
+                return True
+    return False
+
+
+def use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(value: bool, enabled: bool) -> str:
+    raw = "TRUE" if value else "FALSE"
+    if not enabled:
+        return f"{raw:<5}"
+    if value:
+        return f"\033[32;1m{raw:<5}\033[0m"
+    return f"\033[31m{raw}\033[0m"
+
+
+def fmt_witnesses(wits: list[str], limit: int = HOLDER_PRINT_LIMIT) -> Optional[str]:
+    if not wits:
+        return None
+    shown = wits[:limit]
+    extra = len(wits) - limit
+    text = ", ".join(shown)
+    if extra > 0:
+        text += f" (+{extra})"
+    return text
+
+
+def print_human(
+    report: dict,
+    eras: list[Era],
+    color: bool,
+    show_wits: bool,
+) -> None:
+    name = os.path.basename(report["repo"])
+    scanned = report["commits_scanned"]
+    reachable = report["reachable"]
+    walk = "first-parent" if report["first_parent"] else "full"
+    if scanned != reachable:
+        count = f"{scanned} of {reachable} commits"
+    else:
+        count = f"{scanned} commits"
+    extra = []
+    if report["include_now"]:
+        extra.append("now")
+    extra.append("copy")
+    bits = ", ".join([count, walk, *extra])
+    print(f"# {report['predicate']}  ({name}, {bits})")
+    ident = report.get("identity") or []
+    if len(ident) >= 2:
+        print("       copy: " + " → ".join(ident))
+    for era in eras:
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        unit = "commit" if era.count == 1 else "commits"
+        label = paint(era.value, color)
+        print(f"{label} {era.count:>3} {unit:<8} {span}  {dates}".rstrip())
+        if era.count == 1:
+            print(f"       {era.start.subject}")
+        else:
+            print(f"       {era.start.short}  {era.start.subject}")
+            print(f"       {era.end.short}  {era.end.subject}")
+        if era.origin is not None:
+            n = era.origin_count
+            as_name = ""
+            if era.origin.witnesses:
+                as_name = f"  as {era.origin.witnesses[0]}"
+            print(
+                f"       origin: {era.origin.short}  {era.origin.subject}"
+                f"  ({n} commit{'s' if n != 1 else ''} before this merge)"
+                f"{as_name}"
+            )
+        if show_wits and era.value:
+            wtxt = fmt_witnesses(era.holders)
+            if wtxt:
+                print(f"       holders: {wtxt}")
+            if era.split == "holders":
+                for h in era.added:
+                    print(f"       + {h}")
+                for h in era.dropped:
+                    print(f"       - {h}")
+    holds = "TRUE" if report["holds_now"] else "FALSE"
+    holder_splits = sum(1 for e in eras if e.split == "holders")
+    bits_out = [
+        f"now={holds}",
+        f"true={report['true_commits']}/{report['commits_scanned']}",
+        f"eras={len(eras)}",
+    ]
+    if report["split_holders"] and holder_splits:
+        bits_out.append(f"boolean={report['boolean_eras']}")
+        bits_out.append(f"holder_splits={holder_splits}")
+    bits_out.append(f"probes={report['probes']}")
+    if report.get("identity"):
+        bits_out.append("aka=" + ",".join(report["identity"]))
+    print("  ".join(bits_out))
+    for w in report["warnings"]:
+        print(f"warning: {w}")
+    for h in report["hints"]:
+        print(f"hint: {h}")
+
+
+def print_oneline(eras: list[Era]) -> None:
+    for era in eras:
+        flag = "T" if era.value else "F"
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        holders = ",".join(era.holders)
+        split = "" if era.split == "start" else era.split
+        print(
+            f"{flag}\t{era.count}\t{span}\t{dates}\t{holders}\t{split}\t{era.kind_name}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=TOOL,
+        description=(
+            "Show eras of git history where a dest is a new holder of this blob. "
+            "copy SRC / exists SRC occupy dests cribbed from SRC (or dests that "
+            "are themselves crib dests). git mv is FOLLOW, not COPY."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  crib copy a.rs
+  crib exists a.rs
+  crib exists src/init/install.rs
+  crib --full exists src/init.rs
+  crib --no-follow exists 'old name.txt'
+""",
+    )
+    p.add_argument("-C", "--repo", default=".", help="repository (default: cwd)")
+    p.add_argument("--rev", default="HEAD", help="end revision (default: HEAD)")
+    p.add_argument("--range", dest="rev_range", metavar="REV_RANGE", help="limit to A..B")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="walk every reachable commit, not only first-parent",
+    )
+    p.add_argument("--now", action="store_true", help="append the working tree as a final sample")
+    p.add_argument("--index", action="store_true", help="append the index as a sample")
+    p.add_argument("--limit", type=int, default=None, help="keep only the last N commits")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
+    p.add_argument("--oneline", action="store_true", help="T/F count span dates")
+    p.add_argument("--revs", action="store_true", help="print SHAs where the predicate holds")
+    p.add_argument("--bounds", action="store_true", help="print start_sha end_sha value count")
+    p.add_argument("--true-bounds", action="store_true", help="like --bounds but only TRUE eras")
+    p.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    p.add_argument("--no-witnesses", action="store_true", help="do not print dest holder paths")
+    p.add_argument(
+        "--boolean",
+        action="store_true",
+        help="compress only on TRUE/FALSE; ignore dest-set changes",
+    )
+    p.add_argument(
+        "--copy",
+        dest="want_copy",
+        action="store_true",
+        default=True,
+        help="occupy extra holders of this blob (default)",
+    )
+    p.add_argument(
+        "--follow",
+        dest="want_follow",
+        action="store_true",
+        help="rejected: git mv is FOLLOW; use berth --follow exists PATH",
+    )
+    p.add_argument(
+        "--no-follow",
+        dest="follow_dest",
+        action="store_false",
+        default=True,
+        help="do not follow dest identity after a later git mv of the dest",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pe = sub.add_parser("exists", help="PATH is a copy source or dest (same as copy)")
+    pe.add_argument("path", help="source or dest path relative to repo root")
+    pc = sub.add_parser("copy", help="PATH is a copy source or dest")
+    pc.add_argument("path", help="source or dest path relative to repo root")
+    return p
+
+
+def walk_occupancy(
+    repo: str,
+    commits: list[Sample],
+    query: str,
+    cache: TreeCache,
+    *,
+    follow_dest: bool,
+) -> tuple[list[CopyBond], dict[str, list[Identity]], list[Identity]]:
+    bonds: list[CopyBond] = []
+    identities_by_sha: dict[str, list[Identity]] = {}
+    extra_idents: list[Identity] = []
+    empty: dict[str, str] = {}
+    birth_cache: dict[str, Optional[str]] = {}
+
+    for sample in commits:
+        parent = first_parent_of(sample)
+        tree_a = cache.tree(parent) if parent else empty
+        tree_b = cache.tree(sample.sha)
+        idents = detect_identities(cache, tree_a, tree_b)
+        born_dests = [i.b_path for i in idents if i.kind == "born" and i.b_path]
+        if born_dests:
+            # First-parent merge: dest is A vs mainline, copy event is off-mainline.
+            # dest-on-B vs source-on-A at the merge is the wrong pair (kizu 0.195).
+            idents.extend(
+                origin_copies_for_dests(
+                    repo, cache, born_dests, query, sample.sha, birth_cache
+                )
+            )
+        identities_by_sha[sample.sha] = idents
+        extra_idents.extend(idents)
+        if not follow_dest:
+            # path occupancy of dest: a later dest rename kills the old dest path
+            for ident in idents:
+                if ident.kind == "renamed" and ident.a_path:
+                    for bond in bonds:
+                        if not bond.dead and bond.dest == ident.a_path:
+                            bond.dead = True
+        apply_identities(bonds, idents, tree_b, sample.sha)
+        holders = holders_for(query, bonds)
+        sample.value = bool(holders)
+        sample.witnesses = holders
+    return bonds, identities_by_sha, extra_idents
+
+
+def probe_dirty(
+    repo: str,
+    cache: TreeCache,
+    bonds: list[CopyBond],
+    query: str,
+    *,
+    kind: str,
+    head_sha: Optional[str],
+    follow_dest: bool,
+) -> tuple[Sample, list[CopyBond]]:
+    sample = now_sample() if kind == "worktree" else index_sample()
+    parent = head_sha
+    spec = "WORKTREE" if kind == "worktree" else "INDEX"
+    tree_a = cache.tree(parent) if parent else {}
+    tree_b = cache.tree(spec)
+    idents = detect_identities(cache, tree_a, tree_b)
+    dirty_bonds = [
+        CopyBond(
+            source=b.source,
+            dest=b.dest,
+            source_names=list(b.source_names),
+            dest_names=list(b.dest_names),
+            born_sha=b.born_sha,
+            similarity=b.similarity,
+            dead=b.dead,
+        )
+        for b in bonds
+    ]
+    if not follow_dest:
+        for ident in idents:
+            if ident.kind == "renamed" and ident.a_path:
+                for bond in dirty_bonds:
+                    if not bond.dead and bond.dest == ident.a_path:
+                        bond.dead = True
+    apply_identities(dirty_bonds, idents, tree_b, spec)
+    holders = holders_for(query, dirty_bonds)
+    sample.value = bool(holders)
+    sample.witnesses = holders
+    return sample, dirty_bonds
+
+
+def identity_chain(bonds: list[CopyBond], query: str) -> list[str]:
+    names: list[str] = []
+    dests: list[str] = []
+    for bond in matching_bonds(query, bonds):
+        for n in bond.source_names:
+            if n not in names:
+                names.append(n)
+        for n in bond.dest_names:
+            if n not in dests:
+                dests.append(n)
+    if not names and not dests:
+        return []
+    # source then dests
+    out = list(names)
+    for d in dests:
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def annotate_copy_origin(
+    repo: str,
+    eras: list[Era],
+    first_parent: bool,
+    bonds: list[CopyBond],
+    query: str,
+) -> int:
+    extra = 0
+    if not first_parent:
+        return extra
+    live = [b for b in matching_bonds(query, bonds) if b.born_sha]
+    if not live:
+        return extra
+    for era in eras:
+        if not era.value or era.start.kind != "commit":
+            continue
+        parents = merge_parents(repo, era.start.sha)
+        if len(parents) < 2:
+            continue
+        # Name the earliest copy birth off this merge.
+        born = live[0].born_sha
+        if born == era.start.sha:
+            continue
+        extra += 1
+        r = run_git(
+            repo,
+            ["log", "-1", "--pretty=format:%H\t%ct\t%ci\t%s", born],
+            check=False,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            continue
+        parts = r.stdout.strip().split("\t", 3)
+        if len(parts) < 4:
+            continue
+        sha, ts, iso, subject = parts
+        origin = Sample(
+            sha=sha,
+            short=sha[:7],
+            timestamp=int(ts),
+            iso=iso,
+            subject=subject,
+            kind="commit",
+            witnesses=[live[0].source_names[0], live[0].dest_names[0]]
+            if live[0].dest_names
+            else [live[0].source],
+        )
+        era.origin = origin
+        # count reachable commits from merge that hold dest before this walk sample
+        era.origin_count = 0
+        dest = live[0].dest_names[0] if live[0].dest_names else live[0].dest
+        behind = run_git(
+            repo,
+            ["rev-list", "--count", f"{era.start.sha}", f"^{parents[0]}"],
+            check=False,
+        )
+        try:
+            era.origin_count = int(behind.stdout.strip() or "0")
+        except ValueError:
+            era.origin_count = 0
+        # witnesses used for "as <path>"
+        origin.witnesses = [dest]
+    return extra
+
+
+def build_hints(
+    repo: str,
+    spec: str,
+    query: str,
+    *,
+    first_parent: bool,
+    never_held: bool,
+    bonds: list[CopyBond],
+    identities_by_sha: dict[str, list[Identity]],
+    commits: list[Sample],
+    cache: TreeCache,
+) -> tuple[list[str], list[str], int]:
+    hints: list[str] = []
+    warnings: list[str] = []
+    extra = 0
+    if not never_held:
+        return hints, warnings, extra
+
+    rejected = follow_rejected(query, identities_by_sha)
+    if rejected:
+        old, new = rejected
+        hints.append(
+            f"{quote(old)} → {quote(new)} is a follow (A name gone), not a copy. "
+            f"berth --follow exists {quote(old)}"
+        )
+        return hints, warnings, extra
+
+    if first_parent:
+        full = load_commits(repo, spec, first_parent=False, limit=None)
+        extra += 1
+        full_bonds, full_idents, _ = walk_occupancy(
+            repo, full, query, cache, follow_dest=True
+        )
+        matched = matching_bonds(query, full_bonds)
+        if matched:
+            born = matched[0]
+            hints.append(
+                f"never cribbed on first-parent, but dest {quote(born.dest)} "
+                f"was copied from {quote(born.source)} off the mainline "
+                f"({born.born_sha[:7]}). rerun with --full"
+            )
+            return hints, warnings, extra
+        full_follow = follow_rejected(query, full_idents)
+        if full_follow:
+            old, new = full_follow
+            hints.append(
+                f"{quote(old)} → {quote(new)} is a follow (A name gone), not a copy. "
+                f"berth --follow exists {quote(old)}"
+            )
+            return hints, warnings, extra
+
+    if unique_birth(query, identities_by_sha):
+        hints.append(
+            f"{quote(query)} was a unique birth, not a crib dest. "
+            f"held exists {quote(query)}"
+        )
+    return hints, warnings, extra
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "want_follow", False):
+        die(
+            "git mv is FOLLOW, not COPY. crib occupies extra holders. "
+            f"use berth --follow exists {quote(getattr(args, 'path', 'PATH'))}"
+        )
+
+    try:
+        repo = resolve_repo(args.repo)
+    except GitError as e:
+        die(e.message)
+
+    spec = args.rev_range if args.rev_range else args.rev
+    end_rev = spec
+    first_parent = not args.full
+    split_holders = not args.boolean
+    query = args.path
+    follow_dest = bool(args.follow_dest)
+
+    try:
+        commits = load_commits(repo, spec, first_parent=first_parent, limit=args.limit)
+    except GitError as e:
+        die(e.message)
+
+    if not commits:
+        die(f"no commits at {spec} (empty repository?)")
+
+    reachable = reachable_count(repo, spec)
+    cache = TreeCache(repo)
+    bonds, identities_by_sha, _ = walk_occupancy(
+        repo, commits, query, cache, follow_dest=follow_dest
+    )
+
+    extra_samples: list[Sample] = []
+    head_sha = commits[-1].sha if commits else None
+    if args.index:
+        s, bonds = probe_dirty(
+            repo, cache, bonds, query, kind="index", head_sha=head_sha, follow_dest=follow_dest
+        )
+        extra_samples.append(s)
+    if args.now:
+        s, bonds = probe_dirty(
+            repo, cache, bonds, query, kind="worktree", head_sha=head_sha, follow_dest=follow_dest
+        )
+        extra_samples.append(s)
+
+    samples = commits + extra_samples
+    true_commit_n = sum(1 for s in commits if s.value)
+    holds_now = bool(samples[-1].value) if samples else False
+    never_held = true_commit_n == 0
+    always_held = true_commit_n == len(commits) and len(commits) > 0
+
+    hints, warnings, hint_probes = build_hints(
+        repo,
+        spec,
+        query,
+        first_parent=first_parent,
+        never_held=never_held,
+        bonds=bonds,
+        identities_by_sha=identities_by_sha,
+        commits=commits,
+        cache=cache,
+    )
+    cache.probes += hint_probes
+
+    boolean_eras = compress(samples, split_holders=False)
+    eras = compress(samples, split_holders=split_holders)
+    classify_eras(eras)
+    cache.probes += annotate_copy_origin(repo, eras, first_parent, bonds, query)
+
+    identity = identity_chain(bonds, query)
+    copies = [
+        {
+            "from": b.source_names[0] if b.source_names else b.source,
+            "to": b.dest_names[-1] if b.dest_names else b.dest,
+            "source_names": list(b.source_names),
+            "dest_names": list(b.dest_names),
+            "born": b.born_sha,
+            "similarity": b.similarity,
+            "dead": b.dead,
+        }
+        for b in matching_bonds(query, bonds)
+    ]
+
+    pred = f"{args.cmd} {query}"
+    report = {
+        "repo": repo,
+        "predicate": pred,
+        "end_rev": end_rev,
+        "first_parent": first_parent,
+        "include_now": bool(args.now),
+        "holds_now": holds_now,
+        "never_held": never_held,
+        "always_held": always_held,
+        "commits_scanned": len(commits),
+        "reachable": reachable,
+        "probes": cache.probes,
+        "true_commits": true_commit_n,
+        "boolean_eras": len(boolean_eras),
+        "split_holders": split_holders,
+        "copy": True,
+        "follow": False,
+        "identity": identity,
+        "copies": copies,
+        "eras": [],
+        "hint": hints[0] if hints else None,
+        "hints": hints,
+        "warnings": warnings,
+    }
+    for era in eras:
+        rec = {
+            "value": era.value,
+            "count": era.count,
+            "split": era.split,
+            "kind": era.kind_name,
+            "start": era.start.as_json(),
+            "end": era.end.as_json(),
+            "holders": list(era.holders),
+            "added": list(era.added),
+            "dropped": list(era.dropped),
+            "witnesses_start": list(era.start.witnesses) if era.value else [],
+            "witnesses_end": list(era.end.witnesses) if era.value else [],
+        }
+        if era.origin is not None:
+            rec["origin"] = era.origin.as_json()
+            rec["origin_true_commits"] = era.origin_count
+        report["eras"].append(rec)
+
+    if not args.quiet:
+        if args.json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        elif args.revs:
+            for s in samples:
+                if s.value and s.kind == "commit":
+                    print(s.sha)
+        elif args.true_bounds:
+            for era in eras:
+                if era.value:
+                    print(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+        elif args.bounds:
+            for era in eras:
+                print(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+        elif args.oneline:
+            print_oneline(eras)
+        else:
+            print_human(
+                report,
+                eras,
+                use_color(args.color),
+                show_wits=not args.no_witnesses,
+            )
+
+    return 0 if holds_now else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except GitError as e:
+        die(e.message)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

@@ -1,0 +1,70 @@
+OFFBY      SitboneCore/BrowserSiteIdentity.swift:37  last.count == 2
+           same-field neighbor is off by one from the cut
+           CUT    3  SitboneCore/BrowserSiteIdentity.swift:38  (off-by-one d=1)
+
+BRINK      SitboneCore/BrowserSiteIdentity.swift:32  parts.count > 2
+           constructed values sit on both sides of the cut
+           CUT    2  SitboneCore/BrowserSiteIdentity.swift:41  (exclusive)
+           CUT    3  SitboneCore/BrowserSiteIdentity.swift:38  (inclusive)
+
+BRINK      SitboneCore/BrowserSiteIdentity.swift:37  parts.count >= 3
+           constructed values sit on both sides of the cut
+           CUT    2  SitboneCore/BrowserSiteIdentity.swift:41  (exclusive)
+           CUT    3  SitboneCore/BrowserSiteIdentity.swift:38  (inclusive)
+
+BRINK      SitboneCore/SiteResolver.swift:87  words.count <= 3
+           inclusive bound; 3 is constructed (first/last hit)
+           CUT    3  SitboneCore/SiteResolver.swift:77  (inclusive)
+           CUT    3  SitboneCore/SiteResolver.swift:81  (inclusive)
+
+BRINK      SitboneCore/SiteResolver.swift:150  $1 < 0.1
+           exclusive bound; 0.1 is constructed (last miss)
+           CUT    0.1  SitboneCore/SiteResolver.swift:156  (exclusive)
+
+SENTINEL   SitboneCore/PresenceArbiter.swift:113  case in ['absent', 'unknown', 'none']
+           sentinel is constructed; siblings exist — domain edge is live
+           CUT    'unknown'  SitboneCore/PresenceArbiter.swift:77  (exact field=status)
+           CUT    'unknown'  SitboneCore/PresenceArbiter.swift:84  (exact field=status)
+           CUT    'unknown'  SitboneCore/PresenceArbiter.swift:85  (exact field=status)
+           CUT    'unknown'  SitboneCore/PresenceArbiter.swift:86  (exact field=status)
+           CUT    'absent'  SitboneCore/PresenceArbiter.swift:112  (exact)
+           CUT    'absent'  SitboneCore/PresenceArbiter.swift:114  (exact field=present)
+
+SENTINEL   SitboneCore/SitboneCore.swift:591  currentPhaseDuration > 0
+           excluded numeric sentinel 0 sits on the cut
+           CUT    0  SitboneCore/SitboneCore.swift:421  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:763  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:848  (exclusive field=currentPhaseDuration)
+
+SENTINEL   SitboneCore/SitboneCore.swift:831  totalElapsed > 0
+           excluded numeric sentinel 0 sits on the cut
+           CUT    0  SitboneCore/SitboneCore.swift:417  (exclusive field=totalElapsed)
+           CUT    0  SitboneCore/SitboneCore.swift:758  (exclusive field=totalElapsed)
+
+SENTINEL   SitboneCore/SitboneCore.swift:838  currentPhaseDuration > 0
+           excluded numeric sentinel 0 sits on the cut
+           CUT    0  SitboneCore/SitboneCore.swift:421  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:763  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:848  (exclusive field=currentPhaseDuration)
+
+SENTINEL   SitboneCore/SitboneCore.swift:846  currentPhaseDuration > 0
+           excluded numeric sentinel 0 sits on the cut
+           CUT    0  SitboneCore/SitboneCore.swift:421  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:763  (exclusive field=currentPhaseDuration)
+           CUT    0  SitboneCore/SitboneCore.swift:848  (exclusive field=currentPhaseDuration)
+
+SENTINEL   SitboneUI/NotchOverlay.swift:1191  case in ['away', 'nil']
+           neighboring sentinel is constructed against this sentinel cut
+           CUT    'zero'  SitboneUI/NotchOverlay.swift:326  (sentinel)
+
+NEIGHBOR   SitboneCore/SitboneCore.swift:212  case == 'away'
+           adjacent enum variant is constructed; the compared-to value is not
+           CUT    'drift'  SitboneCore/SitboneCore.swift:806  (neighbor)
+
+NEIGHBOR   SitboneCore/SitboneCore.swift:805  case == 'flow'
+           adjacent enum variant is constructed; the compared-to value is not
+           CUT    'drift'  SitboneCore/SitboneCore.swift:806  (neighbor)
+
+NEIGHBOR   SitboneCore/SitboneCore.swift:806  case == 'drift'
+           adjacent enum variant is constructed; the compared-to value is not
+           CUT    'flow'  SitboneCore/SitboneCore.swift:805  (neighbor)

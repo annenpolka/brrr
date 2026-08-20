@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""pin — mint a durable fingerprint address; resolve it onto any tree.
+
+A file:line is a locator. It dies when the file splits. A pin is the
+fingerprint (line + identifiers + neighbors + path hint) so a ticket
+can store the address without the SHA or the path:line.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import zlib
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEF_RE = re.compile(
+    r"""^(\s*)(?:(?:pub(?:\s*\([^)]*\))?|crate|async|unsafe|static|
+         private|protected|public|internal|open|override|fileprivate|
+         export|default)\s+)*
+        (?:fn|def|func|function|class|struct|enum|trait|interface|impl|
+         extension|typedef|type)\b""",
+    re.VERBOSE,
+)
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "class",
+    "const",
+    "crate",
+    "def",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "i",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "int",
+    "let",
+    "mod",
+    "mut",
+    "n",
+    "none",
+    "not",
+    "of",
+    "or",
+    "pub",
+    "return",
+    "self",
+    "static",
+    "str",
+    "struct",
+    "t",
+    "the",
+    "this",
+    "to",
+    "true",
+    "type",
+    "use",
+    "var",
+    "void",
+    "where",
+    "with",
+}
+TRIVIAL_NORMS = {
+    "",
+    "{",
+    "}",
+    "};",
+    "[",
+    "]",
+    "(",
+    ")",
+    "else",
+    "else:",
+    "pass",
+    "break",
+    "continue",
+    "end",
+    "end;",
+    "//",
+    "#",
+    "*/",
+    "/*",
+}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+MAX_FILE_BYTES = 1_000_000
+MAX_TEXT_CHARS = 240
+MAX_NEIGHBOR_CHARS = 140
+MAX_PIN_PLAIN = 64_000
+
+PREFIX = "pin1."
+
+
+@dataclass
+class Fingerprint:
+    path: str
+    line: int
+    text: str
+    tokens: list[str] = field(default_factory=list)
+    unique: list[str] = field(default_factory=list)
+    before: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)
+    anchors: list[str] = field(default_factory=list)
+    col: Optional[int] = None
+
+    def payload(self) -> dict:
+        d: dict = {"v": 1, "p": self.path, "n": self.line, "t": self.text}
+        if self.tokens:
+            d["k"] = self.tokens
+        if self.unique:
+            d["u"] = self.unique
+        if self.before:
+            d["b"] = self.before
+        if self.after:
+            d["a"] = self.after
+        if self.anchors:
+            d["g"] = self.anchors
+        if self.col is not None:
+            d["c"] = self.col
+        return d
+
+    @classmethod
+    def from_payload(cls, d: dict) -> "Fingerprint":
+        if not isinstance(d, dict) or d.get("v") != 1:
+            raise ValueError("unsupported pin version")
+        text = d.get("t")
+        path = d.get("p")
+        line = d.get("n")
+        if not isinstance(text, str) or not isinstance(path, str) or not isinstance(line, int):
+            raise ValueError("pin missing path/line/text")
+        return cls(
+            path=path,
+            line=line,
+            text=text,
+            tokens=_str_list(d.get("k")),
+            unique=_str_list(d.get("u")),
+            before=_str_list(d.get("b")),
+            after=_str_list(d.get("a")),
+            anchors=_str_list(d.get("g")),
+            col=d.get("c") if isinstance(d.get("c"), int) else None,
+        )
+
+
+@dataclass
+class Hit:
+    fp: Fingerprint
+    name: Optional[str]
+    token: str
+    status: str
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+    gap_path: Optional[str] = None
+    gap_line: Optional[int] = None
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+
+def _str_list(val: object) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    return [x for x in val if isinstance(x, str)]
+
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def clip(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def decode_bytes(data: bytes) -> Optional[str]:
+    if b"\x00" in data[:4096]:
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def load_git_paths(root: Path, ref: Optional[str]) -> list[str]:
+    if ref is None:
+        raw = git_ok(root, ["ls-files", "-z"])
+    else:
+        raw = git_ok(root, ["ls-tree", "-r", "--name-only", "-z", ref])
+    if raw is None:
+        return []
+    return [posix_rel(p) for p in raw.split("\0") if p and not should_skip_path(p)]
+
+
+def read_git_file(root: Path, ref: Optional[str], path: str) -> Optional[list[str]]:
+    if ref is None:
+        fp = root / path
+        try:
+            data = fp.read_bytes()
+        except OSError:
+            return None
+        text = decode_bytes(data)
+        if text is None:
+            return None
+        return split_lines(text)
+    try:
+        cp = git(root, ["show", f"{ref}:{path}"], check=True)
+    except subprocess.CalledProcessError:
+        return None
+    text = decode_bytes(cp.stdout)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def walk_dir_files(root: Path) -> Iterator[str]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield rel
+
+
+def read_dir_file(root: Path, path: str) -> Optional[list[str]]:
+    fp = root / path
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        return None
+    text = decode_bytes(data)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    untracked: bool,
+    label: str,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    if directory is not None:
+        if not directory.is_dir():
+            raise SystemExit(f"pin: not a directory: {directory}")
+        for path in walk_dir_files(directory):
+            lines = read_dir_file(directory, path)
+            if lines is not None:
+                files[path] = lines
+        snap = Snapshot(label=label, files=files)
+        snap.index()
+        return snap
+    if git_root is None:
+        raise SystemExit("pin: not a git repository (use --repo or --from-dir/--to-dir)")
+    paths = load_git_paths(git_root, ref)
+    if ref is None and untracked:
+        extra = git_ok(git_root, ["ls-files", "-o", "--exclude-standard", "-z"]) or ""
+        for p in extra.split("\0"):
+            if p and not should_skip_path(p):
+                paths.append(posix_rel(p))
+    for path in paths:
+        lines = read_git_file(git_root, ref, path)
+        if lines is not None:
+            files[path] = lines
+    snap = Snapshot(label=label, files=files)
+    snap.index()
+    return snap
+
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    p = posix_rel(raw.replace("\\", "/"))
+    while p.startswith("./"):
+        p = p[2:]
+    known_set = known if isinstance(known, set) else set(known)
+    if p in known_set:
+        return p
+    best = None
+    for kp in known_set:
+        if p.endswith("/" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    return best
+
+
+def parse_locator(text: str, known: Iterable[str]) -> tuple[str, int, Optional[int]]:
+    if is_pin_token(text):
+        raise SystemExit("pin mint: that looks like a pin token; use resolve")
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        raise SystemExit(f"pin: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    bound = bind_path(rest, known)
+    path = bound or posix_rel(rest)
+    if not path:
+        raise SystemExit(f"pin: missing path in {text}")
+    return path, line, col
+
+
+def is_pin_token(s: str) -> bool:
+    s = s.strip()
+    return s.startswith(PREFIX) and len(s) > len(PREFIX) + 2
+
+
+def encode_pin(fp: Fingerprint) -> str:
+    raw = json.dumps(fp.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    packed = zlib.compress(raw, 9)
+    return PREFIX + base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+def decode_pin(token: str) -> Fingerprint:
+    token = token.strip()
+    if not is_pin_token(token):
+        raise ValueError("not a pin token")
+    b64 = token[len(PREFIX) :]
+    pad = "=" * (-len(b64) % 4)
+    try:
+        packed = base64.urlsafe_b64decode(b64 + pad)
+        raw = zlib.decompress(packed)
+    except Exception as e:
+        raise ValueError(f"corrupt pin: {e}") from e
+    if len(raw) > MAX_PIN_PLAIN:
+        raise ValueError("pin payload too large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt pin json: {e}") from e
+    return Fingerprint.from_payload(data)
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def is_def_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "//", "/*", "*", "///", "--", "!", "{", "}")):
+        return False
+    return bool(DEF_RE.match(line.rstrip()))
+
+
+def is_comment_or_attr(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith(("#", "//", "/*", "*", "///", "--", "@", "#[", "#[derive"))
+
+
+def collect_neighbors(lines: list[str], idx: int, ctx: int) -> tuple[list[str], list[str]]:
+    """Neighbors of this line, stopping at a sibling definition.
+
+    Previous/next functions are not this line's fingerprint. Attached
+    comments and the body immediately around the line are.
+    """
+    here = lines[idx - 1]
+    here_indent = indent_of(here)
+    here_is_def = is_def_line(here)
+    before: list[str] = []
+    j = idx - 1
+    while j >= 1 and len(before) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j -= 1
+            continue
+        if here_is_def and is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        # Previous function body (deeper indent) is not this line's neighborhood.
+        if here_is_def and indent_of(raw) > here_indent and not is_comment_or_attr(raw):
+            j -= 1
+            continue
+        before.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j -= 1
+    before.reverse()
+    after: list[str] = []
+    j = idx + 1
+    while j <= len(lines) and len(after) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j += 1
+            continue
+        if is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        after.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j += 1
+    return before, after
+
+
+def mint_fingerprint(src: Snapshot, path: str, line: int, col: Optional[int], ctx: int, force: bool) -> Fingerprint:
+    src_lines = src.files.get(path)
+    if src_lines is None:
+        hits = [p for p in src.files if p == path or p.endswith("/" + path)]
+        if len(hits) == 1:
+            path = hits[0]
+            src_lines = src.files[path]
+        elif not hits:
+            raise SystemExit(f"pin mint: source path not in snapshot: {path}")
+        else:
+            raise SystemExit(f"pin mint: source path ambiguous: {path}")
+    if line < 1 or line > len(src_lines):
+        raise SystemExit(f"pin mint: line {line} out of range ({path} has {len(src_lines)} lines)")
+    raw = src_lines[line - 1]
+    if normalize(raw) in TRIVIAL_NORMS and not force:
+        raise SystemExit(f"pin mint: line is too trivial to fingerprint: {path}:{line}")
+    toks = tokens(raw)
+    ranked = sorted(set(toks), key=lambda t: (-len(t), t.lower()))[:8]
+    unique = []
+    for tok in ranked:
+        if src.token_df.get(tok, 99) <= 2 and len(tok) >= 4:
+            unique.append(tok)
+    before, after = collect_neighbors(src_lines, line, ctx)
+    skip = set(ranked)
+    nearby: list[tuple[int, str]] = []
+    for i, src_raw in enumerate(src_lines, start=1):
+        if i == line or not is_def_line(src_raw):
+            continue
+        for tok in tokens(src_raw):
+            if tok in skip or len(tok) < 4:
+                continue
+            if src.token_df.get(tok, 99) <= 2:
+                nearby.append((abs(i - line), tok))
+                break
+    nearby.sort()
+    anchors: list[str] = []
+    seen_anchor: set[str] = set()
+    for _, tok in nearby:
+        if tok in seen_anchor:
+            continue
+        anchors.append(tok)
+        seen_anchor.add(tok)
+        if len(anchors) >= 4:
+            break
+    return Fingerprint(
+        path=path,
+        line=line,
+        text=clip(raw, MAX_TEXT_CHARS),
+        tokens=ranked,
+        unique=unique,
+        before=before,
+        after=after,
+        anchors=anchors,
+        col=col,
+    )
+
+
+def path_score(src: str, dst: str) -> float:
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    score = 0.0
+    if s_base == d_base:
+        score += 0.55
+    s_stem, s_ext = os.path.splitext(src)
+    if dst.startswith(s_stem + "/") or f"/{os.path.basename(s_stem)}/" in f"/{dst}":
+        score += 0.35
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.05
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.15 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def neighbor_window_score(fp: Fingerprint, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    neigh = fp.before + fp.after
+    if not neigh:
+        return 0.0
+    if ctx <= 0:
+        return 0.0
+    lo = max(1, dst_i - ctx)
+    hi = min(len(dst_lines), dst_i + ctx)
+    window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+    hits = sum(1 for n in neigh if normalize(n) in window)
+    return hits / len(neigh)
+
+
+def score_pin(
+    fp: Fingerprint,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+    dst: Snapshot,
+) -> float:
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_window_score(fp, dst_lines, dst_i, ctx)
+    ps = path_score(fp.path, dst_path)
+    if fp.text == draw or normalize(fp.text) == normalize(draw):
+        n = normalize(fp.text)
+        unique_line = n not in TRIVIAL_NORMS and len(dst.by_norm.get(n, ())) == 1
+        unique_tok = False
+        if fp.unique:
+            dt = set(tokens(draw))
+            unique_tok = any(u in dt and dst.token_df.get(u, 99) <= 2 for u in fp.unique)
+        # Unique exact landings are 1.0 even after a rename. Common clones
+        # (`import {`) keep path as the tie-break so identity cannot jump files.
+        if unique_line or unique_tok or fp.path == dst_path:
+            return 1.0
+        return min(1.0, 0.70 + 0.25 * ps + 0.05 * ns)
+    lr = line_ratio(fp.text, draw)
+    ts = token_score(fp.text, draw)
+    ub = 0.0
+    if fp.unique:
+        dt = set(tokens(draw))
+        hits = sum(1 for u in fp.unique if u in dt)
+        ub = 0.08 * hits / len(fp.unique)
+    return min(1.0, W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps + ub)
+
+
+def candidates_for_pin(fp: Fingerprint, dst: Snapshot) -> list[tuple[str, int]]:
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(path, line)] = None
+
+    n = normalize(fp.text)
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    for tok in list(fp.unique) + [t for t in fp.tokens if t not in fp.unique]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred: list[str] = []
+    if fp.path in dst.files:
+        preferred.append(fp.path)
+    stem = os.path.splitext(fp.path)[0]
+    base = os.path.basename(fp.path)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base):
+            preferred.append(p)
+    for p in preferred:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(fp: Fingerprint, dst_path: Optional[str], dst_raw: str, dst_line: Optional[int], score: float) -> str:
+    if dst_path is None or dst_line is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    same_text = normalize(fp.text) == normalize(dst_raw) or line_ratio(fp.text, dst_raw) >= 0.96
+    if same_text and fp.path == dst_path:
+        if fp.line == dst_line:
+            return "same"
+        return "shifted"
+    if same_text:
+        return "moved"
+    return "edited"
+
+
+def describe_hole(fp: Fingerprint, dst: Snapshot) -> tuple[Optional[str], Optional[int], str]:
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    for raw in reversed(fp.before):
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            prev_hit = locs[0]
+            break
+    for raw in fp.after:
+        n = normalize(raw)
+        if n in TRIVIAL_NORMS:
+            continue
+        locs = dst.by_norm.get(n, [])
+        if len(locs) == 1:
+            next_hit = locs[0]
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return prev_hit[0], min(hi, lo + 1), f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return (
+            next_hit[0],
+            next_hit[1],
+            f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}",
+        )
+    if prev_hit:
+        return prev_hit[0], prev_hit[1], f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return next_hit[0], next_hit[1], f"next context at {next_hit[0]}:{next_hit[1]}"
+    surviving: list[str] = []
+    gap_path = None
+    gap_line = None
+    for tok in fp.anchors:
+        locs = dst.by_token.get(tok, [])
+        if len(locs) == 1:
+            p, i = locs[0]
+            surviving.append(f"{tok} at {p}:{i}")
+            if gap_path is None:
+                gap_path, gap_line = p, i
+    if surviving:
+        return gap_path, gap_line, "surviving anchors: " + "; ".join(surviving[:4])
+    return None, None, "no candidates"
+
+
+def resolve_fingerprint(fp: Fingerprint, dst: Snapshot, ctx: int, debug: bool) -> Hit:
+    cands = candidates_for_pin(fp, dst)
+    best: Optional[tuple[float, str, int, str]] = None
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc = score_pin(fp, dpath, dlines, dline, ctx, dst)
+        if best is None or sc > best[0]:
+            best = (sc, dpath, dline, dlines[dline - 1])
+    if debug and best:
+        print(
+            f"# debug {fp.path}:{fp.line} -> {best[1]}:{best[2]} score={best[0]:.3f} cands={len(cands)}",
+            file=sys.stderr,
+        )
+    token = encode_pin(fp)
+    if best is None:
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            score=0.0,
+            note=note,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    sc, dpath, dline, draw = best
+    status = classify(fp, dpath, draw, dline, sc)
+    if status == "deleted":
+        gap_path, gap_line, note = describe_hole(fp, dst)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        return Hit(
+            fp=fp,
+            name=None,
+            token=token,
+            status="deleted",
+            dest_path=dpath,
+            dest_line=dline,
+            score=sc,
+            note=note,
+            dest_text=draw,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "shifted":
+        note = "same file, line number drifted"
+    return Hit(
+        fp=fp,
+        name=None,
+        token=token,
+        status=status,
+        dest_path=dpath,
+        dest_line=dline,
+        score=sc,
+        note=note,
+        dest_text=draw,
+    )
+
+
+def format_from(fp: Fingerprint) -> str:
+    col = f":{fp.col}" if fp.col is not None else ""
+    return f"{fp.path}:{fp.line}{col}"
+
+
+def format_to(hit: Hit) -> str:
+    if hit.dest_path is None or hit.dest_line is None or hit.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{hit.fp.col}" if hit.fp.col is not None else ""
+    return f"{hit.dest_path}:{hit.dest_line}{col}"
+
+
+def print_human_hit(hit: Hit) -> None:
+    src = format_from(hit.fp)
+    dst = format_to(hit)
+    if hit.status == "deleted":
+        dst = "(deleted)"
+    extra = f"  {hit.note}" if hit.note else ""
+    label = f"{hit.name}  " if hit.name else ""
+    print(f"{label}{src:40} → {dst:40} {hit.status:11} {hit.score:5.2f}{extra}")
+
+
+def print_porcelain_hit(hit: Hit) -> None:
+    note = hit.note.replace("\t", " ").replace("\n", " ")
+    name = hit.name or "-"
+    print(f"{hit.status}\t{name}\t{format_from(hit.fp)}\t{format_to(hit)}\t{hit.score:.3f}\t{note}")
+
+
+def print_json_hit(hit: Hit) -> None:
+    obj = {
+        "pin": hit.token,
+        "name": hit.name,
+        "from": {"path": hit.fp.path, "line": hit.fp.line, "col": hit.fp.col},
+        "to": (
+            None
+            if hit.dest_path is None or hit.status in {"deleted", "unresolved"}
+            else {"path": hit.dest_path, "line": hit.dest_line, "col": hit.fp.col}
+        ),
+        "status": hit.status,
+        "score": round(hit.score, 4),
+        "note": hit.note,
+        "text": hit.fp.text,
+        "dest_text": hit.dest_text or None,
+    }
+    if hit.gap_path is not None:
+        obj["gap"] = {"path": hit.gap_path, "line": hit.gap_line}
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def print_show(fp: Fingerprint, token: str, file=sys.stdout) -> None:
+    print(token, file=file)
+    print(f"  minted: {format_from(fp)}", file=file)
+    print(f"  text:   {fp.text}", file=file)
+    if fp.tokens:
+        print(f"  tokens: {', '.join(fp.tokens)}", file=file)
+    if fp.unique:
+        print(f"  unique: {', '.join(fp.unique)}", file=file)
+    if fp.anchors:
+        print(f"  anchors: {', '.join(fp.anchors)}", file=file)
+    if fp.before:
+        print("  before:", file=file)
+        for line in fp.before:
+            print(f"    - {line}", file=file)
+    if fp.after:
+        print("  after:", file=file)
+        for line in fp.after:
+            print(f"    - {line}", file=file)
+
+
+def parse_pinfile_line(line: str) -> Optional[tuple[Optional[str], str]]:
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    parts = raw.split()
+    token = None
+    name = None
+    for i, part in enumerate(parts):
+        if is_pin_token(part):
+            token = part
+            if i > 0:
+                name = " ".join(parts[:i])
+            break
+    if token is None:
+        return None
+    return name, token
+
+
+def load_pinfile(text: str) -> list[tuple[Optional[str], str]]:
+    out: list[tuple[Optional[str], str]] = []
+    for line in text.splitlines():
+        parsed = parse_pinfile_line(line)
+        if parsed:
+            out.append(parsed)
+    return out
+
+
+def append_pinfile(path: Path, name: Optional[str], token: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{name}\t{token}\n" if name else f"{token}\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def add_common(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--repo", "-C", type=Path, default=None, help="git repository (default: discover from cwd)")
+    sp.add_argument("--json", action="store_true", help="NDJSON output")
+    sp.add_argument("--porcelain", action="store_true", help="TSV output")
+    sp.add_argument("--strict", action="store_true", help="exit 1 if a pin is unresolved")
+    sp.add_argument("--debug", action="store_true", help="scorer traces on stderr")
+    sp.add_argument("--context", type=int, default=3, help="neighbor window (default 3)")
+    sp.add_argument("--untracked", action="store_true", help="include untracked files in worktree snapshots")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="pin",
+        description="Mint a durable fingerprint address and resolve it onto any tree. Not a locator string.",
+    )
+    p.add_argument("--version", action="version", version=f"pin {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    m = sub.add_parser("mint", help="capture path:line once as a pin token")
+    add_common(m)
+    m.add_argument("locations", nargs="*", help="path:line (once). omit to read locators from stdin")
+    m.add_argument("--from", dest="from_ref", default=None, help="source git ref to mint from")
+    m.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory (skip git)")
+    m.add_argument("--name", action="append", default=None, help="pinfile name (repeat to match locators)")
+    m.add_argument("--file", type=Path, default=None, help="append minted pins to a pinfile")
+    m.add_argument("--force", action="store_true", help="mint even if the line looks trivial")
+    m.add_argument("--pretty", action="store_true", help="dump fingerprint to stderr")
+
+    r = sub.add_parser("resolve", help="land a stored pin on --to / --to-dir; no path:line")
+    add_common(r)
+    r.add_argument("pins", nargs="*", help="pin1.… tokens (or names if --file). omit to read a pinfile on stdin")
+    r.add_argument("--to", dest="to_ref", default=None, help="destination git ref (default: worktree)")
+    r.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    r.add_argument("--file", type=Path, default=None, help="pinfile of stored pins")
+
+    s = sub.add_parser("show", help="decode a pin without resolving")
+    s.add_argument("pins", nargs="+", help="pin1.… tokens")
+    s.add_argument("--json", action="store_true", help="JSON payload")
+
+    sub.add_parser("selftest", help="internal checks")
+    return p
+
+
+def git_root_from_args(args: argparse.Namespace, need_git: bool) -> Optional[Path]:
+    if not need_git:
+        return None
+    cwd = Path.cwd()
+    start = args.repo if getattr(args, "repo", None) is not None else cwd
+    git_root = discover_repo(start)
+    if args.repo is not None:
+        git_root = args.repo.resolve()
+        if not (git_root / ".git").exists() and not (git_root / ".git").is_file():
+            print(f"pin: {git_root} is not a git repo", file=sys.stderr)
+            raise SystemExit(2)
+    return git_root
+
+
+def emit_hit(hit: Hit, args: argparse.Namespace) -> None:
+    if args.json:
+        print_json_hit(hit)
+    elif args.porcelain:
+        print_porcelain_hit(hit)
+    else:
+        print_human_hit(hit)
+
+
+def cmd_mint(args: argparse.Namespace) -> int:
+    need_git = args.from_dir is None
+    git_root = git_root_from_args(args, need_git)
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else args.from_ref,
+        directory=args.from_dir,
+        untracked=args.untracked,
+        label=str(args.from_dir or args.from_ref or "worktree"),
+    )
+    locations = list(args.locations)
+    if not locations:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["mint", "-h"])
+            return 2
+        for line in sys.stdin.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            locations.append(line)
+    names = list(args.name or [])
+    if names and len(names) not in (1, len(locations)):
+        print("pin mint: --name count must be 1 or match locators", file=sys.stderr)
+        return 2
+    if names and len(names) == 1 and len(locations) > 1:
+        # a single name is only valid for one locator
+        print("pin mint: give one --name per locator", file=sys.stderr)
+        return 2
+    unresolved = False
+    for i, loc in enumerate(locations):
+        try:
+            path, line, col = parse_locator(loc, src.paths)
+            fp = mint_fingerprint(src, path, line, col, args.context, args.force)
+        except SystemExit as e:
+            msg = str(e)
+            if msg and msg != "2":
+                print(msg if msg.startswith("pin") else f"pin mint: {msg}", file=sys.stderr)
+            unresolved = True
+            continue
+        token = encode_pin(fp)
+        name = names[i] if names else None
+        if args.file is not None:
+            append_pinfile(args.file, name, token)
+        if args.pretty:
+            print_show(fp, token, file=sys.stderr)
+            print(f"{name}\t{token}" if name else token)
+            continue
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "pin": token,
+                        "name": name,
+                        "from": {"path": fp.path, "line": fp.line, "col": fp.col},
+                        "text": fp.text,
+                        "tokens": fp.tokens,
+                        "unique": fp.unique,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        elif args.porcelain:
+            n = name or "-"
+            print(f"minted\t{n}\t{format_from(fp)}\t{token}")
+        elif name:
+            print(f"{name}\t{token}")
+        else:
+            print(token)
+    if args.strict and unresolved:
+        return 1
+    if unresolved and not locations:
+        return 1
+    if unresolved and not args.locations:
+        return 1
+    if unresolved:
+        return 1
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    items: list[tuple[Optional[str], str]] = []
+    file_entries: list[tuple[Optional[str], str]] = []
+    if args.file is not None:
+        try:
+            text = args.file.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"pin resolve: cannot read {args.file}: {e}", file=sys.stderr)
+            return 2
+        file_entries = load_pinfile(text)
+        by_name = {n: t for n, t in file_entries if n}
+    else:
+        by_name = {}
+
+    if args.pins:
+        for raw in args.pins:
+            if is_pin_token(raw):
+                items.append((None, raw))
+            elif raw in by_name:
+                items.append((raw, by_name[raw]))
+            elif ":" in raw and not is_pin_token(raw) and re.search(r":\d+$", raw):
+                print(
+                    f"pin resolve: {raw} is a locator; pins are minted tokens, not path:line",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                print(f"pin resolve: not a pin token: {raw}", file=sys.stderr)
+                return 2
+    elif args.file is not None:
+        items = file_entries
+    else:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["resolve", "-h"])
+            return 2
+        items = load_pinfile(sys.stdin.read())
+        if not items:
+            print("pin resolve: stdin had no pin tokens", file=sys.stderr)
+            return 2
+
+    need_git = args.to_dir is None
+    git_root = git_root_from_args(args, need_git)
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else args.to_ref,
+        directory=args.to_dir,
+        untracked=args.untracked,
+        label=str(args.to_dir or args.to_ref or "worktree"),
+    )
+
+    unresolved = False
+    for name, token in items:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            hit = Hit(
+                fp=Fingerprint(path="?", line=0, text=""),
+                name=name,
+                token=token,
+                status="unresolved",
+                note=str(e),
+            )
+            emit_hit(hit, args)
+            unresolved = True
+            continue
+        hit = resolve_fingerprint(fp, dst, args.context, args.debug)
+        hit.name = name
+        hit.token = token
+        emit_hit(hit, args)
+        if hit.status == "unresolved":
+            unresolved = True
+    if args.strict and unresolved:
+        return 1
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    rc = 0
+    for token in args.pins:
+        try:
+            fp = decode_pin(token)
+        except ValueError as e:
+            print(f"pin show: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        if args.json:
+            print(json.dumps({"pin": token, **fp.payload()}, ensure_ascii=False))
+        else:
+            print_show(fp, token)
+    return rc
+
+
+def cmd_selftest() -> int:
+    fails = 0
+
+    def check(cond: bool, msg: str) -> None:
+        nonlocal fails
+        if not cond:
+            print(f"selftest FAIL: {msg}", file=sys.stderr)
+            fails += 1
+
+    fp = Fingerprint(
+        path="src/app.rs",
+        line=529,
+        text="pub fn seen_hunk_fingerprint(",
+        tokens=["seen_hunk_fingerprint"],
+        unique=["seen_hunk_fingerprint"],
+        before=["/// the hunk behaves as if it were unmarked (auto-expand)."],
+        after=["    seen: &BTreeMap<(PathBuf, usize), u64>,"],
+    )
+    token = encode_pin(fp)
+    check(token.startswith(PREFIX), "token prefix")
+    back = decode_pin(token)
+    check(back.path == fp.path and back.text == fp.text, "roundtrip fields")
+    check(encode_pin(back) == token, "canonical re-encode")
+    check(path_score("src/app.rs", "src/app/layout.rs") >= 0.35, "split-dir path affinity")
+    check(path_score("src/calc.py", "src/math/ops.py") < 1.0, "rename is not identity")
+    check(normalize("  fn foo  ") == "fn foo", "normalize")
+    check("seen_hunk_fingerprint" in tokens("pub fn seen_hunk_fingerprint("), "tokens")
+    sample = [
+        "def secret_sauce(x):",
+        "    MAGIC = 0xDEADBEEF",
+        "    return x ^ MAGIC",
+        "",
+        "def doomed():",
+        "    return \"this will be deleted\"",
+        "",
+        "def helper_keep():",
+        "    return \"stable helper\"",
+    ]
+    b, a = collect_neighbors(sample, 8, 3)
+    check(not any("doomed" in x for x in b + a), "sibling def is not a neighbor")
+    check(not any("deleted" in x for x in b + a), "previous function body is not a neighbor")
+    check(any("stable helper" in x for x in a), "body after a def is a neighbor")
+    check(is_def_line("pub fn seen_hunk_fingerprint("), "rust pub fn is a def")
+    check(is_def_line("pub(crate) fn edit_insert_str("), "rust vis fn is a def")
+    check(is_def_line("public func transform(_ request: TransformRequest)"), "swift func is a def")
+    check(not is_def_line("/// the hunk behaves"), "doc comment is not a def")
+    try:
+        decode_pin("pin1.not-valid")
+        check(False, "corrupt pin should raise")
+    except ValueError:
+        check(True, "corrupt pin")
+    if fails:
+        print(f"selftest: {fails} failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+_VALUE_FLAGS = {
+    "--repo",
+    "-C",
+    "--from",
+    "--from-dir",
+    "--to",
+    "--to-dir",
+    "--file",
+    "--name",
+    "--context",
+}
+_COMMANDS = {"mint", "resolve", "show", "selftest"}
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Allow flags on either side of the subcommand, and `pin pin1.…` as resolve."""
+    if not argv:
+        return argv
+    if argv[0] in _COMMANDS or argv[0] in {"-h", "--help", "--version"}:
+        return argv
+    if is_pin_token(argv[0]) or (argv[0] == "-" and len(argv) == 1):
+        return ["resolve", *argv]
+
+    i = 0
+    cmd_at: Optional[int] = None
+    while i < len(argv):
+        a = argv[i]
+        if a in _COMMANDS:
+            cmd_at = i
+            break
+        if is_pin_token(a) or a == "-":
+            return ["resolve", *argv]
+        if a.startswith("--") and "=" in a:
+            i += 1
+            continue
+        if a in _VALUE_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        i += 1
+    if cmd_at is not None and cmd_at != 0:
+        return [argv[cmd_at], *argv[:cmd_at], *argv[cmd_at + 1 :]]
+    if any(is_pin_token(a) for a in argv):
+        return ["resolve", *argv]
+    return argv
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = normalize_argv(argv)
+    args = build_parser().parse_args(argv)
+    if not args.cmd:
+        build_parser().print_help()
+        return 2
+    if args.cmd == "mint":
+        return cmd_mint(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    if args.cmd == "show":
+        return cmd_show(args)
+    if args.cmd == "selftest":
+        return cmd_selftest()
+    build_parser().print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
+        print(f"pin: git failed: {err}", file=sys.stderr)
+        sys.exit(2)

@@ -1,0 +1,1583 @@
+#!/usr/bin/env python3
+"""sate — occupancy of a patch in a tree.
+
+A unified diff is not a boolean (git apply --check). It is a set of
+before→after image claims. sate reports how a tree occupies each claim:
+
+  APPLIED     after-image is in the tree; before-image is gone
+  PENDING     before-image is in the tree; after-image is absent
+  MIXED       both change-cores are tangled in the same region
+  DUPLEX      both images exist as blocks (copied, not replaced)
+  SUPERSEDED  neither image; the world moved on
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+VERSION = "0.2.0"  # 0.1 exact/core; 0.2 addition-prefix is not DUPLEX
+
+FATES = ("APPLIED", "PENDING", "MIXED", "DUPLEX", "SUPERSEDED")
+SKIP_FATES = ("SKIP", "BINARY", "EMPTY", "NOFILE")
+
+EXIT_APPLIED = 0
+EXIT_PENDING = 1
+EXIT_SPLIT = 2
+EXIT_ERROR = 3
+
+HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
+)
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+GENERIC_RE = re.compile(
+    r"^[\s{}\[\]().,:;]*$"
+    r"|^\s*(else:?|end|pass|break|continue|return|fi|then|do|done|"
+    r"end\.?|\);?|//|/\*|\*/|#)\s*$",
+    re.I,
+)
+
+
+# ---------------------------------------------------------------------------
+# paths
+# ---------------------------------------------------------------------------
+
+def unquote_git_path(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        out = bytearray()
+        i = 0
+        n = len(inner)
+        while i < n:
+            if inner[i] == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt == "n":
+                    out.append(0x0A)
+                    i += 2
+                elif nxt == "t":
+                    out.append(0x09)
+                    i += 2
+                elif nxt == "r":
+                    out.append(0x0D)
+                    i += 2
+                elif nxt in '"\\':
+                    out.append(ord(nxt))
+                    i += 2
+                elif nxt in "01234567":
+                    j = i + 1
+                    acc = 0
+                    c = 0
+                    while c < 3 and j < n and inner[j] in "01234567":
+                        acc = (acc << 3) + int(inner[j])
+                        j += 1
+                        c += 1
+                    out.append(acc & 0xFF)
+                    i = j
+                else:
+                    out.append(ord(nxt))
+                    i += 2
+            else:
+                out.append(ord(inner[i]))
+                i += 1
+        return out.decode("utf-8", "replace")
+    return s
+
+
+def strip_ab_prefix(path: str) -> str:
+    path = unquote_git_path(path)
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def looks_dev_null(path: str) -> bool:
+    return path in ("/dev/null", "a:/dev/null", "b:/dev/null") or path.endswith("/dev/null")
+
+
+def _next_git_path(rest: str) -> tuple[str, str]:
+    rest = rest.lstrip()
+    if rest.startswith('"'):
+        i = 1
+        out = ['"']
+        while i < len(rest):
+            if rest[i] == "\\" and i + 1 < len(rest):
+                out.append(rest[i : i + 2])
+                i += 2
+                continue
+            out.append(rest[i])
+            if rest[i] == '"':
+                return "".join(out), rest[i + 1 :]
+            i += 1
+        return rest, ""
+    # unquoted: consume until space-b-slash of the second path, handled by caller
+    sp = rest.find(" ")
+    if sp == -1:
+        return rest, ""
+    return rest[:sp], rest[sp:]
+
+
+def parse_diff_git_paths(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git ") :]
+    # quoted pair
+    if rest.lstrip().startswith('"'):
+        a, rest2 = _next_git_path(rest)
+        b, _ = _next_git_path(rest2)
+        if a and b:
+            return strip_ab_prefix(a), strip_ab_prefix(b)
+    # unquoted: split on ' b/' (git's second path prefix)
+    idx = rest.find(" b/")
+    idx2 = rest.find(' "b/')
+    if idx2 != -1 and (idx == -1 or idx2 < idx):
+        old = rest[:idx2]
+        new = rest[idx2 + 1 :]
+        return strip_ab_prefix(old), strip_ab_prefix(new)
+    if idx != -1:
+        return strip_ab_prefix(rest[:idx]), strip_ab_prefix(rest[idx + 1 :])
+    parts = rest.split(" ", 1)
+    if len(parts) != 2:
+        return None
+    return strip_ab_prefix(parts[0]), strip_ab_prefix(parts[1])
+
+
+# ---------------------------------------------------------------------------
+# patch objects
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    header: str
+    tagged: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def before(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] in " -"]
+
+    @property
+    def after(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] in " +"]
+
+    @property
+    def minus(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] == "-"]
+
+    @property
+    def plus(self) -> list[str]:
+        return [t[1] for t in self.tagged if t[0] == "+"]
+
+
+@dataclass
+class FilePatch:
+    old_path: str
+    new_path: str
+    kind: str  # modify | create | delete | rename
+    hunks: list[Hunk] = field(default_factory=list)
+    binary: bool = False
+    rename: bool = False
+
+    @property
+    def path(self) -> str:
+        if self.kind == "delete":
+            return self.old_path
+        return self.new_path or self.old_path
+
+
+@dataclass
+class Verdict:
+    fate: str
+    path: str
+    hunk: int
+    header: str
+    kind: str
+    method: str
+    before_hits: int = 0
+    after_hits: int = 0
+    near_before: float = 0.0
+    near_after: float = 0.0
+    near_line: int | None = None
+    note: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "fate": self.fate,
+            "path": self.path,
+            "hunk": self.hunk,
+            "header": self.header,
+            "kind": self.kind,
+            "method": self.method,
+            "before_hits": self.before_hits,
+            "after_hits": self.after_hits,
+            "near_before": round(self.near_before, 3),
+            "near_after": round(self.near_after, 3),
+            "near_line": self.near_line,
+            "note": self.note,
+        }
+
+
+# ---------------------------------------------------------------------------
+# parse unified diff / git show / format-patch
+# ---------------------------------------------------------------------------
+
+def parse_patch(text: str) -> list[FilePatch]:
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    files: list[FilePatch] = []
+    # skip mailbox headers
+    while i < n and not (
+        lines[i].startswith("diff --git ")
+        or lines[i].startswith("--- ")
+        or lines[i].startswith("*** ")
+    ):
+        i += 1
+
+    current: FilePatch | None = None
+
+    def flush():
+        nonlocal current
+        if current is not None:
+            files.append(current)
+            current = None
+
+    while i < n:
+        line = lines[i]
+        if line.startswith("diff --git "):
+            flush()
+            parsed = parse_diff_git_paths(line)
+            if not parsed:
+                i += 1
+                continue
+            old, new = parsed
+            current = FilePatch(old_path=old, new_path=new, kind="modify")
+            i += 1
+            while i < n:
+                l2 = lines[i]
+                if l2.startswith("diff --git ") or l2.startswith("@@ "):
+                    break
+                if l2.startswith("new file mode"):
+                    current.kind = "create"
+                elif l2.startswith("deleted file mode"):
+                    current.kind = "delete"
+                elif l2.startswith("rename from "):
+                    current.rename = True
+                    current.kind = "rename"
+                    current.old_path = l2[len("rename from ") :]
+                elif l2.startswith("rename to "):
+                    current.rename = True
+                    current.kind = "rename"
+                    current.new_path = l2[len("rename to ") :]
+                elif l2.startswith("GIT binary patch") or l2.startswith("Binary files "):
+                    current.binary = True
+                elif l2.startswith("--- "):
+                    rhs = l2[4:].strip()
+                    if looks_dev_null(rhs):
+                        current.kind = "create"
+                        current.old_path = "/dev/null"
+                    else:
+                        p = strip_ab_prefix(rhs)
+                        if p:
+                            current.old_path = p
+                elif l2.startswith("+++ "):
+                    rhs = l2[4:].strip()
+                    if looks_dev_null(rhs):
+                        current.kind = "delete"
+                        current.new_path = "/dev/null"
+                    else:
+                        p = strip_ab_prefix(rhs)
+                        if p:
+                            current.new_path = p
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if line.startswith("--- ") and (current is None or not current.hunks):
+            # standalone unified diff without diff --git
+            if current is None:
+                rhs = line[4:].strip()
+                old = "/dev/null" if looks_dev_null(rhs) else strip_ab_prefix(rhs)
+                kind = "create" if looks_dev_null(rhs) else "modify"
+                current = FilePatch(old_path=old, new_path=old, kind=kind)
+            i += 1
+            if i < n and lines[i].startswith("+++ "):
+                rhs = lines[i][4:].strip()
+                if looks_dev_null(rhs):
+                    current.kind = "delete"
+                    current.new_path = "/dev/null"
+                else:
+                    current.new_path = strip_ab_prefix(rhs)
+                    if current.kind != "create":
+                        current.kind = "modify"
+                i += 1
+            continue
+
+        if line.startswith("@@ ") and current is not None:
+            m = HUNK_RE.match(line)
+            if not m:
+                i += 1
+                continue
+            hunk = Hunk(
+                old_start=int(m.group(1)),
+                old_count=int(m.group(2) or "1"),
+                new_start=int(m.group(3)),
+                new_count=int(m.group(4) or "1"),
+                header=line,
+            )
+            i += 1
+            while i < n:
+                hl = lines[i]
+                if hl.startswith("@@ ") or hl.startswith("diff --git ") or hl.startswith("--- "):
+                    break
+                if hl.startswith("\\"):
+                    i += 1
+                    continue
+                if not hl:
+                    # empty context line can appear as completely empty
+                    hunk.tagged.append((" ", ""))
+                    i += 1
+                    continue
+                tag = hl[0]
+                if tag in " +-":
+                    hunk.tagged.append((tag, hl[1:]))
+                    i += 1
+                    continue
+                break
+            current.hunks.append(hunk)
+            continue
+
+        if line.startswith("GIT binary patch") or line.startswith("Binary files "):
+            if current is not None:
+                current.binary = True
+            i += 1
+            continue
+
+        i += 1
+
+    flush()
+    return files
+
+
+# ---------------------------------------------------------------------------
+# matching
+# ---------------------------------------------------------------------------
+
+Norm = Callable[[str], str]
+
+
+def ident(s: str) -> str:
+    return s
+
+
+def space_norm(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).rstrip()
+
+
+def apply_norm(lines: list[str], norm: Norm) -> list[str]:
+    return [norm(L) for L in lines]
+
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    first = needle[0]
+    start = 0
+    length = len(hay)
+    while start < length:
+        try:
+            j = hay.index(first, start)
+        except ValueError:
+            break
+        if hay[j : j + n] == needle:
+            hits.append(j)
+        start = j + 1
+    return hits
+
+
+def is_subseq(hay: list[str], needle: list[str]) -> bool:
+    if not needle:
+        return False
+    it = iter(hay)
+    try:
+        for x in needle:
+            while next(it) != x:
+                pass
+        return True
+    except StopIteration:
+        return False
+
+
+def significant(lines: list[str]) -> list[str]:
+    out = []
+    for L in lines:
+        s = L.strip()
+        if len(s) < 8:
+            continue
+        if GENERIC_RE.match(L) or GENERIC_RE.match(s):
+            continue
+        out.append(L)
+    if out:
+        return out
+    out = [L for L in lines if L.strip()]
+    return out
+
+
+def best_overlap(
+    hay: list[str], needle: list[str], hint: int | None = None
+) -> tuple[float, int]:
+    """Exact-line overlap of a same-sized window. Returns (ratio, start_index)."""
+    if not needle:
+        return 1.0, 0
+    if not hay:
+        return 0.0, 0
+    n = len(needle)
+    if n > len(hay):
+        hits = sum(1 for a, b in zip(needle, hay) if a == b)
+        return hits / n, 0
+    cands: set[int] = set()
+    max_start = len(hay) - n
+    if hint is not None:
+        base = max(0, min(hint, max_start))
+        for d in range(0, 160):
+            cands.add(max(0, base - d))
+            cands.add(min(max_start, base + d))
+    ranked = sorted(enumerate(needle), key=lambda iv: len(iv[1]), reverse=True)[:4]
+    for idx, line in ranked:
+        if len(line.strip()) < 4:
+            continue
+        start = 0
+        while True:
+            try:
+                j = hay.index(line, start)
+            except ValueError:
+                break
+            cands.add(max(0, min(j - idx, max_start)))
+            start = j + 1
+    if not cands:
+        step = max(1, n // 2)
+        cands.update(range(0, max_start + 1, step))
+    best_r, best_p = -1.0, 0
+    for p in cands:
+        window = hay[p : p + n]
+        hits = sum(1 for a, b in zip(needle, window) if a == b)
+        r = hits / n
+        if r > best_r:
+            best_r, best_p = r, p
+            if r == 1.0:
+                break
+    return max(0.0, best_r), best_p
+
+
+# Fuzz threshold used after v1 dogfood: occupancy of a drifted block.
+FUZZ_RATIO = 0.85
+
+
+def classify_hunk(
+    file_lines: list[str] | None,
+    hunk: Hunk,
+    kind: str,
+    path: str,
+    hunk_no: int,
+    norm: Norm,
+    fuzz: bool = True,
+) -> Verdict:
+    header = hunk.header
+    if file_lines is None:
+        if kind == "create":
+            return Verdict("PENDING", path, hunk_no, header, kind, "missing-create")
+        if kind == "delete":
+            # deletion of a missing file: already applied
+            return Verdict("APPLIED", path, hunk_no, header, kind, "missing-delete")
+        return Verdict("SUPERSEDED", path, hunk_no, header, kind, "missing-file")
+
+    hay = apply_norm(file_lines, norm)
+    before = apply_norm(hunk.before, norm)
+    after = apply_norm(hunk.after, norm)
+    minus = apply_norm(hunk.minus, norm)
+    plus = apply_norm(hunk.plus, norm)
+    sig_minus = significant(minus)
+    sig_plus = significant(plus)
+
+    before_hits = find_all(hay, before) if before else []
+    after_hits = find_all(hay, after) if after else []
+    minus_hits = find_all(hay, minus) if minus else []
+    plus_hits = find_all(hay, plus) if plus else []
+    sig_minus_hits = find_all(hay, sig_minus) if sig_minus else []
+    sig_plus_hits = find_all(hay, sig_plus) if sig_plus else []
+
+    minus_sub = is_subseq(hay, sig_minus) if sig_minus else False
+    plus_sub = is_subseq(hay, sig_plus) if sig_plus else False
+
+    hint = max(0, hunk.old_start - 1)
+    nb, pb = best_overlap(hay, before, hint) if before else (0.0, 0)
+    na, pa = best_overlap(hay, after, hint) if after else (0.0, 0)
+    near_line = (pa if na >= nb else pb) + 1
+    near_b, near_a = nb, na
+
+    def V(fate: str, method: str, note: str = "") -> Verdict:
+        return Verdict(
+            fate=fate,
+            path=path,
+            hunk=hunk_no,
+            header=header,
+            kind=kind,
+            method=method,
+            before_hits=len(before_hits),
+            after_hits=len(after_hits),
+            near_before=near_b,
+            near_after=near_a,
+            near_line=near_line,
+            note=note,
+        )
+
+    # identical images (context-only)
+    if before and before == after:
+        return V("SKIP", "noop")
+
+    def unexplained(small_hits: list[int], big_hits: list[int], small: list[str], big: list[str]) -> list[int]:
+        """Hits of `small` that are not a slice of some occurrence of `big`."""
+        if not small or not big_hits or not big:
+            return list(small_hits)
+        offsets = find_all(big, small)
+        explained: set[int] = set()
+        for bp in big_hits:
+            if not offsets:
+                # identical length + equal would have offset 0; otherwise none
+                if small == big:
+                    explained.add(bp)
+            for off in offsets:
+                explained.add(bp + off)
+        return [p for p in small_hits if p not in explained]
+
+    # --- exact blocks ---
+    # Pure addition: `before` is context and a prefix of `after`. Finding both
+    # is APPLIED, not DUPLEX. Pure deletion is the mirror image.
+    if plus and not minus:
+        if after_hits:
+            return V("APPLIED", "exact-after")
+        if before_hits:
+            return V("PENDING", "exact-before")
+    elif minus and not plus:
+        if before_hits:
+            return V("PENDING", "exact-before")
+        if after_hits:
+            return V("APPLIED", "exact-after")
+    else:
+        if after_hits and before_hits:
+            leftover_before = unexplained(before_hits, after_hits, before, after)
+            leftover_after = unexplained(after_hits, before_hits, after, before)
+            if leftover_before and leftover_after:
+                return V(
+                    "DUPLEX",
+                    "exact-both",
+                    note=f"before@{leftover_before[:3]} after@{leftover_after[:3]}",
+                )
+            if after_hits and not leftover_before:
+                return V("APPLIED", "exact-after")
+            if before_hits and not leftover_after:
+                return V("PENDING", "exact-before")
+            return V("DUPLEX", "exact-both")
+        if after_hits:
+            return V("APPLIED", "exact-after")
+        if before_hits:
+            return V("PENDING", "exact-before")
+
+    # addition-only (context drifted; exact blocks missed)
+    if plus and not minus:
+        if after_hits:
+            return V("APPLIED", "add-after")
+        if before_hits:
+            return V("PENDING", "add-before")
+        if sig_plus and sig_plus_hits and not minus_sub:
+            return V("APPLIED", "add-core")
+        if sig_plus and plus_sub:
+            return V("APPLIED", "add-subseq")
+        if fuzz and near_a >= FUZZ_RATIO:
+            return V("APPLIED", f"fuzz-after:{near_a:.2f}")
+        if fuzz and near_b >= FUZZ_RATIO:
+            return V("PENDING", f"fuzz-before:{near_b:.2f}")
+        if before and is_subseq(hay, before):
+            return V("PENDING", "add-context-subseq")
+        return V("SUPERSEDED", "add-neither")
+
+    # deletion-only
+    if minus and not plus:
+        if before_hits:
+            return V("PENDING", "del-before")
+        if after_hits:
+            return V("APPLIED", "del-after")
+        if sig_minus and sig_minus_hits:
+            return V("PENDING", "del-core")
+        if sig_minus and minus_sub:
+            return V("PENDING", "del-subseq")
+        if sig_minus and not minus_sub:
+            return V("APPLIED", "del-gone")
+        if fuzz and near_b >= FUZZ_RATIO:
+            return V("PENDING", f"fuzz-before:{near_b:.2f}")
+        if fuzz and near_a >= FUZZ_RATIO:
+            return V("APPLIED", f"fuzz-after:{near_a:.2f}")
+        return V("SUPERSEDED", "del-neither")
+
+    # --- change cores (contiguous) ---
+    if sig_plus_hits and sig_minus_hits:
+        # both cores as blocks: copied or mixed
+        if abs((sig_plus_hits[0] - sig_minus_hits[0])) > max(len(sig_plus), len(sig_minus), 3):
+            return V("DUPLEX", "core-both-apart")
+        return V("MIXED", "core-both-near")
+    if sig_plus_hits and not minus_sub:
+        return V("APPLIED", "core-plus")
+    if sig_minus_hits and not plus_sub:
+        return V("PENDING", "core-minus")
+
+    # --- subsequence of significant change lines ---
+    if plus_sub and minus_sub:
+        return V("MIXED", "subseq-both")
+    if plus_sub and not minus_sub:
+        return V("APPLIED", "subseq-plus")
+    if minus_sub and not plus_sub:
+        return V("PENDING", "subseq-minus")
+
+    # --- fuzzy windows (v2: occupancy despite context drift) ---
+    if fuzz:
+        if near_a >= FUZZ_RATIO and near_b < 0.5:
+            return V("APPLIED", f"fuzz-after:{near_a:.2f}")
+        if near_b >= FUZZ_RATIO and near_a < 0.5:
+            return V("PENDING", f"fuzz-before:{near_b:.2f}")
+        # Shared context inflates before/after overlap. MIXED needs both
+        # change-cores present, not just the @@ context lines.
+        if sig_plus or sig_minus:
+            p_ratio = (
+                sum(1 for L in sig_plus if L in hay) / len(sig_plus) if sig_plus else 0.0
+            )
+            m_ratio = (
+                sum(1 for L in sig_minus if L in hay) / len(sig_minus) if sig_minus else 0.0
+            )
+            if p_ratio >= 0.5 and m_ratio >= 0.5:
+                return V("MIXED", f"fuzz-cores:{m_ratio:.2f}/{p_ratio:.2f}")
+
+    # bag of significant lines in a local window
+    if sig_plus or sig_minus:
+        win_start = max(0, hint - 40)
+        win = hay[win_start : hint + max(len(before), len(after), 1) + 40]
+        p_hit = sum(1 for L in sig_plus if L in win)
+        m_hit = sum(1 for L in sig_minus if L in win)
+        if p_hit and m_hit:
+            return V("MIXED", "window-bag", note=f"plus={p_hit}/{len(sig_plus)} minus={m_hit}/{len(sig_minus)}")
+        if p_hit and not m_hit:
+            return V("APPLIED", "window-plus")
+        if m_hit and not p_hit:
+            return V("PENDING", "window-minus")
+
+    return V("SUPERSEDED", "neither")
+
+
+def classify_file(
+    fp: FilePatch,
+    old_lines: list[str] | None,
+    new_lines: list[str] | None,
+    norm: Norm,
+    fuzz: bool = True,
+) -> list[Verdict]:
+    path = fp.path
+    out: list[Verdict] = []
+
+    if fp.binary and not fp.hunks:
+        out.append(
+            Verdict("BINARY", path, 0, "(binary)", fp.kind, "binary")
+        )
+        return out
+
+    if fp.kind == "create" and not fp.hunks:
+        if new_lines is None:
+            out.append(Verdict("PENDING", path, 0, "(new file)", "create", "missing"))
+        else:
+            out.append(Verdict("APPLIED", path, 0, "(new file)", "create", "exists"))
+        return out
+
+    if fp.kind == "delete" and not fp.hunks:
+        if old_lines is None and new_lines is None:
+            out.append(Verdict("APPLIED", path, 0, "(deleted)", "delete", "missing"))
+        else:
+            out.append(Verdict("PENDING", fp.old_path, 0, "(deleted)", "delete", "exists"))
+        return out
+
+    if fp.kind == "rename" and not fp.hunks:
+        old_exists = old_lines is not None
+        new_exists = new_lines is not None
+        if new_exists and not old_exists:
+            out.append(Verdict("APPLIED", fp.new_path, 0, "(rename)", "rename", "new-present"))
+        elif old_exists and not new_exists:
+            out.append(Verdict("PENDING", fp.old_path, 0, "(rename)", "rename", "old-present"))
+        elif old_exists and new_exists:
+            out.append(Verdict("DUPLEX", fp.new_path, 0, "(rename)", "rename", "both-present"))
+        else:
+            out.append(Verdict("SUPERSEDED", fp.new_path or fp.old_path, 0, "(rename)", "rename", "neither"))
+        return out
+
+    # hunks: prefer the path that exists
+    if fp.kind == "create":
+        target = new_lines
+        tpath = fp.new_path
+        tkind = "create"
+    elif fp.kind == "delete":
+        target = old_lines if old_lines is not None else new_lines
+        tpath = fp.old_path
+        tkind = "delete"
+    else:
+        if new_lines is not None:
+            target = new_lines
+            tpath = fp.new_path
+        else:
+            target = old_lines
+            tpath = fp.old_path
+        tkind = "rename" if fp.kind == "rename" else "modify"
+
+    if not fp.hunks:
+        if target is None:
+            out.append(Verdict("SUPERSEDED", tpath, 0, "(empty)", tkind, "no-hunks-missing"))
+        else:
+            out.append(Verdict("SKIP", tpath, 0, "(empty)", tkind, "no-hunks"))
+        return out
+
+    for i, h in enumerate(fp.hunks, 1):
+        out.append(classify_hunk(target, h, tkind, tpath, i, norm, fuzz=fuzz))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# tree IO
+# ---------------------------------------------------------------------------
+
+def git(args: list[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        check=check,
+    )
+
+
+def read_tree_file(root: Path, path: str, against: str | None) -> list[str] | None:
+    if not path or looks_dev_null(path):
+        return None
+    if against is None:
+        p = root / path
+        try:
+            data = p.read_bytes()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, OSError):
+            return None
+        if b"\0" in data[:8192]:
+            return None
+        return data.decode("utf-8", "replace").splitlines()
+    proc = git(["show", f"{against}:{path}"], root)
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def classify_parsed(
+    files: list[FilePatch],
+    root: Path,
+    against: str | None,
+    norm: Norm,
+    fuzz: bool = True,
+) -> list[Verdict]:
+    verdicts: list[Verdict] = []
+    for fp in files:
+        old_lines = None
+        new_lines = None
+        if fp.old_path and not looks_dev_null(fp.old_path):
+            old_lines = read_tree_file(root, fp.old_path, against)
+        if fp.new_path and not looks_dev_null(fp.new_path):
+            if fp.new_path == fp.old_path:
+                new_lines = old_lines
+            else:
+                new_lines = read_tree_file(root, fp.new_path, against)
+        verdicts.extend(classify_file(fp, old_lines, new_lines, norm, fuzz=fuzz))
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
+# suggestions as patches
+# ---------------------------------------------------------------------------
+
+def suggestion_to_filepatch(obj: dict) -> FilePatch:
+    path = obj.get("path") or obj.get("filename") or ""
+    before = obj.get("before")
+    after = obj.get("after")
+    if isinstance(before, str):
+        before = before.splitlines()
+    if isinstance(after, str):
+        after = after.splitlines()
+    body = obj.get("body") or obj.get("comment") or ""
+    if after is None and body:
+        m = SUGGEST_RE.search(body)
+        if m:
+            after = m.group(1).rstrip("\n").splitlines()
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    if before is None and diff_hunk:
+        # comment on the new side: '+' lines are what the suggestion replaces
+        plus = [ln[1:] for ln in diff_hunk.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+        minus = [ln[1:] for ln in diff_hunk.splitlines() if ln.startswith("-") and not ln.startswith("---")]
+        side = (obj.get("side") or "RIGHT").upper()
+        before = plus if side in ("RIGHT", "NEW", "+") and plus else minus
+    if before is None:
+        before = []
+    if after is None:
+        after = []
+    hunk = Hunk(old_start=int(obj.get("line") or obj.get("original_line") or 1),
+                old_count=len(before) or 1,
+                new_start=int(obj.get("line") or 1),
+                new_count=len(after) or 1,
+                header=f"@@ suggestion {obj.get('id') or obj.get('html_url') or path} @@")
+    # fabricate tagged lines without shared context
+    for L in before:
+        hunk.tagged.append(("-", L))
+    for L in after:
+        hunk.tagged.append(("+", L))
+    return FilePatch(old_path=path, new_path=path, kind="modify", hunks=[hunk])
+
+
+def load_suggestions(text: str) -> list[FilePatch]:
+    text = text.strip()
+    objs: list[dict]
+    if text.startswith("["):
+        data = json.loads(text)
+        if isinstance(data, dict) and "comments" in data:
+            data = data["comments"]
+        objs = list(data)
+    else:
+        objs = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            objs.append(json.loads(line))
+    return [suggestion_to_filepatch(o) for o in objs if o.get("path") or o.get("filename")]
+
+
+# ---------------------------------------------------------------------------
+# reports
+# ---------------------------------------------------------------------------
+
+def counted(verdicts: list[Verdict]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for v in verdicts:
+        c[v.fate] = c.get(v.fate, 0) + 1
+    return c
+
+
+def material(verdicts: list[Verdict]) -> list[Verdict]:
+    return [v for v in verdicts if v.fate not in SKIP_FATES]
+
+
+def unanimous(verdicts: list[Verdict]) -> str:
+    s = {v.fate for v in material(verdicts)}
+    if not s:
+        return "EMPTY"
+    if len(s) == 1:
+        return next(iter(s))
+    return "SPLIT"
+
+
+def exit_for(uni: str) -> int:
+    if uni in ("APPLIED", "EMPTY"):
+        return EXIT_APPLIED
+    if uni == "PENDING":
+        return EXIT_PENDING
+    return EXIT_SPLIT
+
+
+def format_human(verdicts: list[Verdict], title: str) -> str:
+    uni = unanimous(verdicts)
+    c = counted(verdicts)
+    bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+    lines = [f"sate  {title}  unanimous={uni}  {bits}"]
+    for v in verdicts:
+        if v.fate == "SKIP":
+            continue
+        loc = f"{v.path}" if v.hunk == 0 else f"{v.path}  #{v.hunk}"
+        extra = f"  {v.method}"
+        if v.fate in ("SUPERSEDED", "MIXED") and (v.near_before or v.near_after):
+            extra += f"  near={v.near_line} before={v.near_before:.2f} after={v.near_after:.2f}"
+        if v.note:
+            extra += f"  {v.note}"
+        hdr = f"  {v.header}" if v.header and not v.header.startswith("(suggestion") else ""
+        lines.append(f"{v.fate:<11} {loc}{extra}{hdr}")
+    return "\n".join(lines) + "\n"
+
+
+def format_tsv(verdicts: list[Verdict]) -> str:
+    rows = ["fate\tpath\thunk\tkind\tmethod\tnear_line\tnear_before\tnear_after\theader"]
+    for v in verdicts:
+        if v.fate == "SKIP":
+            continue
+        rows.append(
+            "\t".join(
+                [
+                    v.fate,
+                    v.path,
+                    str(v.hunk),
+                    v.kind,
+                    v.method,
+                    "" if v.near_line is None else str(v.near_line),
+                    f"{v.near_before:.3f}",
+                    f"{v.near_after:.3f}",
+                    v.header.replace("\t", " "),
+                ]
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def format_json(verdicts: list[Verdict], extra: dict) -> str:
+    payload = {
+        **extra,
+        "unanimous": unanimous(verdicts),
+        "counts": counted(verdicts),
+        "hunks": [v.as_dict() for v in verdicts if v.fate != "SKIP"],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# git helpers for --git / --log
+# ---------------------------------------------------------------------------
+
+def patch_of_rev(root: Path, rev: str) -> str:
+    if ".." in rev:
+        proc = git(["diff", "--find-renames", "--patch", rev], root)
+    else:
+        proc = git(["show", "--format=", "--patch", "--find-renames", rev], root)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"git show/diff failed for {rev}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def log_revs(
+    root: Path,
+    n: int,
+    include_merges: bool = False,
+    first_parent: bool = False,
+) -> list[tuple[str, int, str]]:
+    fmt = "%H\t%ct\t%s"
+    args = ["log", f"-n{n}", f"--pretty=format:{fmt}"]
+    if first_parent:
+        args.append("--first-parent")
+    if not include_merges:
+        args.append("--no-merges")
+    proc = git(args, root)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace"))
+    out = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        h, ts, subj = line.split("\t", 2)
+        out.append((h, int(ts), subj))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _write_tree(root: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+
+def _patch(old: str, new: str, path: str) -> str:
+    """Tiny unified diff from two file texts (path in both)."""
+    import difflib
+
+    a = old.splitlines(keepends=True)
+    b = new.splitlines(keepends=True)
+    if a and not a[-1].endswith("\n"):
+        a[-1] += "\n"
+    if b and not b[-1].endswith("\n"):
+        b[-1] += "\n"
+    lines = list(
+        difflib.unified_diff(a, b, fromfile=f"a/{path}", tofile=f"b/{path}", n=3)
+    )
+    return "".join(lines)
+
+
+def _assert_fate(verdicts: list[Verdict], want: str, label: str) -> None:
+    mat = material(verdicts)
+    got = unanimous(mat)
+    if got != want:
+        detail = ", ".join(f"{v.fate}:{v.method}" for v in mat) or "EMPTY"
+        raise AssertionError(f"{label}: unanimous={got} want={want} ({detail})")
+
+
+def selftest(fuzz: bool = True) -> int:
+    failed = 0
+    passed = 0
+
+    def t(name: str, fn: Callable[[], None]) -> None:
+        nonlocal failed, passed
+        try:
+            fn()
+            passed += 1
+            print(f"  ok  {name}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAIL {name}: {e}", file=sys.stderr)
+
+    def run_mem(tree: dict[str, str], patch: str) -> list[Verdict]:
+        with tempfile.TemporaryDirectory(prefix="sate-st-") as td:
+            root = Path(td)
+            _write_tree(root, tree)
+            files = parse_patch(patch)
+            if not files:
+                raise AssertionError("parser produced no files")
+            return classify_parsed(files, root, None, ident, fuzz=fuzz)
+
+    # 1 exact PENDING / APPLIED
+    old = "def add(a, b):\n    return a - b\n"
+    new = "def add(a, b):\n    return a + b\n"
+    p = _patch(old, new, "add.py")
+
+    t("pending-exact", lambda: _assert_fate(run_mem({"add.py": old}, p), "PENDING", "pending"))
+    t("applied-exact", lambda: _assert_fate(run_mem({"add.py": new}, p), "APPLIED", "applied"))
+
+    def superseded():
+        v = run_mem({"add.py": "def add(a, b):\n    return a + b + 1\n"}, p)
+        _assert_fate(v, "SUPERSEDED", "superseded")
+
+    t("superseded-neither", superseded)
+
+    # mixed: one of two substitutions taken
+    old_m = "def f():\n    a = 1\n    b = 2\n    return a + b\n"
+    new_m = "def f():\n    a = 10\n    b = 20\n    return a + b\n"
+    mid_m = "def f():\n    a = 10\n    b = 2\n    return a + b\n"
+    pm = _patch(old_m, new_m, "m.py")
+
+    t("mixed-partial", lambda: _assert_fate(run_mem({"m.py": mid_m}, pm), "MIXED", "mixed"))
+    t("mixed-pending", lambda: _assert_fate(run_mem({"m.py": old_m}, pm), "PENDING", "mixed-pending"))
+    t("mixed-applied", lambda: _assert_fate(run_mem({"m.py": new_m}, pm), "APPLIED", "mixed-applied"))
+
+    # duplex: both images present
+    def duplex():
+        both = old + "\n" + new
+        v = run_mem({"add.py": both}, p)
+        _assert_fate(v, "DUPLEX", "duplex")
+
+    t("duplex-both-images", duplex)
+
+    def add_prefix_not_duplex():
+        # 6 context lines + inserted body: before is a prefix of after.
+        old = "a\nb\nc\nd\ne\nf\n"
+        new = "a\nb\nc\nd\ne\nf\nNEW_LINE_ONE\nNEW_LINE_TWO\n"
+        pa = _patch(old, new, "t.py")
+        v = run_mem({"t.py": new}, pa)
+        _assert_fate(v, "APPLIED", "add-prefix")
+        if any(x.fate == "DUPLEX" for x in v):
+            raise AssertionError("addition hunk must not DUPLEX on its own context")
+
+    t("addition-prefix-is-applied-not-duplex", add_prefix_not_duplex)
+
+    def del_prefix_not_duplex():
+        old = "a\nb\nc\nGONE_LINE\n"
+        new = "a\nb\nc\n"
+        pd = _patch(old, new, "t.py")
+        v = run_mem({"t.py": old}, pd)
+        _assert_fate(v, "PENDING", "del-prefix")
+
+    t("deletion-prefix-is-pending-not-duplex", del_prefix_not_duplex)
+
+    # create
+    create_patch = (
+        "diff --git a/new.txt b/new.txt\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/new.txt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+hello\n"
+        "+world\n"
+    )
+
+    t(
+        "create-pending",
+        lambda: _assert_fate(run_mem({}, create_patch), "PENDING", "create-pending"),
+    )
+    t(
+        "create-applied",
+        lambda: _assert_fate(
+            run_mem({"new.txt": "hello\nworld\n"}, create_patch), "APPLIED", "create-applied"
+        ),
+    )
+    t(
+        "create-drift",
+        lambda: _assert_fate(
+            run_mem({"new.txt": "hello\nthere\n"}, create_patch), "SUPERSEDED", "create-drift"
+        ),
+    )
+
+    # delete
+    delete_patch = (
+        "diff --git a/gone.txt b/gone.txt\n"
+        "deleted file mode 100644\n"
+        "--- a/gone.txt\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-hello\n"
+        "-world\n"
+    )
+    t(
+        "delete-pending",
+        lambda: _assert_fate(
+            run_mem({"gone.txt": "hello\nworld\n"}, delete_patch), "PENDING", "delete-pending"
+        ),
+    )
+    t(
+        "delete-applied",
+        lambda: _assert_fate(run_mem({}, delete_patch), "APPLIED", "delete-applied"),
+    )
+
+    # context drifted but change taken
+    old_c = "def foo():\n    helper()\n    return 1\n    # end\n"
+    new_c = "def foo():\n    helper()\n    return 2\n    # end\n"
+    drifted = "def foo():\n    helper()\n    extra()\n    return 2\n    # end\n"
+    pc = _patch(old_c, new_c, "c.py")
+
+    def context_drift():
+        v = run_mem({"c.py": drifted}, pc)
+        _assert_fate(v, "APPLIED", "context-drift")
+
+    t("core-applied-context-drift", context_drift)
+
+    # split fates in one patch (two files)
+    split_patch = p + _patch(old_m, new_m, "m.py")
+
+    def split_fates():
+        v = run_mem({"add.py": new, "m.py": old_m}, split_patch)
+        uni = unanimous(v)
+        if uni != "SPLIT":
+            raise AssertionError(f"want SPLIT got {uni}")
+
+    t("split-across-files", split_fates)
+
+    # ignore-space: extra indent on after-image
+    def ignore_space():
+        spaced = "def add(a, b):\n        return a + b\n"
+        with tempfile.TemporaryDirectory(prefix="sate-sp-") as td:
+            root = Path(td)
+            _write_tree(root, {"add.py": spaced})
+            files = parse_patch(p)
+            v_exact = classify_parsed(files, root, None, ident, fuzz=fuzz)
+            v_sp = classify_parsed(files, root, None, space_norm, fuzz=fuzz)
+            if unanimous(v_sp) != "APPLIED":
+                raise AssertionError(f"ignore-space want APPLIED got {unanimous(v_sp)}")
+            if unanimous(v_exact) == "APPLIED":
+                # extra indent may still exact-match after fuzz; either is fine
+                # as long as space_norm is APPLIED
+                pass
+
+    t("ignore-space", ignore_space)
+
+    # japanese + spaces in path
+    def weird_names():
+        path = "docs/計画 (1).md"
+        oldw = "alpha\n"
+        neww = "beta\n"
+        pw = _patch(oldw, neww, path)
+        v = run_mem({path: neww}, pw)
+        _assert_fate(v, "APPLIED", "weird-applied")
+        parsed = parse_patch(pw)
+        if parsed[0].path != path:
+            raise AssertionError(f"parser path {parsed[0].path!r} != {path!r}")
+
+    t("weird-path-spaces-japanese", weird_names)
+
+    # suggestion JSONL
+    def suggestions():
+        with tempfile.TemporaryDirectory(prefix="sate-sg-") as td:
+            root = Path(td)
+            _write_tree(root, {"mod.py": "TIMEOUT = 60\n"})
+            text = (
+                '{"path":"mod.py","before":["TIMEOUT = 30"],'
+                '"after":["TIMEOUT = 60"],"id":"r1"}\n'
+            )
+            fps = load_suggestions(text)
+            v = classify_parsed(fps, root, None, ident, fuzz=fuzz)
+            _assert_fate(v, "APPLIED", "suggest-taken")
+            _write_tree(root, {"mod.py": "TIMEOUT = 30\n"})
+            v2 = classify_parsed(fps, root, None, ident, fuzz=fuzz)
+            _assert_fate(v2, "PENDING", "suggest-open")
+            _write_tree(root, {"mod.py": "TIMEOUT = 45\n"})
+            v3 = classify_parsed(fps, root, None, ident, fuzz=fuzz)
+            _assert_fate(v3, "SUPERSEDED", "suggest-mutated")
+
+    t("suggest-taken-open-mutated", suggestions)
+
+    # GitHub-ish body
+    def gh_body():
+        obj = {
+            "path": "x.py",
+            "side": "RIGHT",
+            "diff_hunk": "@@ -1,3 +1,3 @@\n def f():\n-    return 1\n+    return 2\n",
+            "body": "use 3\n```suggestion\n    return 3\n```",
+        }
+        fp = suggestion_to_filepatch(obj)
+        if fp.kind != "modify":
+            raise AssertionError("kind")
+        if fp.hunks[0].plus != ["    return 3"]:
+            raise AssertionError(f"plus={fp.hunks[0].plus}")
+        if fp.hunks[0].minus != ["    return 2"]:
+            raise AssertionError(f"minus={fp.hunks[0].minus}")
+
+    t("github-suggestion-extract", gh_body)
+
+    # parser: rename header
+    def parse_rename():
+        text = (
+            "diff --git a/old name.txt b/new name.txt\n"
+            "similarity index 100%\n"
+            "rename from old name.txt\n"
+            "rename to new name.txt\n"
+        )
+        fps = parse_patch(text)
+        if len(fps) != 1 or fps[0].kind != "rename":
+            raise AssertionError(fps)
+        if fps[0].old_path != "old name.txt" or fps[0].new_path != "new name.txt":
+            raise AssertionError((fps[0].old_path, fps[0].new_path))
+
+    t("parse-rename", parse_rename)
+
+    def parse_git_spaces():
+        text = "diff --git a/old name.txt b/new name.txt\n"
+        got = parse_diff_git_paths(text.strip())
+        if got != ("old name.txt", "new name.txt"):
+            raise AssertionError(got)
+
+    t("parse-diff-git-spaces", parse_git_spaces)
+
+    # sandwich invariant in a real git repo
+    def sandwich():
+        with tempfile.TemporaryDirectory(prefix="sate-git-") as td:
+            root = Path(td)
+            git(["init", "-q", "-b", "main"], root)
+            git(["config", "user.name", "sate"], root)
+            git(["config", "user.email", "sate@test"], root)
+            git(["config", "commit.gpgsign", "false"], root)
+            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t0"], root)
+            (root / "app.py").write_text("x = 2\n", encoding="utf-8")
+            git(["add", "app.py"], root)
+            git(["commit", "-q", "-m", "t1 bump"], root)
+            patch = patch_of_rev(root, "HEAD")
+            files = parse_patch(patch)
+            v_head = classify_parsed(files, root, "HEAD", ident, fuzz=fuzz)
+            v_parent = classify_parsed(files, root, "HEAD^", ident, fuzz=fuzz)
+            _assert_fate(v_head, "APPLIED", "sandwich-HEAD")
+            _assert_fate(v_parent, "PENDING", "sandwich-parent")
+
+    t("occupancy-sandwich", sandwich)
+
+    # no-newline marker does not become a tagged line
+    def nonewline():
+        text = (
+            "diff --git a/z b/z\n"
+            "--- a/z\n"
+            "+++ b/z\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "\\ No newline at end of file\n"
+        )
+        fps = parse_patch(text)
+        tags = fps[0].hunks[0].tagged
+        if any(t[1].startswith(" No newline") or t[0] == "\\" for t in tags):
+            raise AssertionError(tags)
+        if fps[0].hunks[0].plus != ["new"] or fps[0].hunks[0].minus != ["old"]:
+            raise AssertionError(tags)
+
+    t("no-newline-marker", nonewline)
+
+    print(f"selftest  {passed} passed  {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+sate — occupancy of a patch in a tree
+
+A patch is a set of before→after claims, not a boolean. git apply --check
+says "does not apply". sate says APPLIED / PENDING / MIXED / DUPLEX /
+SUPERSEDED per hunk.
+
+Usage:
+  sate PATCH                 classify PATCH against the worktree
+  sate -                     classify a diff on stdin
+  sate --git REV             classify `git show REV` (or A..B as diff)
+  sate --log [N]             last N non-merge patches vs --against (HEAD)
+  sate --log N --first-parent   GitHub merge-mainline walk
+  sate --suggest FILE        review suggestions (JSON/JSONL) as 1-hunk patches
+  sate --selftest
+
+Tree:
+  -C DIR           repository / tree root (default: cwd)
+  --against REF    read files from git REF instead of the worktree
+                   (--log defaults to HEAD)
+
+Matching:
+  --ignore-space   collapse horizontal whitespace
+  --fuzz           accept windows with ≥0.85 line overlap (opt-in)
+  --no-fuzz        exact/core/subseq only (default)
+
+Output:
+  --json / --tsv / --quiet
+  --report-only    always exit 0
+  --only FATE      hide other fates
+
+Exit:
+  0  unanimous APPLIED (or empty)
+  1  unanimous PENDING
+  2  SPLIT / MIXED / DUPLEX / SUPERSEDED
+  3  error
+"""
+
+
+def emit(verdicts: list[Verdict], args: argparse.Namespace, extra: dict) -> int:
+    if args.only:
+        want = set(args.only.split(","))
+        verdicts = [v for v in verdicts if v.fate in want or v.fate in SKIP_FATES]
+    title = extra.get("title") or extra.get("patch") or extra.get("git") or "."
+    if args.json:
+        sys.stdout.write(
+            format_json(verdicts, {k: v for k, v in extra.items() if k != "title"})
+        )
+    elif args.tsv:
+        sys.stdout.write(format_tsv(verdicts))
+    else:
+        if not args.quiet:
+            sys.stdout.write(format_human(verdicts, str(title)))
+        else:
+            uni = unanimous(verdicts)
+            c = counted(verdicts)
+            bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+            sys.stdout.write(f"{uni}\t{bits}\n")
+    code = exit_for(unanimous(verdicts))
+    if args.report_only:
+        return 0
+    return code
+
+
+def cmd_patch_text(
+    text: str, args: argparse.Namespace, extra: dict
+) -> int:
+    root = Path(args.C).resolve()
+    files = parse_patch(text)
+    if not files:
+        print("sate: no hunks in patch", file=sys.stderr)
+        return 0 if args.report_only else EXIT_APPLIED
+    norm = space_norm if args.ignore_space else ident
+    verdicts = classify_parsed(files, root, args.against, norm, fuzz=args.fuzz)
+    extra.setdefault("tree", str(root))
+    extra.setdefault("against", args.against)
+    return emit(verdicts, args, extra)
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    root = Path(args.C).resolve()
+    n = args.log if isinstance(args.log, int) and args.log > 0 else 15
+    against = args.against if args.against is not None else "HEAD"
+    revs = log_revs(
+        root, n, include_merges=False, first_parent=args.first_parent
+    )
+    norm = space_norm if args.ignore_space else ident
+    rows = []
+    all_verdicts: list[Verdict] = []
+    for h, ts, subj in revs:
+        try:
+            text = patch_of_rev(root, h)
+        except RuntimeError as e:
+            print(f"sate: skip {h[:8]}: {e}", file=sys.stderr)
+            continue
+        files = parse_patch(text)
+        if not files:
+            rows.append(
+                {
+                    "commit": h,
+                    "subject": subj,
+                    "unanimous": "EMPTY",
+                    "counts": {},
+                    "hunks": 0,
+                }
+            )
+            continue
+        # log classifies each historical patch against `against`
+        saved = args.against
+        args.against = against
+        verdicts = classify_parsed(files, root, against, norm, fuzz=args.fuzz)
+        args.against = saved
+        all_verdicts.extend(verdicts)
+        rows.append(
+            {
+                "commit": h,
+                "subject": subj,
+                "timestamp": ts,
+                "unanimous": unanimous(verdicts),
+                "counts": counted(verdicts),
+                "hunks": len(material(verdicts)),
+                "detail": [v.as_dict() for v in verdicts if v.fate != "SKIP"]
+                if args.verbose
+                else None,
+            }
+        )
+    if args.json:
+        sys.stdout.write(
+            json.dumps(
+                {"tree": str(root), "against": against, "n": n, "commits": rows},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        )
+    elif args.tsv:
+        sys.stdout.write("unanimous\thunks\tcommit\tsubject\n")
+        for r in rows:
+            sys.stdout.write(
+                f"{r['unanimous']}\t{r['hunks']}\t{r['commit'][:12]}\t{r['subject']}\n"
+            )
+    else:
+        print(f"sate log  n={len(rows)}  against={against}  tree={root}")
+        for r in rows:
+            short = r["commit"][:8]
+            c = r["counts"]
+            bits = " ".join(f"{k}={v}" for k, v in sorted(c.items()) if v)
+            print(f"{r['unanimous']:<11} {r['hunks']:>3}h  {short}  {r['subject']}")
+            if bits and r["unanimous"] == "SPLIT":
+                print(f"            {bits}")
+            if args.verbose and r.get("detail"):
+                for d in r["detail"]:
+                    if d["fate"] in SKIP_FATES:
+                        continue
+                    print(f"            {d['fate']:<11} {d['path']}  #{d['hunk']}  {d['method']}")
+    if args.report_only:
+        return 0
+    # log is a report; fail only if every commit split/superseded? too noisy.
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sate",
+        description="Occupancy of a patch in a tree",
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="See README.md. Exit 0 APPLIED, 1 PENDING, 2 SPLIT.",
+    )
+    p.add_argument("patch", nargs="?", help="unified diff file, or - for stdin")
+    p.add_argument("-C", default=".", metavar="DIR", help="tree root")
+    p.add_argument("--against", default=None, metavar="REF", help="git ref to read")
+    p.add_argument("--git", metavar="REV", help="classify git show REV / git diff A..B")
+    p.add_argument(
+        "--log",
+        nargs="?",
+        const=15,
+        type=int,
+        metavar="N",
+        help="last N non-merge commits vs --against (default HEAD)",
+    )
+    p.add_argument(
+        "--first-parent",
+        action="store_true",
+        help="with --log, walk first-parent only (GitHub merge style)",
+    )
+    p.add_argument("--suggest", metavar="FILE", help="JSON/JSONL review suggestions")
+    p.add_argument("--ignore-space", action="store_true")
+    p.add_argument("--fuzz", dest="fuzz", action="store_true", default=False)
+    p.add_argument("--no-fuzz", dest="fuzz", action="store_false")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--only", metavar="FATE[,FATE]")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(HELP)
+        return 0
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"sate {VERSION}")
+        return 0
+    if args.selftest:
+        return selftest(fuzz=args.fuzz)
+
+    try:
+        if args.log is not None:
+            return cmd_log(args)
+        if args.suggest:
+            text = Path(args.suggest).read_text(encoding="utf-8")
+            fps = load_suggestions(text)
+            root = Path(args.C).resolve()
+            norm = space_norm if args.ignore_space else ident
+            verdicts = classify_parsed(fps, root, args.against, norm, fuzz=args.fuzz)
+            return emit(
+                verdicts,
+                args,
+                {
+                    "title": args.suggest,
+                    "patch": args.suggest,
+                    "kind": "suggest",
+                    "tree": str(root),
+                    "against": args.against,
+                },
+            )
+        if args.git:
+            root = Path(args.C).resolve()
+            text = patch_of_rev(root, args.git)
+            return cmd_patch_text(text, args, {"title": f"git:{args.git}", "git": args.git})
+        if args.patch == "-" or (args.patch is None and not sys.stdin.isatty()):
+            text = sys.stdin.read()
+            return cmd_patch_text(text, args, {"title": "stdin", "patch": "-"})
+        if args.patch:
+            text = Path(args.patch).read_text(encoding="utf-8")
+            return cmd_patch_text(text, args, {"title": args.patch, "patch": args.patch})
+        sys.stdout.write(HELP)
+        return EXIT_ERROR
+    except BrokenPipeError:
+        return 0
+    except RuntimeError as e:
+        print(f"sate: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except OSError as e:
+        print(f"sate: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

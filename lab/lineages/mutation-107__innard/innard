@@ -1,0 +1,2091 @@
+#!/usr/bin/env python3
+"""innard — earliest pipeline stage that produced this byte, including inner $()."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, BinaryIO, Iterable
+
+VERSION = "0.2"
+
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+
+# ---------------------------------------------------------------------------
+# Quote / nest walker
+# ---------------------------------------------------------------------------
+
+
+class Walker:
+    """Single-pass shell-ish scanner. Tracks quotes, $(), ${}, (), ``."""
+
+    def __init__(self, s: str) -> None:
+        self.s = s
+        self.n = len(s)
+        self.i = 0
+        self.quote: str | None = None
+        self.paren = 0
+        self.brace = 0
+        self.backtick = False
+
+    def peek(self, k: int = 1) -> str:
+        j = self.i + k
+        return self.s[j] if j < self.n else ""
+
+    def at(self) -> str:
+        return self.s[self.i] if self.i < self.n else ""
+
+    def nested(self) -> bool:
+        return bool(self.paren or self.brace or self.backtick)
+
+    def step_quoted(self) -> str | None:
+        """Consume one quoted/backtick char. Returns consumed text, or None if not in quote."""
+        s, i, n = self.s, self.i, self.n
+        if self.quote:
+            c = s[i]
+            if self.quote == "'" and c == "'":
+                self.quote = None
+                self.i += 1
+                return c
+            if self.quote == '"':
+                if c == "\\" and i + 1 < n:
+                    self.i += 2
+                    return s[i : i + 2]
+                if c == '"':
+                    self.quote = None
+                    self.i += 1
+                    return c
+            self.i += 1
+            return c
+        if self.backtick:
+            c = s[i]
+            if c == "\\" and i + 1 < n:
+                self.i += 2
+                return s[i : i + 2]
+            if c == "`":
+                self.backtick = False
+                self.i += 1
+                return c
+            self.i += 1
+            return c
+        return None
+
+    def open_token(self) -> str | None:
+        """If at an opener, consume it and update depth. Else None."""
+        s, i = self.s, self.i
+        c = s[i]
+        if c in "'\"":
+            self.quote = c
+            self.i += 1
+            return c
+        if c == "`":
+            self.backtick = True
+            self.i += 1
+            return c
+        if c == "$" and self.peek() == "(":
+            self.paren += 1
+            self.i += 2
+            return "$("
+        if c == "$" and self.peek() == "{":
+            self.brace += 1
+            self.i += 2
+            return "${"
+        if c == "(":
+            self.paren += 1
+            self.i += 1
+            return "("
+        if c == ")" and self.paren:
+            self.paren -= 1
+            self.i += 1
+            return ")"
+        if c == "{":
+            self.brace += 1
+            self.i += 1
+            return "{"
+        if c == "}" and self.brace:
+            self.brace -= 1
+            self.i += 1
+            return "}"
+        return None
+
+
+def _is_2gt1_at(s: str, i: int) -> bool:
+    """Unquoted 2>&1 token: start/whitespace/;|&( before, end/whitespace/;|&) after."""
+    if s[i : i + 4] != "2>&1":
+        return False
+    if i > 0 and s[i - 1] not in " \t\n;|&(":
+        return False
+    if i + 4 < len(s) and s[i + 4] not in " \t\n;|&)":
+        return False
+    return True
+
+
+def peel_merge_stderr(cmd: str) -> tuple[str, bool]:
+    """Peel every top-level unquoted `2>&1`. Mid-command counts. Inside $() does not."""
+    s = cmd
+    n = len(s)
+    merge = False
+    out: list[str] = []
+    w = Walker(s)
+    while w.i < n:
+        q = w.step_quoted()
+        if q is not None:
+            out.append(q)
+            continue
+        if w.paren == 0 and w.brace == 0 and _is_2gt1_at(s, w.i):
+            merge = True
+            w.i += 4
+            continue
+        tok = w.open_token()
+        if tok is not None:
+            out.append(tok)
+            continue
+        out.append(s[w.i])
+        w.i += 1
+    cleaned = re.sub(r"[ \t]{2,}", " ", "".join(out)).strip()
+    return cleaned, merge
+
+
+def split_pipeline(src: str) -> list[tuple[str, bool]]:
+    """Cut on top-level `|` and `|&`. Quoted `|`, `||`, and `|` inside $() ${} () `` { } stay."""
+    s = src.strip()
+    if not s:
+        raise ValueError("empty pipeline")
+    stages: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    w = Walker(s)
+    n = w.n
+
+    while w.i < n:
+        q = w.step_quoted()
+        if q is not None:
+            buf.append(q)
+            continue
+        if w.paren == 0 and w.brace == 0 and w.at() == "|":
+            nxt = w.peek()
+            if nxt == "|":
+                buf.append("||")
+                w.i += 2
+                continue
+            cmd = "".join(buf).strip()
+            if not cmd:
+                raise ValueError("empty pipeline stage")
+            if nxt == "&":
+                stages.append((cmd, True))
+                buf = []
+                w.i += 2
+                continue
+            stages.append((cmd, False))
+            buf = []
+            w.i += 1
+            continue
+        tok = w.open_token()
+        if tok is not None:
+            buf.append(tok)
+            continue
+        buf.append(s[w.i])
+        w.i += 1
+
+    if w.quote:
+        raise ValueError("unclosed quote in pipeline")
+    if w.backtick:
+        raise ValueError("unclosed backtick in pipeline")
+    cmd = "".join(buf).strip()
+    if cmd:
+        stages.append((cmd, False))
+    if not stages:
+        raise ValueError("empty pipeline")
+
+    out: list[tuple[str, bool]] = []
+    for cmd, amp in stages:
+        cmd2, merge = peel_merge_stderr(cmd)
+        if not cmd2:
+            raise ValueError("empty pipeline stage after peeling 2>&1")
+        out.append((cmd2, amp or merge))
+    return out
+
+
+def split_plus(args: list[str]) -> list[str] | None:
+    if "+" not in args:
+        return None
+    stages: list[str] = []
+    cur: list[str] = []
+    for a in args:
+        if a == "+":
+            cmd = " ".join(cur).strip()
+            if not cmd:
+                raise ValueError("empty + stage")
+            stages.append(cmd)
+            cur = []
+        else:
+            cur.append(a)
+    cmd = " ".join(cur).strip()
+    if not cmd:
+        raise ValueError("empty + stage")
+    stages.append(cmd)
+    return stages
+
+
+# ---------------------------------------------------------------------------
+# Inner pipelines: $()  ` `  <()  bash -c  { }
+# ---------------------------------------------------------------------------
+
+
+def _match_paren(s: str, open_at: int) -> int:
+    """Index of `(` at open_at; return index of matching `)` or -1."""
+    depth = 0
+    quote: str | None = None
+    i = open_at
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if quote:
+            if quote == "'" and c == "'":
+                quote = None
+            elif quote == '"':
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == '"':
+                    quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+            continue
+        i += 1
+    return -1
+
+
+def _match_backtick(s: str, open_at: int) -> int:
+    i = open_at + 1
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if s[i] == "`":
+            return i
+        i += 1
+    return -1
+
+
+def find_subs(cmd: str) -> list[tuple[str, str]]:
+    """Top-level $(), backticks, <(), >(). $() also inside double quotes. Not $(( ))."""
+    s = cmd
+    n = len(s)
+    found: list[tuple[str, str]] = []
+    quote: str | None = None
+    i = 0
+    while i < n:
+        c = s[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == "$" and i + 1 < n and s[i + 1] == "(" and not (
+                i + 2 < n and s[i + 2] == "("
+            ):
+                close = _match_paren(s, i + 1)
+                if close < 0:
+                    break
+                found.append(("$()", s[i + 2 : close]))
+                i = close + 1
+                continue
+            if c == "`":
+                close = _match_backtick(s, i)
+                if close < 0:
+                    break
+                found.append(("` `", s[i + 1 : close]))
+                i = close + 1
+                continue
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and s[i + 1] == "(":
+            if i + 2 < n and s[i + 2] == "(":
+                close = _match_paren(s, i + 1)
+                i = close + 1 if close >= 0 else n
+                continue
+            close = _match_paren(s, i + 1)
+            if close < 0:
+                break
+            found.append(("$()", s[i + 2 : close]))
+            i = close + 1
+            continue
+        if c == "`":
+            close = _match_backtick(s, i)
+            if close < 0:
+                break
+            found.append(("` `", s[i + 1 : close]))
+            i = close + 1
+            continue
+        if c in "<>" and i + 1 < n and s[i + 1] == "(":
+            close = _match_paren(s, i + 1)
+            if close < 0:
+                break
+            kind = "<()" if c == "<" else ">()"
+            found.append((kind, s[i + 2 : close]))
+            i = close + 1
+            continue
+        i += 1
+    return [(k, inner.strip()) for k, inner in found if inner.strip()]
+
+
+def tokenize(s: str) -> list[str]:
+    """Quote-aware whitespace split. Surrounding quotes stripped from each token."""
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if quote:
+            if quote == "'" and c == "'":
+                quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if c == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
+                    i += 2
+                    continue
+                if c == '"':
+                    quote = None
+                    i += 1
+                    continue
+            buf.append(c)
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c in " \t\n":
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def extract_shell_c(cmd: str) -> str | None:
+    """If this stage *is* `bash -c '…'` (or sh/zsh -lc), return the -c script."""
+    tokens = tokenize(cmd)
+    i = 0
+    while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("=") and not tokens[i].startswith("-"):
+        i += 1
+    if i >= len(tokens):
+        return None
+    comm = os.path.basename(tokens[i])
+    if comm not in SHELLS:
+        return None
+    i += 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "-c":
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if t.startswith("-") and not t.startswith("--") and "c" in t[1:]:
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    return None
+
+
+def _balanced_group(s: str, open_ch: str, close_ch: str) -> int | None:
+    """If s starts with open_ch, return index of matching close at top level, else None."""
+    if not s or s[0] != open_ch:
+        return None
+    depth = 0
+    quote: str | None = None
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if quote:
+            if quote == "'" and c == "'":
+                quote = None
+            elif quote == '"':
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == '"':
+                    quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def extract_group(cmd: str) -> tuple[str, str] | None:
+    """Whole-stage `{ cmd; }` or `( cmd )`. Not the product — just so `{ }` is not three syntax errors."""
+    s = cmd.strip()
+    close = _balanced_group(s, "{", "}")
+    if close is not None and s[close + 1 :].strip() == "":
+        inner = s[1:close].strip()
+        if inner.endswith(";"):
+            inner = inner[:-1].strip()
+        if inner:
+            return ("{ }", inner)
+    close = _balanced_group(s, "(", ")")
+    if close is not None and s[close + 1 :].strip() == "":
+        inner = s[1:close].strip()
+        if inner:
+            return ("( )", inner)
+    return None
+
+
+def extract_inners(cmd: str) -> list[tuple[str, str]]:
+    """Inner pipelines of one stage. Prefer whole-group, then bash -c, then $() / <()."""
+    g = extract_group(cmd)
+    if g is not None:
+        return [g]
+    sc = extract_shell_c(cmd)
+    if sc is not None:
+        return [("bash -c", sc)]
+    return find_subs(cmd)
+
+
+# ---------------------------------------------------------------------------
+# Run / record
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StageRec:
+    i: int
+    argv: str
+    merge_stderr: bool
+    stdout: bytes = b""
+    stderr: bytes = b""
+    piped: bytes = b""
+    exit: int | None = None
+    duration_s: float = 0.0
+    path: str = ""
+    nest: str | None = None
+    parent_argv: str | None = None
+
+
+class _Closer:
+    def __init__(self, fp: BinaryIO | None, n: int) -> None:
+        self.fp = fp
+        self.n = n
+        self.lock = threading.Lock()
+
+    def done(self) -> None:
+        with self.lock:
+            self.n -= 1
+            if self.n <= 0 and self.fp is not None:
+                try:
+                    self.fp.close()
+                except OSError:
+                    pass
+                self.fp = None
+
+
+def _pump(
+    src: BinaryIO | None,
+    records: list[bytearray],
+    record_lock: threading.Lock,
+    writes: list[BinaryIO],
+    closer: _Closer | None,
+) -> None:
+    try:
+        if src is None:
+            return
+        while True:
+            chunk = src.read(65536)
+            if not chunk:
+                break
+            with record_lock:
+                for rec in records:
+                    rec.extend(chunk)
+            dead: list[BinaryIO] = []
+            for w in writes:
+                try:
+                    w.write(chunk)
+                    w.flush()
+                except BrokenPipeError:
+                    dead.append(w)
+                except OSError:
+                    dead.append(w)
+            for w in dead:
+                writes.remove(w)
+    finally:
+        try:
+            if src is not None:
+                src.close()
+        except OSError:
+            pass
+        if closer is not None:
+            closer.done()
+
+
+def _kill_pg(p: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def _feed_stdin(fp: BinaryIO, data: bytes) -> None:
+    try:
+        fp.write(data)
+        fp.flush()
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            fp.close()
+        except OSError:
+            pass
+
+
+def run_pipeline(
+    specs: list[tuple[str, bool]],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = 60.0,
+    passthrough: bool = False,
+    stdin_data: bytes | None = None,
+    forward_stderr: bool = True,
+) -> list[StageRec]:
+    n = len(specs)
+    if n == 0:
+        raise ValueError("no stages")
+    procs: list[subprocess.Popen[bytes]] = []
+    try:
+        for i, (cmd, _merge) in enumerate(specs):
+            use_stdin = i > 0 or stdin_data is not None
+            p = subprocess.Popen(
+                ["bash", "-c", cmd],
+                stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                start_new_session=True,
+            )
+            procs.append(p)
+    except OSError:
+        for p in procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        raise
+
+    rec_out = [bytearray() for _ in range(n)]
+    rec_err = [bytearray() for _ in range(n)]
+    rec_pipe = [bytearray() for _ in range(n)]
+    locks = [threading.Lock() for _ in range(n)]
+    threads: list[threading.Thread] = []
+    t0 = time.monotonic()
+
+    try:
+        for i, p in enumerate(procs):
+            merge = specs[i][1]
+            next_in = procs[i + 1].stdin if i + 1 < n else None
+            stdout_writes: list[BinaryIO] = []
+            stderr_writes: list[BinaryIO] = []
+            n_writers = 0
+            if next_in is not None:
+                stdout_writes.append(next_in)
+                n_writers += 1
+                if merge:
+                    stderr_writes.append(next_in)
+                    n_writers += 1
+            elif passthrough:
+                stdout_writes.append(sys.stdout.buffer)
+                if merge:
+                    stderr_writes.append(sys.stdout.buffer)
+            if not merge and forward_stderr:
+                stderr_writes.append(sys.stderr.buffer)
+
+            closer = _Closer(next_in, n_writers) if next_in is not None else None
+            out_recs: list[bytearray] = [rec_out[i], rec_pipe[i]]
+            err_recs: list[bytearray] = [rec_err[i]]
+            if merge:
+                err_recs.append(rec_pipe[i])
+
+            threads.append(
+                threading.Thread(
+                    target=_pump,
+                    args=(p.stdout, out_recs, locks[i], stdout_writes, closer),
+                    daemon=True,
+                )
+            )
+            threads.append(
+                threading.Thread(
+                    target=_pump,
+                    args=(p.stderr, err_recs, locks[i], stderr_writes, closer if merge else None),
+                    daemon=True,
+                )
+            )
+
+        for t in threads:
+            t.start()
+
+        if stdin_data is not None and procs[0].stdin is not None:
+            feed = threading.Thread(
+                target=_feed_stdin, args=(procs[0].stdin, stdin_data), daemon=True
+            )
+            feed.start()
+            threads.append(feed)
+
+        deadline = None if timeout is None else (t0 + timeout)
+        for p in procs:
+            remain = None if deadline is None else max(0.01, deadline - time.monotonic())
+            try:
+                p.wait(timeout=remain)
+            except subprocess.TimeoutExpired:
+                for q in procs:
+                    _kill_pg(q)
+                raise TimeoutError(f"pipeline exceeded {timeout}s") from None
+        for t in threads:
+            t.join(timeout=5.0)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                _kill_pg(p)
+
+    dt = time.monotonic() - t0
+    recs: list[StageRec] = []
+    for i, (cmd, merge) in enumerate(specs):
+        recs.append(
+            StageRec(
+                i=i,
+                argv=cmd,
+                merge_stderr=merge,
+                stdout=bytes(rec_out[i]),
+                stderr=bytes(rec_err[i]),
+                piped=bytes(rec_pipe[i]),
+                exit=procs[i].returncode,
+                duration_s=dt,
+                path=str(i),
+            )
+        )
+    return recs
+
+
+def collect_inner_recs(
+    cmd: str,
+    outer_i: int,
+    ctr: list[int],
+    **kwargs: Any,
+) -> list[StageRec]:
+    """Run every inner pipeline of cmd. Descend $() / bash -c / <() / { } first."""
+    out: list[StageRec] = []
+    for kind, inner_src in extract_inners(cmd):
+        try:
+            specs = split_pipeline(inner_src)
+        except ValueError:
+            continue
+        for icmd, _im in specs:
+            out.extend(collect_inner_recs(icmd, outer_i, ctr, **kwargs))
+        recs = run_pipeline(specs, **kwargs)
+        for r in recs:
+            r.path = f"{outer_i}.{ctr[0]}"
+            ctr[0] += 1
+            r.nest = kind
+            r.parent_argv = cmd
+            out.append(r)
+    return out
+
+
+def run_pipeline_tree(
+    specs: list[tuple[str, bool]],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = 60.0,
+    passthrough: bool = False,
+    stdin_data: bytes | None = None,
+    forward_stderr: bool = True,
+) -> list[StageRec]:
+    """Outer pipeline plus instrumented inner $() / bash -c / <() / group stages.
+
+    Search order: inners of stage 0, outer 0, inners of stage 1, outer 1, …
+    Inner runs do not take the outer pipe's stdin and do not forward stderr.
+    """
+    inner_kw: dict[str, Any] = dict(
+        cwd=cwd,
+        timeout=timeout,
+        passthrough=False,
+        stdin_data=None,
+        forward_stderr=False,
+    )
+    outer = run_pipeline(
+        specs,
+        cwd=cwd,
+        timeout=timeout,
+        passthrough=passthrough,
+        stdin_data=stdin_data,
+        forward_stderr=forward_stderr,
+    )
+    flat: list[StageRec] = []
+    for i, (cmd, _merge) in enumerate(specs):
+        kids = collect_inner_recs(cmd, i, [0], **inner_kw)
+        flat.extend(kids)
+        o = outer[i]
+        o.path = str(i)
+        o.nest = None
+        o.parent_argv = None
+        flat.append(o)
+    for i, r in enumerate(flat):
+        r.i = i
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# Trace
+# ---------------------------------------------------------------------------
+
+
+def _blob_dump(b: bytes) -> dict[str, str]:
+    try:
+        return {"encoding": "utf-8", "text": b.decode("utf-8")}
+    except UnicodeDecodeError:
+        return {"encoding": "base64", "b64": base64.b64encode(b).decode("ascii")}
+
+
+def _blob_load(d: dict[str, Any] | str | None) -> bytes:
+    if d is None:
+        return b""
+    if isinstance(d, str):
+        return d.encode("utf-8")
+    enc = d.get("encoding") or ("utf-8" if "text" in d else "base64")
+    if enc == "utf-8" or "text" in d and enc != "base64":
+        return str(d.get("text") or "").encode("utf-8")
+    return base64.b64decode(d.get("b64") or b"")
+
+
+def recs_to_json(pipeline: str, recs: list[StageRec], stdin_data: bytes | None) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "tool": "innard",
+        "pipeline": pipeline,
+        "stdin": _blob_dump(stdin_data) if stdin_data else None,
+        "stages": [
+            {
+                "i": r.i,
+                "path": r.path or str(r.i),
+                "argv": r.argv,
+                "merge_stderr": r.merge_stderr,
+                "nest": r.nest,
+                "parent_argv": r.parent_argv,
+                "stdout": _blob_dump(r.stdout),
+                "stderr": _blob_dump(r.stderr),
+                "piped": _blob_dump(r.piped),
+                "exit": r.exit,
+                "duration_s": round(r.duration_s, 4),
+            }
+            for r in recs
+        ],
+    }
+
+
+def recs_from_json(doc: dict[str, Any]) -> tuple[str, list[StageRec], bytes | None]:
+    pipeline = str(doc.get("pipeline") or "")
+    stdin_data = _blob_load(doc.get("stdin")) if doc.get("stdin") else None
+    recs: list[StageRec] = []
+    for s in doc.get("stages") or []:
+        recs.append(
+            StageRec(
+                i=int(s.get("i", len(recs))),
+                argv=str(s.get("argv") or ""),
+                merge_stderr=bool(s.get("merge_stderr")),
+                stdout=_blob_load(s.get("stdout")),
+                stderr=_blob_load(s.get("stderr")),
+                piped=_blob_load(s.get("piped")),
+                exit=s.get("exit"),
+                duration_s=float(s.get("duration_s") or 0),
+                path=str(s.get("path") or s.get("i") or len(recs)),
+                nest=s.get("nest"),
+                parent_argv=s.get("parent_argv"),
+            )
+        )
+    return pipeline, recs, stdin_data
+
+
+def load_trace(path: str) -> tuple[str, list[StageRec], bytes | None]:
+    if path == "-":
+        doc = json.load(sys.stdin)
+        return recs_from_json(doc)
+    if os.path.isdir(path):
+        return _load_trace_dir(path)
+    with open(path, encoding="utf-8") as f:
+        return recs_from_json(json.load(f))
+
+
+def _read_first(path: str, stem: str, exts: tuple[str, ...]) -> bytes:
+    for ext in exts:
+        p = os.path.join(path, f"{stem}.{ext}")
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                return f.read()
+    return b""
+
+
+def _load_trace_dir(path: str) -> tuple[str, list[StageRec], bytes | None]:
+    names = os.listdir(path)
+
+    def key(s: str) -> tuple:
+        try:
+            return (0, int(s))
+        except ValueError:
+            return (1, s)
+
+    stems = sorted(
+        {
+            n.rsplit(".", 1)[0]
+            for n in names
+            if n.endswith((".argv", ".cmd", ".stdout", ".out"))
+        },
+        key=key,
+    )
+    recs: list[StageRec] = []
+    for i, stem in enumerate(stems):
+        argv_b = _read_first(path, stem, ("argv", "cmd"))
+        argv = argv_b.decode("utf-8", "replace").strip()
+        stdout = _read_first(path, stem, ("stdout", "out"))
+        stderr = _read_first(path, stem, ("stderr", "err"))
+        piped = _read_first(path, stem, ("piped",)) or stdout
+        recs.append(
+            StageRec(
+                i=i,
+                argv=argv or stem,
+                merge_stderr=False,
+                stdout=stdout,
+                stderr=stderr,
+                piped=piped,
+                path=str(i),
+            )
+        )
+    meta = os.path.join(path, "pipeline.txt")
+    pipeline = ""
+    if os.path.isfile(meta):
+        with open(meta, encoding="utf-8") as f:
+            pipeline = f.read().strip()
+    return pipeline, recs, None
+
+
+# ---------------------------------------------------------------------------
+# Search: first producer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Hit:
+    stage: int
+    stream: str
+    byte: int
+    line: int
+    col: int
+    argv: str
+    kind: str
+    text: str
+    exit: int | None = None
+    path: str = ""
+    nest: str | None = None
+    parent_argv: str | None = None
+
+
+@dataclass
+class Payload:
+    stage: int
+    stream: str
+    byte: int
+    argv: str
+    text: str
+    relation: str
+    needle_at: int = 0
+    path: str = ""
+
+
+@dataclass
+class Piece:
+    kind: str  # "from" | "glue"
+    text: str
+    needle_at: int
+    stage: int | None = None
+    stream: str | None = None
+    byte: int | None = None
+    argv: str | None = None
+    path: str | None = None
+
+
+@dataclass
+class Later:
+    stage: int
+    argv: str
+    stream: str
+    kind: str
+    byte: int
+    path: str = ""
+    nest: str | None = None
+
+
+@dataclass
+class Report:
+    needle: str
+    producer: Hit | None
+    payload: Payload | None
+    pieces: list[Piece] = field(default_factory=list)
+    later: list[Later] = field(default_factory=list)
+    tee_sim: Hit | None = None
+    disagrees_with_tee: bool = False
+    stages: list[StageRec] = field(default_factory=list)
+    from_stdin: bool = False
+    pipeline: str = ""
+
+
+def locate(data: bytes, needle: bytes) -> tuple[int, int, int] | None:
+    if not needle:
+        return None
+    off = data.find(needle)
+    if off < 0:
+        return None
+    line = data.count(b"\n", 0, off) + 1
+    prev = data.rfind(b"\n", 0, off)
+    col = off - (prev + 1)
+    return off, line, col
+
+
+def locate_prefix_line(data: bytes, prefix: bytes) -> tuple[int, int, int, bytes] | None:
+    if not prefix:
+        return None
+    pos = 0
+    line_no = 1
+    while pos <= len(data):
+        nl = data.find(b"\n", pos)
+        end = len(data) if nl < 0 else nl
+        line = data[pos:end]
+        if line.startswith(prefix) or (line + b"\n").startswith(prefix):
+            return pos, line_no, 0, line
+        if nl < 0:
+            break
+        pos = nl + 1
+        line_no += 1
+    return None
+
+
+def _hit(rec: StageRec, stream: str, data: bytes, needle: bytes, kind: str) -> Hit | None:
+    loc = locate(data, needle)
+    if loc is None:
+        return None
+    off, line, col = loc
+    try:
+        text = needle.decode("utf-8")
+    except UnicodeDecodeError:
+        text = needle.decode("utf-8", "replace")
+    return Hit(
+        stage=rec.i,
+        stream=stream,
+        byte=off,
+        line=line,
+        col=col,
+        argv=rec.argv,
+        kind=kind,
+        text=text,
+        exit=rec.exit,
+        path=rec.path or str(rec.i),
+        nest=rec.nest,
+        parent_argv=rec.parent_argv,
+    )
+
+
+def first_exact(
+    recs: list[StageRec],
+    needle: bytes,
+    *,
+    streams: Iterable[str] = ("stderr", "stdout"),
+    use_piped: bool = False,
+) -> Hit | None:
+    for rec in recs:
+        if use_piped:
+            h = _hit(rec, "piped", rec.piped, needle, "tee")
+            if h:
+                return h
+            continue
+        for stream in streams:
+            data = rec.stderr if stream == "stderr" else rec.stdout
+            h = _hit(rec, stream, data, needle, "mint")
+            if h:
+                return h
+    return None
+
+
+def first_prefix(recs: list[StageRec], prefix: bytes) -> tuple[Hit | None, bytes]:
+    for rec in recs:
+        for stream, data in (("stderr", rec.stderr), ("stdout", rec.stdout)):
+            found = locate_prefix_line(data, prefix)
+            if found is None:
+                continue
+            off, line, col, full = found
+            try:
+                text = full.decode("utf-8")
+            except UnicodeDecodeError:
+                text = full.decode("utf-8", "replace")
+            return (
+                Hit(
+                    stage=rec.i,
+                    stream=stream,
+                    byte=off,
+                    line=line,
+                    col=col,
+                    argv=rec.argv,
+                    kind="mint",
+                    text=text,
+                    exit=rec.exit,
+                    path=rec.path or str(rec.i),
+                    nest=rec.nest,
+                    parent_argv=rec.parent_argv,
+                ),
+                full,
+            )
+    return None, prefix
+
+
+def _in_stdin(needle: bytes, stdin_data: bytes | None) -> bool:
+    return bool(stdin_data and needle and needle in stdin_data)
+
+
+def classify_kind(
+    recs: list[StageRec],
+    hit: Hit,
+    needle: bytes,
+    stdin_data: bytes | None,
+) -> str:
+    if hit.stage < 0:
+        return "stdin"
+    if hit.stage == 0:
+        if hit.stream == "stderr":
+            return "mint"
+        if _in_stdin(needle, stdin_data):
+            return "carry"
+        return "mint"
+    prev = recs[hit.stage - 1]
+    if needle in prev.piped or needle in prev.stdout:
+        return "carry"
+    return "mint"
+
+
+def _hay(recs: list[StageRec], before: int, stdin_data: bytes | None) -> list[tuple[int, str, bytes, str, str]]:
+    hay: list[tuple[int, str, bytes, str, str]] = []
+    if stdin_data:
+        hay.append((-1, "stdin", stdin_data, "<stdin>", "-1"))
+    for rec in recs:
+        if rec.i >= before:
+            break
+        hay.append((rec.i, "stderr", rec.stderr, rec.argv, rec.path or str(rec.i)))
+        hay.append((rec.i, "stdout", rec.stdout, rec.argv, rec.path or str(rec.i)))
+    return hay
+
+
+def _b2s(b: bytes) -> str:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("utf-8", "replace")
+
+
+def cover_pieces(
+    recs: list[StageRec],
+    needle: bytes,
+    before: int,
+    stdin_data: bytes | None,
+    min_len: int,
+) -> list[Piece]:
+    if len(needle) < 2:
+        return []
+    hay = _hay(recs, before, stdin_data)
+    if not hay:
+        return []
+    min_len = max(1, min(min_len, len(needle) - 1))
+
+    def search(frag: bytes) -> tuple[int, str, int, str, str] | None:
+        for stage, stream, data, argv, path in hay:
+            off = data.find(frag)
+            if off >= 0:
+                return stage, stream, off, argv, path
+        return None
+
+    pieces: list[Piece] = []
+    p = 0
+    glue_at: int | None = None
+    while p < len(needle):
+        found: tuple[int, str, int, str, str] | None = None
+        frag = b""
+        for L in range(len(needle) - p, min_len - 1, -1):
+            frag = needle[p : p + L]
+            found = search(frag)
+            if found:
+                break
+        if found is None:
+            if glue_at is None:
+                glue_at = p
+            p += 1
+            continue
+        if glue_at is not None:
+            pieces.append(Piece("glue", _b2s(needle[glue_at:p]), glue_at))
+            glue_at = None
+        st, stream, off, argv, path = found
+        pieces.append(
+            Piece("from", _b2s(frag), p, stage=st, stream=stream, byte=off, argv=argv, path=path)
+        )
+        p += len(frag)
+    if glue_at is not None:
+        pieces.append(Piece("glue", _b2s(needle[glue_at:]), glue_at))
+    if not any(x.kind == "from" for x in pieces):
+        return []
+    return pieces
+
+
+def pieces_to_payload(pieces: list[Piece]) -> Payload | None:
+    froms = [x for x in pieces if x.kind == "from"]
+    if not froms:
+        return None
+    best = max(froms, key=lambda x: len(x.text))
+    relation = "piece" if len(froms) > 1 else "suffix"
+    return Payload(
+        stage=best.stage if best.stage is not None else -1,
+        stream=best.stream or "",
+        byte=best.byte or 0,
+        argv=best.argv or "",
+        text=best.text,
+        relation=relation,
+        needle_at=best.needle_at,
+        path=best.path or "",
+    )
+
+
+def _path_wraps(parent: str, child: str) -> bool:
+    """True if parent is the outer stage that contains child (e.g. '0' wraps '0.1')."""
+    if not parent or not child:
+        return False
+    return child == parent or child.startswith(parent + ".")
+
+
+def later_hits(recs: list[StageRec], needle: bytes, producer: Hit) -> list[Later]:
+    out: list[Later] = []
+    for rec in recs:
+        if rec.i < producer.stage:
+            continue
+        for stream, data in (("stderr", rec.stderr), ("stdout", rec.stdout)):
+            if rec.i == producer.stage and stream == producer.stream:
+                continue
+            loc = locate(data, needle)
+            if loc is None:
+                continue
+            kind = "carry"
+            if rec.i == producer.stage:
+                kind = "also"
+            elif needle not in (recs[rec.i - 1].piped if rec.i else b""):
+                if rec.i > 0 and needle not in recs[rec.i - 1].stdout:
+                    kind = "remint"
+                    # $() / bash -c / <() do not capture stderr. The wrap's
+                    # stderr is the inner fd, not a second mint.
+                    if (
+                        stream == "stderr"
+                        and producer.stream == "stderr"
+                        and producer.nest
+                        and rec.nest is None
+                        and _path_wraps(rec.path or str(rec.i), producer.path)
+                    ):
+                        kind = "leak"
+            out.append(
+                Later(
+                    rec.i,
+                    rec.argv,
+                    stream,
+                    kind,
+                    loc[0],
+                    path=rec.path or str(rec.i),
+                    nest=rec.nest,
+                )
+            )
+    return out
+
+
+def analyze(
+    recs: list[StageRec],
+    needle: bytes,
+    *,
+    stdin_data: bytes | None = None,
+    prefix: bool = False,
+    min_payload: int = 4,
+    pipeline: str = "",
+) -> Report:
+    used_needle = needle
+    producer: Hit | None
+    if prefix:
+        producer, used_needle = first_prefix(recs, needle)
+        needle = used_needle if producer else needle
+    else:
+        producer = first_exact(recs, needle)
+
+    # Skeptic tee is the *user's* pipe, not the instrumented inner $() dumps.
+    outer = [r for r in recs if r.nest is None]
+    tee = first_exact(outer if outer else recs, needle if not prefix else used_needle, use_piped=True)
+    payload = None
+    pieces: list[Piece] = []
+    from_stdin = False
+    if producer is not None:
+        producer.kind = classify_kind(recs, producer, needle, stdin_data)
+        if producer.kind == "carry" and producer.stage == 0 and _in_stdin(needle, stdin_data):
+            from_stdin = True
+        if producer.kind == "mint":
+            pieces = cover_pieces(recs, needle, producer.stage, stdin_data, min_payload)
+            payload = pieces_to_payload(pieces)
+            if payload is not None:
+                producer.kind = "wrap"
+
+    later = later_hits(recs, needle, producer) if producer else []
+    disagrees = False
+    if producer is None:
+        disagrees = tee is not None
+    elif tee is None:
+        disagrees = True
+    elif tee.path != producer.path and tee.stage != producer.stage:
+        disagrees = True
+    elif producer.kind == "wrap":
+        disagrees = True
+    elif producer.nest is not None:
+        disagrees = True
+
+    try:
+        needle_s = (used_needle if prefix and producer else needle).decode("utf-8")
+    except UnicodeDecodeError:
+        needle_s = needle.decode("utf-8", "replace")
+
+    return Report(
+        needle=needle_s,
+        producer=producer,
+        payload=payload,
+        pieces=pieces,
+        later=later,
+        tee_sim=tee,
+        disagrees_with_tee=disagrees,
+        stages=recs,
+        from_stdin=from_stdin,
+        pipeline=pipeline,
+    )
+
+
+def needle_from_final(recs: list[StageRec], line: int | None, span: tuple[int, int] | None) -> bytes:
+    if not recs:
+        raise ValueError("no stages")
+    outers = [r for r in recs if r.nest is None]
+    last = outers[-1] if outers else recs[-1]
+    data = last.stdout
+    if last.merge_stderr:
+        data = last.piped or (last.stdout + last.stderr)
+    if line is not None:
+        lines = data.split(b"\n")
+        if lines and lines[-1] == b"":
+            lines = lines[:-1]
+        idx = line if line >= 0 else len(lines) + line
+        if line >= 0:
+            idx = line - 1
+        if idx < 0 or idx >= len(lines):
+            raise ValueError(f"no line {line} in final stdout ({len(lines)} lines)")
+        return lines[idx]
+    if span is not None:
+        a, b = span
+        if a < 0:
+            a = len(data) + a
+        if b < 0:
+            b = len(data) + b
+        if a < 0 or b > len(data) or a >= b:
+            raise ValueError(f"span {span} out of range for {len(data)} final bytes")
+        return data[a:b]
+    raise ValueError("need --line or --span")
+
+
+# ---------------------------------------------------------------------------
+# Format
+# ---------------------------------------------------------------------------
+
+
+def _short(s: str, n: int = 80) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _stage_label(path: str, i: int) -> str:
+    return path if path else str(i)
+
+
+def format_human(rep: Report) -> str:
+    lines: list[str] = []
+    if rep.producer is None:
+        lines.append("INNARD  NONE")
+        lines.append(f"        needle  {rep.needle!r}")
+        if rep.tee_sim is None:
+            lines.append("        tee     miss (piped dumps do not contain it either)")
+        else:
+            lines.append(
+                f"        tee     stage {_stage_label(rep.tee_sim.path, rep.tee_sim.stage)}  {_short(rep.tee_sim.argv)}"
+            )
+        return "\n".join(lines) + "\n"
+    p = rep.producer
+    sl = _stage_label(p.path, p.stage)
+    lines.append(f"INNARD  {p.kind.upper()}  stage {sl}  {p.stream}  {_short(p.argv)}")
+    if p.nest:
+        who = _short(p.parent_argv or "")
+        lines.append(f"        nest    {p.nest} of  {who}")
+    lines.append(f"        needle  {rep.needle!r}")
+    exit_s = "" if p.exit is None else f"  exit {p.exit}"
+    lines.append(f"        at      byte {p.byte}  line {p.line}  col {p.col}{exit_s}")
+    if rep.from_stdin:
+        lines.append("        from    <stdin>  (stage carried it; did not mint)")
+    if rep.pieces:
+        lines.append("        pieces")
+        for pc in rep.pieces:
+            if pc.kind == "glue":
+                lines.append(f"                glue    {pc.text!r}  (needle byte {pc.needle_at})")
+            else:
+                who = (
+                    "<stdin>"
+                    if (pc.stage is not None and pc.stage < 0)
+                    else f"stage {pc.path or pc.stage}  {pc.stream}  {_short(pc.argv or '')}"
+                )
+                lines.append(f"                from    {who}")
+                lines.append(
+                    f"                        {pc.text!r}  byte {pc.byte}  (needle byte {pc.needle_at})"
+                )
+    elif rep.payload is not None:
+        pl = rep.payload
+        who = "<stdin>" if pl.stage < 0 else f"stage {pl.path or pl.stage}  {pl.stream}  {_short(pl.argv)}"
+        lines.append(f"        payload {pl.relation}  {who}")
+        lines.append(f"                {pl.text!r}  byte {pl.byte}")
+    if rep.tee_sim is None:
+        lines.append("        tee     MISS  (unpiped stderr, or wrap not yet exact)")
+    elif p.kind == "wrap" or p.nest:
+        lines.append(
+            f"        tee     stage {_stage_label(rep.tee_sim.path, rep.tee_sim.stage)}  piped  {_short(rep.tee_sim.argv)}  (first exact on the outer pipe)"
+        )
+    elif rep.disagrees_with_tee:
+        lines.append(
+            f"        tee     stage {_stage_label(rep.tee_sim.path, rep.tee_sim.stage)}  piped  {_short(rep.tee_sim.argv)}  (different stage)"
+        )
+    else:
+        lines.append(
+            f"        tee     stage {_stage_label(rep.tee_sim.path, rep.tee_sim.stage)}  piped  (same stage)"
+        )
+    if p.stream == "stderr" and (rep.tee_sim is None or rep.tee_sim.path != p.path):
+        lines.append("        note    tee on the pipe never sees unpiped stderr")
+    if p.kind == "wrap":
+        lines.append("        note    exact needle is minted by a transform; pieces lived earlier")
+    if p.nest:
+        lines.append("        note    first-producer is the inner stage, not the outer wrap")
+    if p.nest and p.stream == "stderr":
+        lines.append(
+            "        note    $() captures stdout only; inner stderr never entered the substitution"
+        )
+    if any(L.kind == "leak" for L in rep.later):
+        lines.append("        note    later wrap stderr is fd inheritance, not a remint")
+    if rep.later:
+        lines.append("        later")
+        for L in rep.later:
+            nest = f"  {L.nest}" if L.nest else ""
+            lines.append(
+                f"                stage {_stage_label(L.path, L.stage)}  {L.kind}  {L.stream}  {_short(L.argv)}{nest}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def format_json(rep: Report) -> str:
+    def hit(h: Hit | None) -> dict[str, Any] | None:
+        if h is None:
+            return None
+        return {
+            "stage": h.stage,
+            "path": h.path or str(h.stage),
+            "stream": h.stream,
+            "byte": h.byte,
+            "line": h.line,
+            "col": h.col,
+            "argv": h.argv,
+            "kind": h.kind,
+            "text": h.text,
+            "exit": h.exit,
+            "nest": h.nest,
+            "parent_argv": h.parent_argv,
+        }
+
+    doc = {
+        "needle": rep.needle,
+        "pipeline": rep.pipeline,
+        "producer": hit(rep.producer),
+        "payload": None
+        if rep.payload is None
+        else {
+            "stage": rep.payload.stage,
+            "path": rep.payload.path,
+            "stream": rep.payload.stream,
+            "byte": rep.payload.byte,
+            "argv": rep.payload.argv,
+            "text": rep.payload.text,
+            "relation": rep.payload.relation,
+            "needle_at": rep.payload.needle_at,
+        },
+        "pieces": [
+            {
+                "kind": pc.kind,
+                "text": pc.text,
+                "needle_at": pc.needle_at,
+                "stage": pc.stage,
+                "path": pc.path,
+                "stream": pc.stream,
+                "byte": pc.byte,
+                "argv": pc.argv,
+            }
+            for pc in rep.pieces
+        ],
+        "from_stdin": rep.from_stdin,
+        "later": [
+            {
+                "stage": L.stage,
+                "path": L.path,
+                "argv": L.argv,
+                "stream": L.stream,
+                "kind": L.kind,
+                "byte": L.byte,
+                "nest": L.nest,
+            }
+            for L in rep.later
+        ],
+        "tee_sim": hit(rep.tee_sim),
+        "disagrees_with_tee": rep.disagrees_with_tee,
+        "stages": [
+            {
+                "i": s.i,
+                "path": s.path or str(s.i),
+                "argv": s.argv,
+                "merge_stderr": s.merge_stderr,
+                "nest": s.nest,
+                "parent_argv": s.parent_argv,
+                "exit": s.exit,
+                "stdout_bytes": len(s.stdout),
+                "stderr_bytes": len(s.stderr),
+                "piped_bytes": len(s.piped),
+            }
+            for s in rep.stages
+        ],
+    }
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def format_tsv(rep: Report) -> str:
+    cols = ["kind", "path", "stage", "stream", "nest", "byte", "line", "col", "exit", "argv", "needle"]
+    if rep.producer is None:
+        return "\t".join(cols) + "\n" + "\t".join(["NONE", "", "", "", "", "", "", "", "", "", rep.needle]) + "\n"
+    p = rep.producer
+    row = [
+        p.kind.upper(),
+        p.path or str(p.stage),
+        str(p.stage),
+        p.stream,
+        p.nest or "",
+        str(p.byte),
+        str(p.line),
+        str(p.col),
+        "" if p.exit is None else str(p.exit),
+        p.argv.replace("\t", " "),
+        rep.needle.replace("\t", " "),
+    ]
+    return "\t".join(cols) + "\n" + "\t".join(row) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Selftest
+# ---------------------------------------------------------------------------
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def selftest() -> int:
+    n_ok = 0
+
+    def check(name: str, fn: Any) -> None:
+        nonlocal n_ok
+        fn()
+        print(f"  ok  {name}")
+        n_ok += 1
+
+    def t_split_quotes() -> None:
+        st = split_pipeline("awk 'BEGIN{print \"a|b\"}' | cat")
+        _assert(len(st) == 2, st)
+        _assert("a|b" in st[0][0] or "a|b" in st[0][0].replace("\\", ""), st)
+        _assert(st[1][0] == "cat", st)
+
+    def t_split_or_and_amp() -> None:
+        st = split_pipeline("false || echo x | cat")
+        _assert(len(st) == 2, st)
+        _assert("||" in st[0][0], st)
+        st = split_pipeline("python3 -c 'import sys; sys.stderr.write(\"e\\n\")' |& cat")
+        _assert(len(st) == 2 and st[0][1] is True, st)
+
+    def t_split_2gt1_trailing() -> None:
+        st = split_pipeline("git status 2>&1 | rg foo")
+        _assert(len(st) == 2, st)
+        _assert(st[0] == ("git status", True), st)
+        _assert(st[1] == ("rg foo", False), st)
+
+    def t_split_2gt1_mid() -> None:
+        st = split_pipeline("git -C /tmp 2>&1 status | cat")
+        _assert(len(st) == 2, st)
+        _assert(st[0] == ("git -C /tmp status", True), st)
+        st = split_pipeline("git 2>&1 status | cat")
+        _assert(st[0] == ("git status", True), st)
+        st = peel_merge_stderr("echo $(git 2>&1 status)")
+        _assert(st[1] is False, st)
+        _assert("2>&1" in st[0], st)
+
+    def t_split_nested() -> None:
+        st = split_pipeline("echo $(foo | bar) | baz")
+        _assert(len(st) == 2, st)
+        _assert("$(foo | bar)" in st[0][0], st)
+        _assert(st[1][0] == "baz", st)
+
+    def t_split_brace_one_stage() -> None:
+        st = split_pipeline("{ printf kizu | tr k K; } | cat")
+        _assert(len(st) == 2, st)
+        _assert("printf kizu" in st[0][0] and "tr k K" in st[0][0], st)
+        _assert(st[1][0] == "cat", st)
+
+    def t_split_rg_alt() -> None:
+        st = split_pipeline("echo hello | rg 'a|b'")
+        _assert(len(st) == 2 and st[1][0] == "rg 'a|b'", st)
+
+    def t_extract_dollar() -> None:
+        inn = extract_inners("echo $(printf kizu | tr k K)")
+        _assert(inn == [("$()", "printf kizu | tr k K")], inn)
+        inn = extract_inners('echo "$(printf kizu | tr k K)"')
+        _assert(inn == [("$()", "printf kizu | tr k K")], inn)
+        inn = extract_inners("echo $((1+1))")
+        _assert(inn == [], inn)
+
+    def t_extract_bash_c() -> None:
+        inn = extract_inners("bash -c 'printf a | sed s/a/b/'")
+        _assert(inn == [("bash -c", "printf a | sed s/a/b/")], inn)
+        inn = extract_inners("bash -lc 'echo x'")
+        _assert(inn == [("bash -c", "echo x")], inn)
+
+    def t_extract_proc() -> None:
+        inn = extract_inners("cat <(printf a | tr a b)")
+        _assert(inn == [("<()", "printf a | tr a b")], inn)
+
+    def t_plus() -> None:
+        st = split_plus(["printf", "hi", "+", "cat"])
+        _assert(st == ["printf hi", "cat"], st)
+
+    def t_run_mint() -> None:
+        recs = run_pipeline_tree(
+            [("printf '%s\\n' hello", False), ("cat", False), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"hello")
+        _assert(rep.producer is not None, "missing producer")
+        _assert(rep.producer.kind == "mint" and rep.producer.stream == "stdout", rep.producer)
+        _assert(rep.producer.path == "0", rep.producer)
+        _assert(not rep.disagrees_with_tee, "tee should see stdout")
+
+    def t_run_stderr() -> None:
+        recs = run_pipeline_tree(
+            [("python3 -c 'import sys; sys.stderr.write(\"fatal: not a git repository\\n\")'", False), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"fatal: not a git repository")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.stream == "stderr" and rep.producer.kind == "mint", rep.producer)
+        _assert(rep.tee_sim is None, "tee should miss unpiped stderr")
+        _assert(rep.disagrees_with_tee, "must disagree with tee")
+
+    def t_run_wrap() -> None:
+        recs = run_pipeline_tree(
+            [("printf '%s\\n' 'not a git repository'", False), ("sed 's/^/fatal: /'", False), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        needle = b"fatal: not a git repository"
+        rep = analyze(recs, needle)
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.kind == "wrap" and "sed" in rep.producer.argv, (rep.producer.kind, rep.producer.argv))
+        froms = [x.text for x in rep.pieces if x.kind == "from"]
+        _assert("not a git repository" in froms, rep.pieces)
+        glue = "".join(x.text for x in rep.pieces if x.kind == "glue")
+        _assert("fatal:" in glue, glue)
+        _assert(rep.tee_sim is not None and "sed" in (rep.tee_sim.argv or ""), rep.tee_sim)
+        _assert(rep.disagrees_with_tee, "wrap must disagree with exact tee")
+
+    def t_run_2gt1_keeps_fd() -> None:
+        recs = run_pipeline_tree(
+            [("python3 -c 'import sys; sys.stderr.write(\"fatal\\n\")'", True), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"fatal")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.stream == "stderr", rep.producer)
+        _assert(rep.tee_sim is not None, "merged should be tee-visible")
+
+    def t_run_2gt1_mid_command() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("python3 2>&1 -c 'import sys; sys.stderr.write(\"fatal\\n\")' | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"fatal")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.stream == "stderr", rep.producer)
+        _assert(recs[0].merge_stderr is True, recs[0])
+        _assert(rep.producer.nest is None, rep.producer)
+
+    def t_run_stdin_carry() -> None:
+        recs = run_pipeline_tree(
+            [("cat", False), ("cat", False)],
+            stdin_data=b"hello-from-outside\n",
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"hello-from-outside", stdin_data=b"hello-from-outside\n")
+        _assert(rep.producer is not None and rep.producer.kind == "carry" and rep.from_stdin, rep.producer)
+
+    def t_line_span() -> None:
+        recs = run_pipeline_tree(
+            [("printf '%s\\n' one two three", False), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        n = needle_from_final(recs, 2, None)
+        _assert(n == b"two", n)
+        n = needle_from_final(recs, None, (0, 3))
+        _assert(n == b"one", n)
+
+    def t_run_jq_pieces() -> None:
+        recs = run_pipeline_tree(
+            [
+                ("printf '%s\\n' '{\"name\":\"kizu\",\"version\":\"0.7.0\"}'", False),
+                ("jq -r '.name + \"@\" + .version'", False),
+            ],
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"kizu@0.7.0")
+        _assert(rep.producer is not None and rep.producer.kind == "wrap", rep.producer)
+        froms = [x.text for x in rep.pieces if x.kind == "from"]
+        _assert("kizu" in froms and "0.7.0" in froms, froms)
+        glue = "".join(x.text for x in rep.pieces if x.kind == "glue")
+        _assert("@" in glue, glue)
+        _assert(rep.disagrees_with_tee, "jq construct must disagree with tee")
+
+    def t_trace_roundtrip() -> None:
+        recs = run_pipeline_tree(
+            [("python3 -c 'import sys; sys.stderr.write(\"fatal: x\\n\")'", False), ("cat", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        doc = recs_to_json("stage0 | cat", recs, None)
+        _, recs2, _ = recs_from_json(doc)
+        rep = analyze(recs2, b"fatal: x")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.stream == "stderr", rep.producer)
+        _assert(rep.tee_sim is None and rep.disagrees_with_tee, "trace must preserve unpiped stderr")
+
+    def t_run_dollar_inner() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("echo $(printf kizu | tr k K) | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        paths = [r.path for r in recs]
+        _assert(any(r.nest == "$()" and "printf" in r.argv for r in recs), [(r.path, r.nest, r.argv) for r in recs])
+        _assert(any(r.nest == "$()" and r.argv.startswith("tr") for r in recs), recs)
+        _assert("0" in paths and any(p.startswith("0.") for p in paths), paths)
+        rep = analyze(recs, b"Kizu")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.nest == "$()", rep.producer)
+        _assert("tr" in rep.producer.argv, rep.producer)
+        _assert(rep.producer.path.startswith("0."), rep.producer)
+        _assert(rep.tee_sim is not None and rep.tee_sim.nest is None, rep.tee_sim)
+        _assert("echo" in (rep.tee_sim.argv or ""), rep.tee_sim)
+        _assert(rep.disagrees_with_tee, "inner must disagree with outer-pipe tee")
+
+    def t_run_dollar_not_outer_lie() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("echo $(printf kizu | tr k K) | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"kizu")
+        _assert(rep.producer is not None, "missing")
+        _assert("printf" in rep.producer.argv, rep.producer)
+        _assert(rep.producer.nest == "$()", rep.producer)
+        _assert("echo" not in rep.producer.argv, rep.producer)
+
+    def t_run_bash_c_inner() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("bash -c 'printf a | sed s/a/b/' | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"b")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.nest == "bash -c", rep.producer)
+        _assert("sed" in rep.producer.argv, rep.producer)
+
+    def t_run_proc_inner() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("cat <(printf a | tr a b) | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"b")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.nest == "<()", rep.producer)
+        _assert(rep.producer.argv.startswith("tr"), rep.producer)
+
+    def t_run_dollar_stderr_leak() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline(
+                "echo $(python3 -c 'import sys; sys.stderr.write(\"fatal\\n\")') | cat"
+            ),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"fatal")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.nest == "$()" and rep.producer.stream == "stderr", rep.producer)
+        _assert("python3" in rep.producer.argv, rep.producer)
+        leaks = [L for L in rep.later if L.kind == "leak"]
+        _assert(leaks and leaks[0].stream == "stderr", rep.later)
+        _assert("echo" in leaks[0].argv, leaks[0])
+        _assert(not any(L.kind == "remint" and L.stream == "stderr" for L in rep.later), rep.later)
+        _assert(rep.tee_sim is None, "inner stderr must not enter the outer pipe")
+
+    def t_occupancy_carry_untouched() -> None:
+        recs = run_pipeline_tree(
+            [("printf hi", False), ("echo hi", False)],
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"hi")
+        _assert(rep.producer is not None and "printf" in rep.producer.argv, rep.producer)
+        _assert(any(L.kind == "carry" and "echo" in L.argv for L in rep.later), rep.later)
+
+    def t_run_git_fatal_gold() -> None:
+        recs = run_pipeline_tree(
+            split_pipeline("git -C /tmp status | cat"),
+            timeout=10,
+            forward_stderr=False,
+        )
+        rep = analyze(recs, b"fatal: not a git repository")
+        _assert(rep.producer is not None, "missing")
+        _assert(rep.producer.stream == "stderr", rep.producer)
+        _assert(rep.producer.kind == "mint", rep.producer)
+        _assert(rep.producer.nest is None, rep.producer)
+        _assert(rep.tee_sim is None, "gold: fatal never enters the pipe")
+        git = next(r for r in recs if r.nest is None and "git" in r.argv)
+        _assert(len(git.piped) == 0, len(git.piped))
+
+    check("split quotes", t_split_quotes)
+    check("split || and |&", t_split_or_and_amp)
+    check("split trailing 2>&1", t_split_2gt1_trailing)
+    check("split mid-command 2>&1", t_split_2gt1_mid)
+    check("split nested $()", t_split_nested)
+    check("split { } is one outer stage", t_split_brace_one_stage)
+    check("split rg alternation", t_split_rg_alt)
+    check("extract $()", t_extract_dollar)
+    check("extract bash -c", t_extract_bash_c)
+    check("extract <()", t_extract_proc)
+    check("plus stages", t_plus)
+    check("run mint stdout", t_run_mint)
+    check("run unpiped stderr vs tee", t_run_stderr)
+    check("run wrap payload", t_run_wrap)
+    check("run 2>&1 keeps fd", t_run_2gt1_keeps_fd)
+    check("run mid-command 2>&1 is stderr merge", t_run_2gt1_mid_command)
+    check("stdin carry", t_run_stdin_carry)
+    check("line/span from final", t_line_span)
+    check("jq concat pieces", t_run_jq_pieces)
+    check("trace roundtrip stderr", t_trace_roundtrip)
+    check("run $() inner first-producer", t_run_dollar_inner)
+    check("run $() printf not echo wrap", t_run_dollar_not_outer_lie)
+    check("run bash -c inner", t_run_bash_c_inner)
+    check("run <() inner", t_run_proc_inner)
+    check("$() stderr leak not remint", t_run_dollar_stderr_leak)
+    check("occupancy carry untouched", t_occupancy_carry_untouched)
+    check("git fatal never enters pipe", t_run_git_fatal_gold)
+    print(f"selftest {n_ok}/{n_ok}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+USAGE = """innard — earliest stage that already contains this needle, including inner $().
+
+Not leftover-name. Not a wait-source (knot). Not facet. Given a pipeline and a
+needle, emit the first stage whose stdout or stderr already has those bytes —
+descending into $(), backticks, <(), and bash -c instead of naming the wrap.
+Mid-command 2>&1 is a stderr merge at that stage, not a trailing-token peel.
+
+  innard --needle 'Kizu' --sh 'echo $(printf kizu | tr k K) | cat'
+  innard --needle 'fatal: not a git repository' --sh 'git -C /tmp 2>&1 status | cat'
+  innard --needle 'fatal: not a git repository' --sh 'git -C /tmp status | cat'
+  innard --needle STR --trace run.json
+
+tee on the outer pipe is the skeptic. It cannot see unpiped stderr, and an
+exact grep of those dumps names the wrap, not the inner first-producer.
+"""
+
+
+def _parse_span(s: str) -> tuple[int, int]:
+    if ":" not in s:
+        raise ValueError("--span START:END")
+    a, b = s.split(":", 1)
+    return int(a), int(b)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="innard",
+        description=USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--needle", "-n", help="bytes/text to locate (UTF-8)")
+    p.add_argument("--line", type=int, help="1-based line of final stdout as needle (negative from end)")
+    p.add_argument("--span", help="START:END byte slice of final stdout as needle")
+    p.add_argument("--prefix", action="store_true", help="match a line that starts with --needle")
+    p.add_argument("--run", action="store_true", help="run remaining args as a pipeline")
+    p.add_argument("--sh", dest="sh", help="pipeline string (honest | cuts)")
+    p.add_argument("--trace", help="JSON trace file or directory of N.argv/N.stdout/N.stderr")
+    p.add_argument("--save", help="write JSON trace after --run")
+    p.add_argument("--json", action="store_true", dest="json_out")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("-C", "--cwd", default=None)
+    p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--passthrough", "-p", action="store_true", help="original stdout still flows; report on stderr")
+    p.add_argument("--stdin", dest="read_stdin", action="store_true", help="feed innard's stdin to stage 0")
+    p.add_argument("--quiet", "-q", action="store_true", help="do not forward child stderr (still recorded)")
+    p.add_argument("--min-payload", type=int, default=4)
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    return p.parse_args(argv)
+
+
+def _pipeline_from(ns: argparse.Namespace) -> tuple[str, list[tuple[str, bool]]]:
+    rest = list(ns.rest or [])
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    if ns.sh is not None:
+        src = ns.sh
+        return src, split_pipeline(src)
+    if rest:
+        plus = split_plus(rest)
+        if plus is not None:
+            specs = []
+            for cmd in plus:
+                cmd2, merge = peel_merge_stderr(cmd)
+                specs.append((cmd2, merge))
+            return " | ".join(plus), specs
+        src = " ".join(rest)
+        return src, split_pipeline(src)
+    raise SystemExit("innard: provide --sh PIPELINE, --run -- PIPELINE, or stages separated by +")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    ns = parse_args(argv)
+    if ns.version:
+        print(f"innard {VERSION}")
+        return 0
+    if ns.selftest:
+        try:
+            return selftest()
+        except AssertionError as e:
+            print(f"selftest FAIL: {e}", file=sys.stderr)
+            return 1
+
+    stdin_data: bytes | None = None
+    recs: list[StageRec] | None = None
+    pipeline = ""
+
+    rest = list(ns.rest or [])
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+
+    def _looks_like_trace(path: str) -> bool:
+        if path == "-" or os.path.isdir(path):
+            return True
+        if not os.path.isfile(path):
+            return False
+        return path.endswith(".json") or path.endswith(".trace")
+
+    try:
+        if ns.trace:
+            pipeline, recs, stdin_data = load_trace(ns.trace)
+        elif ns.sh is not None or ns.run or (rest and ("|" in " ".join(rest) or "+" in rest)):
+            pipeline, specs = _pipeline_from(ns)
+            if ns.read_stdin:
+                stdin_data = sys.stdin.buffer.read()
+            recs = run_pipeline_tree(
+                specs,
+                cwd=ns.cwd,
+                timeout=None if ns.timeout <= 0 else ns.timeout,
+                passthrough=ns.passthrough,
+                stdin_data=stdin_data,
+                forward_stderr=not ns.quiet,
+            )
+        elif rest and _looks_like_trace(rest[0]):
+            pipeline, recs, stdin_data = load_trace(rest[0])
+        elif rest:
+            pipeline, specs = _pipeline_from(ns)
+            if ns.read_stdin:
+                stdin_data = sys.stdin.buffer.read()
+            recs = run_pipeline_tree(
+                specs,
+                cwd=ns.cwd,
+                timeout=None if ns.timeout <= 0 else ns.timeout,
+                passthrough=ns.passthrough,
+                stdin_data=stdin_data,
+                forward_stderr=not ns.quiet,
+            )
+        else:
+            print("innard: need --run/--sh, --trace FILE, or --selftest", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            return 2
+    except TimeoutError as e:
+        print(f"innard: {e}", file=sys.stderr)
+        return 2
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        print(f"innard: {e}", file=sys.stderr)
+        return 2
+
+    if recs is None:
+        print("innard: no stages", file=sys.stderr)
+        return 2
+
+    if ns.save:
+        doc = recs_to_json(pipeline, recs, stdin_data)
+        if ns.save == "-":
+            if not (ns.json_out or ns.needle or ns.line is not None or ns.span):
+                json.dump(doc, sys.stdout, indent=2, ensure_ascii=False)
+                sys.stdout.write("\n")
+                return 0
+        else:
+            with open(ns.save, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+
+    if ns.needle is None and ns.line is None and ns.span is None:
+        if ns.save:
+            return 0
+        print("innard: provide --needle, --line, or --span", file=sys.stderr)
+        return 2
+
+    try:
+        if ns.needle is not None:
+            needle = ns.needle.encode("utf-8")
+            if b"\x00" in needle:
+                print("innard: embedded NUL in --needle (use --span or a trace)", file=sys.stderr)
+                return 2
+        else:
+            span = _parse_span(ns.span) if ns.span else None
+            needle = needle_from_final(recs, ns.line, span)
+    except ValueError as e:
+        print(f"innard: {e}", file=sys.stderr)
+        return 2
+
+    if not needle:
+        print("innard: empty needle", file=sys.stderr)
+        return 2
+
+    rep = analyze(
+        recs,
+        needle,
+        stdin_data=stdin_data,
+        prefix=ns.prefix,
+        min_payload=ns.min_payload,
+        pipeline=pipeline,
+    )
+
+    out = format_json(rep) if ns.json_out else (format_tsv(rep) if ns.tsv else format_human(rep))
+    if ns.passthrough:
+        sys.stderr.write(out)
+    else:
+        sys.stdout.write(out)
+    return 0 if rep.producer is not None else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.exit(1)

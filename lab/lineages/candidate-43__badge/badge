@@ -1,0 +1,1600 @@
+#!/usr/bin/env python3
+"""badge — never-red keyed by (suite, class, method), not a spelling.
+
+A currently green test is not maiden. SKIP-only is not maiden.
+No records is UNKNOWN, not maiden. <flakyFailure> / <rerunFailure> /
+status="failed" are red. A renamed method or moved class is one identity.
+One fail in 2019 is SCARRED forever in this ledger.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.2"
+
+PASS, FAIL, SKIP, SEEN = "pass", "fail", "skip", "seen"
+MAIDEN, SCARRED, SKIPPED, UNKNOWN, ORPHAN = (
+    "MAIDEN",
+    "SCARRED",
+    "SKIPPED",
+    "UNKNOWN",
+    "ORPHAN",
+)
+VERDICT_ORDER = {SCARRED: 0, MAIDEN: 1, SKIPPED: 2, UNKNOWN: 3, ORPHAN: 4}
+
+STATUS_MAP = {
+    "pass": PASS,
+    "passed": PASS,
+    "ok": PASS,
+    "success": PASS,
+    "xpass": PASS,
+    "fail": FAIL,
+    "failed": FAIL,
+    "failure": FAIL,
+    "error": FAIL,
+    "errored": FAIL,
+    "xfail": FAIL,
+    "timeout": FAIL,
+    "timedout": FAIL,
+    "red": FAIL,
+    "flaky": FAIL,
+    "skip": SKIP,
+    "skipped": SKIP,
+    "ignored": SKIP,
+    "disabled": SKIP,
+    "seen": SEEN,
+    "list": SEEN,
+    "roster": SEEN,
+}
+
+# junit recorded-red, not maiden's child-tag ∈ {failure, error}
+JUNIT_FAIL_CHILD = {
+    "failure",
+    "error",
+    "flakyfailure",
+    "flakyerror",
+    "rerunfailure",
+    "rerunerror",
+}
+JUNIT_SKIP_CHILD = {"skipped", "disabled"}
+JUNIT_FAIL_STATUS = {"fail", "failed", "failure", "error", "errored", "flaky", "red"}
+JUNIT_SKIP_STATUS = {"skip", "skipped", "ignored", "disabled"}
+
+
+@dataclass
+class Obs:
+    id: str
+    status: str
+    t: str | None
+    src: str
+    run: str | None = None
+    suite: str = ""
+    classname: str = ""
+    method: str = ""
+
+
+@dataclass
+class Row:
+    id: str
+    verdict: str
+    n_pass: int
+    n_fail: int
+    n_skip: int
+    first: str | None
+    last: str | None
+    first_red: str | None
+    latest: str | None
+    n_obs: int
+    suite: str = ""
+    classname: str = ""
+    method: str = ""
+    aka: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# identity — the badge is (suite, class, method)
+# ---------------------------------------------------------------------------
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[mK]")
+_EMPTY_PARENS = re.compile(r"\(\)$")
+_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+_CAMEL = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def canonical_id(raw: str) -> str:
+    s = raw.strip().strip('"').strip("'")
+    s = s.replace("\\", "/")
+    m = re.fullmatch(r"-\[(.+?) (.+?)\]", s)
+    if m:
+        s = f"{m.group(1)}/{m.group(2)}"
+    s = _EMPTY_PARENS.sub("", s)
+    if s.startswith("test ") and "..." not in s:
+        s = s[5:].strip()
+    return s
+
+
+def local_tag(tag: str) -> str:
+    return tag.split("}", 1)[-1]
+
+
+def split_swift_spec(spec: str) -> tuple[str, str, str]:
+    """Module.Type[/Nested]/func → (suite, class, method)."""
+    s = canonical_id(spec)
+    if "/" not in s:
+        if "." in s:
+            suite, rest = s.split(".", 1)
+            return suite, s, rest
+        return "", "", s
+    head, method = s.rsplit("/", 1)
+    suite = head.split(".", 1)[0] if "." in head else ""
+    return suite, head, method
+
+
+def split_colon_path(path: str) -> tuple[str, str, str]:
+    """crate::mod::fn or file.py::Class::test → (suite, class, method)."""
+    s = canonical_id(path)
+    bits = s.split("::")
+    if len(bits) >= 3:
+        return bits[0], "::".join(bits[:-1]), bits[-1]
+    if len(bits) == 2:
+        return bits[0], bits[0], bits[1]
+    return "", "", s
+
+
+def display_of(suite: str, classname: str, method: str, native: str = "") -> str:
+    if native:
+        return canonical_id(native)
+    if classname and method:
+        if "/" in classname or "/" in method:
+            return f"{classname}/{method}"
+        return f"{classname}::{method}"
+    return method or classname or suite
+
+
+def triple_of(o: Obs) -> tuple[str, str, str]:
+    return (o.suite or "", o.classname or "", o.method or "")
+
+
+def pkg_prefix(cls: str) -> str:
+    if not cls:
+        return ""
+    if "::" in cls:
+        return cls.rsplit("::", 1)[0]
+    if "." in cls:
+        return cls.rsplit(".", 1)[0]
+    if "/" in cls:
+        return cls.rsplit("/", 1)[0]
+    return ""
+
+
+def method_tokens(name: str) -> frozenset[str]:
+    s = _EMPTY_PARENS.sub("", (name or "").strip())
+    s = re.sub(r"\[[^\]]+\]", "", s)
+    if not s:
+        return frozenset()
+    chunks = re.split(r"[\s_/\.:-]+", s)
+    out: list[str] = []
+    for ch in chunks:
+        if not ch:
+            continue
+        parts = _CAMEL.findall(ch)
+        out.extend(parts if parts else [ch])
+    toks = {p.lower() for p in out if p}
+    if len(toks) > 1:
+        toks -= {"test", "it", "spec"}
+    return frozenset(toks)
+
+
+def method_rename_pair(a: str, b: str) -> bool:
+    """True if one method name is a token-superset of the other (compute_diff → compute_operation_diff)."""
+    if not a or not b or a == b:
+        return False
+    ta, tb = method_tokens(a), method_tokens(b)
+    if not ta or not tb or ta == tb:
+        return False
+    smaller, larger = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(smaller) < 2:
+        return False
+    return smaller < larger
+
+
+def norm_status(raw: str) -> str | None:
+    return STATUS_MAP.get(raw.strip().lower())
+
+
+def iso_utc(dt: datetime | None = None) -> str:
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_from_mtime(path: Path) -> str:
+    try:
+        return iso_utc(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
+    except OSError:
+        return iso_utc()
+
+
+def parse_time(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    s = s.replace(" ", "T")
+    if s.endswith("Z"):
+        return s if re.match(r"\d{4}-\d{2}-\d{2}T", s) else None
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(s[:26], fmt) if "T" in s else datetime.strptime(s[:10], fmt)
+            return iso_utc(dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt)
+        except ValueError:
+            continue
+    m = _TIME.search(s)
+    if not m:
+        return None
+    frag = m.group(1)
+    return frag + ("Z" if not frag.endswith("Z") else "")
+
+
+def strip_ansi(s: str) -> str:
+    return _ANSI.sub("", s)
+
+
+def strip_gha(line: str) -> str:
+    line = strip_ansi(line.rstrip("\n"))
+    if "\t" in line:
+        parts = line.split("\t")
+        if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}T", parts[2]):
+            rest = parts[2]
+            rest = re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s+", "", rest, count=1)
+            return rest
+        if len(parts) >= 2 and re.match(r"\d{4}-\d{2}-\d{2}T", parts[1]):
+            return re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s+", "", parts[1], count=1)
+    m = re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+(.*)$", line)
+    if m:
+        return m.group(1)
+    return line
+
+
+# ---------------------------------------------------------------------------
+# parsers
+# ---------------------------------------------------------------------------
+
+RE_CARGO = re.compile(
+    r"^(?:test\s+)(?P<id>\S+)\s+\.\.\.\s+(?P<st>ok|FAILED|failed|ignored|error)\b",
+    re.I,
+)
+RE_CARGO_LIST = re.compile(r"^(?P<id>\S+):\s+test\s*$")
+RE_XCTEST = re.compile(
+    r"Test Case '-\[(?P<cls>[^\]\s]+) (?P<name>[^\]]+)\]' (?P<st>passed|failed|skipped)\b",
+    re.I,
+)
+RE_SWIFT_TESTING = re.compile(
+    r"^(?:[✔✘✓✗􀢄􁁛]\s+)?Test \"(?P<id>.+?)\" (?P<st>passed|failed|skipped)\b",
+    re.I,
+)
+RE_PYTEST = re.compile(
+    r"^(?P<id>\S+::\S+)\s+(?P<st>PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\b"
+)
+RE_SWIFT_LIST = re.compile(
+    r"^(?P<id>[A-Za-z_][A-Za-z0-9_.]*(?:/[^\s/()]+)+(\([^)]*\))?)\s*$"
+)
+RE_LIBTEST_JSON = re.compile(r"^\s*\{.*\"type\"\s*:\s*\"test\".*\}\s*$")
+
+
+def _obs(
+    id_: str,
+    status: str,
+    t: str | None,
+    src: str,
+    run: str | None,
+    suite: str = "",
+    classname: str = "",
+    method: str = "",
+) -> Obs | None:
+    cid = canonical_id(id_)
+    st = norm_status(status)
+    if not cid or not st:
+        return None
+    method = canonical_id(method) if method else ""
+    classname = classname.strip()
+    suite = suite.strip()
+    if not method or not classname:
+        if "/" in cid and not method:
+            suite2, classname2, method2 = split_swift_spec(cid)
+            suite = suite or suite2
+            classname = classname or classname2
+            method = method or method2
+        elif "::" in cid and not method:
+            suite2, classname2, method2 = split_colon_path(cid)
+            suite = suite or suite2
+            classname = classname or classname2
+            method = method or method2
+        elif not method:
+            method = cid
+    return Obs(
+        id=cid,
+        status=st,
+        t=t,
+        src=src,
+        run=run,
+        suite=suite,
+        classname=classname,
+        method=method,
+    )
+
+
+def junit_status(tc: ET.Element) -> str:
+    """Recorded outcome, not maiden's {failure, error}-child walk."""
+    status = PASS
+    for child in list(tc):
+        ctag = local_tag(child.tag).lower()
+        if ctag in JUNIT_FAIL_CHILD:
+            return FAIL
+        if ctag in JUNIT_SKIP_CHILD:
+            status = SKIP
+    attr = (tc.attrib.get("status") or "").strip().lower()
+    result = (tc.attrib.get("result") or "").strip().lower()
+    for raw in (attr, result):
+        if raw in JUNIT_FAIL_STATUS:
+            return FAIL
+        if raw in JUNIT_SKIP_STATUS and status != FAIL:
+            status = SKIP
+    return status
+
+
+def parse_junit(text: str, src: str, run: str | None, default_t: str | None) -> list[Obs]:
+    out: list[Obs] = []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return out
+
+    def walk(elem: ET.Element, suite_name: str, suite_t: str | None) -> None:
+        tag = local_tag(elem.tag)
+        if tag == "testsuite":
+            suite_name = elem.attrib.get("name") or suite_name
+            suite_t = parse_time(elem.attrib.get("timestamp")) or suite_t
+        if tag == "testcase":
+            name = elem.attrib.get("name") or ""
+            cls = elem.attrib.get("classname") or ""
+            native = f"{cls}::{name}" if cls else name
+            t = parse_time(elem.attrib.get("timestamp")) or suite_t
+            st = junit_status(elem)
+            o = _obs(native, st, t, src, run, suite=suite_name, classname=cls, method=name)
+            if o:
+                out.append(o)
+            return
+        for child in list(elem):
+            walk(child, suite_name, suite_t)
+
+    root_t = parse_time(root.attrib.get("timestamp")) or default_t
+    root_suite = root.attrib.get("name") or ""
+    walk(root, root_suite, root_t)
+    return out
+
+
+def parse_libtest_json_line(line: str, src: str, run: str | None, t: str | None) -> Obs | None:
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("type") != "test":
+        return None
+    event = obj.get("event") or obj.get("status") or ""
+    name = obj.get("name") or ""
+    if event in {"started", "timeout_start"}:
+        return None
+    suite, cls, method = split_colon_path(str(name))
+    return _obs(name, event, t, src, run, suite=suite, classname=cls, method=method)
+
+
+def parse_line(line: str, src: str, run: str | None, t: str | None, roster: bool) -> Obs | None:
+    s = strip_gha(line).strip()
+    if not s or s.startswith("#") or s.startswith("##["):
+        return None
+    if s.startswith("Test Suite ") or s.startswith("Test run") or s.startswith("◇"):
+        return None
+    if re.match(r"^[✔✘✓✗]\s+Suite ", s) or re.match(r"^[✔✘✓✗]\s+Test run", s):
+        return None
+    if s.startswith("{") and '"type"' in s:
+        o = parse_libtest_json_line(s, src, run, t)
+        if o:
+            return o
+    m = RE_CARGO.match(s)
+    if m:
+        tid = m.group("id")
+        suite, cls, method = split_colon_path(tid)
+        return _obs(tid, m.group("st"), t, src, run, suite=suite, classname=cls, method=method)
+    m = RE_XCTEST.search(s)
+    if m:
+        cls, name = m.group("cls"), m.group("name")
+        suite = cls.split(".", 1)[0] if "." in cls else ""
+        return _obs(
+            f"{cls}/{name}",
+            m.group("st"),
+            t,
+            src,
+            run,
+            suite=suite,
+            classname=cls,
+            method=name,
+        )
+    m = RE_SWIFT_TESTING.search(s)
+    if m:
+        display = m.group("id")
+        return _obs(display, m.group("st"), t, src, run, suite="", classname="", method=display)
+    m = RE_PYTEST.match(s)
+    if m:
+        tid = m.group("id")
+        suite, cls, method = split_colon_path(tid)
+        return _obs(tid, m.group("st"), t, src, run, suite=suite, classname=cls, method=method)
+    m = RE_CARGO_LIST.match(s)
+    if m:
+        tid = m.group("id")
+        suite, cls, method = split_colon_path(tid)
+        return _obs(tid, SEEN, t, src, run, suite=suite, classname=cls, method=method)
+    if roster:
+        m = RE_SWIFT_LIST.match(s)
+        if m:
+            tid = m.group("id")
+            suite, cls, method = split_swift_spec(tid)
+            return _obs(tid, SEEN, t, src, run, suite=suite, classname=cls, method=method)
+    return None
+
+
+def looks_like_swift_list(lines: list[str]) -> bool:
+    body = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("[")]
+    if len(body) < 2:
+        return False
+    hits = sum(1 for ln in body if RE_SWIFT_LIST.match(ln))
+    return hits / len(body) >= 0.7
+
+
+def looks_like_ledger(text: str) -> bool:
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("{") and '"id"' in s:
+            return True
+        return False
+    return False
+
+
+def parse_ledger_text(text: str, src: str) -> list[Obs]:
+    out: list[Obs] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("kind") == "source":
+            continue
+        if "id" not in obj or "status" not in obj:
+            continue
+        suite = str(obj.get("suite") or "")
+        cls = str(obj.get("class") or obj.get("classname") or "")
+        method = str(obj.get("method") or "")
+        o = _obs(
+            obj["id"],
+            obj["status"],
+            parse_time(obj.get("t")),
+            obj.get("src") or src,
+            obj.get("run"),
+            suite=suite,
+            classname=cls,
+            method=method,
+        )
+        if o:
+            out.append(o)
+    return out
+
+
+def parse_bytes(text: str, src: str, run: str | None, default_t: str | None, roster: bool) -> list[Obs]:
+    raw = text.lstrip("\ufeff")
+    stripped = raw.lstrip()
+    if stripped.startswith("<") and "testcase" in stripped.lower():
+        return parse_junit(stripped, src, run, default_t)
+    if looks_like_ledger(raw):
+        return parse_ledger_text(raw, src)
+    lines = raw.splitlines()
+    auto_roster = roster or looks_like_swift_list(lines)
+    file_t = default_t
+    for ln in lines[:20]:
+        m = _TIME.search(ln)
+        if m:
+            file_t = m.group(1) + ("Z" if not m.group(1).endswith("Z") else "")
+            break
+    out: list[Obs] = []
+    for ln in lines:
+        t = file_t
+        m = _TIME.search(ln)
+        if m:
+            t = m.group(1) + ("Z" if not m.group(1).endswith("Z") else "")
+        o = parse_line(ln, src, run, t, auto_roster)
+        if o:
+            out.append(o)
+    return out
+
+
+def parse_path(path: Path, run: str | None, roster: bool) -> list[Obs]:
+    src = str(path)
+    default_t = iso_from_mtime(path)
+    if path.is_dir() and (path / "Info.plist").exists():
+        return parse_xcresult(path, run, default_t)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise SystemExit(f"badge: cannot read {path}: {e}") from e
+    return parse_bytes(text, src, run or path.name, default_t, roster)
+
+
+def parse_xcresult(path: Path, run: str | None, default_t: str | None) -> list[Obs]:
+    """Refuse-or-walk: xcresulttool JSON if present, else empty list (caller may warn)."""
+    import subprocess
+
+    for args in (
+        ["xcrun", "xcresulttool", "get", "test-results", "tests", "--path", str(path)],
+        ["xcrun", "xcresulttool", "get", "--legacy", "--path", str(path), "--format", "json"],
+    ):
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if p.returncode != 0 or not p.stdout.strip():
+            continue
+        try:
+            obj = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            continue
+        return _walk_xcresult_json(obj, str(path), run or path.name, default_t)
+    return []
+
+
+def _walk_xcresult_json(obj: object, src: str, run: str | None, t: str | None) -> list[Obs]:
+    out: list[Obs] = []
+
+    def unbox(x: object) -> object:
+        if isinstance(x, dict) and set(x.keys()) <= {"_value", "_type"} and "_value" in x:
+            return x["_value"]
+        return x
+
+    def walk(x: object) -> None:
+        x = unbox(x)
+        if isinstance(x, dict):
+            name = unbox(x.get("identifier") or x.get("name") or x.get("testName") or x.get("id"))
+            st = unbox(x.get("result") or x.get("status") or x.get("testStatus"))
+            if name and st and isinstance(name, str) and isinstance(st, str):
+                o = _obs(str(name), str(st), t, src, run)
+                if o:
+                    out.append(o)
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(obj)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ledger
+# ---------------------------------------------------------------------------
+
+def default_ledger(root: Path) -> Path:
+    return root / ".badge" / "ledger.jsonl"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def load_ledger(path: Path) -> tuple[list[Obs], set[str]]:
+    if not path.exists():
+        return [], set()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    shas: set[str] = set()
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("kind") == "source" and obj.get("sha256"):
+            shas.add(obj["sha256"])
+    return parse_ledger_text(text, str(path)), shas
+
+
+def append_ledger(path: Path, obs: list[Obs], src: str, sha: str | None) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing, shas = load_ledger(path)
+    if sha and sha in shas:
+        return 0
+    seen = {(o.id, o.status, o.t, o.src, o.run) for o in existing}
+    added = 0
+    with path.open("a", encoding="utf-8") as f:
+        if sha:
+            f.write(json.dumps({"kind": "source", "src": src, "sha256": sha}, ensure_ascii=False) + "\n")
+        for o in obs:
+            key = (o.id, o.status, o.t, o.src, o.run)
+            if key in seen:
+                continue
+            seen.add(key)
+            rec = {
+                "id": o.id,
+                "status": o.status,
+                "t": o.t,
+                "src": o.src,
+                "run": o.run,
+                "suite": o.suite,
+                "class": o.classname,
+                "method": o.method,
+            }
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            added += 1
+    return added
+
+
+# ---------------------------------------------------------------------------
+# fold / classify
+# ---------------------------------------------------------------------------
+
+def _times(recs: list[Obs]) -> list[str]:
+    return [o.t for o in recs if o.t]
+
+
+def classify_id(recs: list[Obs], in_roster: bool | None) -> Row:
+    n_pass = sum(1 for o in recs if o.status == PASS)
+    n_fail = sum(1 for o in recs if o.status == FAIL)
+    n_skip = sum(1 for o in recs if o.status == SKIP)
+    outcomes = [o for o in recs if o.status in {PASS, FAIL, SKIP}]
+    ts = _times(outcomes)
+    first = min(ts) if ts else None
+    last = max(ts) if ts else None
+    reds = _times([o for o in recs if o.status == FAIL])
+    first_red = min(reds) if reds else None
+    latest = None
+    if outcomes:
+        if last:
+            at_last = [o for o in outcomes if o.t == last]
+            if not at_last:
+                at_last = outcomes
+        else:
+            at_last = outcomes
+        rank = {FAIL: 0, SKIP: 1, PASS: 2}
+        latest = sorted(at_last, key=lambda o: rank.get(o.status, 9))[0].status
+    if n_fail:
+        verdict = SCARRED
+    elif n_pass:
+        verdict = MAIDEN
+    elif n_skip:
+        verdict = SKIPPED
+    else:
+        verdict = UNKNOWN
+    if in_roster is False and verdict != UNKNOWN:
+        verdict = ORPHAN
+    sample = recs[0] if recs else None
+    return Row(
+        id=sample.id if sample else "",
+        verdict=verdict,
+        n_pass=n_pass,
+        n_fail=n_fail,
+        n_skip=n_skip,
+        first=first,
+        last=last,
+        first_red=first_red,
+        latest=latest,
+        n_obs=len(outcomes),
+        suite=sample.suite if sample else "",
+        classname=sample.classname if sample else "",
+        method=sample.method if sample else "",
+    )
+
+
+def fold(obs: list[Obs], roster: set[str] | None, aka_map: dict[str, list[str]] | None = None) -> list[Row]:
+    by: dict[str, list[Obs]] = defaultdict(list)
+    for o in obs:
+        by[o.id].append(o)
+    ids = set(by)
+    if roster is not None:
+        ids |= roster
+    rows: list[Row] = []
+    for i in ids:
+        recs = by.get(i, [])
+        if not recs:
+            recs = [Obs(id=i, status=SEEN, t=None, src="roster", run=None)]
+        in_roster: bool | None
+        if roster is None:
+            in_roster = None
+        else:
+            in_roster = i in roster
+        row = classify_id(recs, in_roster)
+        row.id = i
+        if aka_map:
+            row.aka = sorted(set(aka_map.get(i, [])) - {i})
+        if recs:
+            # prefer the latest spelling's triple
+            dated = [o for o in recs if o.t]
+            pick = max(dated, key=lambda o: o.t or "") if dated else recs[-1]
+            row.suite = pick.suite
+            row.classname = pick.classname
+            row.method = pick.method
+        rows.append(row)
+    rows.sort(key=lambda r: (VERDICT_ORDER.get(r.verdict, 9), r.id))
+    return rows
+
+
+def filter_latest(obs: list[Obs]) -> list[Obs]:
+    """Keep each test's newest outcome(s). The rg PASS snapshot."""
+    by: dict[str, list[Obs]] = defaultdict(list)
+    for o in obs:
+        if o.status == SEEN:
+            continue
+        by[o.id].append(o)
+    out: list[Obs] = []
+    for recs in by.values():
+        ts = [o.t for o in recs if o.t]
+        if ts:
+            last = max(ts)
+            at = [o for o in recs if o.t == last]
+        else:
+            at = recs[-1:]
+        out.extend(at)
+    return out
+
+
+def skeptic_rows(obs: list[Obs], aka_map: dict[str, list[str]] | None = None) -> list[Row]:
+    """Newest outcome is PASS but recorded history has a fail — not rg PASS."""
+    hist = fold(obs, roster=None, aka_map=aka_map)
+    hits = [r for r in hist if r.verdict == SCARRED and r.latest == PASS]
+    hits.sort(key=lambda r: (r.first_red or "", r.id))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# unify — (suite, class, method) across class-move / method-rename
+# ---------------------------------------------------------------------------
+
+UNIFY = True
+
+
+class _UF:
+    def __init__(self, items: list[str]) -> None:
+        self.p = {i: i for i in items}
+        self.m: dict[str, list[str]] = {i: [i] for i in items}
+
+    def find(self, x: str) -> str:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def members(self, x: str) -> list[str]:
+        return self.m[self.find(x)]
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if len(self.m[ra]) < len(self.m[rb]):
+            ra, rb = rb, ra
+        self.p[rb] = ra
+        self.m[ra].extend(self.m[rb])
+        del self.m[rb]
+
+
+def _cooccur_pairs(obs: list[Obs]) -> set[tuple[str, str]]:
+    by: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for o in obs:
+        by[(o.src, o.run or "")].add(o.id)
+    pairs: set[tuple[str, str]] = set()
+    for ids in by.values():
+        uniq = sorted(ids)
+        for i, a in enumerate(uniq):
+            for b in uniq[i + 1 :]:
+                pairs.add((a, b))
+                pairs.add((b, a))
+    return pairs
+
+
+def unify_identities(obs: list[Obs]) -> tuple[list[Obs], dict[str, list[str]]]:
+    """Fold class-moves and method-renames onto one (suite, class, method) badge.
+
+    Class move: same suite + same method, class last-segment changed, shared package prefix.
+    Method rename: same suite + same class, method token-subset (min 2 tokens), never co-occur.
+    Co-occurrence in the same src/run is a hard barrier (roster of 213 stays 213).
+    """
+    if not obs:
+        return obs, {}
+    keys = sorted({o.id for o in obs})
+    # representative triple per spelling (latest obs)
+    by_id: dict[str, list[Obs]] = defaultdict(list)
+    for o in obs:
+        by_id[o.id].append(o)
+
+    def latest_triple(i: str) -> tuple[str, str, str]:
+        recs = by_id[i]
+        dated = [x for x in recs if x.t]
+        pick = max(dated, key=lambda x: x.t or "") if dated else recs[-1]
+        return pick.suite, pick.classname, pick.method
+
+    triples = {i: latest_triple(i) for i in keys}
+    uf = _UF(keys)
+    forbidden = _cooccur_pairs(obs)
+
+    def can_union(a: str, b: str) -> bool:
+        if a == b:
+            return False
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb:
+            return False
+        for x in uf.members(ra):
+            for y in uf.members(rb):
+                if (x, y) in forbidden:
+                    return False
+        return True
+
+    candidates: list[tuple[int, str, str]] = []
+    for i, a in enumerate(keys):
+        sa, ca, ma = triples[a]
+        for b in keys[i + 1 :]:
+            sb, cb, mb = triples[b]
+            if (a, b) in forbidden:
+                continue
+            score = 0
+            if sa and sa == sb and ma and ma == mb and ca != cb:
+                pa, pb = pkg_prefix(ca), pkg_prefix(cb)
+                if pa and pa == pb:
+                    score = 3  # class move
+            elif sa == sb and ca and ca == cb and method_rename_pair(ma, mb):
+                score = 2  # method rename
+            if score:
+                candidates.append((score, a, b))
+    candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+    for _, a, b in candidates:
+        if can_union(a, b):
+            uf.union(a, b)
+
+    def last_t(i: str) -> str:
+        ts = [o.t for o in by_id[i] if o.t]
+        return max(ts) if ts else ""
+
+    canon: dict[str, str] = {}
+    aka_map: dict[str, list[str]] = defaultdict(list)
+    for root, members in list(uf.m.items()):
+        group = uf.members(root)
+        # newest spelling, then longest method (rename target), then id
+        def rank(i: str) -> tuple:
+            _, _, meth = triples[i]
+            return (last_t(i), len(meth), i)
+
+        chosen = sorted(group, key=rank)[-1]
+        for i in group:
+            canon[i] = chosen
+            if i != chosen:
+                aka_map[chosen].append(i)
+
+    if not any(k != v for k, v in canon.items()):
+        return obs, {}
+
+    out: list[Obs] = []
+    for o in obs:
+        new_id = canon.get(o.id, o.id)
+        if new_id == o.id:
+            out.append(o)
+            continue
+        ns, nc, nm = triples.get(new_id, triple_of(o))
+        out.append(
+            Obs(
+                id=new_id,
+                status=o.status,
+                t=o.t,
+                src=o.src,
+                run=o.run,
+                suite=ns or o.suite,
+                classname=nc or o.classname,
+                method=nm or o.method,
+            )
+        )
+    return out, {k: sorted(set(v)) for k, v in aka_map.items()}
+
+
+# ---------------------------------------------------------------------------
+# aliases (Swift Testing display → specifier)
+# ---------------------------------------------------------------------------
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "target",
+    ".build",
+    "dist",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".swiftpm",
+    "DerivedData",
+    ".maiden",
+    ".badge",
+}
+
+RE_SWIFT_TEST_FUNC = re.compile(r"^\s*func\s+(test\w*)\s*\(")
+RE_SWIFT_ATTEST = re.compile(r'@Test\s*\(\s*"((?:[^"\\]|\\.)*)"')
+RE_SWIFT_TYPE = re.compile(
+    r"^\s*(?:(?:public|private|internal|fileprivate|final)\s+)*(?:struct|class|enum|actor)\s+(\w+)"
+)
+
+
+def _swift_test_roots(root: Path) -> list[Path]:
+    tests = root / "Tests"
+    return [tests] if tests.is_dir() else []
+
+
+def swift_display_aliases(root: Path) -> dict[str, str]:
+    """Map Swift Testing display name → Module.Type[/Nested]/func."""
+    aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for walk_root in _swift_test_roots(root):
+        for dirpath, dirnames, filenames in os.walk(walk_root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if not fn.endswith(".swift"):
+                    continue
+                path = Path(dirpath) / fn
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                try:
+                    rel = path.relative_to(root)
+                except ValueError:
+                    rel = path
+                parts = rel.parts
+                module = path.stem
+                if "Tests" in parts:
+                    i = parts.index("Tests")
+                    if i + 1 < len(parts):
+                        module = parts[i + 1]
+                stack: list[tuple[int, str]] = []
+                depth = 0
+                lines = text.splitlines()
+                for i, ln in enumerate(lines):
+                    tm = RE_SWIFT_TYPE.match(ln)
+                    if tm:
+                        stack.append((depth, tm.group(1)))
+                    am = RE_SWIFT_ATTEST.search(ln)
+                    if am:
+                        display = am.group(1)
+                        func = None
+                        for nxt in lines[i : i + 8]:
+                            fm = re.search(r"func\s+(\w+)\s*\(", nxt)
+                            if fm:
+                                func = fm.group(1)
+                                break
+                        types = [name for _, name in stack]
+                        if func and types:
+                            spec = canonical_id(
+                                f"{module}.{types[0]}/" + "/".join(types[1:] + [func])
+                            )
+                            if display in aliases and aliases[display] != spec:
+                                ambiguous.add(display)
+                            else:
+                                aliases[display] = spec
+                    depth += ln.count("{") - ln.count("}")
+                    if depth < 0:
+                        depth = 0
+                    stack = [(d, n) for d, n in stack if d < depth]
+    for key in ambiguous:
+        aliases.pop(key, None)
+    return aliases
+
+
+def apply_aliases(obs: list[Obs], aliases: dict[str, str]) -> list[Obs]:
+    if not aliases:
+        return obs
+    out: list[Obs] = []
+    for o in obs:
+        mapped = aliases.get(o.id)
+        if mapped and mapped != o.id:
+            suite, cls, method = split_swift_spec(mapped)
+            out.append(
+                Obs(
+                    id=mapped,
+                    status=o.status,
+                    t=o.t,
+                    src=o.src,
+                    run=o.run,
+                    suite=suite or o.suite,
+                    classname=cls or o.classname,
+                    method=method or o.method,
+                )
+            )
+        else:
+            out.append(o)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def summary(rows: list[Row]) -> dict[str, int]:
+    c: dict[str, int] = defaultdict(int)
+    for r in rows:
+        c[r.verdict] += 1
+    return dict(c)
+
+
+def format_tsv(rows: list[Row], header: bool) -> str:
+    lines: list[str] = []
+    show_aka = any(r.aka for r in rows)
+    cols = ["verdict", "n_pass", "n_fail", "n_skip", "first", "last", "latest", "id"]
+    if show_aka:
+        cols.append("aka")
+    if header:
+        lines.append("\t".join(cols))
+    for r in rows:
+        cells = [
+            r.verdict,
+            str(r.n_pass),
+            str(r.n_fail),
+            str(r.n_skip),
+            r.first or "—",
+            r.last or "—",
+            r.latest or "—",
+            r.id,
+        ]
+        if show_aka:
+            cells.append(",".join(r.aka) if r.aka else "—")
+        lines.append("\t".join(cells))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _row_dict(r: Row) -> dict:
+    d = asdict(r)
+    d["class"] = d.pop("classname")
+    return d
+
+
+def format_json(rows: list[Row], extra: dict | None = None) -> str:
+    payload = {
+        "version": VERSION,
+        "summary": summary(rows),
+        "tests": [_row_dict(r) for r in rows],
+    }
+    if extra:
+        payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def format_why(obs: list[Obs], tid: str, aka_map: dict[str, list[str]] | None = None) -> str:
+    want = {canonical_id(tid), tid}
+    if aka_map:
+        for canon, olds in aka_map.items():
+            if tid in olds or canonical_id(tid) in olds or tid == canon:
+                want.add(canon)
+                want.update(olds)
+    recs = [o for o in obs if o.id in want or o.id == canonical_id(tid)]
+    if not recs:
+        return f"badge: no records for {tid}\n"
+    recs = sorted(recs, key=lambda o: o.t or "")
+    sample = recs[-1]
+    lines = [
+        f"# {sample.id}  n={len(recs)}  suite={sample.suite or '—'}  "
+        f"class={sample.classname or '—'}  method={sample.method or '—'}"
+    ]
+    if aka_map and sample.id in aka_map:
+        lines.append(f"# aka  {', '.join(aka_map[sample.id])}")
+    for o in recs:
+        lines.append(f"{o.status:4}  {o.t or '—':20}  run={o.run or '—'}  src={o.src}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+JUNIT_FAIL = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2019-06-01T12:00:00">
+  <testcase classname="pkg.T" name="alpha"><failure message="boom">boom</failure></testcase>
+  <testcase classname="pkg.T" name="beta"/>
+  <testcase classname="pkg.T" name="gamma"><skipped/></testcase>
+</testsuite>
+"""
+
+JUNIT_GREEN = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2024-08-01T12:00:00">
+  <testcase classname="pkg.T" name="alpha"/>
+  <testcase classname="pkg.T" name="beta"/>
+  <testcase classname="pkg.T" name="gamma"><skipped/></testcase>
+  <testcase classname="pkg.T" name="delta"/>
+</testsuite>
+"""
+
+JUNIT_FLAKY = """<?xml version="1.0"?>
+<testsuite name="pkg" tests="2" failures="0" timestamp="2024-08-01T12:00:00">
+  <testcase classname="pkg.T" name="alpha">
+    <flakyFailure message="boom">java.lang.AssertionError: boom</flakyFailure>
+  </testcase>
+  <testcase classname="pkg.T" name="beta"/>
+</testsuite>
+"""
+
+JUNIT_RERUN = """<?xml version="1.0"?>
+<testsuite name="pkg" tests="1" failures="0" timestamp="2024-08-01T12:00:00">
+  <testcase classname="pkg.T" name="alpha">
+    <rerunFailure message="boom">first try failed</rerunFailure>
+  </testcase>
+</testsuite>
+"""
+
+JUNIT_STATUS_FAIL = """<?xml version="1.0"?>
+<testsuite name="pkg" tests="2" failures="1" timestamp="2019-06-01T12:00:00">
+  <testcase classname="pkg.T" name="alpha" status="failed"/>
+  <testcase classname="pkg.T" name="beta" status="passed"/>
+</testsuite>
+"""
+
+JUNIT_RENAME_FAIL = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2019-06-01T12:00:00">
+  <testcase classname="pkg.T" name="compute_diff"><failure>boom</failure></testcase>
+</testsuite>
+"""
+
+JUNIT_RENAME_PASS = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2024-08-01T12:00:00">
+  <testcase classname="pkg.T" name="compute_operation_diff"/>
+</testsuite>
+"""
+
+JUNIT_CLASS_FAIL = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2019-06-01T12:00:00">
+  <testcase classname="pkg.Old" name="alpha"><failure>boom</failure></testcase>
+</testsuite>
+"""
+
+JUNIT_CLASS_PASS = """<?xml version="1.0"?>
+<testsuite name="pkg" timestamp="2024-08-01T12:00:00">
+  <testcase classname="pkg.New" name="alpha"/>
+</testsuite>
+"""
+
+CARGO_FAIL = """
+running 3 tests
+test app::tests::alpha ... FAILED
+test app::tests::beta ... ok
+test app::tests::skippy ... ignored
+
+failures:
+    app::tests::alpha
+test result: FAILED. 1 passed; 1 failed; 1 ignored
+"""
+
+CARGO_PASS = """
+running 3 tests
+test app::tests::alpha ... ok
+test app::tests::beta ... ok
+test app::tests::skippy ... ignored
+test result: ok. 2 passed; 0 failed; 1 ignored
+"""
+
+SWIFT_XCTEST = """
+Test Case '-[SitboneCoreTests.SessionProfileTests testDefaultProfile]' passed (0.000 seconds).
+Test Case '-[SitboneCoreTests.FocusStateMachineTests testFlowStaysWhenIdleBelowT1]' failed (0.010 seconds).
+"""
+
+SWIFT_TESTING = """
+◇ Suite UILogicTests started.
+◇ Test "formatTime: ゼロ" started.
+✔ Test "formatTime: ゼロ" passed after 0.001 seconds.
+✔ Suite UILogicTests passed after 0.001 seconds.
+✔ Test run with 1 test in 1 suite passed after 0.001 seconds.
+"""
+
+GHA_CARGO = """
+ubuntu-latest / stable\tcargo test\t2026-04-16T06:40:47.000Z test kizu::scar::undo ... FAILED
+ubuntu-latest / stable\tcargo test\t2026-04-16T06:41:12.000Z test kizu::hook::parse ... ok
+macos-latest / stable\tcargo test\t2026-05-04T12:46:38.100Z test kizu::scar::undo ... ok
+macos-latest / stable\tcargo test\t2026-05-04T12:46:38.200Z test kizu::hook::parse ... ok
+"""
+
+
+def _selftest() -> int:
+    failed: list[str] = []
+    n_ok = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal n_ok
+        if cond:
+            n_ok += 1
+            print(f"  ok  {name}")
+        else:
+            failed.append(name)
+            print(f"  FAIL {name} {detail}", file=sys.stderr)
+
+    fail_obs = parse_bytes(JUNIT_FAIL, "run-2019.xml", "2019", "2019-06-01T12:00:00Z", False)
+    green_obs = parse_bytes(JUNIT_GREEN, "run-2024.xml", "2024", "2024-08-01T12:00:00Z", False)
+    all_obs = fail_obs + green_obs
+    rows = {r.id: r for r in fold(all_obs, None)}
+    check("junit ids", set(rows) == {"pkg.T::alpha", "pkg.T::beta", "pkg.T::gamma", "pkg.T::delta"})
+    check("alpha scarred", rows["pkg.T::alpha"].verdict == SCARRED and rows["pkg.T::alpha"].n_fail == 1)
+    check("beta maiden", rows["pkg.T::beta"].verdict == MAIDEN and rows["pkg.T::beta"].n_pass == 2)
+    check("gamma skipped not maiden", rows["pkg.T::gamma"].verdict == SKIPPED)
+    check("delta maiden", rows["pkg.T::delta"].verdict == MAIDEN)
+    check("triple on alpha", rows["pkg.T::alpha"].suite == "pkg" and rows["pkg.T::alpha"].method == "alpha")
+    check("empty is unknown", fold([], {"never.ran"})[0].verdict == UNKNOWN)
+
+    sk = {r.id: r for r in skeptic_rows(all_obs)}
+    check("skeptic catches alpha", "pkg.T::alpha" in sk)
+    check("skeptic ignores beta", "pkg.T::beta" not in sk)
+    check("skeptic ignores delta", "pkg.T::delta" not in sk)
+    latest = {r.id: r for r in fold(filter_latest(all_obs), None)}
+    check(
+        "latest-only would maiden alpha",
+        latest["pkg.T::alpha"].verdict == MAIDEN and latest["pkg.T::alpha"].n_fail == 0,
+    )
+
+    cargo = parse_bytes(CARGO_FAIL + "\n" + CARGO_PASS, "cargo.log", "c", "2020-01-01T00:00:00Z", False)
+    crows = {r.id: r for r in fold(cargo, None)}
+    check("cargo alpha scarred", crows["app::tests::alpha"].verdict == SCARRED)
+    check("cargo skippy skipped", crows["app::tests::skippy"].verdict == SKIPPED)
+    check("cargo beta maiden", crows["app::tests::beta"].verdict == MAIDEN)
+    check("cargo triple", crows["app::tests::alpha"].suite == "app" and crows["app::tests::alpha"].method == "alpha")
+
+    xct = parse_bytes(SWIFT_XCTEST, "xctest.log", "s", "2026-01-01T00:00:00Z", False)
+    xids = {o.id: o.status for o in xct}
+    check(
+        "xctest canonical",
+        "SitboneCoreTests.SessionProfileTests/testDefaultProfile" in xids
+        and xids["SitboneCoreTests.FocusStateMachineTests/testFlowStaysWhenIdleBelowT1"] == FAIL,
+    )
+    st = parse_bytes(SWIFT_TESTING, "swift.log", "s", "2026-01-01T00:00:00Z", False)
+    check("swift testing display", any(o.id == "formatTime: ゼロ" and o.status == PASS for o in st))
+    check("swift suite is not a test", all("Suite" not in o.id for o in st))
+
+    gha = parse_bytes(GHA_CARGO, "gha.log", "g", None, False)
+    grows = {r.id: r for r in fold(gha, None)}
+    check("gha prefix stripped + scarred", grows.get("kizu::scar::undo") and grows["kizu::scar::undo"].verdict == SCARRED)
+    check("gha skeptic currently-green scar", "kizu::scar::undo" in {r.id for r in skeptic_rows(gha)})
+    check("gha hook never-red", grows["kizu::hook::parse"].verdict == MAIDEN)
+
+    roster = parse_bytes(
+        "app::tests::alpha: test\napp::tests::newborn: test\n",
+        "list.txt",
+        "list",
+        None,
+        True,
+    )
+    check("roster seen", {o.id for o in roster} == {"app::tests::alpha", "app::tests::newborn"})
+    mixed = fold(cargo + roster, {o.id for o in roster if o.status == SEEN})
+    by = {r.id: r for r in mixed}
+    check("roster unknown", by["app::tests::newborn"].verdict == UNKNOWN)
+    check("orphan cargo skippy", by["app::tests::skippy"].verdict == ORPHAN)
+
+    sl = parse_bytes(
+        "SitboneUITests.UILogicTests/formatTimeZero()\n"
+        "SitboneCoreTests.SessionProfileTests/testDefaultProfile\n"
+        "SitboneCoreTests.PresenceArbiterTests/EMASmoothing/firstReadingNoSmoothing()\n"
+        "SitboneCoreTests.SystemSleepTests/ウェイク処理/cameraRestartsAfterWake()\n",
+        "swift.list",
+        "list",
+        None,
+        True,
+    )
+    check(
+        "swift list parens stripped",
+        {o.id for o in sl}
+        == {
+            "SitboneUITests.UILogicTests/formatTimeZero",
+            "SitboneCoreTests.SessionProfileTests/testDefaultProfile",
+            "SitboneCoreTests.PresenceArbiterTests/EMASmoothing/firstReadingNoSmoothing",
+            "SitboneCoreTests.SystemSleepTests/ウェイク処理/cameraRestartsAfterWake",
+        },
+    )
+    check(
+        "nested swift specifier kept",
+        "SitboneCoreTests.PresenceArbiterTests/EMASmoothing/firstReadingNoSmoothing" in {o.id for o in sl},
+    )
+
+    skip_only = parse_bytes(
+        """<?xml version="1.0"?><testsuite><testcase name="never"><skipped/></testcase></testsuite>""",
+        "s.xml",
+        "s",
+        "2020-01-01T00:00:00Z",
+        False,
+    )
+    check("skip-only not maiden", fold(skip_only, None)[0].verdict == SKIPPED)
+
+    flaky = parse_bytes(JUNIT_FLAKY, "flaky.xml", "f", "2024-08-01T12:00:00Z", False)
+    frows = {r.id: r for r in fold(flaky, None)}
+    check("flakyFailure is red", frows["pkg.T::alpha"].verdict == SCARRED and frows["pkg.T::alpha"].n_fail == 1)
+    check("flaky sibling still maiden", frows["pkg.T::beta"].verdict == MAIDEN)
+
+    rerun = parse_bytes(JUNIT_RERUN, "rerun.xml", "r", "2024-08-01T12:00:00Z", False)
+    check("rerunFailure is red", fold(rerun, None)[0].verdict == SCARRED)
+
+    stfail = parse_bytes(JUNIT_STATUS_FAIL, "st.xml", "s", "2019-06-01T12:00:00Z", False)
+    srows = {r.id: r for r in fold(stfail, None)}
+    check("status=failed is red", srows["pkg.T::alpha"].verdict == SCARRED)
+    check("status=passed is maiden", srows["pkg.T::beta"].verdict == MAIDEN)
+
+    rename = parse_bytes(JUNIT_RENAME_FAIL, "rf.xml", "2019", "2019-06-01T12:00:00Z", False) + parse_bytes(
+        JUNIT_RENAME_PASS, "rp.xml", "2024", "2024-08-01T12:00:00Z", False
+    )
+    if UNIFY:
+        rename, aka = unify_identities(rename)
+        rrows = {r.id: r for r in fold(rename, None, aka)}
+        check("rename is one identity", len(rrows) == 1)
+        only = next(iter(rrows.values()))
+        check("rename folded is SCARRED", only.verdict == SCARRED and only.n_fail == 1 and only.n_pass == 1)
+        check("rename aka keeps old spelling", "pkg.T::compute_diff" in (only.aka + [only.id]))
+    else:
+        rrows = {r.id: r for r in fold(rename, None)}
+        check(
+            "v0.1 rename still splits (string method)",
+            set(rrows) == {"pkg.T::compute_diff", "pkg.T::compute_operation_diff"},
+        )
+        check("v0.1 old spelling SCARRED", rrows["pkg.T::compute_diff"].verdict == SCARRED)
+        check("v0.1 new spelling MAIDEN", rrows["pkg.T::compute_operation_diff"].verdict == MAIDEN)
+
+    moved = parse_bytes(JUNIT_CLASS_FAIL, "cf.xml", "2019", "2019-06-01T12:00:00Z", False) + parse_bytes(
+        JUNIT_CLASS_PASS, "cp.xml", "2024", "2024-08-01T12:00:00Z", False
+    )
+    if UNIFY:
+        moved, aka2 = unify_identities(moved)
+        mrows = {r.id: r for r in fold(moved, None, aka2)}
+        check("class move is one identity", len(mrows) == 1 and next(iter(mrows.values())).verdict == SCARRED)
+    else:
+        mrows = {r.id: r for r in fold(moved, None)}
+        check("v0.1 class move still splits", set(mrows) == {"pkg.Old::alpha", "pkg.New::alpha"})
+
+    check("token rename detects compute_diff", method_rename_pair("compute_diff", "compute_operation_diff"))
+    check("token rename ignores alpha/beta", not method_rename_pair("alpha", "beta"))
+    gold_u, _ = unify_identities(all_obs)
+    check("unify does not collapse gold 4-id fold", len({r.id for r in fold(gold_u, None)}) == 4)
+    if UNIFY:
+        check(
+            "skeptic of unified rename is the scar",
+            "pkg.T::compute_operation_diff" in {r.id for r in skeptic_rows(rename, aka)},
+        )
+
+    here = Path(__file__).resolve().parent
+    tree = here / "fixtures" / "tree"
+    if tree.is_dir():
+        aliases = swift_display_aliases(tree)
+        check(
+            "alias display → specifier",
+            aliases.get("formatTime: ゼロ") == "SitboneUITests.UILogicTests/formatTimeZero",
+        )
+        check(
+            "nested suite alias",
+            aliases.get("初回読み取りはEMAなし（raw scoreがそのまま使われる）")
+            == "SitboneCoreTests.PresenceArbiterTests/EMASmoothing/firstReadingNoSmoothing",
+        )
+        mapped = apply_aliases(st, aliases)
+        check(
+            "alias rewrites log id",
+            any(o.id == "SitboneUITests.UILogicTests/formatTimeZero" for o in mapped),
+        )
+    roster_path = here / "fixtures" / "roster" / "sitbone-list.txt"
+    if roster_path.is_file():
+        n_list = parse_bytes(roster_path.read_text(encoding="utf-8"), str(roster_path), "list", None, True)
+        check("sitbone roster 213 UNKNOWN shape", len(n_list) == 213)
+        check("sitbone roster not maiden", all(o.status == SEEN for o in n_list))
+        unified_list, _ = unify_identities(n_list)
+        check("unify does not collapse sitbone 213", len({o.id for o in unified_list}) == 213)
+
+    print(f"{n_ok} passed, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def gather(
+    files: list[Path],
+    ledger: Path | None,
+    roster_flag: bool,
+    use_ledger: bool,
+) -> list[Obs]:
+    obs: list[Obs] = []
+    if use_ledger and ledger and ledger.exists():
+        loaded, _ = load_ledger(ledger)
+        obs.extend(loaded)
+    for p in files:
+        if str(p) == "-":
+            text = sys.stdin.read()
+            obs.extend(parse_bytes(text, "-", None, iso_utc(), roster_flag))
+        else:
+            obs.extend(parse_path(p, run=None, roster=roster_flag))
+    return obs
+
+
+def cmd_ingest(args: argparse.Namespace, files: list[Path], ledger: Path) -> int:
+    if not files:
+        print("badge ingest: no files", file=sys.stderr)
+        return 2
+    total = 0
+    for p in files:
+        if str(p) == "-":
+            text = sys.stdin.read()
+            src = "-"
+            sha = sha256_text(text)
+            obs = parse_bytes(text, src, args.run, iso_utc(), args.roster)
+        else:
+            text = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+            src = str(p)
+            sha = sha256_text(text) if p.is_file() else None
+            obs = parse_path(p, run=args.run or p.name, roster=args.roster)
+        n = append_ledger(ledger, obs, src, sha)
+        total += n
+        if not args.quiet:
+            print(f"ingested {n}  src={src}  ledger={ledger}")
+    if args.json:
+        print(json.dumps({"added": total, "ledger": str(ledger)}))
+    return 0
+
+
+def filter_only(rows: list[Row], only: str | None) -> list[Row]:
+    if not only:
+        return rows
+    want = {v.strip().upper() for v in only.split(",")}
+    return [r for r in rows if r.verdict in want]
+
+
+def cmd_classify(args: argparse.Namespace, files: list[Path], ledger: Path | None, root: Path) -> int:
+    if args.latest and args.skeptic:
+        print("badge: --skeptic cannot compose with --latest (that is rg PASS)", file=sys.stderr)
+        return 2
+    obs = gather(files, ledger, args.roster, use_ledger=not args.no_ledger)
+    aliases = {} if args.no_alias_swift else swift_display_aliases(root)
+    if aliases:
+        obs = apply_aliases(obs, aliases)
+    aka_map: dict[str, list[str]] = {}
+    do_unify = UNIFY and not args.no_unify
+    if do_unify:
+        obs, aka_map = unify_identities(obs)
+    seen_ids = {o.id for o in obs if o.status == SEEN}
+    roster_ids: set[str] | None = seen_ids or None
+    if args.latest:
+        obs = filter_latest(obs)
+        roster_ids = None
+    if args.why:
+        tid = canonical_id(args.why)
+        if aliases:
+            tid = aliases.get(tid, tid)
+        if aka_map:
+            for canon, olds in aka_map.items():
+                if tid == canon or tid in olds:
+                    tid = canon
+                    break
+        sys.stdout.write(format_why(obs, tid, aka_map))
+        recs = [o for o in obs if o.id == tid]
+        return 0 if recs else 1
+    if args.skeptic:
+        rows = skeptic_rows(obs, aka_map)
+        extra = {"kind": "skeptic", "note": "latest run PASS but history has fail — not rg PASS"}
+    else:
+        rows = fold(obs, roster_ids, aka_map)
+        extra = None
+    rows = filter_only(rows, args.only)
+    if args.json:
+        sys.stdout.write(format_json(rows, extra))
+    else:
+        if args.summary or args.counts or not rows:
+            s = summary(rows if not args.skeptic else fold(obs, roster_ids, aka_map))
+            if args.skeptic:
+                print(
+                    f"# SKEPTIC {len(rows)}  (latest PASS ∩ history FAIL)  "
+                    f"SCARRED={s.get(SCARRED, 0)} MAIDEN={s.get(MAIDEN, 0)} "
+                    f"SKIPPED={s.get(SKIPPED, 0)} UNKNOWN={s.get(UNKNOWN, 0)}"
+                )
+            else:
+                print(
+                    f"# SCARRED {s.get(SCARRED, 0)}  MAIDEN {s.get(MAIDEN, 0)}  "
+                    f"SKIPPED {s.get(SKIPPED, 0)}  UNKNOWN {s.get(UNKNOWN, 0)}  "
+                    f"ORPHAN {s.get(ORPHAN, 0)}"
+                )
+        if rows and not args.counts:
+            sys.stdout.write(format_tsv(rows, header=args.header))
+    if args.check:
+        want = {v.strip().upper() for v in args.check.split(",")}
+        if args.skeptic or "SKEPTIC" in want:
+            hit = bool(skeptic_rows(obs, aka_map) if not args.skeptic else rows)
+        else:
+            hit = any(r.verdict in want for r in rows)
+        return 1 if hit else 0
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="badge",
+        description="Never-red tests keyed by (suite, class, method) — not a spelling, not rg PASS.",
+    )
+    p.add_argument("-C", dest="root", default=".", help="root (ledger, aliases)")
+    p.add_argument("--ledger", help="ledger jsonl (default: ROOT/.badge/ledger.jsonl)")
+    p.add_argument("--no-ledger", action="store_true", help="ignore on-disk ledger")
+    p.add_argument("--roster", action="store_true", help="treat inputs as runner --list (status=seen)")
+    p.add_argument(
+        "--no-alias-swift",
+        action="store_true",
+        help="do not map Swift Testing display names to list specifiers",
+    )
+    p.add_argument("--no-unify", action="store_true", help="do not join class-moves / method-renames")
+    p.add_argument("--latest", action="store_true", help="fold only the newest run (the rg PASS lie)")
+    p.add_argument("--skeptic", action="store_true", help="latest PASS but history FAIL")
+    p.add_argument("--only", help="MAIDEN,SCARRED,SKIPPED,UNKNOWN,ORPHAN")
+    p.add_argument("--check", help="exit 1 if any row has this verdict (or SKEPTIC)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--header", action="store_true")
+    p.add_argument("--summary", action="store_true")
+    p.add_argument("--counts", action="store_true", help="print the summary line only")
+    p.add_argument("--why", metavar="ID")
+    p.add_argument("--run", help="run id to stamp on ingest")
+    p.add_argument("--quiet", "-q", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("words", nargs="*", help="ingest | files | why-id")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        # ingest --run ID FILE  leaves FILE in extra under argparse *
+        args.words = list(args.words) + extra
+    if args.version:
+        print(f"badge {VERSION}")
+        return 0
+    if args.selftest:
+        return _selftest()
+    root = Path(args.root).resolve()
+    ledger = Path(args.ledger).resolve() if args.ledger else default_ledger(root)
+    words = list(args.words)
+    sub = words[0] if words and words[0] in {"ingest", "why"} else None
+    if sub == "why":
+        args.why = " ".join(words[1:]) if len(words) > 1 else args.why
+        files: list[Path] = []
+        if not args.why:
+            print("badge why: missing id", file=sys.stderr)
+            return 2
+        return cmd_classify(args, files, ledger, root)
+    if sub == "ingest":
+        files = [Path(w) if w != "-" else Path("-") for w in words[1:]]
+        return cmd_ingest(args, files, ledger)
+    files = [Path(w) if w != "-" else Path("-") for w in words]
+    return cmd_classify(args, files, None if args.no_ledger else ledger, root)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

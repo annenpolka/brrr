@@ -1,0 +1,1792 @@
+#!/usr/bin/env python3
+"""ember — leftover claims a diff just made false.
+
+A fact is a typed bound (name, value), rename, or polarity flip from a
+unified diff. Types are version / integer / polarity / other. An afterimage
+is a dest-tree line that still asserts the old fact.
+
+Typed matching: JSON quoted keys are bindings; a version is the full
+token (0.3.0 is not 0.3); a calendar component is not an old integer.
+
+Exit codes: 0 none found, 1 afterimages found, 2 usage/error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Mapping, Sequence, TextIO
+
+NAME = "ember"
+VERSION = "0.2.0"
+
+KEYWORDS = frozenset(
+    """
+    a an the and or not if else elif for while do done then in of on at to from
+    as is was are were be been being this that these those it its they them their
+    we you he she i true false none null nil some ok err error result value data
+    item items type types name names key keys id ids file files path paths line
+    lines self this super crate pub use mod fn let mut const var val def class
+    struct enum trait impl interface return yield break continue pass try catch
+    except finally throw raise with import export default async await new delete
+    int str bool string list dict map vec option result void null undefined
+    public private protected static final override where select insert update
+    func function method module package namespace object switch case match when
+    end begin out ref ptr box rc arc dyn mut self cls argc argv main init
+    get set add put has len size count index min max abs fmt print log
+    info warn warning error fatal panic todo fixme xxx
+    int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 usize isize f32 f64
+    float double char byte bytes string str bool boolean
+    ns swift rust python java kotlin go ts js
+    """.split()
+)
+
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".build",
+        "vendor",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".idea",
+        ".vscode",
+        "Pods",
+        "DerivedData",
+        ".next",
+        "coverage",
+        ".cache",
+        "zig-out",
+        ".moon",
+        ".direnv",
+        "zig-cache",
+        ".cargo",
+        "site-packages",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".turbo",
+        "xcuserdata",
+    }
+)
+
+SKIP_SUFFIXES = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".icns",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".wasm",
+        ".so",
+        ".dylib",
+        ".a",
+        ".o",
+        ".pyc",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".mp3",
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".lock",
+        ".bin",
+        ".exe",
+        ".dll",
+        ".class",
+        ".jar",
+        ".rlib",
+        ".rmeta",
+        ".pack",
+        ".idx",
+        ".bcmap",
+        ".pdb",
+    }
+)
+
+DOC_SUFFIXES = frozenset(
+    {".md", ".mdx", ".rst", ".txt", ".adoc", ".org", ".html"}
+)
+CONFIG_SUFFIXES = frozenset(
+    {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".plist", ".pkl"}
+)
+TEST_HINTS = ("test", "spec", "specs", "fixtures", "golden", "contract")
+
+# Latin-1 letters so café_timeout is one name, not a minted _timeout.
+IDENT_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*")
+KEBAB_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b")
+VERSION_RE = re.compile(r"\bv?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?\b")
+# Longest first: 0.3.0 before 0.3 before 3. Homonym must not truncate.
+NUMBER_RE = re.compile(r"\b\d+(?:\.\d+){2,}(?:-[A-Za-z0-9.]+)?\b|\b\d+\.\d+\b|\b\d+\b")
+STRING_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
+# Quoted JSON keys are bindings. Version group sits before float so
+# 0.3.0 is not taken as 0.3.
+PAIR_RE = re.compile(
+    r"""(?x)
+    (?P<qkey>["'])?
+    (?P<key>
+        [A-Za-zÀ-ÖØ-öø-ÿ_][A-Za-zÀ-ÖØ-öø-ÿ0-9_]*
+        |
+        [A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+
+    )
+    (?(qkey)(?P=qkey))
+    (?:
+        \s*:\s*[A-Za-z_][A-Za-z0-9_\[\]<>.,\s]*
+        (?==)
+    )?
+    \s*
+    (?P<op>=|:|:=)
+    \s*
+    (?:
+        Some\(\s*(?P<someint>\d+)\s*\)
+        |
+        (?P<q>["'])(?P<str>(?:\\.|[^\\])*?)(?P=q)
+        |
+        (?P<ver>v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)
+        |
+        (?P<float>\d+\.\d+)
+        |
+        (?P<int>\d+)
+        |
+        (?P<bool>true|false|True|False|YES|NO|nil|null|None)
+    )
+    """
+)
+# ISO / slash dates. Month 10 is not HOOK_TIMEOUT's old 10.
+CALENDAR_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?\b"
+    r"|\b\d{4}/\d{2}/\d{2}\b"
+)
+BARE_NUM_RE = re.compile(r"\b(\d+\.\d+|\d+)\b")
+CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+")
+POLARITY = {
+    "true": "false",
+    "false": "true",
+    "True": "False",
+    "False": "True",
+    "yes": "no",
+    "no": "yes",
+    "on": "off",
+    "off": "on",
+    "enable": "disable",
+    "disable": "enable",
+    "enabled": "disabled",
+    "disabled": "enabled",
+    "allow": "deny",
+    "deny": "allow",
+    "present": "absent",
+    "absent": "present",
+    "start": "stop",
+    "stop": "start",
+    "open": "close",
+    "close": "open",
+    "include": "exclude",
+    "exclude": "include",
+}
+COMMON_NUMBERS = frozenset({str(i) for i in range(0, 11)} | {"100"})
+GENERIC_NAMES = frozenset(
+    {
+        "threshold",
+        "value",
+        "status",
+        "result",
+        "error",
+        "index",
+        "count",
+        "size",
+        "length",
+        "offset",
+        "limit",
+        "flag",
+        "mode",
+        "type",
+        "kind",
+        "name",
+        "path",
+        "file",
+        "line",
+        "item",
+        "data",
+        "config",
+        "option",
+        "param",
+        "args",
+        "state",
+        "event",
+        "patch",
+        "exit",
+        "request",
+        "response",
+        "message",
+        "output",
+        "input",
+        "slice",
+        "point",
+        "points",
+        "version",
+        "revision",
+        "scenario",
+        "experiment",
+        "validation",
+        "allocation",
+        "timeout",
+    }
+)
+# version/timeout stay allowed as VALUE names; generic only gates remames
+STEM_ALIASES = {
+    "timeout": ("タイムアウト", "time-out"),
+    "retries": ("リトライ", "retry"),
+    "retry": ("リトライ",),
+    "threshold": ("閾値", "しきい値"),
+    "version": ("バージョン",),
+    "intent": ("意図",),
+}
+HISTORICAL_RE = re.compile(
+    r"(?i)\b(since|until|before|after|released|changelog|history|was|formerly|"
+    r"deprecated|superseded|old behavior|previous|used to|replaced)\b|"
+    r"^#+\s*v?\d"
+)
+
+
+@dataclass(frozen=True)
+class Origin:
+    path: str
+    line: int
+    excerpt: str
+
+
+@dataclass(frozen=True)
+class Fact:
+    kind: str  # value | rename | polarity | string | removal
+    name: str
+    old: str
+    new: str
+    origin: Origin
+
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.kind, self.name, self.old, self.new)
+
+
+@dataclass(frozen=True)
+class Finding:
+    fact: Fact
+    path: str
+    line: int
+    claim: str
+    excerpt: str
+    score: int
+    why: tuple[str, ...]
+
+
+@dataclass
+class Hunk:
+    old_start: int
+    new_start: int
+    deleted: list[tuple[int, str]] = field(default_factory=list)
+    added: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    status: str  # modify | add | delete | rename
+    hunks: list[Hunk] = field(default_factory=list)
+    old_path: str | None = None
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{NAME}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(
+    args: Sequence[str],
+    root: Path,
+    *,
+    check: bool = True,
+    binary: bool = False,
+    input: bytes | None = None,
+) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        input=input,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        die(f"git {' '.join(args)} failed: {err or proc.returncode}")
+    return proc.stdout if binary else proc.stdout
+
+
+def git_ok(root: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == b"true"
+
+
+def parse_unified_diff(text: str) -> list[FileDiff]:
+    files: list[FileDiff] = []
+    current: FileDiff | None = None
+    hunk: Hunk | None = None
+    old_ln = 0
+    new_ln = 0
+    pending_old: str | None = None
+
+    def flush_hunk() -> None:
+        nonlocal hunk
+        if current is not None and hunk is not None:
+            if hunk.deleted or hunk.added:
+                current.hunks.append(hunk)
+        hunk = None
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            flush_hunk()
+            current = None
+            hunk = None
+            pending_old = None
+            parts = raw.split()
+            # diff --git a/foo b/bar
+            old_p = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else ""
+            new_p = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else old_p
+            current = FileDiff(path=new_p or old_p, status="modify", old_path=old_p or None)
+            files.append(current)
+            continue
+        if raw.startswith("rename from "):
+            if current is not None:
+                current.old_path = raw[len("rename from ") :]
+                current.status = "rename"
+            continue
+        if raw.startswith("rename to "):
+            if current is not None:
+                current.path = raw[len("rename to ") :]
+                current.status = "rename"
+            continue
+        if raw.startswith("deleted file"):
+            if current is not None:
+                current.status = "delete"
+            continue
+        if raw.startswith("new file"):
+            if current is not None:
+                current.status = "add"
+            continue
+        if raw.startswith("--- "):
+            rest = raw[4:]
+            if rest.startswith("a/"):
+                pending_old = rest[2:]
+            elif rest == "/dev/null":
+                pending_old = None
+            continue
+        if raw.startswith("+++ "):
+            rest = raw[4:]
+            if current is None:
+                path = rest[2:] if rest.startswith("b/") else rest
+                current = FileDiff(path=path, status="modify", old_path=pending_old)
+                files.append(current)
+            elif rest.startswith("b/"):
+                current.path = rest[2:]
+            elif rest == "/dev/null" and current is not None:
+                current.status = "delete"
+            continue
+        if raw.startswith("@@"):
+            flush_hunk()
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            if not m:
+                continue
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(2))
+            hunk = Hunk(old_start=old_ln, new_start=new_ln)
+            continue
+        if hunk is None or current is None:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            hunk.deleted.append((old_ln, raw[1:]))
+            old_ln += 1
+        elif raw.startswith("+"):
+            hunk.added.append((new_ln, raw[1:]))
+            new_ln += 1
+        elif raw.startswith(" ") or raw == "":
+            old_ln += 1
+            new_ln += 1
+    flush_hunk()
+    return [f for f in files if f.path and f.path != "/dev/null"]
+
+
+def pair_value(m: re.Match[str]) -> str:
+    if m.group("someint") is not None:
+        return m.group("someint")
+    if m.group("str") is not None:
+        return m.group("str")
+    if m.group("ver") is not None:
+        return m.group("ver")
+    if m.group("float") is not None:
+        return m.group("float")
+    if m.group("int") is not None:
+        return m.group("int")
+    if m.group("bool") is not None:
+        return m.group("bool")
+    return ""
+
+
+def is_keyword_name(key: str) -> bool:
+    """Refuse generic English; keep code-shaped names (DEBUG, MAX, …)."""
+    if key.lower() not in KEYWORDS:
+        return False
+    return not looks_like_symbol(key)
+
+
+def extract_pairs(line: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for m in PAIR_RE.finditer(line):
+        key = m.group("key")
+        val = pair_value(m)
+        if key and val != "" and not is_keyword_name(key):
+            out.append((key, val))
+    return out
+
+
+def extract_idents(line: str) -> list[str]:
+    found: list[str] = []
+    for m in IDENT_RE.finditer(line):
+        tok = m.group(0)
+        # Do not mint `_timeout` from a leading letter IDENT_RE cannot see.
+        if m.start() > 0 and line[m.start() - 1].isalpha():
+            continue
+        if len(tok) < 3:
+            continue
+        if tok.lower() in KEYWORDS and not looks_like_symbol(tok):
+            continue
+        if tok.isnumeric():
+            continue
+        found.append(tok)
+    for m in KEBAB_RE.finditer(line):
+        tok = m.group(0)
+        if tok.lower() not in KEYWORDS:
+            found.append(tok)
+    return found
+
+
+def extract_strings(line: str) -> list[str]:
+    out: list[str] = []
+    for m in STRING_RE.finditer(line):
+        inner = m.group(0)[1:-1]
+        if len(inner) >= 6 and not inner.startswith("/"):
+            out.append(inner)
+    return out
+
+
+def stems(name: str) -> set[str]:
+    parts = re.split(r"[_\-./\s]+", name)
+    camel = CAMEL_RE.findall(name)
+    bits = {p.lower() for p in parts + camel if len(p) >= 4 and p.lower() not in KEYWORDS}
+    compact = name.lower()
+    if len(compact) >= 4 and " " not in compact:
+        bits.add(compact)
+    return bits
+
+
+def similar(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    al, bl = a.lower(), b.lower()
+    ratio = difflib.SequenceMatcher(None, al, bl).ratio()
+    tok_a = {t for t in re.split(r"[_\-./\s]+", al) if t}
+    tok_b = {t for t in re.split(r"[_\-./\s]+", bl) if t}
+    tok_a.update(x.lower() for x in CAMEL_RE.findall(a))
+    tok_b.update(x.lower() for x in CAMEL_RE.findall(b))
+    jacc = len(tok_a & tok_b) / (len(tok_a | tok_b) or 1)
+    return max(ratio, (ratio + jacc) / 2, jacc)
+
+
+def looks_like_symbol(tok: str) -> bool:
+    """True for code-shaped identifiers; false for ordinary prose words."""
+    if not tok or len(tok) < 2:
+        return False
+    if "_" in tok or "-" in tok or "/" in tok or "." in tok:
+        return True
+    if re.search(r"[a-z][A-Z]", tok):
+        return True
+    if re.fullmatch(r"[A-Z]{2,}[A-Z0-9]*", tok):
+        return True
+    if re.search(r"\d", tok) and re.search(r"[A-Za-z]", tok):
+        return True
+    if tok.startswith(("@", "--", "$")):
+        return True
+    return False
+
+
+def is_case_only(a: str, b: str) -> bool:
+    return a.lower() == b.lower() and a != b
+
+
+def is_plural_pair(a: str, b: str) -> bool:
+    al, bl = a.lower(), b.lower()
+    if bl == al + "s" or al == bl + "s":
+        return True
+    if bl == al + "es" or al == bl + "es":
+        return True
+    if al.endswith("y") and bl == al[:-1] + "ies":
+        return True
+    if bl.endswith("y") and al == bl[:-1] + "ies":
+        return True
+    return False
+
+
+def is_inflection_pair(a: str, b: str) -> bool:
+    """request/requests, approximate/approximating, eleven/twelve — not remames."""
+    if is_plural_pair(a, b) or is_case_only(a, b):
+        return True
+    al, bl = a.lower(), b.lower()
+    suffixes = ("ing", "ed", "er", "est", "ly", "tion", "ments")
+    for s in suffixes:
+        if al + s == bl or bl + s == al:
+            return True
+        if al.endswith(s) and bl == al[: -len(s)] and len(al) - len(s) >= 4:
+            return True
+        if bl.endswith(s) and al == bl[: -len(s)] and len(bl) - len(s) >= 4:
+            return True
+    return False
+
+
+def ident_tokens(tok: str) -> set[str]:
+    bits = {t.lower() for t in re.split(r"[_\-./]+", tok) if t}
+    bits.update(x.lower() for x in CAMEL_RE.findall(tok))
+    return {b for b in bits if len(b) >= 3}
+
+
+def should_emit_rename(old: str, new: str, *, pair_key: bool) -> bool:
+    if not old or not new or old == new:
+        return False
+    if is_inflection_pair(old, new):
+        return False
+    shared = ident_tokens(old) & ident_tokens(new)
+    if pair_key and similar(old, new) >= 0.45 and len(old) >= 4:
+        return True
+    if looks_like_symbol(old) and looks_like_symbol(new) and (shared or similar(old, new) >= 0.70):
+        return True
+    return False
+
+
+def leftover_pairs(line: str) -> dict[str, str]:
+    return dict(extract_pairs(line))
+
+
+def value_type(val: str) -> str:
+    if not val:
+        return "empty"
+    if val in POLARITY:
+        return "polarity"
+    if VERSION_RE.fullmatch(val) or re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?", val):
+        return "version"
+    if re.fullmatch(r"\d+", val):
+        return "integer"
+    if re.fullmatch(r"\d+\.\d+", val):
+        return "float"
+    return "other"
+
+
+def mask_calendar(text: str) -> str:
+    """Blank ISO/slash dates so month 10 is not integer 10."""
+    return CALENDAR_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def stem_in_text(stem: str, text: str) -> bool:
+    """Token-bounded stem: timeout ⊄ settimeout, present ⊄ presentation."""
+    if not stem:
+        return False
+    if not stem.isascii():
+        return stem in text
+    return (
+        re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(stem) + r"(?![A-Za-z0-9_])",
+            text,
+            re.I,
+        )
+        is not None
+    )
+
+
+def is_homonym_binding(fact: Fact, line: str) -> bool:
+    """Same name bound to a different *full* literal — another symbol.
+
+    Compare complete tokens. `version 0.3.0` is not a homonym of 0.3.0
+    just because a shorter number regex would have bound 0.3.
+    """
+    pairs = leftover_pairs(line)
+    if fact.name in pairs:
+        bound = pairs[fact.name]
+        if bound != fact.old and bound != fact.new:
+            return True
+    if fact.kind == "rename" and fact.old in pairs:
+        bound = pairs[fact.old]
+        if fact.new and bound != fact.new:
+            return True
+    return False
+
+
+def align_lines(
+    deleted: Sequence[tuple[int, str]], added: Sequence[tuple[int, str]]
+) -> list[tuple[tuple[int, str] | None, tuple[int, str] | None]]:
+    """Pair deleted/added lines; identical bodies first, then greedy similarity."""
+    used_add = [False] * len(added)
+    pairs: list[tuple[tuple[int, str] | None, tuple[int, str] | None]] = []
+
+    add_by_body: dict[str, list[int]] = {}
+    for i, (_, body) in enumerate(added):
+        add_by_body.setdefault(body, []).append(i)
+
+    matched_del = [False] * len(deleted)
+    for di, (dln, dbody) in enumerate(deleted):
+        bucket = add_by_body.get(dbody)
+        if bucket:
+            ai = bucket.pop(0)
+            used_add[ai] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[ai]))
+            if not bucket:
+                add_by_body.pop(dbody, None)
+
+    for di, (dln, dbody) in enumerate(deleted):
+        if matched_del[di]:
+            continue
+        best_i = -1
+        best = 0.45
+        dstrip = dbody.strip()
+        for ai, (aln, abody) in enumerate(added):
+            if used_add[ai]:
+                continue
+            score = similar(dstrip, abody.strip())
+            # boost if they share a key
+            dkeys = {k for k, _ in extract_pairs(dbody)}
+            akeys = {k for k, _ in extract_pairs(abody)}
+            if dkeys & akeys:
+                score += 0.25
+            if score > best:
+                best = score
+                best_i = ai
+        if best_i >= 0:
+            used_add[best_i] = True
+            matched_del[di] = True
+            pairs.append((deleted[di], added[best_i]))
+        else:
+            pairs.append((deleted[di], None))
+
+    for ai, a in enumerate(added):
+        if not used_add[ai]:
+            pairs.append((None, a))
+    return pairs
+
+
+def is_distinctive_value(val: str) -> bool:
+    if not val:
+        return False
+    if VERSION_RE.fullmatch(val):
+        return True
+    if re.fullmatch(r"\d+\.\d+", val):
+        return True
+    if val in POLARITY:
+        return True
+    if len(val) >= 4 and not val.isdigit():
+        return True
+    if val.isdigit() and val not in COMMON_NUMBERS:
+        return True
+    return False
+
+
+def extract_facts(files: Sequence[FileDiff], kinds: set[str]) -> list[Fact]:
+    added_idents: set[str] = set()
+    added_strings: set[str] = set()
+    added_pairs: set[tuple[str, str]] = set()
+    for fd in files:
+        for h in fd.hunks:
+            for _, line in h.added:
+                added_idents.update(extract_idents(line))
+                added_strings.update(extract_strings(line))
+                added_pairs.update(extract_pairs(line))
+
+    facts: list[Fact] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def emit(kind: str, name: str, old: str, new: str, origin: Origin) -> None:
+        if kind not in kinds:
+            return
+        if old == new:
+            return
+        if not old:
+            return
+        fact = Fact(kind=kind, name=name, old=old, new=new, origin=origin)
+        k = fact.key()
+        if k in seen:
+            return
+        seen.add(k)
+        facts.append(fact)
+
+    for fd in files:
+        if fd.status == "add":
+            continue
+        for h in fd.hunks:
+            for d, a in align_lines(h.deleted, h.added):
+                if d is None:
+                    continue
+                dln, dbody = d
+                origin = Origin(fd.old_path or fd.path, dln, dbody.strip()[:200])
+                if a is None:
+                    if "removal" in kinds:
+                        for ident in extract_idents(dbody):
+                            if ident not in added_idents:
+                                emit("removal", ident, ident, "", origin)
+                    continue
+
+                _aln, abody = a
+                dpairs = extract_pairs(dbody)
+                apair_list = extract_pairs(abody)
+                apairs = dict(apair_list)
+
+                def emit_value(name: str, old: str, new: str) -> None:
+                    if len(old) > 80 or len(new) > 80:
+                        return
+                    if (
+                        old in COMMON_NUMBERS
+                        and not looks_like_symbol(name)
+                        and name.lower()
+                        not in {"version", "timeout", "retries", "threshold", "intent"}
+                    ):
+                        return
+                    kind = (
+                        "polarity"
+                        if old in POLARITY and POLARITY[old].lower() == new.lower()
+                        else "value"
+                    )
+                    if kind == "value" and not (
+                        is_distinctive_value(old)
+                        or is_distinctive_value(new)
+                        or name.lower() in {"version", "timeout", "retries", "threshold"}
+                    ):
+                        if not (old.isdigit() or re.fullmatch(r"\d+\.\d+", old)):
+                            return
+                    emit(kind, name, old, new, origin)
+
+                for key, old in dpairs:
+                    if key in apairs and apairs[key] != old:
+                        emit_value(key, old, apairs[key])
+
+                # renamed binding: MAX_RETRIES = 3 → MAX_ATTEMPTS = 8
+                if len(dpairs) == 1 and len(apair_list) == 1:
+                    (dk, dv), (ak, av) = dpairs[0], apair_list[0]
+                    if dk != ak and similar(dk, ak) >= 0.45:
+                        if dk not in added_idents and should_emit_rename(dk, ak, pair_key=True):
+                            emit("rename", dk, dk, ak, origin)
+                        if dv != av:
+                            emit_value(dk, dv, av)
+
+                if not dpairs and not apair_list:
+                    dnums = BARE_NUM_RE.findall(dbody)
+                    anums = BARE_NUM_RE.findall(abody)
+                    if len(dnums) == 1 and len(anums) == 1 and dnums[0] != anums[0]:
+                        shared = stems(dbody) & stems(abody)
+                        shared = {s for s in shared if s.lower() not in KEYWORDS}
+                        if shared:
+                            emit_value(sorted(shared, key=len, reverse=True)[0], dnums[0], anums[0])
+
+                dkeys = {k for k, _ in dpairs}
+                akeys = set(apairs)
+                didents = [i for i in extract_idents(dbody) if i not in dkeys]
+                aidents = [i for i in extract_idents(abody) if i not in akeys]
+                removed = [i for i in didents if i not in aidents]
+                added = [i for i in aidents if i not in didents]
+                used_added: set[int] = set()
+                for r in removed:
+                    best_j = -1
+                    best = 0.62
+                    for j, n in enumerate(added):
+                        if j in used_added:
+                            continue
+                        s = similar(r, n)
+                        if stems(r) & stems(n):
+                            s += 0.15
+                        if s > best:
+                            best = s
+                            best_j = j
+                    if best_j >= 0:
+                        if r not in added_idents and should_emit_rename(
+                            r, added[best_j], pair_key=False
+                        ):
+                            emit("rename", r, r, added[best_j], origin)
+                        used_added.add(best_j)
+
+                dst = extract_strings(dbody)
+                ast = set(extract_strings(abody))
+                for s in dst:
+                    if (
+                        s not in ast
+                        and s not in added_strings
+                        and 6 <= len(s) <= 80
+                        and is_distinctive_value(s)
+                    ):
+                        new = next(iter(ast - set(dst)), "")
+                        if len(new) > 80:
+                            new = new[:80]
+                        emit("string", s[:40], s, new, origin)
+
+    return facts
+
+
+def classify_claim(path: str, line: str) -> str:
+    p = path.replace("\\", "/").lower()
+    stripped = line.lstrip()
+    if any(part in p.split("/") for part in ("test", "tests", "spec", "specs")) or any(
+        h in p for h in TEST_HINTS
+    ):
+        if "assert" in stripped or "expect(" in stripped or "XCT" in stripped:
+            return "assert"
+        return "test"
+    suffix = Path(path).suffix.lower()
+    if suffix in DOC_SUFFIXES or "/docs/" in p or "/adr/" in p or p.endswith("readme"):
+        return "docs"
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+    if stripped.startswith(("//", "#", "///", "//!", "--", "*", "/*", "<!--")):
+        return "comment"
+    if "assert" in stripped or "expect(" in stripped:
+        return "assert"
+    if STRING_RE.search(line) and not PAIR_RE.search(line):
+        return "string"
+    return "code"
+
+
+def needle_in_line(
+    needle: str, line: str, *, ident: bool, vtype: str | None = None
+) -> bool:
+    if not needle:
+        return False
+    hay = line
+    # Integers do not live inside hyphenated calendar tokens.
+    if not ident and (
+        vtype == "integer" or (vtype is None and re.fullmatch(r"\d+", needle))
+    ):
+        hay = mask_calendar(line)
+    if ident:
+        pat = r"(?<![A-Za-z0-9_])" + re.escape(needle) + r"(?![A-Za-z0-9_])"
+        if re.search(pat, hay) is not None:
+            return True
+        if needle.lower() != needle and needle.lower() in hay.lower():
+            return re.search(pat, hay, re.I) is not None
+        return False
+    # Full version/number token. 0.3.0 is not 0.3; 10 is not 2024-10-01.
+    if re.fullmatch(r"v?\d+(?:\.\d+)+", needle) or re.fullmatch(r"\d+", needle):
+        pat = r"(?<![\d.])" + re.escape(needle) + r"(?![\d.])"
+        return re.search(pat, hay) is not None
+    if vtype == "polarity" or (vtype is None and needle in POLARITY):
+        return stem_in_text(needle, hay)
+    return needle in hay
+
+
+def name_mentioned(fact: Fact, text: str) -> tuple[bool, bool]:
+    """Return (exact_name, stem_or_alias). Stems are token-bounded."""
+    if needle_in_line(fact.name, text, ident=True):
+        return True, False
+    for st in stems(fact.name):
+        if len(st) >= 4 and stem_in_text(st, text):
+            return False, True
+    for alias in STEM_ALIASES.get(fact.name.lower(), ()):
+        if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+            return False, True
+    for st in stems(fact.name):
+        for alias in STEM_ALIASES.get(st, ()):
+            if stem_in_text(alias, text) or (not alias.isascii() and alias in text):
+                return False, True
+    return False, False
+
+
+def score_finding(
+    fact: Fact,
+    path: str,
+    line: str,
+    claim: str,
+    *,
+    nearby: str = "",
+    file_has_new: bool = False,
+) -> tuple[int, list[str]]:
+    why: list[str] = []
+    score = 0
+
+    same_file = path == fact.origin.path
+    if same_file:
+        score += 12
+        why.append("same-file")
+
+    has_name, has_stem = name_mentioned(fact, line)
+    same_line_name = has_name or has_stem
+    if not same_line_name and nearby:
+        n_name, n_stem = name_mentioned(fact, nearby)
+        if n_name or n_stem:
+            why.append("nearby-name")
+            score += 14
+            # Polarity words are not distinctive; do not promote a nearby
+            # stem into a same-line name-stem credit.
+            if fact.kind != "polarity":
+                has_stem = True
+    if has_name:
+        score += 40
+        why.append("same-line-name")
+    elif has_stem:
+        score += 18
+        why.append("name-stem")
+    if fact.kind == "polarity" and not same_line_name:
+        return 0, []
+
+    vt = value_type(fact.old)
+    if fact.kind == "polarity":
+        vt = "polarity"
+    if fact.kind in {"value", "polarity"}:
+        if needle_in_line(fact.old, line, ident=False, vtype=vt):
+            score += 28
+            why.append("old-value")
+        if fact.new and needle_in_line(
+            fact.new, line, ident=False, vtype=value_type(fact.new)
+        ):
+            score -= 20
+            why.append("also-new-value")
+    elif fact.kind in {"rename", "removal"}:
+        if needle_in_line(fact.old, line, ident=True):
+            score += 36
+            why.append("old-ident")
+        if fact.new and needle_in_line(fact.new, line, ident=True):
+            score -= 15
+            why.append("also-new-ident")
+        generic = fact.old.lower() in GENERIC_NAMES or fact.name.lower() in GENERIC_NAMES
+        backticked = f"`{fact.old}`" in line or f"`{fact.name}`" in line
+        if generic and claim in {"docs", "code", "comment", "string"} and not backticked:
+            score -= 28
+            why.append("generic-ident")
+    elif fact.kind == "string":
+        # Word-bound polarity leftovers; raw substring for longer strings.
+        if value_type(fact.old) == "polarity" or fact.old in POLARITY:
+            hit = needle_in_line(fact.old, line, ident=False, vtype="polarity")
+        else:
+            hit = fact.old in line
+        if hit:
+            score += 40
+            why.append("old-string")
+
+    claim_boost = {
+        "comment": 18,
+        "docs": 16,
+        "assert": 22,
+        "test": 12,
+        "config": 20,
+        "string": 10,
+        "code": 4,
+    }
+    score += claim_boost.get(claim, 0)
+    why.append(f"claim:{claim}")
+
+    if HISTORICAL_RE.search(line.lstrip()):
+        score -= 25
+        why.append("historical")
+
+    if file_has_new and fact.new:
+        score -= 32
+        why.append("file-has-new")
+
+    if (
+        fact.kind in {"rename", "removal"}
+        and not looks_like_symbol(fact.old)
+        and path != fact.origin.path
+    ):
+        score -= 40
+        why.append("off-file-prose-rename")
+
+    if fact.name.lower() == "version" and claim == "config":
+        score += 15
+        why.append("version-config")
+
+    return max(score, 0), why
+
+
+def should_skip_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(p in SKIP_DIRS for p in parts):
+        return True
+    suffix = Path(rel).suffix.lower()
+    if suffix in SKIP_SUFFIXES:
+        return True
+    name = Path(rel).name
+    if name.startswith(".") and name not in {".gitignore", ".env.example"}:
+        # still search .md? skip dotfiles except common text
+        if suffix not in {".md", ".toml", ".yml", ".yaml", ".json", ".txt"}:
+            return True
+    return False
+
+
+def list_tree_files(root: Path, rev: str | None) -> list[str]:
+    files: list[str] = []
+    if git_ok(root):
+        if rev is None:
+            out = git(["ls-files", "-z", "-c", "-o", "--exclude-standard"], root)
+        else:
+            out = git(["ls-tree", "-r", "--name-only", "-z", rev], root)
+        files = [p for p in out.decode("utf-8", "replace").split("\0") if p]
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                full = Path(dirpath) / name
+                rel = str(full.relative_to(root))
+                files.append(rel)
+
+    # Nested git repos are invisible to the parent index. Walk them on disk
+    # when searching the worktree (historical revs have no nested contents).
+    if rev is None:
+        nested: list[str] = []
+        for dirpath, dirnames, _filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            here = Path(dirpath)
+            if here == root:
+                continue
+            if (here / ".git").exists():
+                rel_base = here.relative_to(root)
+                for inner in list_tree_files(here, None):
+                    nested.append(str(rel_base / inner))
+                dirnames[:] = []
+        files.extend(nested)
+
+    # unique, stable
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in files:
+        if p in seen or should_skip_path(p):
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def read_tree_file(root: Path, rel: str, rev: str | None) -> str | None:
+    if rev is None:
+        path = root / rel
+        if not path.is_file():
+            return None
+        try:
+            if path.stat().st_size > 1_500_000:
+                return None
+        except OSError:
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+    else:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"{rev}:{rel}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        data = proc.stdout
+        if len(data) > 1_500_000:
+            return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def scan(
+    root: Path,
+    rev: str | None,
+    facts: Sequence[Fact],
+    min_score: int,
+    changed_new_lines: Mapping[str, set[int]],
+) -> list[Finding]:
+    if not facts:
+        return []
+    files = list_tree_files(root, rev)
+    findings: list[Finding] = []
+    seen_hit: set[tuple[str, int, str, str, str]] = set()
+
+    for rel in files:
+        text = read_tree_file(root, rel, rev)
+        if text is None:
+            continue
+        skip_lines = changed_new_lines.get(rel, set())
+        lines = text.splitlines()
+        file_new_cache: dict[tuple[str, str], bool] = {}
+        for i, line in enumerate(lines, start=1):
+            if i in skip_lines:
+                continue
+            if not line.strip():
+                continue
+            nearby = "\n".join(lines[max(0, i - 3) : i - 1] + lines[i : i + 2])
+            for fact in facts:
+                # cheap reject
+                if fact.kind in {"rename", "removal"}:
+                    if fact.old not in line and fact.old.lower() not in line.lower():
+                        continue
+                else:
+                    if fact.old not in line:
+                        continue
+                vt = "polarity" if fact.kind == "polarity" else value_type(fact.old)
+                if fact.kind in {"rename", "removal", "string"}:
+                    if not needle_in_line(
+                        fact.old,
+                        line,
+                        ident=fact.kind != "string",
+                        vtype=vt if fact.kind == "string" else None,
+                    ):
+                        continue
+                elif not needle_in_line(fact.old, line, ident=False, vtype=vt):
+                    continue
+                if is_homonym_binding(fact, line):
+                    continue
+                claim = classify_claim(rel, line)
+                fk = (fact.new, fact.kind)
+                if fk not in file_new_cache:
+                    if fact.new:
+                        file_new_cache[fk] = needle_in_line(
+                            fact.new,
+                            text,
+                            ident=fact.kind in {"rename", "removal"},
+                            vtype=value_type(fact.new),
+                        )
+                    else:
+                        file_new_cache[fk] = False
+                score, why = score_finding(
+                    fact,
+                    rel,
+                    line,
+                    claim,
+                    nearby=nearby,
+                    file_has_new=file_new_cache[fk],
+                )
+                if score < min_score:
+                    continue
+                key = (rel, i, fact.kind, fact.name, fact.old)
+                if key in seen_hit:
+                    continue
+                seen_hit.add(key)
+                excerpt = line.strip()
+                if len(excerpt) > 220:
+                    excerpt = excerpt[:217] + "..."
+                findings.append(
+                    Finding(
+                        fact=fact,
+                        path=rel,
+                        line=i,
+                        claim=claim,
+                        excerpt=excerpt,
+                        score=score,
+                        why=tuple(why),
+                    )
+                )
+    findings.sort(key=lambda f: (-f.score, f.fact.name, f.path, f.line))
+    return findings
+
+
+def obtain_diff(root: Path, args: argparse.Namespace) -> tuple[str, str, str]:
+    """Return (diff_text, from_label, to_label). to_label is 'worktree' or a rev."""
+    if args.diff is not None:
+        if args.diff == "-":
+            raw = sys.stdin.buffer.read()
+            src = "stdin"
+        else:
+            p = Path(args.diff)
+            try:
+                raw = p.read_bytes()
+            except OSError as e:
+                die(f"cannot read {p}: {e}")
+            src = str(p)
+        if b"\0" in raw[:8192]:
+            die(f"binary diff ({src})")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            die(f"binary diff ({src}): {e}")
+        return text, "diff" if src == "stdin" else src, "worktree"
+
+    if not git_ok(root):
+        die(f"not a git repository: {root} (pass --diff or run inside a repo)")
+
+    if args.staged:
+        raw = git(["diff", "--cached", "--no-color", "--no-ext-diff"], root)
+        return raw.decode("utf-8", "replace"), "HEAD", "index"
+
+    from_rev = args.from_rev
+    to_rev = args.to_rev
+    if from_rev is None and to_rev is None:
+        raw = git(["diff", "HEAD", "--no-color", "--no-ext-diff"], root)
+        return raw.decode("utf-8", "replace"), "HEAD", "worktree"
+    if from_rev is not None and to_rev is None:
+        raw = git(["diff", from_rev, "--no-color", "--no-ext-diff"], root)
+        return raw.decode("utf-8", "replace"), from_rev, "worktree"
+    assert from_rev is not None and to_rev is not None
+    raw = git(["diff", from_rev, to_rev, "--no-color", "--no-ext-diff"], root)
+    return raw.decode("utf-8", "replace"), from_rev, to_rev
+
+
+def changed_new_lines(files: Sequence[FileDiff]) -> dict[str, set[int]]:
+    """New-file line numbers of added lines — those already reflect the new fact."""
+    out: dict[str, set[int]] = {}
+    for fd in files:
+        acc = out.setdefault(fd.path, set())
+        for h in fd.hunks:
+            for ln, _ in h.added:
+                acc.add(ln)
+    return out
+
+
+def color_enabled(args: argparse.Namespace, stream: TextIO) -> bool:
+    if args.no_color:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return stream.isatty()
+
+
+def paint(text: str, code: str, on: bool) -> str:
+    if not on:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def print_human(
+    findings: Sequence[Finding],
+    facts: Sequence[Fact],
+    *,
+    frm: str,
+    to: str,
+    root: Path,
+    explain: bool,
+    color: bool,
+) -> None:
+    n = len(findings)
+    header = f"{NAME}: {n} afterimage{'s' if n != 1 else ''}  {frm} → {to}  ({root})"
+    print(paint(header, "1", color))
+    if not findings:
+        if facts:
+            print(f"  {len(facts)} fact(s) changed; none left an afterimage (min-score gated).")
+        else:
+            print("  no fact mutations in this diff.")
+        return
+
+    grouped: dict[tuple[str, str, str, str], list[Finding]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for f in findings:
+        k = f.fact.key()
+        if k not in grouped:
+            grouped[k] = []
+            order.append(k)
+        grouped[k].append(f)
+
+    for k in order:
+        group = grouped[k]
+        fact = group[0].fact
+        if fact.kind == "rename":
+            title = f"{fact.old} → {fact.new}"
+            kind = "RENAME"
+        elif fact.kind == "polarity":
+            title = f"{fact.name}: {fact.old} → {fact.new}"
+            kind = "FLIP"
+        elif fact.kind == "removal":
+            title = f"{fact.old} (removed)"
+            kind = "GONE"
+        elif fact.kind == "string":
+            title = f'"{fact.old}" → "{fact.new}"'
+            kind = "STR"
+        else:
+            title = f"{fact.name}: {fact.old} → {fact.new}"
+            kind = "FACT"
+        print()
+        print(
+            paint(kind, "33;1", color),
+            paint(title, "1", color),
+            paint(f"  {fact.origin.path}:{fact.origin.line}", "2", color),
+        )
+        for hit in group:
+            loc = f"{hit.path}:{hit.line}"
+            score = f"{hit.score:>3}"
+            claim = f"{hit.claim:<7}"
+            print(
+                f"  {paint(score, '36', color)} {paint(claim, '35', color)} {paint(loc, '32', color):<42} {hit.excerpt}"
+            )
+            if explain:
+                print(paint(f"         why: {', '.join(hit.why)}", "2", color))
+
+
+def print_tsv(findings: Sequence[Finding]) -> None:
+    print("score\tclaim\tpath\tline\tname\told\tnew\tkind\texcerpt")
+    for f in findings:
+        excerpt = f.excerpt.replace("\t", " ").replace("\n", " ")
+        print(
+            f"{f.score}\t{f.claim}\t{f.path}\t{f.line}\t{f.fact.name}\t{f.fact.old}\t{f.fact.new}\t{f.fact.kind}\t{excerpt}"
+        )
+
+
+def print_json(
+    findings: Sequence[Finding],
+    facts: Sequence[Fact],
+    *,
+    frm: str,
+    to: str,
+    root: Path,
+) -> None:
+    def origin(o: Origin) -> dict[str, object]:
+        return {"path": o.path, "line": o.line, "excerpt": o.excerpt}
+
+    def fact_d(fa: Fact) -> dict[str, object]:
+        return {
+            "kind": fa.kind,
+            "name": fa.name,
+            "old": fa.old,
+            "new": fa.new,
+            "origin": origin(fa.origin),
+        }
+
+    payload = {
+        "from": frm,
+        "to": to,
+        "root": str(root),
+        "version": VERSION,
+        "facts": [fact_d(fa) for fa in facts],
+        "findings": [
+            {
+                "fact": fact_d(f.fact),
+                "path": f.path,
+                "line": f.line,
+                "claim": f.claim,
+                "excerpt": f.excerpt,
+                "score": f.score,
+                "why": list(f.why),
+            }
+            for f in findings
+        ],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def parse_kinds(s: str) -> set[str]:
+    allowed = {"value", "rename", "polarity", "string", "removal"}
+    parts = {p.strip() for p in s.split(",") if p.strip()}
+    if not parts:
+        die("empty --kinds")
+    unknown = parts - allowed
+    if unknown:
+        die(f"unknown kinds {sorted(unknown)}; allowed: {sorted(allowed)}")
+    return parts
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=NAME,
+        description="Print leftover claims a diff just made false (typed afterimages).",
+    )
+    p.add_argument("from_rev", nargs="?", help="git revision (old side). Default: HEAD")
+    p.add_argument("to_rev", nargs="?", help="git revision (new side). Default: worktree")
+    p.add_argument("-C", "--root", default=".", help="repository root (default: cwd)")
+    p.add_argument(
+        "--diff",
+        metavar="FILE",
+        help="read unified diff from FILE ('-' = stdin) instead of git",
+    )
+    p.add_argument("--staged", action="store_true", help="compare index to HEAD")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--tsv", action="store_true", help="TSV output")
+    p.add_argument("--facts-only", action="store_true", help="print extracted facts and stop")
+    p.add_argument("--explain", action="store_true", help="show score reasons")
+    p.add_argument("--min-score", type=int, default=55, help="minimum finding score (default 55)")
+    p.add_argument(
+        "--kinds",
+        default="value,rename,polarity,string",
+        help="comma-separated fact kinds (value,rename,polarity,string,removal)",
+    )
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("self_test", nargs="?", help=argparse.SUPPRESS)
+    return p
+
+
+def cmd_self_test() -> int:
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name} {detail}")
+            failures += 1
+
+    diff = """diff --git a/src/retry.py b/src/retry.py
+index 111..222 100644
+--- a/src/retry.py
++++ b/src/retry.py
+@@ -1,5 +1,5 @@
+-# Default retry budget is 3 attempts.
+-MAX_RETRIES = 3
++# Default retry budget is 8 attempts.
++MAX_ATTEMPTS = 8
+ def retry():
+     pass
+"""
+    files = parse_unified_diff(diff)
+    check("parse file path", files and files[0].path == "src/retry.py")
+    facts = extract_facts(files, {"value", "rename", "polarity", "string"})
+    names = {(f.kind, f.name, f.old, f.new) for f in facts}
+    check(
+        "bound value 3→8",
+        any(k[0] == "value" and k[2] == "3" and k[3] == "8" for k in names),
+        str(names),
+    )
+    check(
+        "rename MAX_RETRIES",
+        any(k[0] == "rename" and k[2] == "MAX_RETRIES" and k[3] == "MAX_ATTEMPTS" for k in names),
+        str(names),
+    )
+
+    polar = """diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,2 +1,2 @@
+-pub const ENABLE_CACHE: bool = true;
++pub const ENABLE_CACHE: bool = false;
+"""
+    pf = extract_facts(parse_unified_diff(polar), {"value", "polarity"})
+    check(
+        "polarity true→false",
+        any(f.kind == "polarity" and f.old.lower() == "true" for f in pf),
+        str(pf),
+    )
+
+    ver = """diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,3 @@
+ [package]
+ name = "kizu"
+-version = "0.3.0"
++version = "0.7.0"
+"""
+    vf = extract_facts(parse_unified_diff(ver), {"value"})
+    check(
+        "version pair",
+        any(f.name == "version" and f.old == "0.3.0" and f.new == "0.7.0" for f in vf),
+        str(vf),
+    )
+
+    some = """diff --git a/init.rs b/init.rs
+--- a/init.rs
++++ b/init.rs
+@@ -1 +1 @@
+-timeout: Some(10),
++timeout: Some(30),
+"""
+    sf = extract_facts(parse_unified_diff(some), {"value"})
+    check(
+        "Some(10) rust option",
+        any(f.name == "timeout" and f.old == "10" and f.new == "30" for f in sf),
+        str(sf),
+    )
+
+    line = '// default max_retries is 3'
+    fact = Fact("value", "max_retries", "3", "8", Origin("src/x.rs", 1, "max_retries = 3"))
+    sc, why = score_finding(fact, "src/x.rs", line, "comment")
+    check("comment leftover scores high", sc >= 70, f"{sc} {why}")
+
+    hist = "# v0.3 — 統合"
+    factv = Fact("value", "version", "0.3.0", "0.7.0", Origin("Cargo.toml", 3, 'version = "0.3.0"'))
+    sc2, why2 = score_finding(factv, "docs/SPEC.md", hist, "docs")
+    check("historical header downranked", sc2 < 55, f"{sc2} {why2}")
+
+    check("needle word bound", needle_in_line("3", "retries 3 times", ident=False))
+    check("needle not substring of version", not needle_in_line("3", "v0.3.2", ident=False))
+
+    prose = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,3 @@
+-Exit `2` on failure. A Patch contains eleven clauses.
++exit `2` on failure. Patches contain twelve clauses.
+"""
+    prose_facts = extract_facts(parse_unified_diff(prose), {"value", "rename", "polarity", "string"})
+    check(
+        "ignore prose remames",
+        not any(f.kind == "rename" and f.old.lower() in {"exit", "patch", "patches"} for f in prose_facts),
+        str(prose_facts),
+    )
+
+    kebab = """diff --git a/x.ts b/x.ts
+--- a/x.ts
++++ b/x.ts
+@@ -1 +1 @@
+-code = "comparison-arithmetic-failed"
++code = "breakpoint-source-failed"
+"""
+    kf = extract_facts(parse_unified_diff(kebab), {"rename", "value", "string"})
+    check(
+        "keep kebab error-code rename",
+        any("comparison-arithmetic-failed" in f.old for f in kf),
+        str(kf),
+    )
+
+    hom = Fact(
+        "rename",
+        "threshold",
+        "threshold",
+        "absentThreshold",
+        Origin("PresenceArbiter.swift", 11, "threshold: Double = 0.4"),
+    )
+    check(
+        "homonym different binding",
+        is_homonym_binding(hom, "private let threshold: Double = 0.7"),
+    )
+    check(
+        "not homonym same leftover value",
+        not is_homonym_binding(
+            Fact("value", "threshold", "0.4", "0.45", Origin("a.swift", 1, "x")),
+            "threshold: Double = 0.4",
+        ),
+    )
+
+    jsver = """diff --git a/plugin.json b/plugin.json
+--- a/plugin.json
++++ b/plugin.json
+@@ -1,4 +1,4 @@
+ {
+-  "version": "0.3.0",
++  "version": "0.7.0",
+   "timeout": 10
+ }
+"""
+    jsf = extract_facts(parse_unified_diff(jsver), {"value", "rename", "polarity", "string"})
+    check(
+        "json quoted version is a named fact",
+        any(f.kind == "value" and f.name == "version" and f.old == "0.3.0" and f.new == "0.7.0" for f in jsf),
+        str(jsf),
+    )
+    check(
+        "json version is not truncated to 0.3",
+        not any(f.old == "0.3" or f.new == "0.3" for f in jsf),
+        str(jsf),
+    )
+    prose_ver = Fact(
+        "value", "version", "0.3.0", "0.7.0", Origin("plugin.json", 2, '"version": "0.3.0"')
+    )
+    check(
+        "prose version 0.3.0 is not a homonym",
+        not is_homonym_binding(prose_ver, "plugin version 0.3.0, hook timeout 10 seconds."),
+    )
+    sc_prose, why_prose = score_finding(
+        prose_ver,
+        "README.md",
+        "plugin version 0.3.0, hook timeout 10 seconds.",
+        "docs",
+    )
+    check(
+        "prose leftover of 0.3.0 scores as a claim",
+        sc_prose >= 70 and "old-value" in why_prose,
+        f"{sc_prose} {why_prose}",
+    )
+
+    check(
+        "integer 10 is not October in ISO date",
+        not needle_in_line("10", "shipped 2024-10-01", ident=False, vtype="integer"),
+    )
+    check(
+        "integer 10 still matches timeout prose",
+        needle_in_line("10", "timeout default is 10", ident=False, vtype="integer"),
+    )
+    # retries=3 is a real leftover; 2024-03-01 must not be why we match.
+    check(
+        "3 matches retries=3 even beside a date",
+        needle_in_line("3", "retries=3 landed 2024-03-01.", ident=False, vtype="integer"),
+    )
+    check(
+        "3 does not match a date-only line",
+        not needle_in_line("3", "landed 2024-03-01.", ident=False, vtype="integer"),
+    )
+
+    debug_diff = """diff --git a/src/flags.py b/src/flags.py
+--- a/src/flags.py
++++ b/src/flags.py
+@@ -1 +1 @@
+-DEBUG = True
++DEBUG = False
+"""
+    df = extract_facts(parse_unified_diff(debug_diff), {"value", "polarity"})
+    check(
+        "DEBUG is a name",
+        any(f.name == "DEBUG" and f.old.lower() == "true" for f in df),
+        str(df),
+    )
+
+    cafe_diff = """diff --git a/src/x.py b/src/x.py
+--- a/src/x.py
++++ b/src/x.py
+@@ -1 +1 @@
+-café_timeout = 10
++café_timeout = 30
+"""
+    cf = extract_facts(parse_unified_diff(cafe_diff), {"value", "rename", "polarity", "string"})
+    check(
+        "do not mint _timeout from café_timeout",
+        not any(f.name == "_timeout" or f.old == "_timeout" for f in cf),
+        str(cf),
+    )
+
+    check(
+        "timeout stem is not settimeout",
+        not stem_in_text("timeout", "assert socket.settimeout(10) or True"),
+    )
+    check(
+        "present is not presentation",
+        not needle_in_line("present", "presentation layer stays", ident=False, vtype="polarity"),
+    )
+
+    jsto = """diff --git a/plugin.json b/plugin.json
+--- a/plugin.json
++++ b/plugin.json
+@@ -1,3 +1,3 @@
+ {
+-  "timeout": 10
++  "timeout": 30
+ }
+"""
+    jtf = extract_facts(parse_unified_diff(jsto), {"value"})
+    check(
+        "json quoted timeout int is a fact",
+        any(f.name == "timeout" and f.old == "10" and f.new == "30" for f in jtf),
+        str(jtf),
+    )
+
+    polar_f = Fact(
+        "polarity", "ENABLE_CACHE", "True", "False", Origin("src/flags.py", 1, "ENABLE_CACHE = True")
+    )
+    sc_ghost, why_ghost = score_finding(
+        polar_f,
+        "README.md",
+        "DEBUG is True",
+        "docs",
+        nearby="the cache is enabled\n",
+    )
+    check(
+        "polarity leftover needs same-line name",
+        sc_ghost < 55,
+        f"{sc_ghost} {why_ghost}",
+    )
+    sc_real, why_real = score_finding(
+        polar_f,
+        "README.md",
+        "assert ENABLE_CACHE is True",
+        "docs",
+    )
+    check(
+        "ENABLE_CACHE is True still scores",
+        sc_real >= 70 and "same-line-name" in why_real,
+        f"{sc_real} {why_real}",
+    )
+
+    return 1 if failures else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"self-test", "--self-test"}:
+        return cmd_self_test()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print(f"{NAME} {VERSION}")
+        return 0
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        die(f"root not found: {root}")
+
+    kinds = parse_kinds(args.kinds)
+    diff_text, frm, to = obtain_diff(root, args)
+    files = parse_unified_diff(diff_text)
+    facts = extract_facts(files, kinds)
+
+    if args.facts_only:
+        if args.json:
+            print_json([], facts, frm=frm, to=to, root=root)
+        else:
+            print(f"{NAME}: {len(facts)} fact(s)  {frm} → {to}")
+            for fa in facts:
+                print(
+                    f"  {fa.kind:<8} {fa.name}: {fa.old!r} → {fa.new!r}  ({fa.origin.path}:{fa.origin.line})"
+                )
+        return 0
+
+    search_rev: str | None
+    if to in {"worktree", "index", "diff"}:
+        search_rev = None
+    else:
+        search_rev = to
+
+    findings = scan(
+        root,
+        search_rev,
+        facts,
+        min_score=args.min_score,
+        changed_new_lines=changed_new_lines(files),
+    )
+
+    if args.json:
+        print_json(findings, facts, frm=frm, to=to, root=root)
+    elif args.tsv:
+        print_tsv(findings)
+    else:
+        print_human(
+            findings,
+            facts,
+            frm=frm,
+            to=to,
+            root=root,
+            explain=args.explain,
+            color=color_enabled(args, sys.stdout),
+        )
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

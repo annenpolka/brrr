@@ -1,0 +1,1674 @@
+#!/usr/bin/env python3
+"""wraith — names whose definitions died but whose mentions remain.
+
+The type-checker for the untyped fringe: docs, configs, scripts, comments,
+and string literals. Compilers catch unbound identifiers in code. Wraith
+catches the leftovers they never see.
+
+Exit codes:
+  0  no holdouts
+  1  usage / git / I/O error
+  2  holdouts found
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+# pub, pub(crate), pub(super), pub(in path::to) — the v1 miss on kizu.
+VIS = (
+    r"(?:pub(?:\([^)]*\))?|public|private|protected|internal|open|final|"
+    r"static|async|override|mutating|export|default|abstract|sealed|"
+    r"data|frozen|unsafe|const|extern|crate)\s+"
+)
+
+MAX_FILE_BYTES = 1_000_000
+DEFAULT_MAX_COMMITS = 400
+
+SKIP_SUFFIXES = {
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".bmp",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".mp4",
+    ".mov",
+    ".mp3",
+    ".wasm",
+    ".bin",
+    ".exe",
+    ".dylib",
+    ".so",
+    ".a",
+    ".o",
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".jar",
+}
+
+SKIP_DIR_PARTS = {
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".build",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".idea",
+    ".next",
+    "coverage",
+    "Pods",
+}
+
+SKIP_BASENAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "poetry.lock",
+    "composer.lock",
+    "go.sum",
+    "Gemfile.lock",
+    "uv.lock",
+}
+
+GENERIC_PATH_PARTS = {
+    "src",
+    "lib",
+    "libs",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "doc",
+    "docs",
+    "script",
+    "scripts",
+    "bin",
+    "pkg",
+    "cmd",
+    "internal",
+    "app",
+    "apps",
+    "source",
+    "sources",
+    "include",
+    "assets",
+    "static",
+    "public",
+    "private",
+    "template",
+    "templates",
+    "example",
+    "examples",
+    "fixture",
+    "fixtures",
+    "vendor",
+    "third_party",
+    "node_modules",
+    "build",
+    "dist",
+    "out",
+    "tmp",
+    "temp",
+    "scratch",
+    "plugin",
+    "plugins",
+    "package",
+    "packages",
+    "module",
+    "modules",
+    "core",
+    "common",
+    "shared",
+    "util",
+    "utils",
+    "helpers",
+    "types",
+    "tying",
+    "css",
+    "js",
+    "ts",
+    "py",
+    "rs",
+    "go",
+    "c",
+    "h",
+    "cpp",
+    "swift",
+}
+
+GENERIC_STEMS = {
+    "index",
+    "main",
+    "app",
+    "lib",
+    "mod",
+    "init",
+    "util",
+    "utils",
+    "helper",
+    "helpers",
+    "types",
+    "type",
+    "common",
+    "shared",
+    "config",
+    "settings",
+    "option",
+    "options",
+    "error",
+    "errors",
+    "test",
+    "tests",
+    "spec",
+    "readme",
+    "license",
+    "changelog",
+    "makefile",
+    "justfile",
+    "dockerfile",
+    "package",
+    "setup",
+    "build",
+    "default",
+    "temp",
+    "tmp",
+    "data",
+    "value",
+    "item",
+    "file",
+    "path",
+    "name",
+    "info",
+    "log",
+    "base",
+    "core",
+}
+
+STOP_NAMES = GENERIC_STEMS | {
+    "self",
+    "this",
+    "super",
+    "cls",
+    "args",
+    "kwargs",
+    "params",
+    "input",
+    "output",
+    "result",
+    "none",
+    "null",
+    "true",
+    "false",
+    "bool",
+    "string",
+    "number",
+    "object",
+    "array",
+    "list",
+    "dict",
+    "map",
+    "set",
+    "vec",
+    "int",
+    "str",
+    "len",
+    "size",
+    "count",
+    "get",
+    "set",
+    "put",
+    "add",
+    "remove",
+    "delete",
+    "update",
+    "create",
+    "new",
+    "old",
+    "run",
+    "call",
+    "apply",
+    "load",
+    "save",
+    "read",
+    "write",
+    "open",
+    "close",
+    "start",
+    "stop",
+    "reset",
+    "clear",
+    "copy",
+    "move",
+    "show",
+    "list",
+    "find",
+    "search",
+    "match",
+    "parse",
+    "format",
+    "handle",
+    "process",
+    "render",
+    "view",
+    "model",
+    "controller",
+    "service",
+    "manager",
+    "debug",
+    "info",
+    "warn",
+    "print",
+    "ok",
+    "err",
+    "some",
+    "maybe",
+    "from",
+    "into",
+    "with",
+    "without",
+    "func",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "interface",
+    "protocol",
+    "module",
+    "import",
+    "export",
+    "public",
+    "private",
+    "return",
+    "yield",
+    "await",
+    "async",
+    "const",
+    "static",
+    "final",
+    "override",
+    "required",
+    "optional",
+    "string",
+    "id",
+    "uid",
+    "url",
+    "http",
+    "json",
+    "html",
+    "xml",
+    "css",
+    "sql",
+    "uuid",
+    "todo",
+    "fixme",
+    "hack",
+    "xxx",
+}
+
+SOFT_EXT = {
+    ".md",
+    ".mdx",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".org",
+    ".json",
+    ".jsonc",
+    ".json5",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".tsv",
+    ".html",
+    ".htm",
+    ".xml",
+    ".svg",
+    ".css",
+    ".scss",
+    ".less",
+    ".env",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".bat",
+    ".cmd",
+    ".tf",
+    ".hcl",
+    ".sql",
+    ".graphql",
+    ".gql",
+    ".proto",
+    ".plist",
+    ".lockb",
+}
+
+SOFT_BASENAMES = {
+    "makefile",
+    "gnumakefile",
+    "dockerfile",
+    "justfile",
+    "rakefile",
+    "procfile",
+    "vagrantfile",
+    "gemfile",
+    "podfile",
+    "brewfile",
+    "readme",
+    "license",
+    "changelog",
+    "authors",
+    "copying",
+    "cmakelists.txt",
+    "cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "taskfile.yml",
+    "snapfile",
+}
+
+CODE_EXT = {
+    ".py",
+    ".pyi",
+    ".rs",
+    ".go",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cs",
+    ".rb",
+    ".php",
+    ".lua",
+    ".r",
+    ".jl",
+    ".scala",
+    ".hs",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".ml",
+    ".mli",
+    ".nim",
+    ".zig",
+    ".dart",
+    ".vue",
+    ".svelte",
+    ".m",
+    ".mm",
+    ".pkl",
+    ".nix",
+    ".jsonnet",
+}
+
+# Definition extractors. First matching group is the name.
+DEF_LINE_PATTERNS = [
+    re.compile(rf"^\s*(?:{VIS})*(?:async\s+|unsafe\s+|const\s+)*fn\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*(?:async\s+)?function\*?\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:async\s+)?def\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*class\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*struct\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*enum\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*interface\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*trait\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*type\s+({IDENT})\s*[=<]"),
+    re.compile(rf"^\s*(?:{VIS})*protocol\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*actor\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*extension\s+({IDENT})\b"),
+    re.compile(rf"^\s*macro_rules!\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*mod\s+({IDENT})\b"),
+    re.compile(rf"^\s*(?:{VIS})*func\s+(?:\([^)]*\)\s*)?({IDENT})\b"),
+    re.compile(
+        rf"^\s*(?:{VIS})*(?:const|let|var)\s+({IDENT})\s*=\s*(?:async\s*)?(?:function\b|\(|\{{)"
+    ),
+    re.compile(rf"^\s*export\s+(?:const|let|var)\s+({IDENT})\b"),
+    re.compile(rf"^\s*pub(?:\([^)]*\))?\s+const\s+({IDENT})\b"),
+    re.compile(
+        rf"^\s*export\s+(?:default\s+)?(?:const|let|var|class|type|interface|enum|function)\s+({IDENT})\b"
+    ),
+    re.compile(rf"^\s*#define\s+({IDENT})\b"),
+]
+
+LOOSE_DEF_RE_CACHE: dict[str, re.Pattern[str]] = {}
+_CAMEL_SPLIT = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
+AS_ALIAS = re.compile(rf"\bas\s+({IDENT})\b")
+
+
+@dataclass
+class Death:
+    name: str
+    kind: str  # "def" | "path"
+    commit: str
+    subject: str
+    path: str
+    line: int | None = None
+
+
+@dataclass
+class Mention:
+    path: str
+    line: int
+    text: str
+    why: str  # "doc" | "config" | "script" | "comment" | "string" | "code"
+    surface: str = ""  # matched spelling (may be a kebab/camel variant)
+
+
+@dataclass
+class Holdout:
+    name: str
+    deaths: list[Death] = field(default_factory=list)
+    mentions: list[Mention] = field(default_factory=list)
+
+
+@dataclass
+class ScanResult:
+    repo: str
+    old: str
+    new: str
+    deaths_considered: int
+    names_dead: int
+    holdouts: list[Holdout]
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def git(repo: str, args: list[str], *, input_bytes: bytes | None = None, check: bool = True) -> bytes:
+    cmd = ["git", "-c", "core.quotepath=false", "-C", repo, *args]
+    proc = subprocess.run(cmd, input=input_bytes, capture_output=True)
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip() or f"git {' '.join(args)} failed"
+        raise GitError(err)
+    return proc.stdout
+
+
+def git_text(repo: str, args: list[str], check: bool = True) -> str:
+    return git(repo, args, check=check).decode("utf-8", "replace")
+
+
+def repo_root(path: str) -> str:
+    try:
+        return git_text(path, ["rev-parse", "--show-toplevel"]).strip()
+    except GitError as e:
+        raise GitError(f"not a git repository: {path}") from e
+
+
+def color_enabled(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+class C:
+    def __init__(self, on: bool) -> None:
+        self.on = on
+
+    def wrap(self, code: str, s: str) -> str:
+        if not self.on:
+            return s
+        return f"\033[{code}m{s}\033[0m"
+
+    def bold(self, s: str) -> str:
+        return self.wrap("1", s)
+
+    def dim(self, s: str) -> str:
+        return self.wrap("2", s)
+
+    def red(self, s: str) -> str:
+        return self.wrap("31", s)
+
+    def yellow(self, s: str) -> str:
+        return self.wrap("33", s)
+
+    def cyan(self, s: str) -> str:
+        return self.wrap("36", s)
+
+    def green(self, s: str) -> str:
+        return self.wrap("32", s)
+
+
+def path_ignored(path: str, globs: list[str]) -> bool:
+    if not globs:
+        return False
+    posix = path.replace("\\", "/")
+    base = posix.split("/")[-1]
+    for g in globs:
+        g = g.replace("\\", "/")
+        if fnmatch.fnmatch(posix, g) or fnmatch.fnmatch(base, g):
+            return True
+        if g.endswith("/**") and (posix == g[:-3] or posix.startswith(g[:-2])):
+            return True
+    return False
+
+
+def skip_path(path: str) -> bool:
+    posix = path.replace("\\", "/")
+    parts = posix.split("/")
+    if any(p in SKIP_DIR_PARTS for p in parts):
+        return True
+    base = parts[-1]
+    if base in SKIP_BASENAMES:
+        return True
+    lower = base.lower()
+    _, ext = os.path.splitext(lower)
+    if ext in SKIP_SUFFIXES:
+        return True
+    return False
+
+
+def is_binary(data: bytes) -> bool:
+    if b"\0" in data[:8192]:
+        return True
+    return False
+
+
+def decode(data: bytes) -> str | None:
+    if is_binary(data):
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def is_distinctive(name: str) -> bool:
+    if not name:
+        return False
+    folded = name.strip()
+    if not folded:
+        return False
+    key = folded.lower()
+    if key in STOP_NAMES or key in GENERIC_PATH_PARTS:
+        return False
+    if len(folded) < 4:
+        return False
+    if any(c in folded for c in "-_."):
+        return len(re.sub(r"[-_.]+", "", folded)) >= 4
+    letters = [c for c in folded if c.isalpha()]
+    if letters and any(c.islower() for c in letters) and any(c.isupper() for c in letters):
+        return True
+    if folded[0].isupper() and len(folded) >= 5:
+        return True
+    # Plain lowercase English (`presence`, `counters`) is not an identifier death.
+    return False
+
+
+def path_identities(path: str) -> list[str]:
+    posix = path.replace("\\", "/")
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if name and name not in seen and is_distinctive(name):
+            seen.add(name)
+            out.append(name)
+
+    add(posix)
+    parts = [p for p in posix.split("/") if p and p != "."]
+    if not parts:
+        return out
+    base = parts[-1]
+    add(base)
+    stem, ext = os.path.splitext(base)
+    if ext.lower() not in {".md", ".txt"}:
+        add(stem)
+    for part in parts[:-1]:
+        if part.lower() not in GENERIC_PATH_PARTS:
+            add(part)
+    return out
+
+
+def should_extract_defs(path: str) -> bool:
+    """Do not mine English prose in docs/config for fake definitions."""
+    kind = file_kind(path)
+    if kind == "doc":
+        return False
+    if kind == "config":
+        return os.path.splitext(path)[1].lower() in CODE_EXT
+    return True
+
+
+def extract_defs(text: str, path: str) -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    if not should_extract_defs(path):
+        return found
+
+    def add(name: str, i: int) -> None:
+        if not is_distinctive(name):
+            return
+        key = (name, i)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((name, i))
+
+    codey = os.path.splitext(path)[1].lower() in CODE_EXT
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        stripped = line.lstrip()
+        if stripped.startswith(("#", "//", "/*", "*", "--")) and not stripped.startswith("#define"):
+            continue
+        name = None
+        for pat in DEF_LINE_PATTERNS:
+            m = pat.search(line)
+            if m:
+                name = m.group(1)
+                break
+        if name:
+            add(name, i)
+        # `use foo as fake_app` / `import x as fake_app` — live binding.
+        # Skip PascalCase (`as String` casts) and skip prose ("as deterministic").
+        if codey:
+            for am in AS_ALIAS.finditer(line):
+                alias = am.group(1)
+                if alias[:1].islower():
+                    add(alias, i)
+    return found
+
+
+def split_ident_words(name: str) -> list[str]:
+    if any(c in name for c in "/\\()[]{} \t"):
+        return []
+    words: list[str] = []
+    for chunk in re.split(r"[-_.]+", name):
+        if not chunk:
+            continue
+        parts = _CAMEL_SPLIT.findall(chunk)
+        words.extend(parts if parts else [chunk])
+    return words
+
+
+def ident_variants(name: str) -> list[str]:
+    """snake / kebab / camel / Pascal spellings of a dead identifier."""
+    out: list[str] = [name]
+    words = split_ident_words(name)
+    if len(words) < 2:
+        return out
+    lower = [w.lower() for w in words]
+    snake = "_".join(lower)
+    kebab = "-".join(lower)
+    camel = lower[0] + "".join(w[:1].upper() + w[1:] for w in lower[1:])
+    pascal = "".join(w[:1].upper() + w[1:] for w in lower)
+    for form in (snake, kebab, camel, pascal):
+        if form and form not in out:
+            out.append(form)
+    return out
+
+
+def loose_def_re(name: str) -> re.Pattern[str]:
+    cached = LOOSE_DEF_RE_CACHE.get(name)
+    if cached is not None:
+        return cached
+    esc = re.escape(name)
+    pat = re.compile(
+        rf"^\s*(?:{VIS})*(?:async\s+|unsafe\s+|const\s+)*"
+        rf"(?:fn|def|func|class|struct|enum|trait|type|interface|protocol|actor|extension|mod)\s+{esc}\b"
+    )
+    LOOSE_DEF_RE_CACHE[name] = pat
+    return pat
+
+
+def cat_file_batch(repo: str, hashes: list[str]) -> dict[str, bytes]:
+    unique = []
+    seen: set[str] = set()
+    for h in hashes:
+        if not h or h in seen or set(h) == {"0"}:
+            continue
+        seen.add(h)
+        unique.append(h)
+    if not unique:
+        return {}
+    payload = "".join(h + "\n" for h in unique).encode()
+    raw = git(repo, ["cat-file", "--batch"], input_bytes=payload)
+    out: dict[str, bytes] = {}
+    i = 0
+    n = len(raw)
+    while i < n:
+        nl = raw.find(b"\n", i)
+        if nl < 0:
+            break
+        header = raw[i:nl].decode("utf-8", "replace")
+        i = nl + 1
+        parts = header.split()
+        if len(parts) >= 3 and parts[1] not in {"missing", "ambiguous"}:
+            size = int(parts[2])
+            content = raw[i : i + size]
+            out[parts[0]] = content
+            i += size
+            if i < n and raw[i : i + 1] == b"\n":
+                i += 1
+        elif len(parts) >= 2:
+            # "<hash> missing"
+            continue
+        else:
+            break
+    return out
+
+
+def ls_tree(repo: str, rev: str) -> list[tuple[str, str]]:
+    """Return (path, blob-hash) for a revision."""
+    raw = git(repo, ["ls-tree", "-r", "-z", rev])
+    files: list[tuple[str, str]] = []
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        bits = meta.decode().split()
+        if len(bits) < 3:
+            continue
+        if bits[1] != "blob":
+            continue
+        path = path_b.decode("utf-8", "replace")
+        if skip_path(path):
+            continue
+        files.append((path, bits[2]))
+    return files
+
+
+def ls_worktree(repo: str) -> list[str]:
+    raw = git_text(repo, ["ls-files", "-z", "-co", "--exclude-standard"])
+    paths = []
+    for path in raw.split("\0"):
+        if not path or skip_path(path):
+            continue
+        paths.append(path)
+    return paths
+
+
+def read_worktree_file(repo: str, path: str) -> bytes | None:
+    full = Path(repo) / path
+    try:
+        if not full.is_file():
+            return None
+        if full.stat().st_size > MAX_FILE_BYTES:
+            return None
+        return full.read_bytes()
+    except OSError:
+        return None
+
+
+def scan_tree(repo: str, rev: str | None) -> tuple[dict[str, list[tuple[str, int]]], dict[str, str], set[str]]:
+    """defs: name -> [(path, line)], texts: path -> text, stems: path-stems present."""
+    defs: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    texts: dict[str, str] = {}
+    stems: set[str] = set()
+
+    if rev is None:
+        paths = ls_worktree(repo)
+        for path in paths:
+            for ident in path_identities(path):
+                stems.add(ident)
+            data = read_worktree_file(repo, path)
+            if data is None:
+                continue
+            text = decode(data)
+            if text is None:
+                continue
+            texts[path] = text
+            for name, line in extract_defs(text, path):
+                defs[name].append((path, line))
+        return defs, texts, stems
+
+    files = ls_tree(repo, rev)
+    blobs = cat_file_batch(repo, [h for _, h in files])
+    for path, h in files:
+        for ident in path_identities(path):
+            stems.add(ident)
+        data = blobs.get(h)
+        if data is None:
+            continue
+        text = decode(data)
+        if text is None:
+            continue
+        texts[path] = text
+        for name, line in extract_defs(text, path):
+            defs[name].append((path, line))
+    return defs, texts, stems
+
+
+def parse_raw_status(status: str) -> str:
+    return status[:1]
+
+
+def collect_history_deaths(
+    repo: str,
+    *,
+    max_commits: int,
+    since: str | None,
+    range_spec: str | None,
+) -> list[Death]:
+    args = ["log", "--first-parent", "-M", "--raw", "--no-abbrev", "--pretty=format:COMMIT %H %s"]
+    if range_spec:
+        args.append(range_spec)
+    else:
+        args.extend(["-n", str(max_commits)])
+        if since:
+            args.append(f"--since={since}")
+    raw = git_text(repo, args)
+    deaths: list[Death] = []
+    commit = ""
+    subject = ""
+    wanted_blobs: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    # hash -> list of (commit, subject, path) for deleted/modified-old blobs
+
+    rename_deaths: list[Death] = []
+
+    for line in raw.splitlines():
+        if line.startswith("COMMIT "):
+            rest = line[len("COMMIT ") :]
+            parts = rest.split(" ", 1)
+            commit = parts[0]
+            subject = parts[1] if len(parts) > 1 else ""
+            continue
+        if not line.startswith(":") or not commit:
+            continue
+        try:
+            meta, paths = line[1:].split("\t", 1)
+        except ValueError:
+            continue
+        bits = meta.split()
+        if len(bits) < 5:
+            continue
+        oldhash, newhash, status = bits[2], bits[3], bits[4]
+        kind = parse_raw_status(status)
+        path_bits = paths.split("\t")
+        oldpath = path_bits[0]
+        newpath = path_bits[1] if len(path_bits) > 1 else ""
+        if kind in {"D", "R", "C"}:
+            for ident in path_identities(oldpath):
+                rename_deaths.append(
+                    Death(
+                        name=ident,
+                        kind="path",
+                        commit=commit,
+                        subject=subject,
+                        path=oldpath,
+                    )
+                )
+        if kind == "D" and set(oldhash) != {"0"}:
+            wanted_blobs[oldhash].append((commit, subject, oldpath))
+        elif kind == "M" and set(oldhash) != {"0"}:
+            wanted_blobs[oldhash].append((commit, subject, oldpath))
+            # new blob needed to subtract surviving local defs
+            if set(newhash) != {"0"}:
+                wanted_blobs[newhash].append((commit, subject, oldpath if not newpath else newpath))
+
+    blobs = cat_file_batch(repo, list(wanted_blobs.keys()))
+    # Re-walk is messy; instead compute per-commit file def diffs using stored lists.
+    # Simpler second pass: group M-pairs from log again.
+
+    deaths.extend(rename_deaths)
+
+    # Second pass for def diffs
+    commit = ""
+    subject = ""
+    for line in raw.splitlines():
+        if line.startswith("COMMIT "):
+            rest = line[len("COMMIT ") :]
+            parts = rest.split(" ", 1)
+            commit = parts[0]
+            subject = parts[1] if len(parts) > 1 else ""
+            continue
+        if not line.startswith(":") or not commit:
+            continue
+        try:
+            meta, paths = line[1:].split("\t", 1)
+        except ValueError:
+            continue
+        bits = meta.split()
+        if len(bits) < 5:
+            continue
+        oldhash, newhash, status = bits[2], bits[3], bits[4]
+        kind = parse_raw_status(status)
+        path_bits = paths.split("\t")
+        oldpath = path_bits[0]
+        newpath = path_bits[1] if len(path_bits) > 1 else oldpath
+        old_text = decode(blobs.get(oldhash, b"")) if oldhash in blobs else None
+        new_text = decode(blobs.get(newhash, b"")) if newhash in blobs else None
+        old_defs = extract_defs(old_text, oldpath) if old_text else []
+        new_defs = extract_defs(new_text, newpath) if new_text else []
+        new_names = {n for n, _ in new_defs}
+        if kind == "D":
+            vanished = old_defs
+            use_path = oldpath
+        elif kind == "M":
+            vanished = [(n, ln) for n, ln in old_defs if n not in new_names]
+            use_path = newpath
+        else:
+            continue
+        for name, ln in vanished:
+            deaths.append(
+                Death(
+                    name=name,
+                    kind="def",
+                    commit=commit,
+                    subject=subject,
+                    path=use_path,
+                    line=ln,
+                )
+            )
+    return deaths
+
+
+def two_tree_deaths(
+    repo: str,
+    old_rev: str,
+    old_defs: dict[str, list[tuple[str, int]]],
+    old_stems: set[str],
+    new_defs: dict[str, list[tuple[str, int]]],
+    new_stems: set[str],
+    new_paths: set[str],
+    old_paths: set[str],
+) -> list[Death]:
+    deaths: list[Death] = []
+    for name, sites in old_defs.items():
+        if name in new_defs:
+            continue
+        path, line = sites[0]
+        deaths.append(
+            Death(
+                name=name,
+                kind="def",
+                commit=old_rev,
+                subject=f"defined in {old_rev}",
+                path=path,
+                line=line,
+            )
+        )
+    for path in sorted(old_paths - new_paths):
+        for ident in path_identities(path):
+            if ident in new_defs or ident in new_stems:
+                continue
+            deaths.append(
+                Death(
+                    name=ident,
+                    kind="path",
+                    commit=old_rev,
+                    subject=f"path existed in {old_rev}",
+                    path=path,
+                )
+            )
+    return deaths
+
+
+def is_soft_file(path: str) -> bool:
+    posix = path.replace("\\", "/")
+    base = posix.split("/")[-1]
+    lower = base.lower()
+    if lower in SOFT_BASENAMES:
+        return True
+    stem, ext = os.path.splitext(lower)
+    if ext in SOFT_EXT:
+        return True
+    if ext == "" and stem in SOFT_BASENAMES:
+        return True
+    if lower.startswith("dockerfile"):
+        return True
+    if lower.startswith("readme"):
+        return True
+    if lower.startswith("changelog"):
+        return True
+    return False
+
+
+def file_kind(path: str) -> str:
+    posix = path.replace("\\", "/")
+    base = posix.split("/")[-1].lower()
+    ext = os.path.splitext(base)[1]
+    if ext in {".md", ".mdx", ".rst", ".txt", ".adoc", ".org"} or base.startswith("readme"):
+        return "doc"
+    if ext in {".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd"} or base in {
+        "makefile",
+        "gnumakefile",
+        "justfile",
+        "rakefile",
+        "procfile",
+    }:
+        return "script"
+    if is_soft_file(path):
+        return "config"
+    return "code"
+
+
+_COMMENT_PREFIX = re.compile(r"^\s*(#|//|--|/\*|\*|<!--)")
+
+
+def occurrence_kind(path: str, line: str, name: str, col: int) -> str | None:
+    """Return why this occurrence counts, or None to ignore (code identifier)."""
+    kind = file_kind(path)
+    if kind != "code":
+        return kind
+    stripped = line.lstrip()
+    if _COMMENT_PREFIX.match(line):
+        return "comment"
+    before = line[:col]
+    # line comments after code
+    for mark in ("//", "#", "--"):
+        pos = before.find(mark)
+        if pos >= 0:
+            # crude: treat as comment if the mark is not inside an even-quote prefix
+            if not _inside_quotes(line, pos):
+                return "comment"
+    # string literal containing this occurrence
+    if _inside_quotes(line, col):
+        return "string"
+    return None  # live code; compilers/linters own this
+
+
+def _inside_quotes(line: str, col: int) -> bool:
+    in_single = False
+    in_double = False
+    in_back = False
+    i = 0
+    while i < col and i < len(line):
+        ch = line[i]
+        if ch == "\\" and (in_single or in_double or in_back):
+            i += 2
+            continue
+        if ch == "'" and not in_double and not in_back:
+            in_single = not in_single
+        elif ch == '"' and not in_single and not in_back:
+            in_double = not in_double
+        elif ch == "`" and not in_single and not in_double:
+            in_back = not in_back
+        i += 1
+    return in_single or in_double or in_back
+
+
+def mention_pattern(name: str) -> re.Pattern[str]:
+    esc = re.escape(name)
+    if re.match(r"^\w", name) and re.search(r"\w$", name):
+        return re.compile(r"(?<![\w-])" + esc + r"(?![\w-])")
+    return re.compile(esc)
+
+
+def find_mentions(
+    texts: dict[str, str],
+    name: str,
+    *,
+    include_code: bool,
+    variants: bool,
+) -> list[Mention]:
+    forms = ident_variants(name) if variants else [name]
+    mentions: list[Mention] = []
+    seen: set[tuple[str, int, str]] = set()
+    for form in forms:
+        pat = mention_pattern(form)
+        for path, text in texts.items():
+            for i, line in enumerate(text.splitlines(), 1):
+                for m in pat.finditer(line):
+                    key = (path, i, form)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    why = occurrence_kind(path, line, name, m.start())
+                    if why is None:
+                        if include_code:
+                            why = "code"
+                        else:
+                            continue
+                    mentions.append(
+                        Mention(
+                            path=path,
+                            line=i,
+                            text=line.strip()[:240],
+                            why=why,
+                            surface=form,
+                        )
+                    )
+    return mentions
+
+
+def still_bound(
+    name: str,
+    new_defs: dict[str, list[tuple[str, int]]],
+    new_stems: set[str],
+    new_texts: dict[str, str] | None = None,
+) -> bool:
+    if name in new_defs or name in new_stems:
+        return True
+    if not new_texts:
+        return False
+    pat = loose_def_re(name)
+    for path, text in new_texts.items():
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in CODE_EXT:
+            continue
+        for raw in text.splitlines():
+            if not pat.match(raw):
+                continue
+            stripped = raw.lstrip()
+            if stripped.startswith(("#", "//", "/*", "*")) and not stripped.startswith("#define"):
+                continue
+            return True
+    return False
+
+
+def weaker_path_identity(short: str, long: str) -> bool:
+    """True if `short` is just a stem/basename/suffix of the longer path identity."""
+    if short == long or not short or not long:
+        return False
+    if long.endswith(short):
+        return True
+    long_noext, ext = os.path.splitext(long)
+    if ext and long_noext.endswith(short):
+        return True
+    base = long.replace("\\", "/").split("/")[-1]
+    stem, _ = os.path.splitext(base)
+    return short in {base, stem}
+
+
+def is_completed_rename(name: str, mentions: list[Mention]) -> bool:
+    """Variant-only hits in live code strings mean the identifier migrated, not lingered.
+
+    Docs/scripts that still use a kebab/camel echo of a deleted snake name are
+    holdouts. A new string enum `'predicate-rejected'` replacing `predicateRejected`
+    is not.
+    """
+    exact = [m for m in mentions if (m.surface or name) == name]
+    if exact:
+        return False
+    if not mentions:
+        return True
+    # Variant leftovers in docs/scripts are holdouts. Variant-only hits in
+    # implementation or config are a finished rename of the identifier.
+    return not any(
+        m.why in {"doc", "script"} or file_kind(m.path) in {"doc", "script"} for m in mentions
+    )
+
+
+def collapse_holdouts(holdouts: list[Holdout]) -> list[Holdout]:
+    """Drop path-identity aliases that only repeat a longer name's mentions."""
+    lines = {h.name: {(m.path, m.line) for m in h.mentions} for h in holdouts}
+    drop: set[str] = set()
+    for a in holdouts:
+        for b in holdouts:
+            if a.name == b.name or a.name in drop:
+                continue
+            if not weaker_path_identity(a.name, b.name):
+                continue
+            if lines[a.name] and lines[a.name] <= lines[b.name]:
+                drop.add(a.name)
+                break
+    return [h for h in holdouts if h.name not in drop]
+
+
+def collapse_deaths(deaths: list[Death]) -> dict[str, list[Death]]:
+    by_name: dict[str, list[Death]] = defaultdict(list)
+    seen: set[tuple[str, str, str, str]] = set()
+    for d in deaths:
+        key = (d.name, d.kind, d.commit, d.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        by_name[d.name].append(d)
+    return by_name
+
+
+def scan(
+    repo: str,
+    *,
+    old: str | None,
+    new: str | None,
+    max_commits: int,
+    since: str | None,
+    range_spec: str | None,
+    include_code: bool,
+    names_filter: set[str] | None,
+    variants: bool = True,
+    ignore: list[str] | None = None,
+) -> ScanResult:
+    new_defs, new_texts, new_stems = scan_tree(repo, new)
+    deaths: list[Death]
+    old_label: str
+    if old is not None:
+        old_defs, _old_texts, old_stems = scan_tree(repo, old)
+        old_path_set = {p for p, _ in ls_tree(repo, old)}
+        if new is None:
+            new_path_set = set(ls_worktree(repo))
+        else:
+            new_path_set = {p for p, _ in ls_tree(repo, new)}
+        deaths = two_tree_deaths(
+            repo,
+            old,
+            old_defs,
+            old_stems,
+            new_defs,
+            new_stems,
+            new_path_set,
+            old_path_set,
+        )
+        old_label = old
+    else:
+        deaths = collect_history_deaths(
+            repo, max_commits=max_commits, since=since, range_spec=range_spec
+        )
+        if range_spec:
+            old_label = range_spec
+        elif since:
+            old_label = f"history since {since}"
+        else:
+            old_label = f"history (last {max_commits} commits)"
+
+    by_name = collapse_deaths(deaths)
+    holdouts: list[Holdout] = []
+    dead_unbound = 0
+    for name, dlist in by_name.items():
+        if names_filter is not None and name not in names_filter:
+            continue
+        if still_bound(name, new_defs, new_stems, new_texts):
+            continue
+        dead_unbound += 1
+        mentions = find_mentions(
+            new_texts, name, include_code=include_code, variants=variants
+        )
+        if ignore:
+            mentions = [m for m in mentions if not path_ignored(m.path, ignore)]
+        if not mentions:
+            continue
+        if variants and is_completed_rename(name, mentions):
+            continue
+        dlist_sorted = sorted(dlist, key=lambda d: d.commit, reverse=True)
+        holdouts.append(Holdout(name=name, deaths=dlist_sorted, mentions=mentions))
+
+    holdouts = collapse_holdouts(holdouts)
+    holdouts.sort(key=lambda h: (-len(h.mentions), h.name.lower()))
+    new_label = "worktree" if new is None else new
+    return ScanResult(
+        repo=repo,
+        old=old_label,
+        new=new_label,
+        deaths_considered=len(deaths),
+        names_dead=dead_unbound,
+        holdouts=holdouts,
+    )
+
+
+def format_human(result: ScanResult, col: C, *, show_all_mentions: bool) -> str:
+    lines: list[str] = []
+    n = len(result.holdouts)
+    m = sum(len(h.mentions) for h in result.holdouts)
+    head = f"{n} name{'s' if n != 1 else ''} linger, {m} mention{'s' if m != 1 else ''}"
+    lines.append(col.bold(col.red("wraith")) + f"  {head}")
+    lines.append(col.dim(f"  {result.old}  →  {result.new}   ({result.names_dead} dead names scanned)"))
+    if not result.holdouts:
+        lines.append(col.green("  clean — no leftover mentions of dead names"))
+        return "\n".join(lines) + "\n"
+
+    for h in result.holdouts:
+        lines.append("")
+        lines.append(col.bold(col.yellow(h.name)))
+        shown_deaths = h.deaths[:3]
+        for d in shown_deaths:
+            loc = d.path if d.line is None else f"{d.path}:{d.line}"
+            short = d.commit[:8] if d.commit else "?"
+            subj = (d.subject or "")[:72]
+            lines.append(
+                col.dim(f"  died {d.kind:4}  {short}  {loc}")
+                + (col.dim(f"  {subj}") if subj else "")
+            )
+        if len(h.deaths) > 3:
+            lines.append(col.dim(f"  … {len(h.deaths) - 3} more deaths"))
+        limit = len(h.mentions) if show_all_mentions else min(8, len(h.mentions))
+        for men in h.mentions[:limit]:
+            loc = f"{men.path}:{men.line}"
+            as_form = ""
+            if men.surface and men.surface != h.name:
+                as_form = col.dim(f" as {men.surface}")
+            lines.append(
+                f"  {col.cyan(loc)}  {col.dim(men.why)}{as_form}  {men.text}"
+            )
+        if len(h.mentions) > limit:
+            lines.append(col.dim(f"  … {len(h.mentions) - limit} more mentions"))
+    return "\n".join(lines) + "\n"
+
+
+def format_porcelain(result: ScanResult) -> str:
+    rows = []
+    for h in result.holdouts:
+        death = h.deaths[0] if h.deaths else None
+        died = ""
+        if death:
+            loc = death.path if death.line is None else f"{death.path}:{death.line}"
+            died = f"{death.kind}@{death.commit[:8]}:{loc}"
+        for men in h.mentions:
+            rows.append(f"{men.path}:{men.line}:{h.name}:{men.why}:{died}")
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def format_json(result: ScanResult) -> str:
+    payload = {
+        "repo": result.repo,
+        "old": result.old,
+        "new": result.new,
+        "deaths_considered": result.deaths_considered,
+        "names_dead": result.names_dead,
+        "holdouts": [
+            {
+                "name": h.name,
+                "deaths": [
+                    {
+                        "kind": d.kind,
+                        "commit": d.commit,
+                        "subject": d.subject,
+                        "path": d.path,
+                        "line": d.line,
+                    }
+                    for d in h.deaths
+                ],
+                "mentions": [
+                    {
+                        "path": m.path,
+                        "line": m.line,
+                        "text": m.text,
+                        "why": m.why,
+                        "surface": m.surface or h.name,
+                    }
+                    for m in h.mentions
+                ],
+            }
+            for h in result.holdouts
+        ],
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def build_self_test_repo(root: Path) -> None:
+    """A nasty little history: deletions, a rename, leftover docs, weird names."""
+    def run(args: list[str], cwd: str | None = None) -> None:
+        subprocess.run(
+            args,
+            cwd=str(root if cwd is None else cwd),
+            check=True,
+            capture_output=True,
+        )
+
+    run(["git", "init", "-q", "-b", "main"])
+    run(["git", "config", "user.email", "wraith@test"])
+    run(["git", "config", "user.name", "Wraith Test"])
+
+    (root / "src").mkdir()
+    (root / "src" / "auth").mkdir()
+    (root / "notes").mkdir()
+    (root / "scripts").mkdir()
+
+    (root / "src" / "retry.py").write_text(
+        "def retry_with_backoff(fn, times=3):\n    return fn()\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "ops.py").write_text(
+        "def scaleFixedCritical(x):\n    return x\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "helpers.py").write_text(
+        "def app_with_files(files):\n    return files\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "users.py").write_text(
+        "class UserService:\n    def load(self):\n        return []\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "auth" / "legacy_jwt_helper.py").write_text(
+        "def decode_legacy_jwt(token):\n    return token\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "weird name (copy).py").write_text(
+        "def loadLegacyToken(raw):\n    return raw.strip()\n\n",
+        encoding="utf-8",
+    )
+    (root / "Makefile").write_text(
+        "retry:\n\tpython -c 'from src.retry import retry_with_backoff; retry_with_backoff(lambda: 1)'\n",
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text(
+        "# demo\n\nTalks to UserService and retry_with_backoff.\n",
+        encoding="utf-8",
+    )
+    (root / "docker-compose.yml").write_text(
+        "services:\n  api:\n    volumes:\n      - ./src/auth/legacy_jwt_helper.py:/app/jwt.py\n",
+        encoding="utf-8",
+    )
+    (root / "notes" / "TODO.md").write_text(
+        "Wire up loadLegacyToken once auth ships.\nSee `src/weird name (copy).py`.\n",
+        encoding="utf-8",
+    )
+    (root / "scripts" / "smoke.sh").write_text(
+        "#!/bin/sh\n# leftover kebab of a snake-case death:\nretry-with-backoff --times 3\n",
+        encoding="utf-8",
+    )
+    (root / "testdata.json").write_text(
+        '{"UserService": true, "retry_with_backoff": 1}\n',
+        encoding="utf-8",
+    )
+    run(["git", "add", "."])
+    run(["git", "commit", "-q", "-m", "initial: retry, UserService, jwt helper, weird file"])
+
+    # Rename UserService -> AccountService, delete the rest, leave leftovers.
+    (root / "src" / "users.py").write_text(
+        "class AccountService:\n    def load(self):\n        return []\n\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "ops.py").write_text(
+        'def apply(op):\n    if op == "scale-fixed-critical":\n        return 1\n    return 0\n',
+        encoding="utf-8",
+    )
+    (root / "src" / "test_helpers.py").write_text(
+        "from src.helpers import app_with_files as fake_app\n\n"
+        "def test_it():\n    assert fake_app([]) == []  # fake_app still bound\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "retry.py").unlink()
+    (root / "src" / "auth" / "legacy_jwt_helper.py").unlink()
+    (root / "src" / "weird name (copy).py").unlink()
+    run(["git", "add", "-A"])
+    run(["git", "commit", "-q", "-m", "delete retry/jwt/weird; rename UserService to AccountService"])
+
+
+def self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="wraith-selftest-") as td:
+        root = Path(td)
+        build_self_test_repo(root)
+        result = scan(
+            str(root),
+            old=None,
+            new=None,
+            max_commits=50,
+            since=None,
+            range_spec=None,
+            include_code=False,
+            names_filter=None,
+        )
+        found = {h.name for h in result.holdouts}
+        groups = {
+            "retry": {"retry_with_backoff"},
+            "user": {"UserService"},
+            "jwt": {
+                "legacy_jwt_helper",
+                "legacy_jwt_helper.py",
+                "src/auth/legacy_jwt_helper.py",
+            },
+            "legacy-token": {"loadLegacyToken"},
+            "weird-file": {
+                "src/weird name (copy).py",
+                "weird name (copy).py",
+                "weird name (copy)",
+            },
+        }
+        print(f"self-test repo: {root}")
+        print(f"holdout names: {sorted(found)}")
+        missing_groups = [g for g, names in groups.items() if not (found & names)]
+        if missing_groups:
+            print(f"MISSING holdout groups: {missing_groups}", file=sys.stderr)
+            print(format_human(result, C(False), show_all_mentions=True))
+            return 1
+        jwt_aliases = found & groups["jwt"]
+        if len(jwt_aliases) != 1:
+            print(f"path-identity collapse failed: {sorted(jwt_aliases)}", file=sys.stderr)
+            return 1
+        retry = next(h for h in result.holdouts if h.name == "retry_with_backoff")
+        surfaces = {m.surface for m in retry.mentions}
+        if "retry-with-backoff" not in surfaces:
+            print("missing kebab-case variant mention retry-with-backoff", file=sys.stderr)
+            print(format_human(result, C(False), show_all_mentions=True))
+            return 1
+        makefile_hits = [m for m in retry.mentions if m.path == "Makefile"]
+        if len(makefile_hits) != 1:
+            print(f"expected 1 Makefile mention, got {len(makefile_hits)}", file=sys.stderr)
+            return 1
+        if "AccountService" in found:
+            print("false positive: AccountService is still defined", file=sys.stderr)
+            return 1
+        for alive in ("scaleFixedCritical", "ScaleFixedCritical", "fake_app", "app_with_files"):
+            if alive in found:
+                print(f"false positive: {alive} should be treated as living/renamed", file=sys.stderr)
+                print(format_human(result, C(False), show_all_mentions=True))
+                return 1
+        print("required holdouts: ok")
+        print("variant hit: retry-with-backoff")
+        print("path-identity collapse: ok")
+        print(format_human(result, C(False), show_all_mentions=True))
+        return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="wraith",
+        description="Find names whose definitions died in git but which still linger in docs, configs, scripts, comments, and strings.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  wraith                       deaths from recent history, mentions in the worktree
+  wraith main                  two-tree: defined in main, gone now, still mentioned
+  wraith main HEAD             two-tree between two commits
+  wraith --range main..HEAD    names that died on this branch and still linger
+  wraith --porcelain           path:line:name:why:death  (pipable)
+  wraith --json                machine-readable
+
+exit 2 if any holdout is found (like grep). --ok-exit always exits 0 on success.
+""",
+    )
+    p.add_argument("old", nargs="?", help="old revision (two-tree mode). omit to scan history")
+    p.add_argument("new", nargs="?", help="new revision (default: worktree)")
+    p.add_argument("-C", "--repo", default=".", help="repository path")
+    p.add_argument("--range", dest="range_spec", help="limit history to a git revision range")
+    p.add_argument("--since", help="git log --since (history mode)")
+    p.add_argument("--max-commits", type=int, default=DEFAULT_MAX_COMMITS)
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--porcelain", action="store_true", help="stable one-line output")
+    p.add_argument("--all", action="store_true", help="include live-code identifier mentions")
+    p.add_argument("--exact", action="store_true", help="do not match kebab/snake/camel variants")
+    p.add_argument(
+        "--ignore",
+        action="append",
+        default=[],
+        help="omit mentions matching a glob (repeatable; 'plans/**' supported)",
+    )
+    p.add_argument("--name", action="append", dest="names", help="only this name (repeatable)")
+    p.add_argument("--ok-exit", action="store_true", help="exit 0 even when holdouts exist")
+    p.add_argument("--self-test", action="store_true", help="run the built-in fixture and exit")
+    p.add_argument("-a", "--all-mentions", action="store_true", help="do not truncate mention lists")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.self_test:
+        return self_test()
+    try:
+        root = repo_root(os.path.abspath(args.repo))
+    except GitError as e:
+        print(f"wraith: {e}", file=sys.stderr)
+        return 1
+
+    names_filter = set(args.names) if args.names else None
+    new = args.new
+    old = args.old
+    try:
+        result = scan(
+            root,
+            old=old,
+            new=new,
+            max_commits=args.max_commits,
+            since=args.since,
+            range_spec=args.range_spec,
+            include_code=args.all,
+            names_filter=names_filter,
+            variants=not args.exact,
+            ignore=args.ignore,
+        )
+    except GitError as e:
+        print(f"wraith: {e}", file=sys.stderr)
+        return 1
+
+    col = C(color_enabled(sys.stdout) and not args.json and not args.porcelain)
+    if args.json:
+        sys.stdout.write(format_json(result))
+    elif args.porcelain:
+        sys.stdout.write(format_porcelain(result))
+    else:
+        sys.stdout.write(format_human(result, col, show_all_mentions=args.all_mentions))
+
+    if result.holdouts and not args.ok_exit:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

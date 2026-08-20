@@ -1,0 +1,51 @@
+{
+  "tool": "cling",
+  "version": "0.1.0",
+  "mode": "snapshot",
+  "pid": 35086,
+  "pgid": 35086,
+  "ppid": 31264,
+  "stat": "Ss",
+  "command": "/bin/zsh -c snap=$(command cat <&3); builtin setopt nonomatch 2>/dev/null; builtin eval \"$snap\"; builtin export GROK_AGENT=1; builtin export PWD=\"$(builtin pwd)\"; builtin setopt aliases 2>/dev/null; unalias find 2>/dev/null || true; find() { local __grok_bin=''; [ -x \"$__grok_bin\" ] || __grok_bin=$(command -v bfs 2>/dev/null) || __grok_bin=''; if [ -z \"$__grok_bin\" ]; then command find \"$@\"; return; fi; if [[ -z ${ZSH_VERSION-} ]] && (( BASH_SUBSHELL > 0 )); then exec -a find \"$__grok_bin\" \"$@\"; else (exec -a find \"$__grok_bin\" \"$@\"); fi; }; __grok_shadow_find=1; unalias grep 2>/dev/null || true; grep() { local __grok_bin=''; [ -x \"$__grok_bin\" ] || __grok_bin=$(command -v ugrep 2>/dev/null) || __grok_bin=''; if [ -z \"$__grok_bin\" ]; then command grep \"$@\"; return; fi; if [[ -z ${ZSH_VERSION-} ]] && (( BASH_SUBSHELL > 0 )); then exec -a grep \"$__grok_bin\" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl \"$@\"; else (exec -a grep \"$__grok_bin\" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl \"$@\"); fi; }; __grok_shadow_grep=1; __grok_user_cmd=\"$1\"; builtin typeset +x __grok_user_cmd 2>/dev/null; builtin set --; builtin eval \"$__grok_user_cmd\" 2>&1 -- # Dogfood snapshot on processes we did not start.\\012echo \"=== live pids of interest ===\"\\012ps -ax -o pid=,command= | python3 -c '\\012import sys\\012keys=(\"Cursor\",\"Code Helper\",\"cargo\",\"rustc\",\"node \",\"tmux\",\"sshd\",\"python\")\\012for line in sys.stdin:\\012    low=line.lower()\\012    if any(k.lower() in low for k in keys) and \"zsh -c\" not in line and \"snap=$\" not in line:\\012        print(line[:180])\\012' | head -40\\012\\012echo\\012echo \"=== snapshot a few ===\"\\012# pick: this shell's parent, a tmux if any, a node/cursor helper\\012python3 - <<'PY'\\012import os, subprocess, json, shutil, sys\\012root = os.path.dirname(os.path.abspath(\"cling\"))\\012cling = os.path.join(root, \"cling\")\\012out = subprocess.check_output([\"ps\",\"-ax\",\"-o\",\"pid=,command=\"], text=True, errors=\"replace\")\\012candidates = []\\012for line in out.splitlines():\\012    line=line.strip()\\012    pid_s,_,cmd=line.partition(\" \")\\012    try:\\012        pid=int(pid_s)\\012    except: continue\\012    if pid==os.getpid(): continue\\012    if \"zsh -c snap=\" in cmd: continue\\012    if any(s in cmd for s in (\"/tmux\", \"Cursor Helper\", \" codex\", \" rustc \")):\\012        candidates.append((pid, cmd[:100]))\\012# also parent\\012candidates.insert(0, (os.getppid(), \"parent\"))\\012# unique pids\\012seen=set(); picked=[]\\012for pid,cmd in candidates:\\012    if pid in seen: continue\\012    seen.add(pid)\\012    picked.append((pid,cmd))\\012    if len(picked)>=4: break\\012print(\"picked\", picked)\\012for pid,cmd in picked:\\012    dest=f\"fixtures/work/snap-{pid}.json\"\\012    r=subprocess.run([cling,\"snapshot\",\"--json\",\"--out\",dest,str(pid)], capture_output=True, text=True)\\012    print(f\"\\n--- snapshot {pid} rc={r.returncode} ---\")\\012    print(r.stderr[:600] if r.stderr else \"(no human, json mode)\")\\012    if r.returncode==0 and os.path.exists(dest):\\012        data=json.load(open(dest))\\012        print(\"cwd\", data.get(\"cwd\"), \"open\", (data.get(\"open\") or {}).get(\"count\"), \"children\", len(data.get(\"children\") or []), \"group\", data.get(\"group_size\"))\\012        print(\"cmd\", (data.get(\"command\") or \"\")[:120])\\012        files=(data.get(\"open\") or {}).get(\"files\") or []\\012        for f in files[:5]:\\012            print(\"  held\", f.get(\"class\"), f.get(\"path\",\"\")[:100])\\012PY",
+  "alive": true,
+  "children": [
+    {
+      "pid": 35092,
+      "ppid": 35086,
+      "pgid": 35086,
+      "stat": "S",
+      "command": "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -"
+    },
+    {
+      "pid": 35094,
+      "ppid": 35092,
+      "pgid": 35086,
+      "stat": "S",
+      "command": "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/annenpolka/.grok/worktrees/annenpolka-brrr/subagent-01a01ac6-9c54-76b0-8e7b-36e36d0f90bb/cling snapshot --json --out fixtures/work/snap-35086.json 35086"
+    },
+    {
+      "pid": 35096,
+      "ppid": 35094,
+      "pgid": 35086,
+      "stat": "R",
+      "command": "ps -ax -o pid=,ppid=,pgid=,stat=,command="
+    }
+  ],
+  "group_size": 4,
+  "group": [
+    35086,
+    35092,
+    35094,
+    35096
+  ],
+  "tmp_roots": [
+    "/private/tmp"
+  ],
+  "watch_would": [],
+  "open": {
+    "count": 0,
+    "files": [],
+    "by_dir": []
+  },
+  "started_at": "2026-08-20T01:35:04.897"
+}

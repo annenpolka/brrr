@@ -1,0 +1,1522 @@
+#!/usr/bin/env python3
+"""tide — test oracles as a time series.
+
+An oracle is a claimed expected value: the literal in assert_eq! / expect().toBe
+/ #expect / unittest, or a scalar leaf in an *expected* / testcase JSON file.
+tide walks git history and reports how those claims moved.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from typing import Any
+
+VERSION = "0.2"
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+def git(repo: str, *args: str, check: bool = True) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"git {' '.join(args)} failed")
+    return r.stdout
+
+
+def git_ok(repo: str, *args: str) -> bool:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    return r.returncode == 0
+
+
+def git_show(repo: str, rev: str, path: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, "show", f"{rev}:{path}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+# ---------------------------------------------------------------------------
+# path roles
+# ---------------------------------------------------------------------------
+
+_TEST_DIR = re.compile(
+    r"(^|/)(tests?|spec|__tests__|testdata|fixtures|testcases|golden|oracles?)(/|$)",
+    re.I,
+)
+_TEST_FILE = re.compile(
+    r"(_test|\.test|\.spec|_spec|Tests?)\.",
+)
+_TEST_BASENAME = {
+    "tests.rs",
+    "test.rs",
+    "tests.py",
+    "test.py",
+    "tests.swift",
+    "test.swift",
+    "tests.go",
+    "tests.ts",
+    "tests.js",
+}
+_LOCKISH = re.compile(r"(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum)$")
+_JSON_STIMULUS = re.compile(r"\.scenario\.json$|scenario-patch\.json$|\.experiment\.json$", re.I)
+_EXCLUDE_JSON = {
+    "package.json",
+    "tsconfig.json",
+    "tsconfig.node.json",
+    "tsconfig.app.json",
+    "compile_commands.json",
+    ".eslintrc.json",
+    "biome.json",
+}
+
+
+def norm_path(p: str) -> str:
+    return p.replace("\\", "/").lstrip("./")
+
+
+def is_test_path(path: str) -> bool:
+    p = norm_path(path)
+    b = p.rsplit("/", 1)[-1]
+    if b.lower() in _TEST_BASENAME:
+        return True
+    if _TEST_DIR.search(p):
+        return True
+    if _TEST_FILE.search(b):
+        return True
+    return False
+
+
+def is_json_oracle_path(path: str) -> bool:
+    p = norm_path(path)
+    if not p.lower().endswith(".json"):
+        return False
+    b = p.rsplit("/", 1)[-1]
+    if b in _EXCLUDE_JSON:
+        return False
+    if _JSON_STIMULUS.search(p):
+        return False
+    low = p.lower()
+    if any(s in low for s in ("expected", "oracle", "testcase", "testcases")):
+        return True
+    return False
+
+
+def is_generated_path(path: str) -> bool:
+    p = norm_path(path).lower()
+    b = p.rsplit("/", 1)[-1]
+    if ".generated." in b or b.endswith(".generated.json") or b.endswith(".generated.ts"):
+        return True
+    if "/generated/" in f"/{p}/":
+        return True
+    return False
+
+
+def is_oracle_file(path: str) -> bool:
+    p = norm_path(path)
+    if _LOCKISH.search(p):
+        return False
+    if is_generated_path(p):
+        return False
+    if is_json_oracle_path(p):
+        return True
+    if is_test_path(p) and p.rsplit(".", 1)[-1].lower() in {
+        "rs", "py", "ts", "tsx", "js", "jsx", "swift", "go", "java", "kt",
+    }:
+        return True
+    return False
+
+
+def is_prod_path(path: str) -> bool:
+    p = norm_path(path)
+    if is_oracle_file(p) or is_test_path(p):
+        return False
+    if p.endswith((".md", ".txt", ".rst", ".html")):
+        return False
+    if "/docs/" in f"/{p}/" or p.startswith("docs/"):
+        return False
+    if _LOCKISH.search(p):
+        return False
+    if p.startswith("."):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# source scan helpers
+# ---------------------------------------------------------------------------
+
+def skip_ws(s: str, i: int) -> int:
+    n = len(s)
+    while i < n and s[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def parse_string(s: str, i: int) -> tuple[str, int] | None:
+    n = len(s)
+    if i >= n:
+        return None
+    # rust raw r#"..."# or r"..."
+    if s[i] == "r" and i + 1 < n:
+        j = i + 1
+        hashes = 0
+        while j < n and s[j] == "#":
+            hashes += 1
+            j += 1
+        if j < n and s[j] == '"':
+            j += 1
+            close = '"' + "#" * hashes
+            k = s.find(close, j)
+            if k < 0:
+                return None
+            return s[j:k], k + len(close)
+    q = s[i]
+    if q not in "\"'":
+        return None
+    j = i + 1
+    out = []
+    while j < n:
+        c = s[j]
+        if c == "\\" and j + 1 < n:
+            nxt = s[j + 1]
+            esc = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", q: q, "0": "\0"}.get(nxt)
+            if esc is not None:
+                out.append(esc)
+            else:
+                out.append(nxt)
+            j += 2
+            continue
+        if c == q:
+            return "".join(out), j + 1
+        out.append(c)
+        j += 1
+    return None
+
+
+_NUM = re.compile(r"-?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?")
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ATOM = {
+    "true": True,
+    "false": False,
+    "True": True,
+    "False": False,
+    "null": None,
+    "None": None,
+    "nil": None,
+    "undefined": None,
+    "Some": "SOME",  # handled as constructor
+}
+
+
+def canon(v: Any) -> str:
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def parse_literal_ish(s: str, i: int, depth: int = 0) -> tuple[Any, int, int] | None:
+    """Return (value, new_index, complexity) or None.
+
+    complexity: 0 primitive, 1 enum/const, 2 collection, 3 constructor.
+    """
+    if depth > 7:
+        return None
+    i = skip_ws(s, i)
+    n = len(s)
+    if i >= n:
+        return None
+
+    if s.startswith("vec!", i):
+        j = skip_ws(s, i + 4)
+        if j < n and s[j] == "[":
+            inner = parse_literal_ish(s, j, depth + 1)
+            if inner:
+                return inner[0], inner[1], max(2, inner[2])
+        return None
+
+    got = parse_string(s, i)
+    if got:
+        return got[0], got[1], 0
+
+    m = _NUM.match(s, i)
+    if m and (m.end() == n or not s[m.end()].isalpha() and s[m.end()] != "_"):
+        raw = m.group(0)
+        val: Any
+        if any(c in raw for c in ".eE"):
+            val = float(raw)
+        else:
+            val = int(raw)
+        return val, m.end(), 0
+
+    # collections
+    if s[i] == "[":
+        items, j = _parse_list(s, i + 1, "]", depth)
+        if items is None:
+            return None
+        return items, j, 2
+    if s[i] == "(":
+        # rust tuple or grouping
+        items, j = _parse_list(s, i + 1, ")", depth)
+        if items is None:
+            return None
+        if len(items) == 1:
+            return items[0], j, 2
+        return items, j, 2
+    if s[i] == "{":
+        obj, j = _parse_object(s, i + 1, depth)
+        if obj is None:
+            return None
+        return obj, j, 2
+
+    # ident / enum / constructor
+    m = _IDENT.match(s, i)
+    if not m:
+        return None
+    name = m.group(0)
+    j = m.end()
+    if name in ("true", "false", "True", "False", "null", "None", "nil", "undefined"):
+        return _ATOM[name], j, 0
+
+    # Path::Ident or Ident::Ident ...
+    parts = [name]
+    while True:
+        j2 = skip_ws(s, j)
+        if s.startswith("::", j2):
+            j2 = skip_ws(s, j2 + 2)
+            m2 = _IDENT.match(s, j2)
+            if not m2:
+                break
+            parts.append(m2.group(0))
+            j = m2.end()
+            continue
+        break
+    j = skip_ws(s, j)
+    # turbofish ignored
+    if s.startswith("::<", j):
+        k = s.find(">", j)
+        if k < 0:
+            return None
+        j = skip_ws(s, k + 1)
+
+    if j < n and s[j] == "(":
+        args, j2 = _parse_list(s, j + 1, ")", depth)
+        if args is None:
+            return None
+        label = "::".join(parts)
+        return {label: args}, j2, 3
+    # Enum/const must be qualified (AgentKind::ClaudeCode). A bare ident is an
+    # expression, not an oracle literal.
+    if len(parts) >= 2:
+        return "::".join(parts), j, 1
+    return None
+
+
+def _parse_list(s: str, i: int, close: str, depth: int) -> tuple[list[Any] | None, int]:
+    items: list[Any] = []
+    n = len(s)
+    i = skip_ws(s, i)
+    if i < n and s[i] == close:
+        return items, i + 1
+    while i < n:
+        i = skip_ws(s, i)
+        if i < n and s[i] == close:
+            return items, i + 1
+        got = parse_literal_ish(s, i, depth + 1)
+        if not got:
+            return None, i
+        items.append(got[0])
+        i = skip_ws(s, got[1])
+        if i < n and s[i] == ",":
+            i += 1
+            continue
+        if i < n and s[i] == close:
+            return items, i + 1
+        return None, i
+    return None, i
+
+
+def _parse_object(s: str, i: int, depth: int) -> tuple[dict[str, Any] | None, int]:
+    obj: dict[str, Any] = {}
+    n = len(s)
+    i = skip_ws(s, i)
+    if i < n and s[i] == "}":
+        return obj, i + 1
+    while i < n:
+        i = skip_ws(s, i)
+        if i < n and s[i] == "}":
+            return obj, i + 1
+        key: str | None = None
+        st = parse_string(s, i)
+        if st:
+            key, i = st
+        else:
+            m = _IDENT.match(s, i)
+            if not m:
+                return None, i
+            key = m.group(0)
+            i = m.end()
+        i = skip_ws(s, i)
+        if i >= n or s[i] not in ":=":
+            return None, i
+        i += 1
+        got = parse_literal_ish(s, i, depth + 1)
+        if not got:
+            return None, i
+        obj[key] = got[0]
+        i = skip_ws(s, got[1])
+        if i < n and s[i] == ",":
+            i += 1
+            continue
+        if i < n and s[i] == "}":
+            return obj, i + 1
+        return None, i
+    return None, i
+
+
+def split_top_args(s: str, i: int, close: str = ")") -> tuple[list[str], int] | None:
+    """Split arguments starting at the char AFTER the opening paren/bracket."""
+    n = len(s)
+    args: list[str] = []
+    start = i
+    depth = 0
+    in_str: str | None = None
+    raw_hashes: int | None = None
+    while i < n:
+        c = s[i]
+        if in_str:
+            if raw_hashes is not None:
+                close_raw = '"' + "#" * raw_hashes
+                if s.startswith(close_raw, i):
+                    i += len(close_raw)
+                    in_str = None
+                    raw_hashes = None
+                    continue
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c == "r" and i + 1 < n and (s[i + 1] == '"' or s[i + 1] == "#"):
+            j = i + 1
+            h = 0
+            while j < n and s[j] == "#":
+                h += 1
+                j += 1
+            if j < n and s[j] == '"':
+                in_str = '"'
+                raw_hashes = h
+                i = j + 1
+                continue
+        if c in "\"'":
+            in_str = c
+            i += 1
+            continue
+        if c in "([{":
+            depth += 1
+            i += 1
+            continue
+        if c in ")]}":
+            if depth == 0 and c == close:
+                args.append(s[start:i].strip())
+                return [a for a in args if a != ""], i + 1
+            depth -= 1
+            i += 1
+            continue
+        if c == "," and depth == 0:
+            args.append(s[start:i].strip())
+            i += 1
+            start = i
+            continue
+        i += 1
+    return None
+
+
+def find_matching(s: str, open_i: int) -> int | None:
+    close_of = {"(": ")", "[": "]", "{": "}"}
+    opener = s[open_i]
+    closer = close_of[opener]
+    got = split_top_args(s, open_i + 1, closer)
+    if not got:
+        return None
+    # split_top_args returns index after closer; reconstruct end
+    # We need the end index; split_top_args already consumed closer.
+    # Re-scan to get end: use a simpler depth count.
+    n = len(s)
+    depth = 0
+    i = open_i
+    in_str: str | None = None
+    raw_hashes: int | None = None
+    while i < n:
+        c = s[i]
+        if in_str:
+            if raw_hashes is not None:
+                close_raw = '"' + "#" * raw_hashes
+                if s.startswith(close_raw, i):
+                    i += len(close_raw)
+                    in_str = None
+                    raw_hashes = None
+                    continue
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c == "r" and i + 1 < n and (s[i + 1] in '"#'):
+            j = i + 1
+            h = 0
+            while j < n and s[j] == "#":
+                h += 1
+                j += 1
+            if j < n and s[j] == '"':
+                in_str = '"'
+                raw_hashes = h
+                i = j + 1
+                continue
+        if c in "\"'":
+            in_str = c
+            i += 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def strip_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def enclosing_test(text: str, pos: int) -> str:
+    line_start = text.rfind("\n", 0, pos) + 1
+    before = text[:line_start].splitlines()[-80:]
+    patterns = [
+        re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)"),
+        re.compile(r"^\s*def\s+(\w+)"),
+        re.compile(r"^\s*(?:async\s+)?function\s+(\w+)"),
+        re.compile(r"^\s*func\s+(\w+)"),
+        re.compile(r"^\s*(?:it|test|it\.only|test\.only)\(\s*([\'\"`])(.+?)\1"),
+        re.compile(r"^\s*(?:it|test)\.each\b"),
+    ]
+    for line in reversed(before):
+        for pat in patterns:
+            m = pat.match(line)
+            if m:
+                if m.lastindex:
+                    return m.group(m.lastindex)
+                return "each"
+    return ""
+
+
+def pick_oracle(lhs_src: str, rhs_src: str) -> tuple[str, Any] | None:
+    """Choose which side is the expected value. Prefer the more constant side."""
+    L = parse_literal_ish(lhs_src, 0)
+    R = parse_literal_ish(rhs_src, 0)
+    # must consume the argument (allow trailing)
+    def ok(src: str, g: tuple[Any, int, int] | None) -> tuple[Any, int] | None:
+        if not g:
+            return None
+        rest = src[g[1] :].strip()
+        if rest and rest not in {",", ""}:
+            # allow trailing rust type ascription? no
+            if rest.startswith("as ") or rest.startswith("!"):
+                return g[0], g[2]
+            # unmatched extra tokens → not a clean literal
+            return None
+        return g[0], g[2]
+
+    l = ok(lhs_src, L)
+    r = ok(rhs_src, R)
+    if r and not l:
+        return strip_ws(lhs_src), r[0]
+    if l and not r:
+        return strip_ws(rhs_src), l[0]
+    if l and r:
+        # lower complexity is the oracle; tie → rhs (conventional expected slot)
+        if r[1] <= l[1]:
+            return strip_ws(lhs_src), r[0]
+        return strip_ws(rhs_src), l[0]
+    return None
+
+
+def split_eq(expr: str) -> tuple[str, str] | None:
+    depth = 0
+    in_str: str | None = None
+    i = 0
+    n = len(expr)
+    while i < n:
+        c = expr[i]
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in "\"'":
+            in_str = c
+            i += 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and expr.startswith("==", i) and not expr.startswith("===", i):
+            return expr[:i].strip(), expr[i + 2 :].strip()
+        elif depth == 0 and expr.startswith("!=", i):
+            return expr[:i].strip(), expr[i + 2 :].strip()
+        i += 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# extractors
+# ---------------------------------------------------------------------------
+
+Oracle = dict[str, Any]
+
+
+def _oracle(path: str, test: str, lhs: str, value: Any, line: int, kind: str, matcher: str) -> Oracle:
+    lhs_n = strip_ws(lhs) or f"#{line}"
+    test_n = test or "_"
+    if kind == "json":
+        key = f"{path}#{lhs_n}"
+    else:
+        key = f"{path}::{test_n}::{lhs_n}"
+    return {
+        "key": key,
+        "path": path,
+        "test": test_n,
+        "lhs": lhs_n,
+        "value": canon(value) if not isinstance(value, str) or kind == "json" else json.dumps(value, ensure_ascii=False),
+        "raw": value,
+        "line": line,
+        "kind": kind,
+        "matcher": matcher,
+    }
+
+
+def _line_of(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
+
+
+_RE_MACRO = re.compile(r"\bassert_(eq|ne)!\s*\(")
+_RE_XCT = re.compile(r"\b(?:XCTAssertEqual|assertEqual|assertEquals|assert_equal)\s*\(")
+_RE_TESTIFY = re.compile(r"\b(?:assert|require|assert)\.Equal\s*\(")
+_RE_EXPECT_HASH = re.compile(r"#expect\s*\(")
+_RE_JEST = re.compile(
+    r"\bexpect\s*\("
+)
+_RE_JEST_MATCHER = re.compile(
+    r"^\s*\)\s*\.\s*(toBe|toEqual|toStrictEqual|toHaveLength|toBeNull|toBeCloseTo)\s*\("
+)
+_RE_PY_ASSERT = re.compile(r"^\s*assert\s+", re.M)
+
+
+def extract_inline(text: str, path: str) -> list[Oracle]:
+    found: list[Oracle] = []
+    seen_pos: set[int] = set()
+
+    def add_pair(pos: int, a: str, b: str, matcher: str, test: str | None = None) -> None:
+        picked = pick_oracle(a, b)
+        if not picked:
+            return
+        lhs, val = picked
+        t = test if test is not None else enclosing_test(text, pos)
+        found.append(_oracle(path, t, lhs, val, _line_of(text, pos), "inline", matcher))
+
+    for m in _RE_MACRO.finditer(text):
+        open_i = m.end() - 1
+        end = find_matching(text, open_i)
+        if end is None:
+            continue
+        args = split_top_args(text, open_i + 1, ")")
+        if not args or len(args[0]) < 2:
+            continue
+        add_pair(m.start(), args[0][0], args[0][1], "assert_" + m.group(1))
+        seen_pos.add(m.start())
+
+    for m in _RE_XCT.finditer(text):
+        if m.start() in seen_pos:
+            continue
+        open_i = m.end() - 1
+        args = split_top_args(text, open_i + 1, ")")
+        if not args or len(args[0]) < 2:
+            continue
+        add_pair(m.start(), args[0][0], args[0][1], "assertEqual")
+
+    for m in _RE_TESTIFY.finditer(text):
+        open_i = m.end() - 1
+        args = split_top_args(text, open_i + 1, ")")
+        if not args or len(args[0]) < 3:
+            continue
+        # t, expected, actual
+        add_pair(m.start(), args[0][2], args[0][1], "testify.Equal")
+
+    for m in _RE_EXPECT_HASH.finditer(text):
+        open_i = m.end() - 1
+        end = find_matching(text, open_i)
+        if end is None:
+            continue
+        inner = text[open_i + 1 : end - 1]
+        sp = split_eq(inner)
+        if not sp:
+            continue
+        add_pair(m.start(), sp[0], sp[1], "#expect")
+
+    for m in _RE_JEST.finditer(text):
+        # don't treat expected( as jest
+        if m.start() > 0 and text[m.start() - 1 : m.start() + 6] == "expected":
+            continue
+        open_i = m.end() - 1
+        end = find_matching(text, open_i)
+        if end is None:
+            continue
+        inner = text[open_i + 1 : end - 1].strip()
+        mm = _RE_JEST_MATCHER.match(text[end - 1 :])
+        if not mm:
+            continue
+        matcher = mm.group(1)
+        open2 = end - 1 + mm.end() - 1
+        args = split_top_args(text, open2 + 1, ")")
+        if not args or not args[0]:
+            continue
+        rhs = args[0][0]
+        add_pair(m.start(), inner, rhs, matcher)
+
+    for m in _RE_PY_ASSERT.finditer(text):
+        # rest of line (simple)
+        nl = text.find("\n", m.end())
+        if nl < 0:
+            nl = len(text)
+        expr = text[m.end() : nl]
+        if "#" in expr:
+            expr = expr[: expr.index("#")]
+        sp = split_eq(expr)
+        if not sp:
+            continue
+        add_pair(m.start(), sp[0], sp[1], "assert")
+
+    return found
+
+
+_ORACLE_ROOTS = (
+    "expectation",
+    "expected",
+    "expected_properties",
+    "expectedResult",
+    "expected_result",
+    "oracle",
+    "oracles",
+)
+_ID_KEYS = {"id", "scenarioId", "scenario_id", "uuid", "name", "description"}
+
+
+def _flatten(obj: Any, prefix: str, out: list[tuple[str, Any]], collapse_arrays: bool) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if prefix in ("$", "") and k in _ID_KEYS:
+                continue
+            if prefix in ("$", ""):
+                child = f"$.{k}"
+            else:
+                child = f"{prefix}.{k}"
+            _flatten(v, child, out, collapse_arrays)
+    elif isinstance(obj, list):
+        if collapse_arrays and all(not isinstance(x, (dict, list)) for x in obj):
+            out.append((prefix, obj))
+            return
+        for i, v in enumerate(obj):
+            _flatten(v, f"{prefix}[{i}]", out, collapse_arrays)
+    else:
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            out.append((prefix, obj))
+
+
+def extract_json(text: str, path: str, oracle_roots_only: bool = False) -> list[Oracle]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    found: list[Oracle] = []
+
+    def emit(obj: Any, test: str) -> None:
+        leaves: list[tuple[str, Any]] = []
+        _flatten(obj, "$", leaves, collapse_arrays=True)
+        for ptr, val in leaves:
+            found.append(_oracle(path, test, ptr, val, 1, "json", "json"))
+
+    test_id = ""
+    if isinstance(data, dict) and isinstance(data.get("id"), str):
+        test_id = data["id"]
+
+    roots_present: list[str] = []
+    if isinstance(data, dict):
+        roots_present = [k for k in data.keys() if k in _ORACLE_ROOTS or str(k).startswith("expected")]
+
+    # roots mode: if the object has an explicit expected-* subtree, that subtree
+    # is the oracle and input/intent/stimulus keys are not. Goldens without those
+    # keys still flatten the whole document.
+    if oracle_roots_only and roots_present:
+        for k in roots_present:
+            emit(data[k], test_id or k)
+        return found
+
+    emit(data, test_id)
+    return found
+
+
+def extract_file(text: str, path: str, json_mode: str = "naive") -> list[Oracle]:
+    p = norm_path(path)
+    if len(text) > 2_000_000:
+        return []
+    if is_json_oracle_path(p):
+        return extract_json(text, p, oracle_roots_only=(json_mode == "roots"))
+    if is_oracle_file(p):
+        return extract_inline(text, p)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# history walk
+# ---------------------------------------------------------------------------
+
+def parse_history(repo: str, walk: int | None, full: bool) -> list[dict[str, Any]]:
+    cmd = [
+        "log",
+        "--name-status",
+        "-M",
+        "--pretty=format:COMMIT\t%H\t%ct\t%s",
+    ]
+    if not full:
+        cmd.append("--first-parent")
+    if walk:
+        cmd.extend(["-n", str(walk)])
+    out = git(repo, *cmd)
+    commits: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for line in out.splitlines():
+        if line.startswith("COMMIT\t"):
+            _, sha, ts, *rest = line.split("\t")
+            cur = {
+                "sha": sha,
+                "ts": int(ts),
+                "subject": rest[0] if rest else "",
+                "changes": [],  # (status, old, new)
+            }
+            commits.append(cur)
+            continue
+        if not line.strip() or cur is None:
+            continue
+        # name-status: M\tpath / A\tpath / D\tpath / R100\told\tnew
+        parts = line.split("\t")
+        if not parts or not parts[0]:
+            continue
+        st = parts[0][0]
+        if st == "R" and len(parts) >= 3:
+            cur["changes"].append(("R", parts[1], parts[2]))
+        elif st in "AMDCT" and len(parts) >= 2:
+            cur["changes"].append((st, parts[1], parts[1]))
+    return commits
+
+
+def walk_oracles(
+    repo: str,
+    walk: int | None,
+    full: bool,
+    pathspecs: list[str],
+    json_mode: str,
+) -> dict[str, dict[str, Any]]:
+    commits = parse_history(repo, walk, full)
+    if not commits:
+        return {}
+    # oldest first
+    commits = list(reversed(commits))
+    # Seed the parent of the window so a first `M` still records the preimage.
+    oldest = commits[0]
+    r = subprocess.run(
+        ["git", "-C", repo, "rev-parse", f"{oldest['sha']}^"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if r.returncode == 0:
+        psha = r.stdout.strip()
+        meta = git(repo, "log", "-1", "--pretty=format:%ct\t%s", psha)
+        ts_s, _, subj = meta.partition("\t")
+        files = git(repo, "ls-tree", "-r", "--name-only", psha)
+        ch = []
+        for f in files.splitlines():
+            if not f:
+                continue
+            if is_oracle_file(f) and (not pathspecs or any(
+                norm_path(f) == sp or norm_path(f).startswith(sp.rstrip("/") + "/") or norm_path(f).endswith(sp)
+                for sp in pathspecs
+            )):
+                ch.append(("A", f, f))
+        commits.insert(0, {"sha": psha, "ts": int(ts_s or "0"), "subject": subj, "changes": ch})
+    series: dict[str, dict[str, Any]] = {}
+    live: dict[str, str] = {}  # key -> canonical value
+    file_keys: dict[str, set[str]] = defaultdict(set)  # path -> keys
+
+    def restrict(path: str) -> bool:
+        if not pathspecs:
+            return True
+        p = norm_path(path)
+        return any(p == sp or p.startswith(sp.rstrip("/") + "/") or p.endswith(sp) for sp in pathspecs)
+
+    for c in commits:
+        sha, ts, subj = c["sha"], c["ts"], c["subject"]
+        prod = any(is_prod_path(ch[2]) or (ch[0] != "R" and is_prod_path(ch[1])) for ch in c["changes"])
+        # remaps
+        refresh: list[tuple[str, str | None]] = []  # (path_at_commit, old_path or None)
+        for st, old, new in c["changes"]:
+            if st == "R":
+                if old in file_keys:
+                    keys = file_keys.pop(old)
+                    # rewrite keys that start with old path
+                    new_keys = set()
+                    for k in keys:
+                        rec = series.get(k)
+                        if rec is None:
+                            continue
+                        new_k = k.replace(old, new, 1) if k.startswith(old) else k
+                        rec["path"] = new
+                        rec["key"] = new_k
+                        if new_k != k:
+                            series[new_k] = rec
+                            del series[k]
+                            if k in live:
+                                live[new_k] = live.pop(k)
+                        new_keys.add(new_k)
+                    file_keys[new] = new_keys
+                if is_oracle_file(new) and restrict(new):
+                    refresh.append((new, old))
+            elif st == "D":
+                if is_oracle_file(old) and restrict(old):
+                    refresh.append((old, old))
+            else:
+                if (is_oracle_file(new) or is_oracle_file(old)) and restrict(new):
+                    refresh.append((new, None))
+
+        for path, _old in refresh:
+            text: str | None
+            if any(st == "D" and oldp == path for st, oldp, _n in c["changes"]):
+                text = None
+            else:
+                text = git_show(repo, sha, path)
+            try:
+                new_oracles = extract_file(text or "", path, json_mode=json_mode) if text is not None else []
+            except Exception:
+                new_oracles = []
+            new_map = {o["key"]: o for o in new_oracles}
+            prev_keys = set(file_keys.get(path, set()))
+            # also keys that still point at this path
+            prev_keys |= {k for k, rec in series.items() if rec.get("path") == path and k in live}
+
+            for key, o in new_map.items():
+                val = o["value"]
+                rec = series.get(key)
+                if rec is None:
+                    rec = {
+                        "key": key,
+                        "path": o["path"],
+                        "test": o["test"],
+                        "lhs": o["lhs"],
+                        "kind": o["kind"],
+                        "matcher": o["matcher"],
+                        "events": [],
+                    }
+                    series[key] = rec
+                    rec["events"].append(_event(sha, ts, subj, val, "BORN", prod))
+                    live[key] = val
+                elif live.get(key) != val:
+                    rec["events"].append(_event(sha, ts, subj, val, "SET", prod))
+                    live[key] = val
+            died = prev_keys - set(new_map)
+            for key in died:
+                if key in live:
+                    rec = series.get(key)
+                    if rec:
+                        rec["events"].append(_event(sha, ts, subj, live[key], "DIED", prod))
+                    live.pop(key, None)
+            file_keys[path] = set(new_map)
+            if not new_map:
+                file_keys.pop(path, None)
+
+    return series
+
+
+def _event(sha: str, ts: int, subj: str, val: str, kind: str, prod: bool) -> dict[str, Any]:
+    return {
+        "commit": sha,
+        "ts": ts,
+        "date": dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d"),
+        "subject": subj,
+        "value": val,
+        "event": kind,
+        "prod": "COUPLED" if prod else "BLESS",
+    }
+
+
+def _as_number(v: str) -> float | None:
+    try:
+        x = json.loads(v)
+    except Exception:
+        return None
+    if isinstance(x, bool) or x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    return None
+
+
+_VER = re.compile(r"^\d+(?:\.\d+)+$")
+
+
+def _as_version(v: str) -> tuple[int, ...] | None:
+    try:
+        x = json.loads(v)
+    except Exception:
+        return None
+    if not isinstance(x, str) or not _VER.fullmatch(x):
+        return None
+    return tuple(int(p) for p in x.split("."))
+
+
+def classify(events: list[dict[str, Any]]) -> dict[str, Any]:
+    sets = [e for e in events if e["event"] in ("BORN", "SET")]
+    values = [e["value"] for e in sets]
+    # collapse consecutive duplicates (shouldn't happen)
+    uniq: list[str] = []
+    for v in values:
+        if not uniq or uniq[-1] != v:
+            uniq.append(v)
+    died = any(e["event"] == "DIED" for e in events)
+    bless_set = any(e["event"] == "SET" and e["prod"] == "BLESS" for e in events)
+    coupled_set = any(e["event"] == "SET" and e["prod"] == "COUPLED" for e in events)
+
+    klass = "STABLE"
+    if len(uniq) >= 2:
+        nums = [_as_number(v) for v in uniq]
+        vers = [_as_version(v) for v in uniq]
+        seq: list[Any] | None = None
+        if all(n is not None for n in nums):
+            seq = [n for n in nums if n is not None]
+        elif all(v is not None for v in vers):
+            seq = [v for v in vers if v is not None]
+        if seq is not None:
+            inc = all(a < b for a, b in zip(seq, seq[1:]))
+            dec = all(a > b for a, b in zip(seq, seq[1:]))
+            if inc or dec:
+                klass = "RATCHET"
+            elif len(set(uniq)) < len(uniq):
+                klass = "FLIPFLOP"
+            else:
+                klass = "DRIFT"
+        elif len(set(uniq)) < len(uniq):
+            klass = "FLIPFLOP"
+        else:
+            klass = "DRIFT"
+        if klass != "RATCHET" and len(set(uniq)) < len(uniq):
+            klass = "FLIPFLOP"
+
+    if died and klass == "STABLE":
+        klass = "VANISH"
+
+    tags = [klass]
+    if bless_set:
+        tags.append("BLESS")
+    if coupled_set:
+        tags.append("COUPLED")
+    if died:
+        tags.append("DIED")
+    if len(sets) == 1 and sets[0]["event"] == "BORN":
+        tags.append("BORN")
+    changed = klass != "STABLE"
+    return {
+        "class": klass,
+        "tags": tags,
+        "values": uniq,
+        "changed": changed,
+        "bless": bless_set,
+        "n_events": len(sets),
+    }
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+CLASS_ORDER = {"FLIPFLOP": 0, "RATCHET": 1, "DRIFT": 2, "VANISH": 3, "STABLE": 4}
+
+
+def interesting(info: dict[str, Any], show_all: bool) -> bool:
+    if show_all:
+        return True
+    # A vanished claim is a change in the suite's vows even if the last
+    # value never mutated (tenaoshi dropping max_diff_ratio).
+    return info["changed"] or info["bless"] or "DIED" in info["tags"]
+
+
+def render_porcelain(repo: str, series: dict[str, dict[str, Any]], show_all: bool, kind: str) -> str:
+    rows = []
+    for rec in series.values():
+        if kind != "all" and rec["kind"] != kind:
+            continue
+        info = classify(rec["events"])
+        rec = {**rec, "info": info}
+        if interesting(info, show_all):
+            rows.append(rec)
+    rows.sort(key=lambda r: (CLASS_ORDER.get(r["info"]["class"], 9), -r["info"]["n_events"], r["key"]))
+
+    n_all = sum(1 for rec in series.values() if kind == "all" or rec["kind"] == kind)
+    n_ch = sum(
+        1
+        for rec in series.values()
+        if (kind == "all" or rec["kind"] == kind) and classify(rec["events"])["changed"]
+    )
+    n_bless = sum(
+        1
+        for rec in series.values()
+        if (kind == "all" or rec["kind"] == kind) and classify(rec["events"])["bless"]
+    )
+    n_flip = sum(
+        1
+        for rec in series.values()
+        if (kind == "all" or rec["kind"] == kind) and classify(rec["events"])["class"] == "FLIPFLOP"
+    )
+    n_ratchet = sum(
+        1
+        for rec in series.values()
+        if (kind == "all" or rec["kind"] == kind) and classify(rec["events"])["class"] == "RATCHET"
+    )
+
+    lines = [
+        f"tide {VERSION}  {repo}",
+        f"oracles={n_all}  changed={n_ch}  bless={n_bless}  flipflop={n_flip}  ratchet={n_ratchet}  shown={len(rows)}",
+        "",
+    ]
+    for rec in rows:
+        info = rec["info"]
+        tag = ",".join(t for t in info["tags"] if t in {info["class"], "BLESS", "DIED"})
+        arrow = " → ".join(info["values"])
+        head = f"{tag:<16} {rec['kind']:<6} {rec['path']}"
+        lines.append(head)
+        extra = f"  {rec['test']}  {rec['lhs']}"
+        lines.append(extra)
+        if arrow:
+            lines.append(f"  {arrow}")
+        for e in rec["events"]:
+            if e["event"] == "DIED":
+                lines.append(
+                    f"  {e['commit'][:8]}  {e['date']}  {e['prod']:<8}  {e['event']}  {e['value']}"
+                )
+            elif e["event"] in ("BORN", "SET"):
+                mark = e["prod"] if e["event"] == "SET" else "BORN"
+                lines.append(
+                    f"  {e['commit'][:8]}  {e['date']}  {mark:<8}  {e['value']}"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_json(repo: str, series: dict[str, dict[str, Any]], show_all: bool, kind: str) -> str:
+    oracles = []
+    for rec in series.values():
+        if kind != "all" and rec["kind"] != kind:
+            continue
+        info = classify(rec["events"])
+        if not interesting(info, show_all):
+            continue
+        oracles.append(
+            {
+                "key": rec["key"],
+                "path": rec["path"],
+                "test": rec["test"],
+                "lhs": rec["lhs"],
+                "kind": rec["kind"],
+                "matcher": rec["matcher"],
+                "class": info["class"],
+                "tags": info["tags"],
+                "values": info["values"],
+                "bless": info["bless"],
+                "events": rec["events"],
+            }
+        )
+    oracles.sort(key=lambda o: (CLASS_ORDER.get(o["class"], 9), o["key"]))
+    return json.dumps({"repo": repo, "version": VERSION, "oracles": oracles}, ensure_ascii=False, indent=2) + "\n"
+
+
+def render_tsv(series: dict[str, dict[str, Any]], show_all: bool, kind: str) -> str:
+    lines = ["class\ttags\tkind\tpath\ttest\tlhs\tvalues\tbless"]
+    for rec in series.values():
+        if kind != "all" and rec["kind"] != kind:
+            continue
+        info = classify(rec["events"])
+        if not interesting(info, show_all):
+            continue
+        lines.append(
+            "\t".join(
+                [
+                    info["class"],
+                    ",".join(info["tags"]),
+                    rec["kind"],
+                    rec["path"],
+                    rec["test"],
+                    rec["lhs"],
+                    " → ".join(info["values"]),
+                    "1" if info["bless"] else "0",
+                ]
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# extract-at
+# ---------------------------------------------------------------------------
+
+def extract_at(repo: str, rev: str, pathspecs: list[str], json_mode: str) -> list[Oracle]:
+    out = git(repo, "ls-tree", "-r", "--name-only", rev)
+    found: list[Oracle] = []
+    for path in out.splitlines():
+        if not path or not is_oracle_file(path):
+            continue
+        if pathspecs:
+            p = norm_path(path)
+            if not any(p == sp or p.startswith(sp.rstrip("/") + "/") or p.endswith(sp) for sp in pathspecs):
+                continue
+        text = git_show(repo, rev, path)
+        if text is None:
+            continue
+        found.extend(extract_file(text, path, json_mode=json_mode))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _selftest() -> int:
+    fails = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal fails
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name}  {detail}", file=sys.stderr)
+            fails += 1
+
+    rust = '''
+#[test]
+fn scan_scars_detects_real_scar_outside_fence_in_markdown() {
+    assert_eq!(hits.len(), 1, "only the scar");
+    assert_eq!(hits[0].message, "real scar outside fence -->");
+    assert_eq!(
+        input.file_paths,
+        vec![PathBuf::from("/tmp/foo.rs")],
+    );
+}
+'''
+    rs = extract_inline(rust, "src/hook/tests.rs")
+    keys = {o["lhs"]: o["raw"] for o in rs}
+    check("rust message literal", keys.get("hits[0].message") == "real scar outside fence -->", str(keys))
+    check("rust len literal", keys.get("hits.len()") == 1, str(keys))
+    check(
+        "rust vec path",
+        "input.file_paths" in keys
+        and isinstance(keys["input.file_paths"], list),
+        str(keys.get("input.file_paths")),
+    )
+
+    swift = '''
+    @Test("formatTime: 秒のみ")
+    func formatTimeSecondsOnly() {
+        #expect(formatTime(45) == "0:45")
+        #expect(engine.driftSoundName == nil)
+    }
+'''
+    sw = extract_inline(swift, "Tests/UILogicTests.swift")
+    raws = {o["lhs"]: o["raw"] for o in sw}
+    check("swift string oracle", raws.get("formatTime(45)") == "0:45", str(raws))
+    check("swift nil oracle", "engine.driftSoundName" in raws and raws["engine.driftSoundName"] is None, str(raws))
+
+    js = '''
+describe("k", () => {
+  it("version", () => {
+    expect(outcome.result.fingerprint.engineVersion).toBe("0.21.0");
+    expect(outcome.trace.decisions.map((decision) => decision.sequence)).toEqual([0, 1, 2, 3, 4]);
+    expect(outcome.ok).toBe(true);
+    expect(first).toEqual(second);
+  });
+});
+'''
+    je = extract_inline(js, "packages/kernel/src/evaluate.test.ts")
+    jmap = {o["lhs"]: o["raw"] for o in je}
+    check("jest toBe version", jmap.get("outcome.result.fingerprint.engineVersion") == "0.21.0", str(jmap))
+    check("jest toEqual array", jmap.get("outcome.trace.decisions.map((decision) => decision.sequence)") == [0, 1, 2, 3, 4], str(list(jmap)))
+    check("jest skip ident ident", "first" not in jmap, str(jmap))
+    check("jest true", jmap.get("outcome.ok") is True, str(jmap))
+
+    py = '''
+class T:
+    def test_sum(self):
+        self.assertEqual(adder.add(2, 3), 5)
+        assert app.TIMEOUT == 30
+'''
+    pe = extract_inline(py, "tests/test_app.py")
+    pmap = {o["lhs"]: o["raw"] for o in pe}
+    check("py assertEqual", pmap.get("adder.add(2, 3)") == 5, str(pmap))
+    check("py assert ==", pmap.get("app.TIMEOUT") == 30, str(pmap))
+
+    tc = json.dumps({
+        "id": "CTR-008",
+        "intent": "短くして",
+        "input": "hello",
+        "expected_properties": {
+            "unchanged": False,
+            "contains": ["2026年7月", "3件"],
+            "max_length_ratio": 0.95,
+        },
+    }, ensure_ascii=False)
+    naive = extract_json(tc, "contracts/testcases/CTR-008.json", oracle_roots_only=False)
+    roots = extract_json(tc, "contracts/testcases/CTR-008.json", oracle_roots_only=True)
+    naive_lhs = {o["lhs"] for o in naive}
+    roots_lhs = {o["lhs"] for o in roots}
+    check("json naive sees input", any("input" in x or x.endswith("input") for x in naive_lhs), str(naive_lhs))
+    check("json roots hides input", not any(x.endswith(".input") or x == "$.input" for x in roots_lhs), str(roots_lhs))
+    check(
+        "json roots has ratio",
+        any("max_length_ratio" in x for x in roots_lhs),
+        str(roots_lhs),
+    )
+    check(
+        "json array collapsed",
+        any(o["lhs"].endswith("contains") and o["raw"] == ["2026年7月", "3件"] for o in roots),
+        str([(o["lhs"], o["raw"]) for o in roots]),
+    )
+
+    def ev(vals: list[str], kinds: list[str], prods: list[str]) -> list[dict[str, Any]]:
+        out = []
+        for i, (v, k, p) in enumerate(zip(vals, kinds, prods)):
+            out.append({"event": k, "value": v, "prod": p, "commit": str(i), "ts": i, "date": "2026-01-01", "subject": ""})
+        return out
+
+    c1 = classify(ev(["1", "2", "4"], ["BORN", "SET", "SET"], ["COUPLED"] * 3))
+    check("ratchet", c1["class"] == "RATCHET", str(c1))
+    c2 = classify(ev(["3", "5", "3"], ["BORN", "SET", "SET"], ["COUPLED", "BLESS", "COUPLED"]))
+    check("flipflop", c2["class"] == "FLIPFLOP" and c2["bless"], str(c2))
+    c3 = classify(ev(['"a"', '"b"'], ["BORN", "SET"], ["COUPLED", "COUPLED"]))
+    check("drift", c3["class"] == "DRIFT", str(c3))
+    c4 = classify(ev(['"x"'], ["BORN"], ["BLESS"]))
+    check("stable born", c4["class"] == "STABLE" and not c4["changed"], str(c4))
+    c5 = classify(ev(['"0.19.0"', '"0.20.0"', '"0.22.0"'], ["BORN", "SET", "SET"], ["COUPLED"] * 3))
+    check("version ratchet", c5["class"] == "RATCHET", str(c5))
+    c6 = classify(ev(['"x"', '"x"'], ["BORN", "DIED"], ["COUPLED", "COUPLED"]))
+    check("vanish", c6["class"] == "VANISH" and "DIED" in c6["tags"], str(c6))
+    check(
+        "generated json is not an oracle file",
+        not is_oracle_file("packages/spec-artifacts/src/conformance/engine.generated.json"),
+    )
+
+    check("test path rust", is_test_path("src/hook/tests.rs"))
+    check("test path jest", is_test_path("packages/kernel/src/evaluate.test.ts"))
+    check("test path swift", is_test_path("Tests/SitboneUITests/UILogicTests.swift"))
+    check("json expected", is_json_oracle_path("data/fixtures/golden/x.expected.json"))
+    check("json scenario skipped", not is_json_oracle_path("data/fixtures/golden/x.scenario.json"))
+    check("prod src", is_prod_path("packages/kernel/src/evaluate.ts"))
+    check("not prod test", not is_prod_path("packages/kernel/src/evaluate.test.ts"))
+    each_src = "it.each([1,2])('n', (n) => {\n  expect(n).toBe(1);\n});\n"
+    each_os = extract_inline(each_src, "x.test.ts")
+    check("it.each does not crash", any(o["raw"] == 1 for o in each_os), str(each_os))
+
+    print("selftest fails:", fails)
+    return 1 if fails else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+USAGE = """tide — test oracles as a time series
+
+An oracle is the expected value a test claims: a literal in assert_eq! /
+expect().toBe / #expect / assertEqual, or a scalar in an *expected*.json /
+testcase JSON. tide walks first-parent history and classifies each claim:
+
+  STABLE    one value
+  DRIFT     several values, no pattern
+  RATCHET   numeric or dotted-version, strictly mono
+  FLIPFLOP  a value returned after leaving
+  VANISH    the claim disappeared (lhs/key gone)
+  BLESS     a value change in a commit that did not touch production
+
+Usage:
+  tide [-C repo] [path ...]
+  tide --at REF [-C repo] [path ...]
+  tide series KEY [-C repo]
+  tide --selftest
+
+Options:
+  -C DIR         git repository (default .)
+  --walk N       first-parent commits (default 250)
+  --full         every reachable commit, not first-parent
+  --at REF       extract oracles at REF; do not walk
+  --all          include STABLE
+  --kind K       inline | json | all (default all)
+  --json         JSON
+  --tsv          TSV
+  --check        exit 1 if BLESS or FLIPFLOP
+  --json-mode M  naive | roots (default roots; roots = expected-* subtree only)
+  --selftest     parser/classifier checks
+  -h, --help
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv and ("-h" in sys.argv or "--help" in sys.argv):
+        pass
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-C", dest="repo", default=".")
+    p.add_argument("--walk", type=int, default=250)
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--at", dest="at_ref", default=None)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--kind", choices=("inline", "json", "all"), default="all")
+    p.add_argument("--json", dest="as_json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--json-mode", choices=("naive", "roots"), default="roots")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("paths", nargs="*")
+    # series subcommand
+    if argv and argv[0] in {"series", "help"}:
+        if argv[0] == "help":
+            sys.stdout.write(USAGE)
+            return 0
+        # series KEY
+        rest = argv[1:]
+        key = None
+        if rest and not rest[0].startswith("-"):
+            key = rest[0]
+            rest = rest[1:]
+        ns = p.parse_args(rest)
+        if ns.help:
+            sys.stdout.write(USAGE)
+            return 0
+        repo = os.path.abspath(ns.repo)
+        if not git_ok(repo, "rev-parse", "--is-inside-work-tree"):
+            print("tide: not a git repository", file=sys.stderr)
+            return 2
+        series = walk_oracles(repo, ns.walk, ns.full, ns.paths, ns.json_mode)
+        if key is None:
+            print("tide series KEY", file=sys.stderr)
+            return 2
+        rec = series.get(key)
+        if rec is None:
+            # suffix match
+            hits = [k for k in series if key in k]
+            if len(hits) == 1:
+                rec = series[hits[0]]
+            elif hits:
+                print("tide: ambiguous key, matches:", file=sys.stderr)
+                for h in hits[:20]:
+                    print(" ", h, file=sys.stderr)
+                return 2
+            else:
+                print("tide: no such oracle", file=sys.stderr)
+                return 1
+        blob = {**rec, "info": classify(rec["events"])}
+        sys.stdout.write(json.dumps(blob, ensure_ascii=False, indent=2) + "\n")
+        return 0
+
+    ns = p.parse_args(argv)
+    if ns.help or (argv == []):
+        # default with no args still runs, help only on -h
+        if ns.help:
+            sys.stdout.write(USAGE)
+            return 0
+    if ns.selftest:
+        return _selftest()
+
+    repo = os.path.abspath(ns.repo)
+    if not git_ok(repo, "rev-parse", "--is-inside-work-tree"):
+        print("tide: not a git repository", file=sys.stderr)
+        return 2
+
+    if ns.at_ref:
+        found = extract_at(repo, ns.at_ref, ns.paths, ns.json_mode)
+        if ns.as_json:
+            sys.stdout.write(json.dumps(found, ensure_ascii=False, indent=2) + "\n")
+        else:
+            print(f"tide {VERSION}  at {ns.at_ref}  {repo}  oracles={len(found)}")
+            for o in found:
+                print(f"{o['kind']:<6} {o['path']}:{o['line']}  {o['test']}  {o['lhs']}  {o['value']}")
+        return 0
+
+    series = walk_oracles(repo, ns.walk if ns.walk > 0 else None, ns.full, ns.paths, ns.json_mode)
+    if ns.as_json:
+        sys.stdout.write(render_json(repo, series, ns.all, ns.kind))
+    elif ns.tsv:
+        sys.stdout.write(render_tsv(series, ns.all, ns.kind))
+    else:
+        sys.stdout.write(render_porcelain(repo, series, ns.all, ns.kind))
+
+    if ns.check:
+        bad = False
+        for rec in series.values():
+            info = classify(rec["events"])
+            if info["bless"] or info["class"] == "FLIPFLOP":
+                bad = True
+                break
+        return 1 if bad else 0
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        print(f"tide: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

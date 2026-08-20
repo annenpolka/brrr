@@ -1,0 +1,2321 @@
+#!/usr/bin/env python3
+"""glyph — shortest covering set of predicates that distinguish two trees.
+
+tell lists unary questions. sheaf prints a covering set plus walks.
+glyph's flipped assumption: **path existence is not identity**.
+`git mv a.rs b.rs` is one glyph (one `--follow` occupancy), not
+`exists a.rs` plus `exists b.rs`.
+
+Two trees in; a covering set out; pasteable held/perch lines.
+`glyph A B | sh` may run held. glyph itself does not walk history.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from fnmatch import fnmatch
+from typing import Iterable, Sequence
+
+
+class GlyphError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# --- git -------------------------------------------------------------------
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: str | None = None,
+    input_bytes: bytes | None = None,
+    input_text: str | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        input=input_text if text else input_bytes,
+        text=text,
+        capture_output=True,
+    )
+
+
+def git(repo: str, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", repo, *args], input_text=input_text)
+
+
+def git_bytes(repo: str, *args: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    return run(
+        ["git", "-C", repo, *args],
+        input_bytes=input_bytes,
+        text=False,
+    )
+
+
+def git_ok(repo: str, *args: str) -> str:
+    proc = git(repo, *args)
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or f"git {' '.join(args)} failed"
+        raise GlyphError(msg)
+    return proc.stdout
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    if not os.path.isdir(start):
+        raise GlyphError(f"not a directory: {start}")
+    proc = run(["git", "-C", start, "rev-parse", "--show-toplevel"])
+    if proc.returncode != 0:
+        raise GlyphError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+# --- sides / trees ---------------------------------------------------------
+
+
+@dataclass
+class Side:
+    spec: str
+    kind: str  # commit | tree | worktree | index
+    sha: str
+    tree: str
+    subject: str
+    iso: str
+
+    @property
+    def short(self) -> str:
+        if self.kind in ("worktree", "index"):
+            return self.sha
+        return self.sha[:7] if len(self.sha) >= 7 else self.sha
+
+
+@dataclass
+class Tree:
+    side: Side
+    paths: dict[str, str]  # path -> blob sha (or synthetic)
+    blobs: dict[str, bytes]  # path -> content (text-ish; missing if skipped)
+
+
+SKIP_TOKEN_SUFFIXES = (
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bin",
+)
+SKIP_TOKEN_NAMES = {
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+    "gemfile.lock",
+}
+SKIP_TOKEN_PARTS = ("/docs/generated/", "/generated/", ".generated.")
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+KEBAB_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*[-][A-Za-z0-9-]*[A-Za-z0-9]")
+CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+HEXISH_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
+STOP = {
+    "this",
+    "that",
+    "with",
+    "from",
+    "have",
+    "were",
+    "they",
+    "them",
+    "then",
+    "than",
+    "into",
+    "over",
+    "such",
+    "only",
+    "also",
+    "just",
+    "your",
+    "what",
+    "when",
+    "will",
+    "some",
+    "true",
+    "false",
+    "none",
+    "null",
+    "self",
+    "type",
+    "func",
+    "name",
+    "data",
+    "file",
+    "path",
+    "test",
+    "main",
+    "todo",
+    "pass",
+    "fail",
+    "info",
+    "warn",
+    "error",
+    "debug",
+    "return",
+    "class",
+    "const",
+    "where",
+    "which",
+    "their",
+    "about",
+    "after",
+    "before",
+    "while",
+    "using",
+    "import",
+    "export",
+}
+
+MAX_BLOB = 1_000_000
+MAX_CJK = 24
+SKIP_GENERATED = True
+CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
+# Split CJK runs only at real compound boundaries. Single-char particles
+# (が in 広がる) produced the るパル / がるパ flood on sitbone/tenaoshi.
+CJK_SPLIT_RE = re.compile(
+    r"(?:、|。|・|：|"
+    r"(?<=[\u4e00-\u9fff])(?:する|した|された)(?=[\u4e00-\u9fff])|"
+    r"(?<=[\u4e00-\u9fff])の(?=[\u4e00-\u9fff]))"
+)
+
+
+def _is_worktree_spec(spec: str) -> bool:
+    return spec in (".", ":worktree", "WORKTREE", ":wt")
+
+
+def _is_index_spec(spec: str) -> bool:
+    return spec in (":index", "INDEX", ":staged", ":cached")
+
+
+def resolve_side(repo: str, spec: str) -> Side:
+    if _is_worktree_spec(spec):
+        return Side(
+            spec=spec,
+            kind="worktree",
+            sha="WORKTREE",
+            tree="WORKTREE",
+            subject="uncommitted working tree",
+            iso="",
+        )
+    if _is_index_spec(spec):
+        return Side(
+            spec=spec,
+            kind="index",
+            sha="INDEX",
+            tree="INDEX",
+            subject="staged index",
+            iso="",
+        )
+    tree = git(repo, "rev-parse", "--verify", f"{spec}^{{tree}}")
+    if tree.returncode != 0:
+        err = tree.stderr.strip() or f"cannot resolve tree-ish {spec!r}"
+        # empty repo often lands here
+        probe = git(repo, "rev-parse", "--verify", spec)
+        if probe.returncode != 0 and "Needed a single revision" in (probe.stderr + tree.stderr):
+            raise GlyphError(f"no commits at {spec} (empty repository?)")
+        raise GlyphError(err)
+    tree_sha = tree.stdout.strip()
+    meta = git(repo, "log", "-1", "--format=%H%x09%ci%x09%s", spec)
+    if meta.returncode == 0 and meta.stdout.strip():
+        parts = meta.stdout.strip().split("\t", 2)
+        sha = parts[0]
+        iso = parts[1] if len(parts) > 1 else ""
+        subject = parts[2] if len(parts) > 2 else ""
+        return Side(spec=spec, kind="commit", sha=sha, tree=tree_sha, subject=subject, iso=iso)
+    return Side(
+        spec=spec,
+        kind="tree",
+        sha=tree_sha,
+        tree=tree_sha,
+        subject="(tree)",
+        iso="",
+    )
+
+
+def _git_blob_sha(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def load_commit_tree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-tree", "-r", "-z", side.tree]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc = git_bytes(repo, *cmd)
+    if proc.returncode != 0:
+        raise GlyphError(proc.stderr.decode("utf-8", "replace").strip() or "ls-tree failed")
+    paths: dict[str, str] = {}
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        obj_type = parts[1].decode("ascii", "replace")
+        sha = parts[2].decode("ascii", "replace")
+        path = path_b.decode("utf-8", "surrogateescape")
+        if obj_type != "blob":
+            continue
+        paths[path] = sha
+    blobs = _load_blobs(repo, paths)
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_worktree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc = git_bytes(repo, *cmd)
+    if proc.returncode != 0:
+        raise GlyphError(proc.stderr.decode("utf-8", "replace").strip() or "ls-files failed")
+    paths: dict[str, str] = {}
+    blobs: dict[str, bytes] = {}
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", "surrogateescape")
+        abs_path = os.path.join(repo, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        if size > MAX_BLOB:
+            paths[rel] = "LARGE"
+            continue
+        try:
+            with open(abs_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        paths[rel] = _git_blob_sha(data)
+        blobs[rel] = data
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_index(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-files", "-z", "--cached", "-s"]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc = git(repo, *cmd)
+    if proc.returncode != 0:
+        raise GlyphError(proc.stderr.strip() or "ls-files --cached failed")
+    paths: dict[str, str] = {}
+    # -s: "<mode> <sha> <stage>\t<path>" but -z uses NUL. Without -z, tabs.
+    # we used -z -s: "mode sha stage\tpath\0"
+    proc_b = git_bytes(repo, *cmd)
+    for entry in proc_b.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split()
+        if len(parts) < 2:
+            continue
+        sha = parts[1].decode("ascii", "replace")
+        path = path_b.decode("utf-8", "surrogateescape")
+        paths[path] = sha
+    blobs = _load_blobs(repo, paths)
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_tree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    if side.kind == "worktree":
+        return load_worktree(repo, side, pathspecs)
+    if side.kind == "index":
+        return load_index(repo, side, pathspecs)
+    return load_commit_tree(repo, side, pathspecs)
+
+
+def _load_blobs(repo: str, paths: dict[str, str]) -> dict[str, bytes]:
+    if not paths:
+        return {}
+    sha_to_paths: dict[str, list[str]] = {}
+    for path, sha in paths.items():
+        sha_to_paths.setdefault(sha, []).append(path)
+    wanted = [sha for sha in sha_to_paths if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)]
+    blobs: dict[str, bytes] = {}
+    if not wanted:
+        return blobs
+    payload = "".join(f"{sha}\n" for sha in wanted).encode()
+    proc = git_bytes(repo, "cat-file", "--batch", input_bytes=payload)
+    if proc.returncode != 0:
+        raise GlyphError("git cat-file --batch failed")
+    data = proc.stdout
+    pos = 0
+    idx = 0
+    n = len(wanted)
+    while idx < n and pos < len(data):
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = data[pos:nl].decode("ascii", "replace")
+        pos = nl + 1
+        if header.endswith(" missing"):
+            idx += 1
+            continue
+        parts = header.split()
+        if len(parts) < 3:
+            idx += 1
+            continue
+        sha, _kind, size_s = parts[0], parts[1], parts[2]
+        try:
+            size = int(size_s)
+        except ValueError:
+            idx += 1
+            continue
+        blob = data[pos : pos + size]
+        pos += size
+        if pos < len(data) and data[pos] == 10:  # trailing newline
+            pos += 1
+        idx += 1
+        if size > MAX_BLOB or b"\0" in blob[:8000]:
+            continue
+        for path in sha_to_paths.get(sha, []):
+            blobs[path] = blob
+    return blobs
+
+
+def skip_token_path(path: str) -> bool:
+    if not SKIP_GENERATED:
+        return False
+    lower = path.lower().replace("\\", "/")
+    base = lower.rsplit("/", 1)[-1]
+    if base in SKIP_TOKEN_NAMES:
+        return True
+    if lower.endswith(SKIP_TOKEN_SUFFIXES):
+        return True
+    for part in SKIP_TOKEN_PARTS:
+        if part in lower:
+            return True
+    return False
+
+
+# --- predicates ------------------------------------------------------------
+
+
+@dataclass
+class Identity:
+    """One occupant across two trees. A rename is one identity, not two paths."""
+
+    kind: str  # born | died | renamed | changed
+    a_path: str | None = None
+    b_path: str | None = None
+    sha_a: str | None = None
+    sha_b: str | None = None
+    similarity: float = 1.0
+
+    @property
+    def paths(self) -> list[str]:
+        out: list[str] = []
+        for p in (self.a_path, self.b_path):
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    @property
+    def key(self) -> str:
+        if self.kind == "renamed":
+            return f"R:{self.a_path}->{self.b_path}"
+        if self.kind == "changed":
+            return f"M:{self.a_path}"
+        if self.kind == "died":
+            return f"D:{self.a_path}"
+        return f"A:{self.b_path}"
+
+
+@dataclass
+class Pred:
+    kind: str  # exists | grep | path | content | follow
+    true_on: str  # A | B | AB
+    pattern: str
+    path: str | None = None
+    flags: str = ""  # e.g. "-F"
+    witnesses: list[str] = field(default_factory=list)
+    covers: list[str] = field(default_factory=list)
+    note: str = ""
+    from_path: str | None = None
+    to_path: str | None = None
+    identity_keys: list[str] = field(default_factory=list)
+
+    @property
+    def held(self) -> str:
+        if self.kind == "follow":
+            # held language: exists --follow OLD. Walks put --follow before exists.
+            src = self.from_path or self.pattern
+            return "exists --follow " + quote(src)
+        bits = [self.kind if self.kind in ("exists", "grep") else "grep"]
+        if self.kind == "exists":
+            return "exists " + quote(self.pattern)
+        flags = self.flags.strip()
+        if flags:
+            bits.append(flags)
+        bits.append(quote(self.pattern))
+        if self.path:
+            bits.append("--")
+            bits.append(quote(self.path))
+        # path/content are emitted as grep -- PATH (held's language)
+        if self.kind in ("path", "content"):
+            return " ".join(bits)
+        return " ".join(bits)
+
+    @property
+    def length(self) -> int:
+        return len(self.held)
+
+    @property
+    def name_like(self) -> bool:
+        if self.kind == "follow":
+            return True
+        return _name_like(self.pattern, self.kind)
+
+    @property
+    def path_stem(self) -> bool:
+        """Pattern is the basename/stem of a covered path — the name you wanted."""
+        if self.kind == "follow":
+            return True
+        for p in self.covers or self.witnesses:
+            base = p.rsplit("/", 1)[-1]
+            stem = base.rsplit(".", 1)[0] if "." in base else base
+            if self.pattern == stem or self.pattern == base:
+                return True
+            if self.kind == "exists" and (stem in self.pattern or base in self.pattern):
+                return True
+        return False
+
+    @property
+    def rank(self) -> tuple:
+        # After dogfood: well-formed names, then path stems (FocusRiverView
+        # before easeIn), then shortest, then broader coverage.
+        # follow is an identity, not two exists — rank it first in its class.
+        return (
+            0 if self.kind == "follow" else 1,
+            0 if self.name_like else 1,
+            0 if self.path_stem else 1,
+            self.length,
+            -len(self.covers),
+            self.kind,
+            self.held,
+        )
+
+
+def quote(s: str) -> str:
+    if s == "":
+        return "''"
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+=,*-]+", s) and not s.startswith("-"):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _name_like(pattern: str, kind: str) -> bool:
+    """True for predicates a human might actually type into held.
+
+    Raw length ranking after dogfood drowned FocusRiverView / 第一級 under
+    3-char CJK slices (がるパ) and leftover camel humps (Apps, Drag).
+    """
+    if kind in ("exists", "follow"):
+        return True
+    if kind == "content":
+        return True
+    if any("\u3040" <= c <= "\u9fff" for c in pattern):
+        # All-kanji compounds (第一級) are names. Mixed crumbs (向けに調整,
+        # leftover がるパ-class slices) are not. Long mixed phrases can be.
+        if all("\u4e00" <= c <= "\u9fff" for c in pattern) and len(pattern) >= 2:
+            return True
+        if all("\u30a0" <= c <= "\u30ff" for c in pattern) and len(pattern) >= 3:
+            return True
+        return len(pattern) >= 8
+    if "-" in pattern or "_" in pattern:
+        return True
+    if re.search(r"[a-z][A-Z]", pattern) or re.match(r"^[A-Z]{2,}[a-z]", pattern):
+        return True
+    if re.match(r"^[A-Z][a-z]+[A-Z]", pattern):
+        return True
+    if kind == "path":
+        return len(pattern) >= 8
+    return len(pattern) >= 8
+
+
+def color_enabled(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never" or args.json or args.oneline or args.walks:
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def paint(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+# --- tokenization ----------------------------------------------------------
+
+
+def ident_pieces(token: str) -> list[str]:
+    """Readable pieces of a name.
+
+    CamelCase yields left-cumulative humps only (Focus, FocusRiver, FocusRiverView).
+    Interior leftover humps (View, Apps, Drag) drowned real names on sitbone.
+    kebab/snake also yields each part: finite-breakpoint → breakpoint.
+    """
+    out: list[str] = []
+    if "_" in token:
+        parts = [p for p in token.split("_") if p]
+        joiner = "_"
+    elif "-" in token:
+        parts = [p for p in token.split("-") if p]
+        joiner = "-"
+    else:
+        parts = CAMEL_SPLIT_RE.findall(token) or [token]
+        joiner = ""
+    if not parts:
+        return [token] if token else []
+    acc = parts[0]
+    if len(acc) >= 4:
+        out.append(acc)
+    for p in parts[1:]:
+        acc = (acc + joiner + p) if joiner else (acc + p)
+        if len(acc) >= 4:
+            out.append(acc)
+    if joiner:
+        for p in parts:
+            if len(p) >= 4 and p not in out:
+                out.append(p)
+    if token not in out and len(token) >= 4:
+        out.append(token)
+    return out
+
+
+def cjk_chunks(text: str) -> list[str]:
+    """Bounded CJK runs, split on kanji の/する compounds — not sliding windows."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(tok: str) -> None:
+        if tok and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+
+    for run in CJK_RUN_RE.findall(text):
+        run = run[:MAX_CJK]
+        parts = [p for p in CJK_SPLIT_RE.split(run) if p]
+        if not parts:
+            parts = [run]
+        for part in parts:
+            if len(part) < 2:
+                continue
+            # Pure hiragana crumbs (入れる, つ書く) are unique by accident.
+            if len(part) < 5 and all("\u3040" <= c <= "\u309f" for c in part):
+                continue
+            add(part)
+    return out
+
+
+def extract_tokens(text: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(tok: str) -> None:
+        if tok and tok not in seen:
+            seen.add(tok)
+            found.append(tok)
+
+    for m in KEBAB_RE.findall(text):
+        add(m)
+        for p in ident_pieces(m):
+            add(p)
+    for m in IDENT_RE.findall(text):
+        if HEXISH_RE.match(m):
+            continue
+        add(m)
+        for p in ident_pieces(m):
+            add(p)
+    for tok in cjk_chunks(text):
+        add(tok)
+    return found
+
+
+def decode_blob(data: bytes) -> str | None:
+    if b"\0" in data[:8000]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", "replace")
+
+
+def build_corpus(blobs: dict[str, bytes]) -> bytes:
+    return b"\0".join(blobs.values())
+
+
+def corpus_has(corpus: bytes, needle: str) -> bool:
+    if not needle:
+        return False
+    return needle.encode("utf-8", "surrogateescape") in corpus
+
+
+def path_tokens(path: str) -> list[str]:
+    out: list[str] = []
+    base = path.rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    for piece in (path, base, stem):
+        out.extend(extract_tokens(piece))
+        if piece not in out and len(piece) >= 4:
+            out.append(piece)
+    return out
+
+
+# --- exists globs ----------------------------------------------------------
+
+
+def glob_hits(glob: str, paths: Iterable[str]) -> list[str]:
+    return [p for p in paths if fnmatch(p, glob)]
+
+
+def exists_candidates(exclusive: Sequence[str], other: Sequence[str], *, min_len: int) -> list[tuple[str, list[str]]]:
+    """Short globs that match some exclusive path and no other-tree path."""
+    if not exclusive:
+        return []
+    other_list = list(other)
+    exclusive_list = list(exclusive)
+    scored: dict[str, list[str]] = {}
+
+    def consider(glob: str) -> None:
+        if not glob:
+            return
+        if glob in scored:
+            return
+        if any(fnmatch(o, glob) for o in other_list):
+            return
+        hits = glob_hits(glob, exclusive_list)
+        if hits:
+            scored[glob] = hits
+
+    # directory globs: only when the directory is absent on the other side
+    dirs: set[str] = set()
+    for p in exclusive_list:
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]))
+    other_dirs: set[str] = set()
+    for p in other_list:
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            other_dirs.add("/".join(parts[:i]))
+        other_dirs.add(p)
+    for d in dirs:
+        if d in other_dirs:
+            continue
+        # no other path is under d or is d
+        if any(o == d or o.startswith(d + "/") for o in other_list):
+            continue
+        consider(d + "/*")
+        consider("*" + d.split("/")[-1] + "/*")
+
+    # extensions unique to this side
+    def ext_of(p: str) -> str | None:
+        base = p.rsplit("/", 1)[-1]
+        if "." not in base:
+            return None
+        return base.rsplit(".", 1)[-1]
+
+    other_ext = {ext_of(p) for p in other_list}
+    for p in exclusive_list:
+        ext = ext_of(p)
+        if ext and ext not in other_ext and len(ext) >= 1:
+            consider("*." + ext)
+
+    # per-path: unique basename, unique suffix components, full path
+    other_basenames = {p.rsplit("/", 1)[-1] for p in other_list}
+    for p in exclusive_list:
+        base = p.rsplit("/", 1)[-1]
+        if base not in other_basenames:
+            consider("*" + base if "/" in p else base)
+            consider(base)
+        # last N components
+        parts = p.split("/")
+        for n in range(1, len(parts) + 1):
+            suffix = "/".join(parts[-n:])
+            if len(suffix) < min_len and n < len(parts):
+                continue
+            consider("*" + suffix if n < len(parts) else suffix)
+            consider("*/" + suffix)
+        consider(p)
+
+        # unique stem glob
+        if "." in base:
+            stem = base.rsplit(".", 1)[0]
+            if len(stem) >= min_len:
+                consider("*" + stem + "*")
+                consider("*" + stem + ".*")
+
+    # keep shortest globs; caller applies dominance
+    items = sorted(scored.items(), key=lambda kv: (len(kv[0]), -len(kv[1]), kv[0]))
+    return items
+
+
+# --- identity (path existence is not identity) -----------------------------
+
+RENAME_SIM_MIN = 0.5
+
+
+def _line_jaccard(a: bytes, b: bytes) -> float:
+    if a == b:
+        return 1.0
+    la = set(a.splitlines())
+    lb = set(b.splitlines())
+    if not la and not lb:
+        return 1.0
+    if not la or not lb:
+        # empty vs non-empty: still a rename if basenames hint; caller decides
+        return 0.0
+    return len(la & lb) / len(la | lb)
+
+
+def _path_pair_score(a_path: str, b_path: str) -> tuple:
+    a_base = a_path.rsplit("/", 1)[-1]
+    b_base = b_path.rsplit("/", 1)[-1]
+    a_stem = a_base.rsplit(".", 1)[0] if "." in a_base else a_base
+    b_stem = b_base.rsplit(".", 1)[0] if "." in b_base else b_base
+    same_base = 0 if a_base == b_base else 1
+    same_stem = 0 if a_stem == b_stem else 1
+    # directory rewrite with same basename is a classic git mv
+    return (same_base, same_stem, abs(len(a_path) - len(b_path)), a_path, b_path)
+
+
+def _blob_of(tree: Tree, path: str) -> bytes | None:
+    return tree.blobs.get(path)
+
+
+def detect_identities(tree_a: Tree, tree_b: Tree) -> list[Identity]:
+    """Pair occupants. A same-blob path change is one rename, not two exists."""
+    only_a = sorted(p for p in tree_a.paths if p not in tree_b.paths)
+    only_b = sorted(p for p in tree_b.paths if p not in tree_a.paths)
+    changed = sorted(
+        p for p in tree_a.paths if p in tree_b.paths and tree_a.paths[p] != tree_b.paths[p]
+    )
+
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    identities: list[Identity] = []
+
+    def take_rename(ap: str, bp: str, sim: float) -> None:
+        used_a.add(ap)
+        used_b.add(bp)
+        identities.append(
+            Identity(
+                kind="renamed",
+                a_path=ap,
+                b_path=bp,
+                sha_a=tree_a.paths.get(ap),
+                sha_b=tree_b.paths.get(bp),
+                similarity=sim,
+            )
+        )
+
+    # 1. Exact blob identity: unique SHA on both exclusive sides.
+    a_by_sha: dict[str, list[str]] = {}
+    for p in only_a:
+        a_by_sha.setdefault(tree_a.paths[p], []).append(p)
+    b_by_sha: dict[str, list[str]] = {}
+    for p in only_b:
+        b_by_sha.setdefault(tree_b.paths[p], []).append(p)
+    for sha, a_paths in a_by_sha.items():
+        b_paths = b_by_sha.get(sha) or []
+        if not b_paths:
+            continue
+        remaining_a = [p for p in a_paths if p not in used_a]
+        remaining_b = [p for p in b_paths if p not in used_b]
+        pairs = sorted(
+            ((ap, bp) for ap in remaining_a for bp in remaining_b),
+            key=lambda pair: _path_pair_score(pair[0], pair[1]),
+        )
+        for ap, bp in pairs:
+            if ap in used_a or bp in used_b:
+                continue
+            take_rename(ap, bp, 1.0)
+
+    # 2. Unique basename among leftovers (src/a.rs → lib/a.rs, content edited).
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    a_base: dict[str, list[str]] = {}
+    b_base: dict[str, list[str]] = {}
+    for p in leftover_a:
+        a_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for p in leftover_b:
+        b_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for base, a_paths in a_base.items():
+        b_paths = b_base.get(base) or []
+        if len(a_paths) == 1 and len(b_paths) == 1:
+            ap, bp = a_paths[0], b_paths[0]
+            if ap in used_a or bp in used_b:
+                continue
+            ba = _blob_of(tree_a, ap)
+            bb = _blob_of(tree_b, bp)
+            sim = _line_jaccard(ba or b"", bb or b"") if ba is not None and bb is not None else 0.0
+            # same basename + exclusive both sides: treat as identity even if
+            # content shifted; a deletion+unrelated birth sharing a name is rare
+            # and --no-follow recovers path identity.
+            take_rename(ap, bp, sim)
+
+    # 3. Content similarity among remaining exclusive paths (git mv + edit).
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    scored: list[tuple[float, str, str]] = []
+    for ap in leftover_a:
+        ba = _blob_of(tree_a, ap)
+        if ba is None:
+            continue
+        for bp in leftover_b:
+            bb = _blob_of(tree_b, bp)
+            if bb is None:
+                continue
+            sim = _line_jaccard(ba, bb)
+            if sim >= RENAME_SIM_MIN:
+                scored.append((sim, ap, bp))
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    for sim, ap, bp in scored:
+        if ap in used_a or bp in used_b:
+            continue
+        take_rename(ap, bp, sim)
+
+    for p in only_a:
+        if p in used_a:
+            continue
+        identities.append(
+            Identity(kind="died", a_path=p, sha_a=tree_a.paths.get(p))
+        )
+    for p in only_b:
+        if p in used_b:
+            continue
+        identities.append(
+            Identity(kind="born", b_path=p, sha_b=tree_b.paths.get(p))
+        )
+    for p in changed:
+        identities.append(
+            Identity(
+                kind="changed",
+                a_path=p,
+                b_path=p,
+                sha_a=tree_a.paths.get(p),
+                sha_b=tree_b.paths.get(p),
+            )
+        )
+    return identities
+
+
+def follow_pred(ident: Identity) -> Pred:
+    src = ident.a_path or ""
+    dst = ident.b_path or ""
+    return Pred(
+        kind="follow",
+        true_on="AB",
+        pattern=src,
+        path=dst,
+        from_path=src,
+        to_path=dst,
+        witnesses=[src, dst],
+        covers=[src, dst],
+        identity_keys=[ident.key],
+        note=f"identity {src} → {dst}",
+    )
+
+
+def compress_follows(preds: Sequence[Pred]) -> list[Pred]:
+    """Collapse a shared directory rewrite into one follow glyph.
+
+    `src/*.rs` → `lib/*.rs` is one identity of a tree, not N exists pairs.
+    """
+    follows = [p for p in preds if p.kind == "follow" and p.from_path and p.to_path]
+    others = [p for p in preds if p.kind != "follow"]
+    if len(follows) < 2:
+        return list(preds)
+
+    def split_dir(path: str) -> tuple[str, str]:
+        if "/" not in path:
+            return "", path
+        d, base = path.rsplit("/", 1)
+        return d, base
+
+    groups: dict[tuple[str, str], list[Pred]] = {}
+    leftover: list[Pred] = []
+    for p in follows:
+        ad, ab = split_dir(p.from_path or "")
+        bd, bb = split_dir(p.to_path or "")
+        if ab == bb and (ad or bd) and ad != bd:
+            groups.setdefault((ad, bd), []).append(p)
+        else:
+            leftover.append(p)
+    out: list[Pred] = []
+    for (ad, bd), members in sorted(groups.items()):
+        if len(members) < 2:
+            leftover.extend(members)
+            continue
+        src_glob = (ad + "/*") if ad else "*"
+        dst_glob = (bd + "/*") if bd else "*"
+        covers: list[str] = []
+        keys: list[str] = []
+        for m in members:
+            covers.extend(m.covers)
+            keys.extend(m.identity_keys)
+        out.append(
+            Pred(
+                kind="follow",
+                true_on="AB",
+                pattern=src_glob,
+                path=dst_glob,
+                from_path=src_glob,
+                to_path=dst_glob,
+                witnesses=[src_glob, dst_glob],
+                covers=list(dict.fromkeys(covers)),
+                identity_keys=list(dict.fromkeys(keys)),
+                note=f"directory identity {src_glob} → {dst_glob}",
+            )
+        )
+    out.extend(leftover)
+    out.extend(others)
+    return out
+
+
+# --- discovery -------------------------------------------------------------
+
+
+def candidate_source_paths(true: Tree, false: Tree) -> list[str]:
+    """Paths whose true-side blob can contribute true-only tokens."""
+    out: list[str] = []
+    for p, sha in true.paths.items():
+        if false.paths.get(p) != sha:
+            out.append(p)
+    return out
+
+
+def collect_true_tokens(true: Tree, source_paths: Sequence[str]) -> dict[str, list[str]]:
+    """token -> list of paths on the true side that contain it as a token source."""
+    token_paths: dict[str, list[str]] = {}
+    for path in source_paths:
+        if skip_token_path(path):
+            # still allow path-name tokens
+            for tok in path_tokens(path):
+                if tok.lower() in STOP or HEXISH_RE.match(tok):
+                    continue
+                bucket = token_paths.setdefault(tok, [])
+                if path not in bucket:
+                    bucket.append(path)
+            continue
+        blob = true.blobs.get(path)
+        texts: list[str] = []
+        if blob is not None:
+            decoded = decode_blob(blob)
+            if decoded is not None:
+                texts.append(decoded)
+        texts.append(path)
+        seen_here: set[str] = set()
+        for text in texts:
+            for tok in extract_tokens(text) if text != path else path_tokens(path):
+                if tok in seen_here:
+                    continue
+                if tok.lower() in STOP or HEXISH_RE.match(tok):
+                    continue
+                seen_here.add(tok)
+                bucket = token_paths.setdefault(tok, [])
+                if path not in bucket:
+                    bucket.append(path)
+    return token_paths
+
+
+def unique_lines(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        s = raw.strip()
+        if len(s) < 8 or len(s) > 100:
+            continue
+        if s.startswith("*") and set(s) <= set("*-=/# "):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def discover_side(
+    *,
+    label: str,
+    true: Tree,
+    false: Tree,
+    min_len: int,
+    kinds: set[str],
+    exclude_paths: Sequence[str] | None = None,
+) -> list[Pred]:
+    preds: list[Pred] = []
+    skip_id = set(exclude_paths or ())
+    exclusive = sorted(p for p in true.paths if p not in false.paths and p not in skip_id)
+    other_paths = list(false.paths)
+    false_corpus = build_corpus(false.blobs)
+    true_corpus = build_corpus(true.blobs)
+    source = candidate_source_paths(true, false)
+    changed = sorted(p for p in true.paths if p in false.paths and true.paths[p] != false.paths[p])
+
+    if "exists" in kinds:
+        for glob, hits in exists_candidates(exclusive, other_paths, min_len=min_len):
+            preds.append(
+                Pred(
+                    kind="exists",
+                    true_on=label,
+                    pattern=glob,
+                    witnesses=hits[:12],
+                    covers=hits,
+                    note="path occupancy",
+                )
+            )
+        # exclusive exact paths as fallback if globber found nothing
+        if exclusive and not any(p.kind == "exists" for p in preds):
+            for p in exclusive:
+                preds.append(
+                    Pred(
+                        kind="exists",
+                        true_on=label,
+                        pattern=p,
+                        witnesses=[p],
+                        covers=[p],
+                    )
+                )
+
+    token_paths = collect_true_tokens(true, source) if kinds & {"grep", "path", "content"} else {}
+
+    if "grep" in kinds:
+        for tok, paths in token_paths.items():
+            if len(tok) < min_len:
+                continue
+            if corpus_has(false_corpus, tok):
+                continue
+            # grep is content occupancy. Path-only tokens are exists, not grep
+            # (mv a.rs b.rs otherwise emits leftover `grep b.rs`).
+            if not corpus_has(true_corpus, tok):
+                continue
+            flags = "" if _safe_regex(tok) else "-F"
+            preds.append(
+                Pred(
+                    kind="grep",
+                    true_on=label,
+                    pattern=tok,
+                    flags=flags,
+                    witnesses=paths[:12],
+                    covers=list(paths),
+                    note="tree-wide",
+                )
+            )
+
+    if "path" in kinds:
+        # token unique to one version of a shared path, but present elsewhere on false
+        for path in changed:
+            if skip_token_path(path):
+                continue
+            a_blob = true.blobs.get(path)
+            b_blob = false.blobs.get(path)
+            if a_blob is None or b_blob is None:
+                continue
+            a_text = decode_blob(a_blob)
+            b_text = decode_blob(b_blob)
+            if a_text is None or b_text is None:
+                continue
+            b_file_corpus = b_text.encode("utf-8", "surrogateescape")
+            seen_tok: set[str] = set()
+            for tok in extract_tokens(a_text):
+                if tok in seen_tok or len(tok) < min_len or tok.lower() in STOP:
+                    continue
+                seen_tok.add(tok)
+                if tok.encode("utf-8", "surrogateescape") in b_file_corpus:
+                    continue
+                if not corpus_has(false_corpus, tok):
+                    continue  # that belongs to grep
+                flags = "" if _safe_regex(tok) else "-F"
+                preds.append(
+                    Pred(
+                        kind="path",
+                        true_on=label,
+                        pattern=tok,
+                        path=path,
+                        flags=flags,
+                        witnesses=[path],
+                        covers=[path],
+                        note="path-scoped; token lives elsewhere on the other tree",
+                    )
+                )
+
+    if "content" in kinds:
+        for path in source:
+            if skip_token_path(path):
+                continue
+            a_blob = true.blobs.get(path)
+            if a_blob is None:
+                continue
+            a_text = decode_blob(a_blob)
+            if a_text is None:
+                continue
+            b_text = ""
+            if path in false.blobs:
+                decoded = decode_blob(false.blobs[path])
+                b_text = decoded or ""
+            b_lines = set(unique_lines(b_text)) if b_text else set()
+            n = 0
+            for line in unique_lines(a_text):
+                if line in b_lines:
+                    continue
+                if corpus_has(false_corpus, line):
+                    # other file on false already has this line; only path-scoped
+                    scoped = True
+                else:
+                    scoped = path not in false.paths
+                    # tree-wide unique line. Long grep; keep as content so
+                    # short greps stay the headline.
+                    scoped = True
+                flags = "-F"
+                preds.append(
+                    Pred(
+                        kind="content",
+                        true_on=label,
+                        pattern=line,
+                        path=path,
+                        flags=flags,
+                        witnesses=[path],
+                        covers=[path],
+                        note="unique line",
+                    )
+                )
+                n += 1
+                if n >= 3:
+                    break
+
+    return _cap_kind(preds)
+
+
+def _cap_kind(preds: list[Pred], n: int = 48) -> list[Pred]:
+    """Keep name-like predicates plus a few raw-short ones; drop the n-gram flood."""
+    out: list[Pred] = []
+    for kind in ("exists", "grep", "path", "content", "follow"):
+        chunk = [p for p in preds if p.kind == kind]
+        named = sorted((p for p in chunk if p.name_like), key=lambda p: p.rank)
+        other = sorted((p for p in chunk if not p.name_like), key=lambda p: p.rank)
+        out.extend(named[:n])
+        out.extend(other[:8])
+    return out
+
+
+def _safe_regex(tok: str) -> bool:
+    return re.fullmatch(r"[A-Za-z0-9_]+", tok) is not None
+
+
+def dominate(preds: Sequence[Pred]) -> list[Pred]:
+    """Drop a predicate if a strictly shorter same-side same-kind one already
+    distinguishes with a substring pattern (grep/path/content) or a more
+    general glob (exists). Keep kind diversity.
+    """
+    by = sorted(preds, key=lambda p: (p.true_on, p.kind, 0 if p.name_like else 1, p.length, -len(p.covers), p.held))
+    kept: list[Pred] = []
+    # per side+kind, keep a pattern if no kept pattern is a substring (grep)
+    # or a strictly more general glob covering a superset (exists)
+    for p in by:
+        if p.kind == "follow":
+            dominated = False
+            for k in kept:
+                if k.kind != "follow":
+                    continue
+                if k.from_path == p.from_path and k.to_path == p.to_path:
+                    dominated = True
+                    break
+                # directory glob already covers this file pair
+                if (
+                    set(p.covers) <= set(k.covers)
+                    and k.length <= p.length
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(p)
+            continue
+        if p.kind == "exists":
+            dominated = False
+            for k in kept:
+                if k.true_on != p.true_on or k.kind != "exists":
+                    continue
+                if k.pattern == p.pattern:
+                    dominated = True
+                    break
+                # shorter glob that already covers this glob's files
+                if k.length <= p.length and set(p.covers) <= set(k.covers):
+                    dominated = True
+                    break
+                # p's glob is a longer spelling of k
+                if k.pattern in p.pattern and set(p.covers) <= set(k.covers):
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(p)
+            continue
+        dominated = False
+        for k in kept:
+            if k.true_on != p.true_on or k.kind != p.kind:
+                continue
+            if k.path != p.path:
+                continue
+            if k.pattern == p.pattern:
+                dominated = True
+                break
+            if k.pattern in p.pattern and k.length <= p.length:
+                # A leftover prefix (Focus) must not delete the path-stem
+                # name (FocusRiverView) that dogfood actually wanted.
+                if p.path_stem and not k.path_stem:
+                    continue
+                if p.name_like and not k.name_like:
+                    continue
+                dominated = True
+                break
+        if not dominated:
+            kept.append(p)
+    return kept
+
+
+def verify_preds(repo: str, a: Tree, b: Tree, preds: Sequence[Pred]) -> list[Pred]:
+    """Drop anything that does not actually split the two trees.
+
+    `follow` is a pair identity, not a unary occupancy: old lives on A,
+    new lives on B. Both trees hold the occupant.
+    """
+    out: list[Pred] = []
+    for p in preds:
+        if p.kind == "follow":
+            src = p.from_path or p.pattern
+            dst = p.to_path or p.path or ""
+            if not src or not dst:
+                continue
+            # glob follow: every covered old path gone on B, new present on B
+            if "*" in src or "*" in dst:
+                if not p.covers:
+                    continue
+                out.append(p)
+                continue
+            if src in a.paths and src not in b.paths and dst in b.paths and dst not in a.paths:
+                p.witnesses = [src, dst]
+                p.covers = [src, dst]
+                out.append(p)
+            continue
+        true_tree = a if p.true_on == "A" else b
+        false_tree = b if p.true_on == "A" else a
+        ok_true, wit_true = probe(repo, true_tree, p)
+        ok_false, _ = probe(repo, false_tree, p)
+        if ok_true and not ok_false:
+            if wit_true:
+                p.witnesses = wit_true[:12]
+                p.covers = wit_true
+            out.append(p)
+    return out
+
+
+def probe(repo: str, tree: Tree, pred: Pred) -> tuple[bool, list[str]]:
+    if pred.kind == "follow":
+        src = pred.from_path or pred.pattern
+        dst = pred.to_path or pred.path or ""
+        hits = []
+        if src in tree.paths:
+            hits.append(src)
+        if dst in tree.paths:
+            hits.append(dst)
+        return bool(hits), hits
+    if pred.kind == "exists":
+        hits = glob_hits(pred.pattern, tree.paths)
+        return bool(hits), hits
+    # grep / path / content: fixed-string occupancy
+    needle = pred.pattern
+    if pred.path:
+        if pred.path not in tree.paths:
+            return False, []
+        blob = tree.blobs.get(pred.path)
+        if blob is None:
+            return False, []
+        hit = needle.encode("utf-8", "surrogateescape") in blob
+        return hit, [pred.path] if hit else []
+    hits: list[str] = []
+    nb = needle.encode("utf-8", "surrogateescape")
+    for path, blob in tree.blobs.items():
+        if nb in blob:
+            hits.append(path)
+            if len(hits) >= 80:
+                break
+    if hits:
+        return True, hits
+    # path-name occupancy (token only in a filename)
+    for path in tree.paths:
+        if needle in path:
+            hits.append(path)
+            if len(hits) >= 80:
+                break
+    return bool(hits), hits
+
+
+def _quality(p: Pred) -> int:
+    # follow is the identity primitive — one occupant, not two exists
+    if p.kind == "follow":
+        return 0
+    # content lines are unique but not a covering primitive — last resort
+    if p.kind == "content":
+        return 4
+    if p.path_stem:
+        return 1
+    if p.name_like:
+        return 2
+    return 3
+
+
+def shortest_cover(
+    preds: Sequence[Pred],
+    delta_paths: Sequence[str],
+    *,
+    per_side: str | None = None,
+    limit: int = 12,
+    budget: int | None = None,
+) -> list[Pred]:
+    """Minimum-cardinality cover of the delta, among well-formed predicates.
+
+    Occupancy-greedy (tell v1) let `grep site` beat FocusRiverView. Quality
+    class is the primary key so a 4-letter accident cannot win. Within a
+    class, fewer predicates beat more, then shorter held-language wins.
+    `budget` is a cap on the sum of held-string lengths (None = unlimited).
+    """
+    universe = set(delta_paths)
+    if not universe:
+        return []
+    pool = [
+        p
+        for p in preds
+        if (per_side is None or p.true_on == per_side) and (set(p.covers) & universe)
+    ]
+    if not pool:
+        return []
+    if len(universe) <= 16 and len(pool) <= 40:
+        exact = _exact_cover(pool, universe, limit=limit, budget=budget)
+        if exact:
+            return exact
+    return _greedy_cover(pool, universe, limit=limit, budget=budget)
+
+
+def _exact_cover(
+    pool: Sequence[Pred],
+    universe: set[str],
+    *,
+    limit: int,
+    budget: int | None,
+) -> list[Pred]:
+    paths = sorted(universe)
+    idx = {path: i for i, path in enumerate(paths)}
+    n = len(paths)
+    full = (1 << n) - 1
+    masks: list[tuple[Pred, int, int, int]] = []
+    for p in pool:
+        mask = 0
+        for path in p.covers:
+            bit = idx.get(path)
+            if bit is not None:
+                mask |= 1 << bit
+        if mask:
+            masks.append((p, mask, _quality(p), p.length))
+    inf: tuple[int, int, int, tuple[int, ...]] = (10**6, 10**6, 10**9, ())
+    dp: list[tuple[int, int, int, tuple[int, ...]]] = [inf] * (1 << n)
+    dp[0] = (0, 0, 0, ())
+    for i, (_p, mask, q, length) in enumerate(masks):
+        for state in range((1 << n) - 1, -1, -1):
+            cur = dp[state]
+            if cur[1] >= limit:
+                continue
+            nxt = state | mask
+            if nxt == state:
+                continue
+            total = cur[2] + length
+            if budget is not None and total > budget:
+                continue
+            cand = (cur[0] + q, cur[1] + 1, total, cur[3] + (i,))
+            if cand[:3] < dp[nxt][:3]:
+                dp[nxt] = cand
+    best = dp[full]
+    if best[3] == ():
+        return []
+    return [masks[i][0] for i in best[3]]
+
+
+def _greedy_cover(
+    pool: Sequence[Pred],
+    universe: set[str],
+    *,
+    limit: int,
+    budget: int | None,
+) -> list[Pred]:
+    uncovered = set(universe)
+    chosen: list[Pred] = []
+    remaining = list(pool)
+    used = 0
+    while uncovered and remaining and len(chosen) < limit:
+        best: Pred | None = None
+        best_key: tuple | None = None
+        for p in remaining:
+            new = uncovered.intersection(p.covers)
+            if not new:
+                continue
+            # quality, then max new (min cardinality), then shorter held
+            key = (_quality(p), -len(new), p.length, p.held)
+            if best_key is None or key < best_key:
+                best = p
+                best_key = key
+        if best is None:
+            break
+        if budget is not None and chosen and used + best.length > budget:
+            break
+        chosen.append(best)
+        used += best.length
+        uncovered.difference_update(best.covers)
+        remaining = [p for p in remaining if p is not best]
+    return chosen
+
+
+def _cover_paths(paths: Sequence[str]) -> list[str]:
+    """Lockfiles / generated blobs stay out of the covering universe."""
+    return [p for p in paths if not skip_token_path(p)]
+
+
+def sided_cover(
+    preds: Sequence[Pred],
+    only_a: Sequence[str],
+    only_b: Sequence[str],
+    changed: Sequence[str],
+    *,
+    limit: int = 12,
+    budget: int | None = None,
+) -> list[Pred]:
+    """Cover exclusive sides independently under a single length budget.
+
+    A global occupancy greedy (tell, sheaf v1) fills `--limit` with B-side
+    module names on an island-vs-HEAD delta and leaves FocusRiverView
+    unexplained. The island's unique name is an only-A essential: it must
+    get a slot even when 60 B-only files out-occupy it.
+
+    `--limit` is the max *total* sheaf size. The smaller exclusive side
+    is reserved 1–2 slots so a one-file island cannot be dropped.
+    """
+    only_a = _cover_paths(only_a)
+    only_b = _cover_paths(only_b)
+    changed = _cover_paths(changed)
+    a_preds = [p for p in preds if p.true_on == "A"]
+    b_preds = [p for p in preds if p.true_on == "B"]
+    sheaf: list[Pred] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def take(items: Sequence[Pred]) -> None:
+        for p in items:
+            if limit >= 0 and len(sheaf) >= limit:
+                return
+            key = (p.true_on, p.kind, p.held)
+            if key in seen:
+                continue
+            seen.add(key)
+            sheaf.append(p)
+
+    # Reserve slots for the smaller exclusive side (the island).
+    n_a, n_b = len(only_a), len(only_b)
+    if n_a and n_b:
+        small_slots = min(2, min(n_a, n_b), max(1, limit // 3 if limit else 2))
+        if n_a <= n_b:
+            a_lim, b_lim = small_slots, max(0, (limit or 12) - small_slots)
+        else:
+            b_lim, a_lim = small_slots, max(0, (limit or 12) - small_slots)
+    elif n_a:
+        a_lim, b_lim = (limit or 12), 0
+    else:
+        a_lim, b_lim = 0, (limit or 12)
+
+    if a_lim and only_a:
+        take(shortest_cover(a_preds, only_a, limit=a_lim, budget=budget))
+    if b_lim and only_b:
+        take(shortest_cover(b_preds, only_b, limit=b_lim, budget=budget))
+    covered: set[str] = set()
+    for p in sheaf:
+        covered.update(p.covers)
+    leftover = [p for p in changed if p not in covered]
+    remain = (limit - len(sheaf)) if limit else 12
+    if leftover and remain > 0:
+        take(shortest_cover(preds, leftover, limit=remain, budget=budget))
+    return sheaf
+
+
+def glyph_cover(
+    preds: Sequence[Pred],
+    identities: Sequence[Identity],
+    *,
+    limit: int = 12,
+    budget: int | None = None,
+) -> list[Pred]:
+    """Cover identities, not leftover path names.
+
+    Renames are consumed first as `follow` glyphs so a git mv cannot spend
+    two exists slots. Remaining births/deaths keep sheaf's exclusive-side
+    reservation so an island (FocusRiverView) still gets a slot vs HEAD.
+    """
+    rename_preds = [p for p in preds if p.kind == "follow"]
+    rename_preds = compress_follows(rename_preds)
+    sheaf: list[Pred] = []
+    seen: set[tuple[str, str, str]] = set()
+    used_paths: set[str] = set()
+
+    def take(items: Sequence[Pred]) -> None:
+        for p in items:
+            if limit >= 0 and len(sheaf) >= limit:
+                return
+            key = (p.true_on, p.kind, p.held)
+            if key in seen:
+                continue
+            seen.add(key)
+            sheaf.append(p)
+            used_paths.update(p.covers)
+
+    # Each rename identity is one glyph. Prefer compressed directory follows.
+    take(sorted(rename_preds, key=lambda p: p.rank))
+
+    only_a = [
+        ident.a_path
+        for ident in identities
+        if ident.kind == "died" and ident.a_path and ident.a_path not in used_paths
+    ]
+    only_b = [
+        ident.b_path
+        for ident in identities
+        if ident.kind == "born" and ident.b_path and ident.b_path not in used_paths
+    ]
+    changed = [
+        ident.a_path
+        for ident in identities
+        if ident.kind == "changed" and ident.a_path
+    ]
+    # rename + edit: identity is one glyph; the blob change still wants a grep
+    for ident in identities:
+        if ident.kind == "renamed" and ident.sha_a != ident.sha_b and ident.b_path:
+            if ident.b_path not in changed:
+                changed.append(ident.b_path)
+    remain = max(0, (limit or 12) - len(sheaf))
+    if remain > 0:
+        unary = [p for p in preds if p.kind != "follow"]
+        take(
+            sided_cover(
+                unary,
+                only_a,
+                only_b,
+                [p for p in changed if p],
+                limit=remain,
+                budget=budget,
+            )
+        )
+    return sheaf
+
+
+# alias for muscle memory / tests
+def cover(
+    preds: Sequence[Pred],
+    delta_paths: Sequence[str],
+    *,
+    per_side: str | None = None,
+    limit: int = 12,
+    budget: int | None = None,
+) -> list[Pred]:
+    return shortest_cover(
+        preds, delta_paths, per_side=per_side, limit=limit, budget=budget
+    )
+
+
+# --- format ----------------------------------------------------------------
+
+
+def format_human(
+    *,
+    repo: str,
+    a: Side,
+    b: Side,
+    delta: dict[str, int],
+    preds: Sequence[Pred],
+    covering: Sequence[Pred],
+    unexplained: Sequence[str],
+    walks: Sequence[dict],
+    color: bool,
+    show_catalog: bool,
+    kinds_order: Sequence[str],
+    identities: Sequence[Identity] | None = None,
+    discovered: int | None = None,
+) -> str:
+    # Comment-prefixed so `glyph A B | sh` runs the walk lines.
+    lines: list[str] = []
+    name = os.path.basename(repo) or repo
+    lines.append(f"# glyph {a.short}..{b.short}  ({name})")
+    lines.append(f"# A  {a.short}  {a.subject}")
+    lines.append(f"# B  {b.short}  {b.subject}")
+    bits = []
+    n_ren = sum(1 for i in (identities or []) if i.kind == "renamed")
+    if delta["deleted"]:
+        bits.append(f"{delta['deleted']} only-A")
+    if delta["added"]:
+        bits.append(f"{delta['added']} only-B")
+    if delta["changed"]:
+        bits.append(f"{delta['changed']} changed")
+    if n_ren:
+        bits.append(f"{n_ren} rename identit" + ("y" if n_ren == 1 else "ies"))
+    if delta["same"]:
+        bits.append(f"{delta['same']} identical")
+    lines.append("# " + ", ".join(bits) if bits else "# identical trees")
+
+    lines.append("#")
+    lines.append("# sheaf  (shortest set; a rename is one identity)")
+    if covering:
+        for p in covering:
+            lines.append("# " + _fmt_pred(p, color).lstrip())
+            w = _fmt_witness_line(p)
+            if w:
+                lines.append("# " + w.strip())
+    else:
+        lines.append("#   (empty)")
+
+    if walks:
+        lines.append("#")
+        lines.append("# walk  (paste, or pipe to sh)")
+        for item in walks:
+            lines.append(item["line"])
+
+    if show_catalog:
+        for label, side in (("A", a), ("B", b)):
+            group = [p for p in preds if p.true_on == label]
+            lines.append("#")
+            header = f"TRUE on {label} only  ({side.short})"
+            painted = paint(color, "32;1" if label == "B" else "36;1", header) if color else header
+            lines.append("# " + painted)
+            if not group:
+                lines.append("#   (none)")
+                continue
+            for kind in kinds_order:
+                chunk = [p for p in group if p.kind == kind]
+                if not chunk:
+                    continue
+                lines.append(f"#   {kind}")
+                for p in chunk:
+                    lines.append("# " + _fmt_pred(p, color, indent="    ").lstrip())
+                    w = _fmt_witness_line(p, indent="           ")
+                    if w:
+                        lines.append("# " + w.strip())
+        follows = [p for p in preds if p.kind == "follow"]
+        if follows:
+            lines.append("#")
+            lines.append("# follow  (rename identities)")
+            for p in follows:
+                lines.append("# " + _fmt_pred(p, color, indent="    ").lstrip())
+    if unexplained:
+        lines.append("#")
+        lines.append(
+            "# unexplained  "
+            + ", ".join(unexplained[:6])
+            + (f"  (+{len(unexplained) - 6})" if len(unexplained) > 6 else "")
+        )
+    lines.append(
+        f"# sheaf={len(covering)}  walks={len(walks)}  discovered={discovered if discovered is not None else len(preds)}  "
+        f"delta={delta['added'] + delta['deleted'] + delta['changed']}"
+        + (f"  renames={n_ren}" if n_ren else "")
+    )
+    return "\n".join(lines)
+
+
+def _fmt_pred(p: Pred, color: bool, indent: str = "  ") -> str:
+    if p.kind == "follow":
+        side = paint(color, "33", "R")
+        src = p.from_path or p.pattern
+        dst = p.to_path or p.path or ""
+        n = len(p.covers)
+        files = f"{n} path" + ("" if n == 1 else "s")
+        shown = f"follow {quote(src)} → {quote(dst)}"
+        return f"{indent}{side}  {p.length:>3}  {shown:<48}  {files}"
+    side = paint(color, "36" if p.true_on == "A" else "32", p.true_on)
+    n = len(p.covers)
+    files = f"{n} file" + ("" if n == 1 else "s")
+    held = p.held
+    return f"{indent}{side}  {p.length:>3}  {held:<48}  {files}"
+
+
+def _fmt_witness_line(p: Pred, indent: str = "           ") -> str:
+    w = _uniq(p.witnesses)
+    if not w:
+        return ""
+    shown = w[:4]
+    extra = f"  (+{len(w) - 4})" if len(w) > 4 else ""
+    return indent + "witnesses: " + ", ".join(shown) + extra
+
+
+def _uniq(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def format_oneline(preds: Sequence[Pred]) -> str:
+    rows = []
+    for p in preds:
+        rows.append(f"{p.kind}\t{p.true_on}\t{p.length}\t{p.held}\t{len(p.covers)}")
+    return "\n".join(rows)
+
+
+def format_held(preds: Sequence[Pred]) -> str:
+    return "\n".join(p.held for p in preds)
+
+
+def format_walks(walks: Sequence[dict]) -> str:
+    return "\n".join(item["line"] for item in walks)
+
+
+# --- walks (held / perch command lines) ------------------------------------
+
+
+_fp_cache: dict[tuple[str, str], set[str]] = {}
+
+
+def _first_parent_shas(repo: str, tip: str) -> set[str]:
+    key = (repo, tip)
+    hit = _fp_cache.get(key)
+    if hit is not None:
+        return hit
+    proc = git(repo, "rev-list", "--first-parent", "--max-count=400", tip)
+    shas: set[str] = set()
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line:
+                shas.add(line)
+    _fp_cache[key] = shas
+    return shas
+
+
+def _sha_in(shas: set[str], sha: str) -> bool:
+    if sha in shas:
+        return True
+    if len(sha) >= 7:
+        for item in shas:
+            if item.startswith(sha) or sha.startswith(item):
+                return True
+    return False
+
+
+def _parent_sha(repo: str, sha: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", f"{sha}^")
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _adjacent_commits(repo: str, a: Side, b: Side) -> bool:
+    if a.kind != "commit" or b.kind != "commit":
+        return False
+    pa = _parent_sha(repo, a.sha)
+    pb = _parent_sha(repo, b.sha)
+    return pa == b.sha or pb == a.sha
+
+
+def _walk_tip(a: Side, b: Side) -> Side | None:
+    if b.kind == "commit":
+        return b
+    if a.kind == "commit":
+        return a
+    return None
+
+
+def needs_full_walk(repo: str, a: Side, b: Side, pred: Pred) -> bool:
+    """Island / off-first-parent true sides need `held --full` (FocusRiverView)."""
+    tip = _walk_tip(a, b)
+    if tip is None:
+        return False
+    true = a if pred.true_on == "A" else b
+    fp = _first_parent_shas(repo, tip.sha)
+    if true.kind == "commit" and not _sha_in(fp, true.sha):
+        return True
+    # deleted-toward-B: A may be reachable only via a merge
+    if a.kind == "commit" and not _sha_in(fp, a.sha):
+        return True
+    return False
+
+
+def build_walks(
+    repo: str,
+    a: Side,
+    b: Side,
+    preds: Sequence[Pred],
+    *,
+    tools: Sequence[str],
+    force_full: bool | None = None,
+) -> list[dict]:
+    out: list[dict] = []
+    tip = _walk_tip(a, b)
+    now = a.kind == "worktree" or b.kind == "worktree"
+    adjacent = _adjacent_commits(repo, a, b)
+    for pred in preds:
+        full = True if force_full is True else (False if force_full is False else needs_full_walk(repo, a, b, pred))
+        prefix: list[str] = ["-C", quote(repo)]
+        if now:
+            prefix.append("--now")
+        if full:
+            prefix.append("--full")
+        follow = pred.kind == "follow"
+        if follow:
+            # git-style: flag before the observer. A rename is one occupancy.
+            prefix.append("--follow")
+        if tip is not None:
+            prefix += ["--rev", tip.short]
+            if adjacent:
+                prefix += ["--limit", "12"]
+        flags = " ".join(prefix)
+        observer = pred.held
+        if follow:
+            src = pred.from_path or pred.pattern
+            observer = "exists " + quote(src)
+        for tool in tools:
+            line = f"{tool} {flags} {observer}"
+            out.append(
+                {
+                    "tool": tool,
+                    "line": line,
+                    "held": pred.held,
+                    "true_on": pred.true_on,
+                    "full": full,
+                    "now": now,
+                    "follow": follow,
+                    "rev": tip.short if tip is not None else None,
+                    "from": pred.from_path,
+                    "to": pred.to_path,
+                }
+            )
+    return out
+
+
+def pred_to_json(p: Pred) -> dict:
+    return {
+        "kind": p.kind,
+        "true_on": p.true_on,
+        "pattern": p.pattern,
+        "path": p.path,
+        "flags": p.flags,
+        "held": p.held,
+        "length": p.length,
+        "witnesses": p.witnesses,
+        "covers": p.covers,
+        "note": p.note,
+        "from": p.from_path,
+        "to": p.to_path,
+        "identity_keys": p.identity_keys,
+    }
+
+
+# --- cli -------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="glyph",
+        description=(
+            "Emit the shortest covering set of predicates that distinguish two "
+            "git trees as ready-to-run held/perch command lines. A rename is one "
+            "identity (--follow), not two exists. glyph does not walk history."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  glyph HEAD~1 HEAD
+  glyph 14b1d6e HEAD
+  glyph HEAD :worktree
+  glyph --held -C sitbone 14b1d6e^ 14b1d6e
+  glyph --perch --walks -C sitbone 14b1d6e HEAD
+  glyph A B | sh
+  glyph --json v0.6.0 v0.7.0 | jq '.sheaf[:5]'
+""",
+    )
+    parser.add_argument("-C", "--repo", default=None, help="repository (default: cwd)")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--oneline", action="store_true", help="kind side length held covers")
+    parser.add_argument(
+        "--held",
+        action="store_true",
+        help="pick held as the walker (default). With --walks, only held lines.",
+    )
+    parser.add_argument(
+        "--perch",
+        action="store_true",
+        help="pick perch as the walker. Combine with --held for both.",
+    )
+    parser.add_argument(
+        "--walks",
+        "--sh",
+        action="store_true",
+        help="print only ready-to-run occupancy command lines (pipeable to sh)",
+    )
+    parser.add_argument(
+        "--walk",
+        default=None,
+        help="which walk tools to emit: held, perch, both (overrides --held/--perch)",
+    )
+    parser.add_argument(
+        "--full-walks",
+        action="store_true",
+        help="force --full on generated held/perch command lines",
+    )
+    parser.add_argument(
+        "--no-walks",
+        action="store_true",
+        help="do not print walk command lines in human output",
+    )
+    parser.add_argument(
+        "--predicates",
+        action="store_true",
+        help="also print the ranked catalog (tell's default)",
+    )
+    parser.add_argument(
+        "--cover",
+        action="store_true",
+        help="accepted for tell/sheaf muscle memory; glyph always emits a covering set",
+    )
+    parser.add_argument(
+        "--follow",
+        dest="follow",
+        action="store_true",
+        default=True,
+        help="treat a rename as one identity (default)",
+    )
+    parser.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        help="path existence is identity (sheaf mode: two exists for a git mv)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="max predicates in the sheaf; exclusive sides are reserved a slot (default: 8)",
+    )
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=0,
+        help="max sum of held-string lengths in the sheaf (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--kind",
+        default="exists,grep,path,content,follow",
+        help="comma-separated: exists,grep,path,content,follow",
+    )
+    parser.add_argument("--side", choices=("A", "B", "both"), default="both")
+    parser.add_argument("--min-len", type=int, default=3, help="minimum token/glob stem length")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    parser.add_argument("--no-skip", action="store_true", help="tokenize lockfiles and generated files too")
+    parser.add_argument("a", help="tree-ish A (commit, tree, :worktree, :index)")
+    parser.add_argument("b", help="tree-ish B")
+    parser.add_argument("paths", nargs="*", help="optional path limiter (after --)")
+    args = parser.parse_args(list(argv))
+    kinds = {k.strip() for k in args.kind.split(",") if k.strip()}
+    allowed = {"exists", "grep", "path", "content", "follow"}
+    bad = kinds - allowed
+    if bad:
+        parser.error("unknown --kind " + ", ".join(sorted(bad)))
+    if not args.follow:
+        kinds.discard("follow")
+    args.kinds = kinds
+    if args.walk:
+        walk_raw = args.walk.strip().lower()
+        if walk_raw in ("both", "all"):
+            args.walk_tools = ["held", "perch"]
+        else:
+            tools = [t.strip() for t in walk_raw.split(",") if t.strip()]
+            allowed_tools = {"held", "perch"}
+            bad_tools = [t for t in tools if t not in allowed_tools]
+            if bad_tools:
+                parser.error("unknown --walk " + ", ".join(bad_tools))
+            args.walk_tools = tools or ["held"]
+    elif args.held and args.perch:
+        args.walk_tools = ["held", "perch"]
+    elif args.perch:
+        args.walk_tools = ["perch"]
+    else:
+        # default walker is held so `glyph A B | sh` runs occupancy, not perch
+        args.walk_tools = ["held"]
+    return args
+
+
+def take_limited(preds: Sequence[Pred], *, limit: int, kinds: Sequence[str]) -> list[Pred]:
+    out: list[Pred] = []
+    for side in ("A", "B", "AB"):
+        for kind in kinds:
+            chunk = [p for p in preds if p.true_on == side and p.kind == kind]
+            chunk.sort(key=lambda p: p.rank)
+            out.extend(chunk[:limit] if limit >= 0 else chunk)
+    return out
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        repo = resolve_repo(args.repo)
+        side_a = resolve_side(repo, args.a)
+        side_b = resolve_side(repo, args.b)
+        pathspecs = list(args.paths)
+        tree_a = load_tree(repo, side_a, pathspecs)
+        tree_b = load_tree(repo, side_b, pathspecs)
+
+        if tree_a.paths == tree_b.paths and all(
+            tree_a.paths[p] == tree_b.paths.get(p) for p in tree_a.paths
+        ):
+            if not args.quiet:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "repo": repo,
+                                "a": _side_json(side_a),
+                                "b": _side_json(side_b),
+                                "identical": True,
+                                "predicates": [],
+                                "sheaf": [],
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    eprint(f"glyph: {side_a.short} and {side_b.short} are identical")
+            return 1
+
+        if args.no_skip:
+            global SKIP_GENERATED
+            SKIP_GENERATED = False
+
+        identities = detect_identities(tree_a, tree_b)
+        rename_paths: set[str] = set()
+        if "follow" in args.kinds:
+            for ident in identities:
+                if ident.kind == "renamed":
+                    rename_paths.update(ident.paths)
+
+        kinds_order = [k for k in ("follow", "exists", "grep", "path", "content") if k in args.kinds]
+        raw: list[Pred] = []
+        if "follow" in args.kinds:
+            raw.extend(follow_pred(ident) for ident in identities if ident.kind == "renamed")
+        exclude = list(rename_paths) if "follow" in args.kinds else []
+        raw.extend(
+            discover_side(
+                label="A",
+                true=tree_a,
+                false=tree_b,
+                min_len=args.min_len,
+                kinds=args.kinds,
+                exclude_paths=exclude,
+            )
+        )
+        raw.extend(
+            discover_side(
+                label="B",
+                true=tree_b,
+                false=tree_a,
+                min_len=args.min_len,
+                kinds=args.kinds,
+                exclude_paths=exclude,
+            )
+        )
+        if args.side in ("A", "B"):
+            raw = [p for p in raw if p.true_on == args.side or p.kind == "follow"]
+
+        verified = verify_preds(repo, tree_a, tree_b, raw)
+        slim = dominate(verified)
+        slim.sort(key=lambda p: (p.true_on, p.kind, *p.rank))
+
+        only_a = sorted(p for p in tree_a.paths if p not in tree_b.paths)
+        only_b = sorted(p for p in tree_b.paths if p not in tree_a.paths)
+        changed = sorted(
+            p for p in tree_a.paths if p in tree_b.paths and tree_a.paths[p] != tree_b.paths[p]
+        )
+        same = len(tree_a.paths) - len(only_a) - len(changed)
+        delta = {
+            "deleted": len(only_a),
+            "added": len(only_b),
+            "changed": len(changed),
+            "same": same,
+            "renames": sum(1 for i in identities if i.kind == "renamed"),
+        }
+        delta_paths = only_a + only_b + changed
+        budget = args.budget if args.budget and args.budget > 0 else None
+        lim = args.limit if args.limit >= 0 else 12
+        if "follow" in args.kinds:
+            covering = glyph_cover(
+                slim,
+                identities,
+                limit=lim,
+                budget=budget,
+            )
+        else:
+            covering = sided_cover(
+                slim,
+                only_a,
+                only_b,
+                changed,
+                limit=lim,
+                budget=budget,
+            )
+        covered: set[str] = set()
+        for p in covering:
+            covered.update(p.covers)
+        unexplained = [p for p in delta_paths if p not in covered]
+
+        shown = covering
+        catalog = take_limited(slim, limit=max(args.limit, 4), kinds=kinds_order)
+        force_full: bool | None = True if args.full_walks else None
+        walks: list[dict] = []
+        if not args.no_walks:
+            walks = build_walks(
+                repo,
+                side_a,
+                side_b,
+                covering,
+                tools=args.walk_tools,
+                force_full=force_full,
+            )
+
+        if not args.quiet:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "repo": repo,
+                            "a": _side_json(side_a),
+                            "b": _side_json(side_b),
+                            "identical": False,
+                            "delta": {
+                                **delta,
+                                "paths": {"only_a": only_a, "only_b": only_b, "changed": changed},
+                                "identities": [_ident_json(i) for i in identities],
+                            },
+                            "sheaf": [pred_to_json(p) for p in covering],
+                            "cover": [pred_to_json(p) for p in covering],
+                            "predicates": [pred_to_json(p) for p in (catalog if args.predicates else covering)],
+                            "walks": walks,
+                            "unexplained": unexplained,
+                            "discovered": len(slim),
+                            "follow": "follow" in args.kinds,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            elif args.walks:
+                text = format_walks(walks)
+                if text:
+                    print(text)
+            elif args.oneline:
+                text = format_oneline(shown)
+                if text:
+                    print(text)
+            else:
+                print(
+                    format_human(
+                        repo=repo,
+                        a=side_a,
+                        b=side_b,
+                        delta=delta,
+                        preds=catalog if args.predicates else covering,
+                        covering=covering,
+                        unexplained=unexplained,
+                        walks=[] if args.no_walks else walks,
+                        color=color_enabled(args),
+                        show_catalog=args.predicates,
+                        kinds_order=kinds_order,
+                        identities=identities,
+                        discovered=len(slim),
+                    )
+                )
+        return 0 if covering or slim else 1
+    except GlyphError as exc:
+        eprint(f"glyph: {exc}")
+        return exc.code
+    except KeyboardInterrupt:
+        eprint("glyph: interrupted")
+        return 130
+
+
+def _side_json(s: Side) -> dict:
+    return {
+        "spec": s.spec,
+        "kind": s.kind,
+        "sha": s.sha,
+        "short": s.short,
+        "tree": s.tree,
+        "subject": s.subject,
+        "iso": s.iso,
+    }
+
+
+def _ident_json(i: Identity) -> dict:
+    return {
+        "kind": i.kind,
+        "a": i.a_path,
+        "b": i.b_path,
+        "sha_a": i.sha_a,
+        "sha_b": i.sha_b,
+        "similarity": i.similarity,
+        "key": i.key,
+    }
+
+
+if __name__ == "__main__":
+    sys.exit(main())

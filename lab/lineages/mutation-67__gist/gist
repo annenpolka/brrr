@@ -1,0 +1,1915 @@
+#!/usr/bin/env python3
+"""gist — rewrite locators inside LSP publishDiagnostics JSON.
+
+A pure Unix filter. Never talks to git. stdin is a textDocument/
+publishDiagnostics stream (JSON-RPC notification, params object,
+NDJSON of Diagnostic / Location values, or LSP Content-Length frames).
+Locators are 0-based `range.start.line` plus `uri` (often on a parent
+params object, not a sibling). stdout is the same schema with addresses
+rewritten from --from-dir onto --to-dir by content fingerprint.
+Content-Length is dest-owned (UTF-8 byte length of the rewritten body).
+
+SARIF `region.startLine` is 1-based and is not this schema: it is
+passed through, never silently shifted. Cargo `file_name` +
+`line_start` is inlay's job. SARIF nested `uri` + `startLine` is
+scribe's job.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Optional
+from urllib.parse import unquote, urlparse
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PY_TB_RE = re.compile(
+    r"""File\s+(?P<q>["'])(?P<path>.*?)(?P=q),\s+line\s+(?P<line>\d+)""",
+    re.IGNORECASE,
+)
+ARROW_RE = re.compile(
+    r"""-->\s+(?P<path>\S+?):(?P<line>\d+)(?::(?P<col>\d+))?"""
+)
+COLON_NUM_RE = re.compile(r":(\d+)(?::(\d+))?(?!\d)")
+GUTTER_RE = re.compile(r"^([ \t]*)(\d+)([ \t]*\|)(.*)$")
+ANSI_RE = re.compile(
+    r"(?:\x1b\[[0-9;:]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
+)
+GUTTER_TTL = 16
+GUTTER_SPAN = 24
+STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "class", "const", "crate",
+    "def", "else", "enum", "false", "fn", "for", "from", "func", "function",
+    "i", "if", "impl", "import", "in", "int", "let", "mod", "mut", "n",
+    "none", "not", "of", "or", "pub", "return", "self", "static", "str",
+    "struct", "t", "the", "this", "to", "true", "type", "use", "var",
+    "void", "where", "with", "guard", "async", "await", "throws", "some",
+    "nil", "func",
+}
+TRIVIAL_NORMS = {
+    "", "{", "}", "};", "[", "]", "(", ")", "else", "else:", "pass",
+    "break", "continue", "end", "end;", "//", "#", "*/", "/*", "try",
+    "catch", "do", "then",
+}
+BASENAME_DENY = {
+    "error", "warning", "note", "info", "debug", "fatal", "help", "line",
+    "file", "http", "https", "http", "tcp", "udp", "ws", "wss", "ftp",
+    "version", "port", "host", "time", "date", "pid", "exit", "code",
+    "status", "thread", "frame", "stack", "trace", "column", "row",
+    "test", "ok", "fail", "failed", "passed", "skip", "skipping",
+    "expected", "actual", "cause", "reason", "module", "package",
+}
+BARE_ALLOW = {
+    "Makefile", "makefile", "GNUmakefile", "Dockerfile", "justfile",
+    "Justfile", "LICENSE", "LICENCE", "COPYING", "Gemfile", "Rakefile",
+    "Cargo.toml", "Package.swift", "go.mod", "go.sum", "pyproject.toml",
+    "CMakeLists.txt", "README", "NOTICE", "AUTHORS", "CHANGELOG",
+}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+MAX_FILE_BYTES = 1_000_000
+SOURCE_EXTS = {
+    ".py", ".rs", ".swift", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".rb", ".java",
+    ".kt", ".kts", ".cs", ".fs", ".scala", ".php", ".sh", ".bash", ".zsh",
+    ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".html", ".css",
+    ".sql", ".r", ".lua", ".zig", ".nim", ".ex", ".exs", ".erl", ".hs",
+    ".ml", ".mli", ".vue", ".svelte", ".gradle", ".kts", ".plist",
+}
+
+# Foreign schemas. gist must not treat these as LSP locators.
+CARGO_FILE_KEYS = {"file_name", "fileName"}
+CARGO_LINE_KEYS = {"line_start", "lineStart"}
+PUBLISH_METHOD = "textDocument/publishDiagnostics"
+
+
+class StreamFission:
+    """One publishDiagnostics notification became several (file split)."""
+
+    __slots__ = ("items",)
+
+    def __init__(self, items: list[Any]) -> None:
+        self.items = items
+
+
+@dataclass
+class Chunk:
+    """One scanned value: bare JSON, an LSP byte frame, or chatter."""
+
+    kind: str  # json | lsp | raw
+    payload: Any
+    nl: str = ""
+    original: str = ""
+    headers: Optional[list[tuple[bytes, bytes]]] = None
+    header_nl: bytes = b"\r\n"
+    raw_bytes: Optional[bytes] = None
+
+
+@dataclass
+class Hit:
+    path: str
+    line: int  # 1-based file line (internal)
+    col: Optional[int] = None
+    span: tuple[int, int] = (0, 0)
+    form: str = "colon"
+    quote: str = '"'
+    raw_path: str = ""
+    zero_based: bool = False  # True for LSP range.line; False for message file:line
+
+
+@dataclass
+class Resolution:
+    hit: Hit
+    status: str  # same | shifted | moved | edited | deleted | unresolved
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None  # 1-based
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+
+
+@dataclass
+class Carry:
+    old_line: int
+    dest_line: int
+    ttl: int
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+    by_basename: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    path_set: frozenset[str] = field(default_factory=frozenset)
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        self.by_basename.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        for path, lines in self.files.items():
+            self.by_basename[os.path.basename(path)].append(path)
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+        self.path_set = frozenset(self.files.keys())
+
+
+@dataclass
+class Ctx:
+    src: Snapshot
+    dst: Snapshot
+    context: int
+    debug: bool
+    trace: bool
+    cache: dict[tuple[str, int], Resolution] = field(default_factory=dict)
+    traced: set[tuple[str, int, str, Optional[str], Optional[int], bool]] = field(default_factory=set)
+    unresolved: bool = False
+    uri_stack: list[str] = field(default_factory=list)
+    ignored: set[str] = field(default_factory=set)
+
+    def resolve(self, hit: Hit) -> Resolution:
+        key = (hit.path, hit.line)
+        base = self.cache.get(key)
+        if base is None:
+            base = resolve_hit(hit, self.src, self.dst, self.context, self.debug)
+            self.cache[key] = base
+        res = Resolution(
+            hit=Hit(
+                path=base.hit.path,
+                line=base.hit.line,
+                col=hit.col,
+                span=hit.span,
+                form=hit.form,
+                quote=hit.quote,
+                raw_path=hit.raw_path,
+                zero_based=hit.zero_based,
+            ),
+            status=base.status,
+            dest_path=base.dest_path,
+            dest_line=base.dest_line,
+            score=base.score,
+            note=base.note,
+            dest_text=base.dest_text,
+        )
+        if res.status == "unresolved":
+            self.unresolved = True
+        if self.trace:
+            tkey = (
+                res.hit.path,
+                res.hit.line,
+                res.status,
+                res.dest_path,
+                res.dest_line,
+                res.hit.zero_based,
+            )
+            if tkey not in self.traced:
+                self.traced.add(tkey)
+                print_trace(res)
+        return res
+
+
+def posix_rel(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/") if p.startswith("/") and not os.path.isabs(path) else p
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS or (part.startswith(".") and part not in (".", "..")) for part in parts[:-1]):
+        return True
+    name = parts[-1] if parts else ""
+    if name.startswith(".") and name not in BARE_ALLOW:
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def decode_bytes(data: bytes) -> Optional[str]:
+    if b"\x00" in data[:4096]:
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def walk_dir_files(root: Path) -> Iterator[str]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield rel
+
+
+def read_dir_file(root: Path, path: str) -> Optional[list[str]]:
+    fp = root / path
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        return None
+    text = decode_bytes(data)
+    if text is None:
+        return None
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def load_snapshot(directory: Path, label: str) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    for path in walk_dir_files(directory):
+        lines = read_dir_file(directory, path)
+        if lines is not None:
+            files[path] = lines
+    snap = Snapshot(label=label, files=files)
+    snap.index()
+    return snap
+
+
+def bind_path(raw: str, snap: Snapshot) -> Optional[str]:
+    p = posix_rel(raw.replace("\\", "/"))
+    while p.startswith("./"):
+        p = p[2:]
+    if p in snap.path_set:
+        return p
+    best = None
+    for kp in snap.path_set:
+        if p.endswith("/" + kp) or p.endswith("\\" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    if best:
+        return best
+    base = os.path.basename(p)
+    hits = snap.by_basename.get(base, [])
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _boundary_ok(text: str, start: int, end: int) -> bool:
+    if start > 0:
+        prev = text[start - 1]
+        if prev.isalnum() or prev in "._-":
+            return False
+    if end < len(text):
+        nxt = text[end]
+        if nxt.isalnum() or nxt in "._-":
+            return False
+    return True
+
+
+def _in_url(text: str, start: int) -> bool:
+    proto = text.rfind("://", 0, start)
+    if proto < 0:
+        return False
+    chunk = text[proto:start]
+    return all(c not in " \t\"'" for c in chunk)
+
+
+def _basename_ok(name: str) -> bool:
+    if not name or name in BASENAME_DENY:
+        return False
+    if name.lower() in BASENAME_DENY:
+        return False
+    if name in BARE_ALLOW:
+        return True
+    stem, ext = os.path.splitext(name)
+    if ext.lower() in SOURCE_EXTS:
+        return True
+    return False
+
+
+def _span_path_start(appeared: str, bound: str, path_start: int, path_end: int) -> tuple[int, str]:
+    appeared_n = appeared.replace("\\", "/")
+    bound_n = bound.replace("\\", "/")
+    if appeared_n == bound_n:
+        return path_start, "colon"
+    if appeared_n.endswith("/" + bound_n):
+        return path_end - len(bound), "colon"
+    base = os.path.basename(bound_n)
+    if appeared_n == base:
+        return path_start, "basename"
+    if appeared_n.endswith("/" + base) and bound_n.endswith("/" + base):
+        return path_end - len(base), "basename"
+    return path_start, "colon"
+
+
+def _take(span: tuple[int, int], occupied: list[tuple[int, int]]) -> bool:
+    s, e = span
+    if s < 0 or e <= s:
+        return False
+    for os_, oe in occupied:
+        if not (e <= os_ or s >= oe):
+            return False
+    occupied.append(span)
+    return True
+
+
+def find_hits(text: str, src: Snapshot) -> list[Hit]:
+    """Pull 1-based `file:line` locators out of a diagnostic message string."""
+    occupied: list[tuple[int, int]] = []
+    found: list[Hit] = []
+
+    for m in PY_TB_RE.finditer(text):
+        if _in_url(text, m.start()):
+            continue
+        bound = bind_path(m.group("path"), src)
+        if not bound:
+            continue
+        span = (m.start(), m.end())
+        if not _take(span, occupied):
+            continue
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group("line")),
+                span=span,
+                form="python",
+                quote=m.group("q"),
+                raw_path=m.group("path"),
+            )
+        )
+
+    for m in ARROW_RE.finditer(text):
+        if _in_url(text, m.start()):
+            continue
+        appeared = m.group("path")
+        bound = bind_path(appeared, src)
+        if not bound:
+            continue
+        path_start, path_end = m.start("path"), m.end("path")
+        span_start, form = _span_path_start(appeared, bound, path_start, path_end)
+        span = (span_start, m.end())
+        if not _take(span, occupied):
+            continue
+        col = int(m.group("col")) if m.group("col") else None
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group("line")),
+                col=col,
+                span=span,
+                form="arrow" if form != "basename" else "basename",
+                raw_path=text[span_start:path_end],
+            )
+        )
+
+    for m in COLON_NUM_RE.finditer(text):
+        span_end = m.end()
+        prefix = text[: m.start()]
+        if not prefix:
+            continue
+        if _in_url(text, m.start()):
+            continue
+        bound = None
+        appeared = None
+        form = "colon"
+        span_start = None
+        for path in src.paths:
+            if not path:
+                continue
+            if prefix.endswith(path) and _boundary_ok(text, m.start() - len(path), m.start()):
+                bound = path
+                appeared = path
+                span_start = m.start() - len(path)
+                form = "colon"
+                break
+        if bound is None:
+            uniques = [
+                (base, paths[0])
+                for base, paths in src.by_basename.items()
+                if len(paths) == 1 and _basename_ok(base)
+            ]
+            uniques.sort(key=lambda x: len(x[0]), reverse=True)
+            for base, path in uniques:
+                if prefix.endswith(base) and _boundary_ok(text, m.start() - len(base), m.start()):
+                    bound = path
+                    appeared = base
+                    span_start = m.start() - len(base)
+                    form = "basename"
+                    break
+        if bound is None or span_start is None:
+            continue
+        span = (span_start, span_end)
+        if not _take(span, occupied):
+            continue
+        col = int(m.group(2)) if m.group(2) else None
+        found.append(
+            Hit(
+                path=bound,
+                line=int(m.group(1)),
+                col=col,
+                span=span,
+                form=form,
+                raw_path=appeared or bound,
+            )
+        )
+
+    found.sort(key=lambda h: h.span[0])
+    return found
+
+
+def path_score(src: str, dst: str) -> float:
+    if src == dst:
+        return 1.0
+    s_parts = src.replace("\\", "/").split("/")
+    d_parts = dst.replace("\\", "/").split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    score = 0.0
+    if s_base == d_base:
+        score += 0.55
+    s_stem, s_ext = os.path.splitext(src)
+    d_stem = os.path.splitext(dst)[0]
+    if dst.startswith(s_stem + "/") or f"/{os.path.basename(s_stem)}/" in f"/{dst}":
+        score += 0.35
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.05
+    if os.path.basename(s_stem) and os.path.basename(s_stem) in d_stem:
+        score += 0.08
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.15 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def neighbor_score(
+    src_lines: list[str], src_i: int, dst_lines: list[str], dst_i: int, ctx: int
+) -> float:
+    if ctx <= 0:
+        return 0.0
+    hits = 0
+    total = 0
+    for delta in range(-ctx, ctx + 1):
+        if delta == 0:
+            continue
+        sj = src_i + delta
+        if sj < 1 or sj > len(src_lines):
+            continue
+        sn = normalize(src_lines[sj - 1])
+        if sn in TRIVIAL_NORMS:
+            continue
+        total += 1
+        lo = max(1, dst_i - ctx)
+        hi = min(len(dst_lines), dst_i + ctx)
+        window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+        if sn in window:
+            hits += 1
+    if total == 0:
+        return 0.0
+    return hits / total
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def score_pair(
+    src_path: str,
+    src_lines: list[str],
+    src_i: int,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+) -> float:
+    sraw = src_lines[src_i - 1]
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_score(src_lines, src_i, dst_lines, dst_i, ctx)
+    ps = path_score(src_path, dst_path)
+    if sraw == draw:
+        return min(1.0, 0.75 + 0.25 * ps + 0.05 * ns)
+    if normalize(sraw) == normalize(draw):
+        return min(1.0, 0.68 + 0.25 * ps + 0.07 * ns)
+    lr = line_ratio(sraw, draw)
+    ts = token_score(sraw, draw)
+    return W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps
+
+
+def candidates_for(
+    src_path: str, src_lines: list[str], src_i: int, dst: Snapshot
+) -> list[tuple[str, int]]:
+    raw = src_lines[src_i - 1]
+    n = normalize(raw)
+    toks = tokens(raw)
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(path, line)] = None
+
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    ranked = sorted(set(toks), key=lambda t: (dst.token_df.get(t, 10**9), -len(t)))
+    for tok in ranked[:4]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred_paths = []
+    if src_path in dst.files:
+        preferred_paths.append(src_path)
+    stem = os.path.splitext(src_path)[0]
+    base = os.path.basename(src_path)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base) or os.path.basename(p) == base:
+            preferred_paths.append(p)
+    for p in preferred_paths:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(
+    src_path: str, src_line: int, src_raw: str, dst_path: Optional[str], dst_line: Optional[int], dst_raw: str, score: float
+) -> str:
+    if dst_path is None or dst_line is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    same_text = normalize(src_raw) == normalize(dst_raw) or line_ratio(src_raw, dst_raw) >= 0.96
+    if src_path == dst_path and same_text:
+        return "same" if src_line == dst_line else "shifted"
+    if same_text:
+        return "moved" if src_path != dst_path else "shifted"
+    return "edited"
+
+
+def describe_hole(src_lines: list[str], src_i: int, dst: Snapshot, ctx: int) -> str:
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    reach = max(ctx * 4, 10)
+    for d in range(1, reach + 1):
+        if prev_hit is None:
+            j = src_i - d
+            if j >= 1:
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        prev_hit = locs[0]
+        if next_hit is None:
+            j = src_i + d
+            if j <= len(src_lines):
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        next_hit = locs[0]
+        if prev_hit and next_hit:
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}"
+    if prev_hit:
+        return f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return f"next context at {next_hit[0]}:{next_hit[1]}"
+    return "no candidates"
+
+
+def resolve_hit(hit: Hit, src: Snapshot, dst: Snapshot, ctx: int, debug: bool) -> Resolution:
+    src_lines = src.files.get(hit.path)
+    if src_lines is None:
+        hits = [p for p in src.files if p == hit.path or p.endswith("/" + hit.path)]
+        if len(hits) == 1:
+            hit.path = hits[0]
+            src_lines = src.files[hit.path]
+        elif not hits:
+            return Resolution(hit=hit, status="unresolved", note="source path not in from-dir")
+        else:
+            return Resolution(hit=hit, status="unresolved", note="source path ambiguous")
+    if hit.line < 1 or hit.line > len(src_lines):
+        return Resolution(
+            hit=hit,
+            status="unresolved",
+            note=f"line {hit.line} out of range (file has {len(src_lines)} lines)",
+        )
+    src_raw = src_lines[hit.line - 1]
+    if normalize(src_raw) in TRIVIAL_NORMS:
+        return Resolution(hit=hit, status="unresolved", note="line is too trivial to fingerprint")
+
+    cands = candidates_for(hit.path, src_lines, hit.line, dst)
+    best: Optional[tuple[float, str, int, str]] = None
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc = score_pair(hit.path, src_lines, hit.line, dpath, dlines, dline, ctx)
+        if best is None or sc > best[0]:
+            best = (sc, dpath, dline, dlines[dline - 1])
+    if debug and best:
+        disp = hit.line - 1 if hit.zero_based else hit.line
+        print(
+            f"# debug {hit.path}:{disp} -> {best[1]}:{best[2]} score={best[0]:.3f} cands={len(cands)}",
+            file=sys.stderr,
+        )
+    if best is None:
+        return Resolution(
+            hit=hit,
+            status="deleted",
+            score=0.0,
+            note=describe_hole(src_lines, hit.line, dst, ctx),
+        )
+    sc, dpath, dline, draw = best
+    status = classify(hit.path, hit.line, src_raw, dpath, dline, draw, sc)
+    if status == "deleted":
+        note = describe_hole(src_lines, hit.line, dst, ctx)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        return Resolution(
+            hit=hit,
+            status="deleted",
+            dest_path=dpath,
+            dest_line=dline,
+            score=sc,
+            note=note,
+            dest_text=draw,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "shifted":
+        note = "same file, line number drifted"
+    return Resolution(
+        hit=hit,
+        status=status,
+        dest_path=dpath,
+        dest_line=dline,
+        score=sc,
+        note=note,
+        dest_text=draw,
+    )
+
+
+def display_line(hit: Hit, line_1: Optional[int]) -> str:
+    if line_1 is None:
+        return "-"
+    n = line_1 - 1 if hit.zero_based else line_1
+    return str(n)
+
+
+def format_from(hit: Hit) -> str:
+    col = f":{hit.col}" if hit.col is not None else ""
+    return f"{hit.path}:{display_line(hit, hit.line)}{col}"
+
+
+def format_to(res: Resolution) -> str:
+    if res.dest_path is None or res.dest_line is None or res.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{res.hit.col}" if res.hit.col is not None else ""
+    return f"{res.dest_path}:{display_line(res.hit, res.dest_line)}{col}"
+
+
+def emit_path(res: Resolution) -> Optional[str]:
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    hit = res.hit
+    if res.dest_path == hit.path:
+        return hit.raw_path or hit.path
+    if hit.form == "basename":
+        dest_base = os.path.basename(res.dest_path)
+        if dest_base == os.path.basename(hit.path) and dest_base == (hit.raw_path or dest_base):
+            return dest_base
+        return res.dest_path
+    return res.dest_path
+
+
+def replacement_text(res: Resolution, original_slice: str = "") -> Optional[str]:
+    """Rewrite a 1-based file:line slice inside a message (not an LSP range)."""
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    hit = res.hit
+    if hit.form == "python":
+        q = hit.quote or '"'
+        return f"File {q}{res.dest_path}{q}, line {res.dest_line}"
+    path = emit_path(res)
+    if path is None:
+        return None
+    col = f":{hit.col}" if hit.col is not None else ""
+    new = f"{path}:{res.dest_line}{col}"
+    return _keep_wrap_ansi(original_slice, new)
+
+
+def _keep_wrap_ansi(old_slice: str, new_text: str) -> str:
+    if not old_slice or "\x1b" not in old_slice:
+        return new_text
+    m = re.search(r"((?:\x1b\[[0-9;:]*[A-Za-z])+):(\d+)(?::(\d+))?$", old_slice)
+    if not m:
+        return new_text
+    m2 = re.search(r":(\d+)(?::(\d+))?$", new_text)
+    if not m2:
+        return new_text
+    return new_text[: m2.start()] + m.group(1) + new_text[m2.start() :]
+
+
+def apply_gutter(body: str, carry: Carry) -> Optional[str]:
+    m = GUTTER_RE.match(body)
+    if not m:
+        return None
+    n = int(m.group(2))
+    delta = n - carry.old_line
+    if delta < 0 or delta > GUTTER_SPAN:
+        return None
+    new_n = carry.dest_line + delta
+    num = str(new_n).rjust(len(m.group(2)))
+    return m.group(1) + num + m.group(3) + m.group(4)
+
+
+def should_carry(res: Resolution, body: str) -> bool:
+    if res.status not in {"same", "shifted", "moved", "edited"} or res.dest_line is None:
+        return False
+    if res.hit.form == "arrow" or "-->" in body:
+        return True
+    if re.search(r":\s*(error|warning|note|fatal)\b", body, re.I):
+        return True
+    if res.hit.col is not None and res.hit.form in {"colon", "basename"}:
+        return True
+    return False
+
+
+def rewrite_line(text: str, resolutions: list[Resolution]) -> str:
+    items = [res for res in resolutions if res.hit.span is not None]
+    items.sort(key=lambda r: r.hit.span[0], reverse=True)
+    out = text
+    for res in items:
+        start, end = res.hit.span
+        new = replacement_text(res, text[start:end] if 0 <= start <= end <= len(text) else "")
+        if not new:
+            continue
+        out = out[:start] + new + out[end:]
+    return out
+
+
+def print_trace(res: Resolution) -> None:
+    note = res.note.replace("\t", " ").replace("\n", " ")
+    print(
+        f"{res.status}\t{format_from(res.hit)}\t{format_to(res)}\t{res.score:.3f}\t{note}",
+        file=sys.stderr,
+    )
+
+
+def as_lsp_line(val: Any) -> Optional[int]:
+    """0-based LSP line. 0 is a valid address (the first line of the file)."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val >= 0 else None
+    if isinstance(val, float) and val.is_integer() and val >= 0:
+        return int(val)
+    if isinstance(val, str) and val.isdigit():
+        return int(val)
+    return None
+
+
+def as_lsp_char(val: Any) -> Optional[int]:
+    return as_lsp_line(val)
+
+
+def keep_line_type(original: Any, dest_line: int) -> Any:
+    if isinstance(original, str):
+        return str(dest_line)
+    return dest_line
+
+
+def emit_file_field(appeared: str, bound: str, dest: str) -> str:
+    appeared_n = appeared.replace("\\", "/")
+    bound_n = bound.replace("\\", "/")
+    dest_n = dest.replace("\\", "/")
+    if appeared_n == bound_n:
+        return dest_n
+    if appeared_n.endswith("/" + bound_n):
+        return appeared_n[: -len(bound_n)] + dest_n
+    base = os.path.basename(bound_n)
+    dest_base = os.path.basename(dest_n)
+    if appeared_n == base:
+        return dest_base if dest_base == base else dest_n
+    if appeared_n.endswith("/" + base):
+        prefix = appeared_n[: -len(base)]
+        if dest_base == base:
+            return prefix + dest_base
+        return prefix + dest_n
+    return dest_n
+
+
+def split_keep(text: str) -> list[tuple[str, str]]:
+    if text == "":
+        return [("", "")]
+    parts: list[tuple[str, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        nl = text.find("\n", i)
+        if nl < 0:
+            parts.append((text[i:], ""))
+            break
+        if nl > i and text[nl - 1] == "\r":
+            parts.append((text[i : nl - 1], "\r\n"))
+        else:
+            parts.append((text[i:nl], "\n"))
+        i = nl + 1
+    return parts
+
+
+def strip_ansi_map(text: str) -> tuple[str, list[int]]:
+    orig_map: list[int] = []
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\x1b":
+            m = ANSI_RE.match(text, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(text[i])
+        orig_map.append(i)
+        i += 1
+    orig_map.append(i)
+    return "".join(out), orig_map
+
+
+def looks_pretty(original: str) -> bool:
+    s = original.strip("\r")
+    return "\n" in s
+
+
+def path_from_uri(uri: str) -> str:
+    if uri.startswith("file:"):
+        parsed = urlparse(uri)
+        path = unquote(parsed.path or "")
+        if os.name == "nt" and path.startswith("/") and len(path) >= 3 and path[2] == ":":
+            path = path[1:]
+        return path
+    return uri
+
+
+def emit_uri(appeared: str, bound: str, dest: str) -> str:
+    if appeared.startswith("file:"):
+        parsed = urlparse(appeared)
+        path = unquote(parsed.path or "")
+        new_path = emit_file_field(path, bound, dest)
+        if path.startswith("/") and not new_path.startswith("/"):
+            new_path = "/" + new_path
+        return parsed._replace(path=new_path).geturl()
+    return emit_file_field(appeared, bound, dest)
+
+
+def note_ignored(ctx: Ctx, kind: str, detail: str) -> None:
+    if kind in ctx.ignored:
+        return
+    ctx.ignored.add(kind)
+    if ctx.trace:
+        print(f"ignored\t{kind}\t-\t-\t{detail}", file=sys.stderr)
+
+
+def resolve_uri_and_lsp_line(
+    ctx: Ctx, appeared: str, lsp_line: int, col: Optional[int]
+) -> tuple[Optional[str], Resolution]:
+    """Bind a URI + 0-based line. Internal fingerprinting is 1-based."""
+    pathish = path_from_uri(appeared)
+    bound = bind_path(pathish, ctx.src)
+    file_line = lsp_line + 1
+    if not bound:
+        res = Resolution(
+            hit=Hit(
+                path=pathish,
+                line=file_line,
+                col=col,
+                raw_path=appeared,
+                form="lsp",
+                zero_based=True,
+            ),
+            status="unresolved",
+            note="source path not in from-dir",
+        )
+        ctx.unresolved = True
+        if ctx.trace:
+            tkey = (pathish, file_line, res.status, res.dest_path, res.dest_line, True)
+            if tkey not in ctx.traced:
+                ctx.traced.add(tkey)
+                print_trace(res)
+        return None, res
+    hit = Hit(
+        path=bound,
+        line=file_line,
+        col=col,
+        span=(0, 0),
+        form="lsp",
+        raw_path=appeared,
+        zero_based=True,
+    )
+    return bound, ctx.resolve(hit)
+
+
+def ordered_dict(original: dict, out: dict) -> dict:
+    ordered: dict[Any, Any] = {}
+    for k in original:
+        if k in out:
+            ordered[k] = out[k]
+    for k, v in out.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Foreign schemas — reject, do not silently treat 1-based integers as LSP
+# ---------------------------------------------------------------------------
+
+def is_cargo_span(obj: dict) -> bool:
+    keys = set(obj)
+    return bool(keys & CARGO_FILE_KEYS) and bool(keys & CARGO_LINE_KEYS)
+
+
+def is_physical_location(obj: dict) -> bool:
+    art = obj.get("artifactLocation") or obj.get("artifact_location")
+    region = obj.get("region")
+    if not isinstance(art, dict):
+        return False
+    if not isinstance(region, dict) and not isinstance(obj.get("contextRegion"), dict):
+        return False
+    uri = art.get("uri")
+    has_uri = isinstance(uri, str) and uri != ""
+    has_index = isinstance(art.get("index"), int)
+    if not has_uri and not has_index:
+        return False
+    if isinstance(region, dict) and (
+        "startLine" in region or "start_line" in region or "charOffset" in region or "byteOffset" in region
+    ):
+        return True
+    ctxr = obj.get("contextRegion")
+    return isinstance(ctxr, dict) and ("startLine" in ctxr or "start_line" in ctxr)
+
+
+def is_sarif_log(obj: dict) -> bool:
+    if not isinstance(obj.get("runs"), list):
+        return False
+    schema = obj.get("$schema")
+    if isinstance(schema, str) and "sarif" in schema.lower():
+        return True
+    if obj.get("version") in {"2.1.0", "2.1.0-rtm.5", "2.0.0"}:
+        return True
+    return False
+
+
+def is_clang_file_loc(obj: dict) -> bool:
+    if is_cargo_span(obj):
+        return False
+    if "key.filepath" in obj or "key.file_path" in obj:
+        return False
+    has_file = isinstance(obj.get("file"), str) or isinstance(obj.get("filename"), str)
+    line = obj.get("line")
+    if not has_file or not isinstance(line, (int, str)):
+        return False
+    return "column" in obj or "offset" in obj or "col" in obj
+
+
+def is_swift_key_diag(obj: dict) -> bool:
+    has_file = isinstance(obj.get("key.filepath"), str) or isinstance(obj.get("key.file_path"), str)
+    if not has_file:
+        return False
+    return obj.get("key.line") is not None or isinstance(obj.get("key.offset"), int)
+
+
+def is_foreign_schema(obj: dict) -> Optional[str]:
+    """Return a kind string if this object is a 1-based / sibling schema we must not shift."""
+    if is_sarif_log(obj):
+        return "sarif"
+    if is_physical_location(obj):
+        return "sarif-physicalLocation"
+    if is_cargo_span(obj):
+        return "cargo"
+    if is_swift_key_diag(obj):
+        return "swift"
+    if is_clang_file_loc(obj):
+        return "clang"
+    return None
+
+
+FOREIGN_NOTE = {
+    "sarif": "1-based region.startLine is not LSP range.start.line; use scribe",
+    "sarif-physicalLocation": "1-based physicalLocation.region.startLine is not LSP; use scribe",
+    "cargo": "file_name+line_start is inlay's sibling schema, not uri+range",
+    "clang": "clang caret.line is 1-based; gist is 0-based range.start.line",
+    "swift": "key.line is 1-based SourceKit; gist is LSP 0-based",
+}
+
+
+# ---------------------------------------------------------------------------
+# LSP schema
+# ---------------------------------------------------------------------------
+
+def is_lsp_range(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    start = obj.get("start")
+    if not isinstance(start, dict):
+        return False
+    return as_lsp_line(start.get("line")) is not None
+
+
+def is_lsp_location(obj: dict) -> bool:
+    uri = obj.get("uri")
+    rng = obj.get("range")
+    return isinstance(uri, str) and uri != "" and is_lsp_range(rng)
+
+
+def is_location_link(obj: dict) -> bool:
+    uri = obj.get("targetUri")
+    if not isinstance(uri, str) or not uri:
+        return False
+    return is_lsp_range(obj.get("targetRange")) or is_lsp_range(obj.get("targetSelectionRange"))
+
+
+def is_lsp_diagnostic(obj: dict) -> bool:
+    if not is_lsp_range(obj.get("range")):
+        return False
+    # Distinguisher: a Diagnostic carries payload besides a bare range.
+    return any(k in obj for k in ("message", "severity", "source", "code", "tags", "relatedInformation", "data"))
+
+
+def is_publish_params(obj: dict) -> bool:
+    if not isinstance(obj.get("uri"), str) or not obj.get("uri"):
+        return False
+    return isinstance(obj.get("diagnostics"), list)
+
+
+def is_jsonrpc_publish(obj: dict) -> bool:
+    if obj.get("method") != PUBLISH_METHOD:
+        return False
+    return isinstance(obj.get("params"), dict)
+
+
+def rewrite_range(rng: dict, dest_start_0: int, orig_start_0: int) -> dict:
+    """Move start/end lines by the dest mapping; keep characters."""
+    out: dict[Any, Any] = {}
+    handled: set[str] = set()
+    start = rng.get("start")
+    if isinstance(start, dict) and as_lsp_line(start.get("line")) is not None:
+        new_start = {}
+        for k, v in start.items():
+            if k == "line":
+                new_start[k] = keep_line_type(v, dest_start_0)
+            else:
+                new_start[k] = v
+        out["start"] = new_start
+        handled.add("start")
+    end = rng.get("end")
+    if isinstance(end, dict) and as_lsp_line(end.get("line")) is not None:
+        old_end_0 = as_lsp_line(end.get("line"))
+        dest_end_0 = dest_start_0
+        if old_end_0 is not None:
+            dest_end_0 = dest_start_0 + (old_end_0 - orig_start_0)
+            if dest_end_0 < dest_start_0:
+                dest_end_0 = dest_start_0
+        new_end = {}
+        for k, v in end.items():
+            if k == "line":
+                new_end[k] = keep_line_type(v, dest_end_0)
+            else:
+                new_end[k] = v
+        out["end"] = new_end
+        handled.add("end")
+    for k, v in rng.items():
+        if k in handled:
+            continue
+        out[k] = v
+    return ordered_dict(rng, out)
+
+
+def rewrite_location(obj: dict, ctx: Ctx) -> dict:
+    appeared = obj["uri"]
+    rng = obj["range"]
+    start_0 = as_lsp_line(rng["start"].get("line")) if isinstance(rng.get("start"), dict) else None
+    if start_0 is None:
+        return rewrite_object_generic(obj, ctx)
+    col = as_lsp_char(rng["start"].get("character")) if isinstance(rng.get("start"), dict) else None
+    bound, res = resolve_uri_and_lsp_line(ctx, appeared, start_0, col)
+    if res.status in {"deleted", "unresolved"} or not res.dest_path or res.dest_line is None or not bound:
+        return rewrite_object_generic(obj, ctx)
+    dest_0 = res.dest_line - 1
+    out: dict[Any, Any] = {}
+    handled: set[str] = set()
+    out["uri"] = emit_uri(appeared, bound, res.dest_path)
+    handled.add("uri")
+    out["range"] = rewrite_range(rng, dest_0, start_0)
+    handled.add("range")
+    for k, v in obj.items():
+        if k in handled:
+            continue
+        out[k] = rewrite_value(v, ctx)
+    return ordered_dict(obj, out)
+
+
+def rewrite_location_link(obj: dict, ctx: Ctx) -> dict:
+    appeared = obj["targetUri"]
+    sel = obj.get("targetSelectionRange") if is_lsp_range(obj.get("targetSelectionRange")) else obj.get("targetRange")
+    if not is_lsp_range(sel):
+        return rewrite_object_generic(obj, ctx)
+    start_0 = as_lsp_line(sel["start"].get("line"))
+    if start_0 is None:
+        return rewrite_object_generic(obj, ctx)
+    col = as_lsp_char(sel["start"].get("character")) if isinstance(sel.get("start"), dict) else None
+    bound, res = resolve_uri_and_lsp_line(ctx, appeared, start_0, col)
+    out: dict[Any, Any] = {}
+    handled: set[str] = set()
+    if res.status not in {"deleted", "unresolved"} and res.dest_path and res.dest_line is not None and bound:
+        dest_0 = res.dest_line - 1
+        out["targetUri"] = emit_uri(appeared, bound, res.dest_path)
+        handled.add("targetUri")
+        for rk in ("targetRange", "targetSelectionRange"):
+            if is_lsp_range(obj.get(rk)):
+                rk_start = as_lsp_line(obj[rk]["start"].get("line"))
+                if rk_start is None:
+                    rk_start = start_0
+                out[rk] = rewrite_range(obj[rk], dest_0 + (rk_start - start_0), rk_start)
+                handled.add(rk)
+    origin = obj.get("originSelectionRange")
+    inherited = ctx.uri_stack[-1] if ctx.uri_stack else None
+    if is_lsp_range(origin) and inherited:
+        o0 = as_lsp_line(origin["start"].get("line"))
+        if o0 is not None:
+            obound, ores = resolve_uri_and_lsp_line(ctx, inherited, o0, as_lsp_char(origin["start"].get("character")))
+            if ores.status not in {"deleted", "unresolved"} and ores.dest_line is not None:
+                out["originSelectionRange"] = rewrite_range(origin, ores.dest_line - 1, o0)
+                handled.add("originSelectionRange")
+                _ = obound
+    for k, v in obj.items():
+        if k in handled:
+            continue
+        out[k] = rewrite_value(v, ctx)
+    return ordered_dict(obj, out)
+
+
+def rewrite_diagnostic(obj: dict, ctx: Ctx, inherited_uri: Optional[str]) -> tuple[dict, Optional[str], str]:
+    """Rewrite one Diagnostic. Returns (object, dest_uri_appearance, status).
+
+    `data` is always kept. Missing range is not a locator.
+    """
+    appeared = obj["uri"] if isinstance(obj.get("uri"), str) and obj.get("uri") else inherited_uri
+    rng = obj.get("range")
+    if not is_lsp_range(rng) or not appeared:
+        # Pathological missing range / missing uri: not a locator.
+        return rewrite_object_generic(obj, ctx), None, "skip"
+
+    start_0 = as_lsp_line(rng["start"].get("line"))
+    if start_0 is None:
+        return rewrite_object_generic(obj, ctx), None, "skip"
+    col = as_lsp_char(rng["start"].get("character")) if isinstance(rng.get("start"), dict) else None
+    bound, res = resolve_uri_and_lsp_line(ctx, appeared, start_0, col)
+    if res.status in {"deleted", "unresolved"} or not res.dest_path or res.dest_line is None or not bound:
+        # Pass the locator through unchanged; still walk nested values (relatedInformation, data).
+        out_pass: dict[Any, Any] = {}
+        for k, v in obj.items():
+            if k in {"range", "uri"}:
+                out_pass[k] = v
+            else:
+                out_pass[k] = rewrite_value(v, ctx)
+        return ordered_dict(obj, out_pass), None, res.status
+
+    dest_0 = res.dest_line - 1
+    dest_uri = emit_uri(appeared, bound, res.dest_path)
+    out: dict[Any, Any] = {}
+    handled: set[str] = set()
+    out["range"] = rewrite_range(rng, dest_0, start_0)
+    handled.add("range")
+    if "uri" in obj and isinstance(obj.get("uri"), str):
+        out["uri"] = dest_uri
+        handled.add("uri")
+    # data keep: walk nested locators, never drop the key.
+    if "data" in obj:
+        out["data"] = rewrite_value(obj["data"], ctx)
+        handled.add("data")
+    for k, v in obj.items():
+        if k in handled:
+            continue
+        out[k] = rewrite_value(v, ctx)
+    return ordered_dict(obj, out), dest_uri, res.status
+
+
+def explode_publish_params(params: dict, ctx: Ctx) -> Any:
+    """Rewrite PublishDiagnosticsParams. File-split fissions into N params.
+
+    A publishDiagnostics document has one uri and many ranges. After a
+    godfile split those ranges may not share a dest file, so one
+    notification becomes several of the same schema.
+    """
+    appeared = params["uri"]
+    diags_in = params.get("diagnostics")
+    if not isinstance(diags_in, list):
+        return rewrite_object_generic(params, ctx)
+
+    ctx.uri_stack.append(appeared)
+    try:
+        buckets: "OrderedDict[str, list[Any]]" = OrderedDict()
+        origin: list[Any] = []
+        for d in diags_in:
+            if not isinstance(d, dict):
+                origin.append(rewrite_value(d, ctx))
+                continue
+            new_d, dest_uri, status = rewrite_diagnostic(d, ctx, appeared)
+            if dest_uri and status not in {"deleted", "unresolved", "skip"}:
+                buckets.setdefault(dest_uri, []).append(new_d)
+            else:
+                origin.append(new_d)
+    finally:
+        ctx.uri_stack.pop()
+
+    def make_params(uri: str, diags: list[Any], keep_version: bool) -> dict:
+        out: dict[Any, Any] = {}
+        for k, v in params.items():
+            if k == "uri":
+                out[k] = uri
+            elif k == "diagnostics":
+                out[k] = diags
+            elif k == "version":
+                if keep_version:
+                    out[k] = v
+            else:
+                out[k] = rewrite_value(v, ctx)
+        if "uri" not in out:
+            out["uri"] = uri
+        if "diagnostics" not in out:
+            out["diagnostics"] = diags
+        return ordered_dict(params if keep_version else {**params, "uri": uri}, out)
+
+    parts: list[dict] = []
+    for uri, ds in buckets.items():
+        parts.append(make_params(uri, ds, keep_version=(uri == appeared)))
+    if origin:
+        parts.append(make_params(appeared, origin, keep_version=True))
+    if not parts:
+        return make_params(appeared, [], keep_version=True)
+    if len(parts) == 1:
+        return parts[0]
+    return StreamFission(parts)
+
+
+def rewrite_jsonrpc_publish(obj: dict, ctx: Ctx) -> Any:
+    params = obj.get("params")
+    if not isinstance(params, dict) or not is_publish_params(params):
+        return rewrite_object_generic(obj, ctx)
+    exploded = explode_publish_params(params, ctx)
+    if isinstance(exploded, StreamFission):
+        items = []
+        for p in exploded.items:
+            new = {}
+            for k, v in obj.items():
+                if k == "params":
+                    new[k] = p
+                elif k == "id" and len(exploded.items) > 1:
+                    continue
+                else:
+                    new[k] = v
+            items.append(new)
+        return StreamFission(items)
+    out = {}
+    for k, v in obj.items():
+        out[k] = exploded if k == "params" else v
+    return out
+
+
+def rewrite_object_generic(obj: dict, ctx: Ctx) -> dict:
+    pushed = False
+    td = obj.get("textDocument")
+    if isinstance(td, dict) and isinstance(td.get("uri"), str) and td["uri"]:
+        ctx.uri_stack.append(td["uri"])
+        pushed = True
+    try:
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            if k in {"jsonrpc", "method", "id", "$schema", "jsonrpc"}:
+                out[k] = v
+                continue
+            nv = rewrite_value(v, ctx)
+            if isinstance(nv, StreamFission):
+                # Nested fission only makes sense as sibling JSON values.
+                out[k] = nv.items[0] if nv.items else v
+            else:
+                out[k] = nv
+        return out
+    finally:
+        if pushed:
+            ctx.uri_stack.pop()
+
+
+def rewrite_object(obj: dict, ctx: Ctx) -> Any:
+    kind = is_foreign_schema(obj)
+    if kind:
+        note_ignored(ctx, kind, FOREIGN_NOTE[kind])
+        return obj
+    if is_jsonrpc_publish(obj):
+        return rewrite_jsonrpc_publish(obj, ctx)
+    if is_publish_params(obj):
+        return explode_publish_params(obj, ctx)
+    if is_lsp_location(obj):
+        return rewrite_location(obj, ctx)
+    if is_location_link(obj):
+        return rewrite_location_link(obj, ctx)
+    if is_lsp_diagnostic(obj):
+        inherited = ctx.uri_stack[-1] if ctx.uri_stack else None
+        new_d, _dest, _st = rewrite_diagnostic(obj, ctx, inherited)
+        return new_d
+    return rewrite_object_generic(obj, ctx)
+
+
+def rewrite_string(text: str, ctx: Ctx) -> str:
+    """Rewrite 1-based file:line inside a JSON string (message, not range)."""
+    pieces = split_keep(text)
+    carry: Optional[Carry] = None
+    out: list[str] = []
+    for body, nl in pieces:
+        visible, mapping = strip_ansi_map(body)
+        gutter_applied = False
+        if carry is not None:
+            rewritten_vis = apply_gutter(visible, carry)
+            if rewritten_vis is not None:
+                body = apply_mapped_replace(body, mapping, visible, rewritten_vis)
+                gutter_applied = True
+        hits = [] if gutter_applied else find_hits(visible, ctx.src)
+        mapped_hits: list[Hit] = []
+        for h in hits:
+            a, b = h.span
+            if a < 0 or b > len(mapping) - 1:
+                continue
+            oa, ob = mapping[a], mapping[b]
+            mapped_hits.append(
+                Hit(
+                    path=h.path,
+                    line=h.line,
+                    col=h.col,
+                    span=(oa, ob),
+                    form=h.form,
+                    quote=h.quote,
+                    raw_path=h.raw_path,
+                    zero_based=False,
+                )
+            )
+        line_res = [ctx.resolve(h) for h in mapped_hits]
+        refreshed: Optional[Carry] = None
+        for r in line_res:
+            if should_carry(r, visible) and r.dest_line is not None:
+                refreshed = Carry(old_line=r.hit.line, dest_line=r.dest_line, ttl=GUTTER_TTL)
+        if refreshed is not None:
+            carry = refreshed
+        elif carry is not None:
+            carry.ttl -= 1
+            if carry.ttl <= 0:
+                carry = None
+        out.append(rewrite_line(body, line_res) + nl)
+    return "".join(out)
+
+
+def apply_mapped_replace(original: str, mapping: list[int], visible: str, new_visible: str) -> str:
+    old_m = GUTTER_RE.match(visible)
+    new_m = GUTTER_RE.match(new_visible)
+    if old_m and new_m and old_m.group(1) == new_m.group(1) and old_m.group(3) == new_m.group(3):
+        gs, ge = old_m.start(2), old_m.end(2)
+        oa = mapping[gs]
+        ob = mapping[ge - 1] + 1 if ge > gs else mapping[ge]
+        return original[:oa] + new_m.group(2) + original[ob:]
+    return new_visible
+
+
+def rewrite_value(val: Any, ctx: Ctx) -> Any:
+    if isinstance(val, dict):
+        return rewrite_object(val, ctx)
+    if isinstance(val, list):
+        out: list[Any] = []
+        for x in val:
+            y = rewrite_value(x, ctx)
+            if isinstance(y, StreamFission):
+                out.extend(y.items)
+            else:
+                out.append(y)
+        return out
+    if isinstance(val, str):
+        return rewrite_string(val, ctx)
+    return val
+
+
+def dumps_json(val: Any, indent: Optional[int]) -> str:
+    if indent is None:
+        return json.dumps(val, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(val, ensure_ascii=False, indent=indent)
+
+
+def _nbytes(s: str) -> int:
+    return len(s.encode("utf-8", "surrogateescape"))
+
+
+def _decode_slice(raw: bytes) -> str:
+    return raw.decode("utf-8", "surrogateescape")
+
+
+HEADER_LINE_RE = re.compile(br"^([A-Za-z0-9-]+):\s*(.*?)\s*$")
+CONTENT_HEADER_RE = re.compile(br"(?i)^content-(length|type)\s*:")
+
+
+def try_lsp_frame(
+    raw: bytes, i: int
+) -> Optional[tuple[list[tuple[bytes, bytes]], bytes, int, bytes]]:
+    """Parse one LSP Content-Length frame at byte offset i.
+
+    Returns (headers, body, end_offset, header_newline) or None. Starts only
+    on a Content-Length / Content-Type line so timestamps like `12:34:56 INFO`
+    are not eaten as headers.
+    """
+    n = len(raw)
+    if i >= n:
+        return None
+    # First line must be an LSP content header.
+    if raw[i] not in (ord("C"), ord("c")):
+        return None
+    nl_pos = raw.find(b"\n", i)
+    if nl_pos < 0:
+        return None
+    first = raw[i:nl_pos]
+    if first.endswith(b"\r"):
+        first = first[:-1]
+    if not CONTENT_HEADER_RE.match(first):
+        return None
+
+    headers: list[tuple[bytes, bytes]] = []
+    pos = i
+    header_nl = b"\r\n"
+    while pos < n:
+        crlf = raw.find(b"\r\n", pos)
+        lf = raw.find(b"\n", pos)
+        if crlf >= 0 and (lf < 0 or crlf <= lf):
+            line = raw[pos:crlf]
+            next_pos = crlf + 2
+            header_nl = b"\r\n"
+        elif lf >= 0:
+            line = raw[pos:lf]
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            next_pos = lf + 1
+            header_nl = b"\n"
+        else:
+            return None
+        if line == b"":
+            pos = next_pos
+            break
+        m = HEADER_LINE_RE.match(line)
+        if not m:
+            return None
+        headers.append((m.group(1), m.group(2)))
+        pos = next_pos
+    else:
+        return None
+
+    clen: Optional[int] = None
+    for name, val in headers:
+        if name.lower() == b"content-length":
+            try:
+                clen = int(val)
+            except ValueError:
+                return None
+            break
+    if clen is None or clen < 0:
+        return None
+    body_end = pos + clen
+    if body_end > n:
+        return None
+    return headers, raw[pos:body_end], body_end, header_nl
+
+
+def scan_stream(raw: bytes) -> Iterator[Chunk]:
+    """Yield JSON values, dest-ownable LSP frames, or chatter.
+
+    Concatenated JSON (NDJSON, pretty objects, one array) and LSP
+    `Content-Length` frames are the ingest. Non-JSON chatter passes through.
+    """
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(raw)
+    while i < n:
+        framed = try_lsp_frame(raw, i)
+        if framed is not None:
+            headers, body, end, header_nl = framed
+            original = _decode_slice(body)
+            try:
+                text = original.lstrip("\ufeff")
+                val, _ = dec.raw_decode(text)
+            except json.JSONDecodeError:
+                yield Chunk(kind="raw", payload="", raw_bytes=raw[i:end])
+                i = end
+                continue
+            yield Chunk(
+                kind="lsp",
+                payload=val,
+                original=original,
+                headers=headers,
+                header_nl=header_nl,
+            )
+            i = end
+            continue
+
+        text = _decode_slice(raw[i:])
+        if text[:1] in "{[":
+            try:
+                val, end = dec.raw_decode(text)
+            except json.JSONDecodeError:
+                nl = text.find("\n")
+                if nl < 0:
+                    yield Chunk(kind="raw", payload=text, raw_bytes=raw[i:])
+                    return
+                line = text[:nl]
+                suffix = "\r\n" if line.endswith("\r") else "\n"
+                body = line[:-1] if suffix == "\r\n" else line
+                consumed = text[: nl + 1]
+                yield Chunk(kind="raw", payload=body, nl=suffix, raw_bytes=consumed.encode("utf-8", "surrogateescape"))
+                i += _nbytes(consumed)
+                continue
+            original = text[:end]
+            j = end
+            nl = "\n"
+            if j < len(text) and text[j] == "\r":
+                j += 1
+                nl = "\r\n" if j < len(text) and text[j] == "\n" else "\r"
+            if j < len(text) and text[j] == "\n":
+                j += 1
+                if nl != "\r\n":
+                    nl = "\n"
+            elif j == end:
+                nl = "\n" if end < len(text) else ""
+            consumed = text[:j]
+            yield Chunk(kind="json", payload=val, nl=nl, original=original)
+            i += _nbytes(consumed)
+            continue
+        nl_at = text.find("\n")
+        if nl_at < 0:
+            yield Chunk(kind="raw", payload=text, raw_bytes=raw[i:])
+            return
+        line = text[:nl_at]
+        if line.endswith("\r"):
+            yield Chunk(
+                kind="raw",
+                payload=line[:-1],
+                nl="\r\n",
+                raw_bytes=text[: nl_at + 1].encode("utf-8", "surrogateescape"),
+            )
+        else:
+            yield Chunk(
+                kind="raw",
+                payload=line,
+                nl="\n",
+                raw_bytes=text[: nl_at + 1].encode("utf-8", "surrogateescape"),
+            )
+        i += _nbytes(text[: nl_at + 1])
+
+
+def read_inputs(names: list[str]) -> bytes:
+    if not names:
+        names = ["-"]
+    chunks: list[bytes] = []
+    for name in names:
+        if name == "-":
+            chunks.append(sys.stdin.buffer.read())
+        else:
+            with open(name, "rb") as fp:
+                chunks.append(fp.read())
+    return b"".join(chunks)
+
+
+def _write_out(data: bytes) -> None:
+    sys.stdout.buffer.write(data)
+
+
+def emit_lsp_frame(headers: list[tuple[bytes, bytes]], body: bytes, header_nl: bytes) -> None:
+    """Write one LSP frame with dest-owned Content-Length (UTF-8 byte length)."""
+    out_headers: list[tuple[bytes, bytes]] = []
+    seen_cl = False
+    clen = str(len(body)).encode("ascii")
+    for name, val in headers:
+        if name.lower() == b"content-length":
+            out_headers.append((name, clen))
+            seen_cl = True
+        else:
+            out_headers.append((name, val))
+    if not seen_cl:
+        out_headers.insert(0, (b"Content-Length", clen))
+    parts: list[bytes] = []
+    for name, val in out_headers:
+        parts.append(name + b": " + val + header_nl)
+    parts.append(header_nl)
+    parts.append(body)
+    _write_out(b"".join(parts))
+
+
+def emit_rewritten(
+    rewritten: Any,
+    original: str,
+    args: argparse.Namespace,
+    nl: str,
+    headers: Optional[list[tuple[bytes, bytes]]] = None,
+    header_nl: bytes = b"\r\n",
+) -> None:
+    items = rewritten.items if isinstance(rewritten, StreamFission) else [rewritten]
+    if args.indent is not None:
+        indent: Optional[int] = args.indent
+    elif args.compact:
+        indent = None
+    elif original and looks_pretty(original):
+        indent = 2
+    else:
+        indent = None
+    bodies = [dumps_json(item, indent) for item in items]
+    if headers is not None:
+        for body in bodies:
+            emit_lsp_frame(headers, body.encode("utf-8"), header_nl)
+        return
+    for i, body in enumerate(bodies):
+        suffix = nl or "\n"
+        if i < len(items) - 1 and not suffix:
+            suffix = "\n"
+        _write_out((body + suffix).encode("utf-8"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gist",
+        description=(
+            "Rewrite locators inside an LSP textDocument/publishDiagnostics "
+            "stream from one directory snapshot onto another. Addresses are "
+            "0-based range.start.line plus uri. Nested schema fields move; "
+            "the JSON stays valid. Content-Length frames are dest-owned. "
+            "No git, no locator arguments."
+        ),
+        epilog="cat publish.json | gist --from-dir old --to-dir new",
+    )
+    p.add_argument(
+        "logs",
+        nargs="*",
+        help="JSON streams to rewrite (default: stdin). '-' is stdin.",
+    )
+    p.add_argument("--from-dir", type=Path, required=True, help="source snapshot directory")
+    p.add_argument("--to-dir", type=Path, required=True, help="destination snapshot directory")
+    p.add_argument("--trace", action="store_true", help="print mapping TSV on stderr (LSP lines are 0-based)")
+    p.add_argument("--context", type=int, default=3, help="neighbor window (default 3)")
+    p.add_argument("--debug", action="store_true", help="scorer traces on stderr")
+    p.add_argument(
+        "--indent",
+        type=int,
+        default=None,
+        help="pretty-print JSON with this indent (overrides input style)",
+    )
+    p.add_argument(
+        "--compact",
+        action="store_true",
+        help="force compact JSON even if the input value was pretty-printed",
+    )
+    p.add_argument("--version", action="version", version=f"gist {VERSION}")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        code = e.code
+        if code in (0, 2):
+            return int(code) if isinstance(code, int) else 2
+        return 2
+    if not args.from_dir.is_dir():
+        print(f"gist: --from-dir is not a directory: {args.from_dir}", file=sys.stderr)
+        return 2
+    if not args.to_dir.is_dir():
+        print(f"gist: --to-dir is not a directory: {args.to_dir}", file=sys.stderr)
+        return 2
+    if not args.logs and sys.stdin.isatty():
+        parser.print_help()
+        return 2
+
+    src = load_snapshot(args.from_dir, str(args.from_dir))
+    dst = load_snapshot(args.to_dir, str(args.to_dir))
+    ctx = Ctx(
+        src=src,
+        dst=dst,
+        context=args.context,
+        debug=args.debug,
+        trace=args.trace,
+    )
+
+    raw = read_inputs(args.logs)
+    for chunk in scan_stream(raw):
+        if chunk.kind == "raw":
+            if chunk.raw_bytes is not None:
+                _write_out(chunk.raw_bytes)
+            else:
+                _write_out((str(chunk.payload) + chunk.nl).encode("utf-8", "surrogateescape"))
+            continue
+        rewritten = rewrite_value(chunk.payload, ctx)
+        emit_rewritten(
+            rewritten,
+            chunk.original,
+            args,
+            chunk.nl,
+            headers=chunk.headers,
+            header_nl=chunk.header_nl,
+        )
+
+    try:
+        sys.stdout.buffer.flush()
+    except Exception:
+        pass
+    if ctx.unresolved:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

@@ -1,0 +1,1209 @@
+#!/usr/bin/env python3
+"""unfmt — inverse printf against a source tree.
+
+Given a runtime string (error, log line, assertion), find format
+templates in the tree that could have produced it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "0.2.0"
+
+# Working-tree indexing + Swift line-continuation are the v0.2 changes
+# from dogfooding tenaoshi (untracked sources) and sitbone (multiline logs).
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "vendor",
+    ".idea",
+    ".next",
+    "coverage",
+    "Pods",
+    ".build",
+    "DerivedData",
+    "zig-out",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".turbo",
+    "out",
+    "bin",
+}
+
+SKIP_SUFFIXES = {
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".lock",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".wasm",
+    ".so",
+    ".dylib",
+    ".a",
+    ".o",
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".jar",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".bin",
+    ".exe",
+    ".dll",
+    ".pdb",
+    ".svg",
+}
+
+SOURCE_EXTS = {
+    ".rs": "rust",
+    ".ts": "js",
+    ".tsx": "js",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".py": "py",
+    ".pyi": "py",
+    ".go": "go",
+    ".swift": "swift",
+    ".c": "c",
+    ".h": "c",
+    ".hh": "c",
+    ".cc": "c",
+    ".cpp": "c",
+    ".cxx": "c",
+    ".hpp": "c",
+    ".java": "java",
+    ".kt": "kt",
+    ".kts": "kt",
+    ".rb": "rb",
+    ".cs": "cs",
+    ".zig": "zig",
+    ".sh": "sh",
+    ".bash": "sh",
+    ".zsh": "sh",
+}
+
+MAX_FILE_BYTES = 2_000_000
+MIN_STATIC_EXACT = 4
+MIN_STATIC_PREFIX = 10
+MIN_STATIC_INFIX = 16
+MIN_STATIC_HOLE = 6
+DEFAULT_MIN_SCORE = 0.34
+DEFAULT_MAX_HITS = 5
+MAX_NOHOLE_CHARS = 280
+SWIFT_CONTINUATION_RE = re.compile(r"\\[ \t]*\n[ \t]*")
+TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|specs?|__tests__|__mocks__)(?:/|$)|"
+    r"\.(?:test|spec)\.|_test\.|_tests\.|Tests/",
+    re.I,
+)
+DATA_LITERAL_RE = re.compile(r"""^\s*[{\[]\s*(?:"|\{|\[|\d)""")
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+PRINTF_RE = re.compile(
+    r"%(?:%|[-+0 #]*\d*(?:\.\d+)?(?:hh|h|ll|l|z|j|t|L)?[sdifugGxXeEpc@voOqTwWcS])"
+)
+SKIP_STDIN_RE = re.compile(
+    r"""(?x)
+    ^\s*$
+    |^(Compiling|Checking|Finished|Running|Downloading|Downloaded|
+       Installing|Updating|Fetching|Resolving|Auditing)\b
+    |^test\ result:
+    |^running\ \d+\ tests
+    |^\s*test\ .*\ \.\.\.\ (ok|ignored|FAILED)?
+    |^\[created\ [^\]]+\]\s*$
+    """
+)
+LOG_PREFIX_RES = [
+    re.compile(r"^(?:\x1b\[[0-9;]*m)+"),
+    re.compile(
+        r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+"
+    ),
+    re.compile(r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*"),
+    re.compile(
+        r"^(?:INFO|WARN|WARNING|ERROR|DEBUG|TRACE|FATAL|Info|Error|Debug|Warning)"
+        r"(?:\s+\[[^\]]+\])?[:\s]+"
+    ),
+    re.compile(r"^[A-Za-z0-9_.-]+\[\d+\]:\s+"),
+    re.compile(r"^(?:error|warning|note|help|fail|failed):\s+", re.I),
+]
+
+
+@dataclass(frozen=True)
+class Template:
+    path: str
+    line: int
+    col: int
+    lang: str
+    raw: str
+    parts: tuple[str, ...]
+    holes: int
+
+    @property
+    def static_len(self) -> int:
+        return sum(len(p) for p in self.parts)
+
+    @property
+    def display(self) -> str:
+        out = []
+        for i, p in enumerate(self.parts):
+            if i:
+                out.append("{}")
+            out.append(p.replace("\n", "\\n").replace("\t", "\\t"))
+        return "".join(out)
+
+
+@dataclass
+class Hit:
+    template: Template
+    score: float
+    variant: str
+    prefix: str
+    suffix: str
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def normalize_query(s: str) -> str:
+    s = strip_ansi(s).replace("\r\n", "\n").replace("\r", "\n")
+    s = s.strip()
+    changed = True
+    while changed and s:
+        changed = False
+        for rx in LOG_PREFIX_RES:
+            n = rx.sub("", s)
+            if n != s:
+                s = n.lstrip()
+                changed = True
+    return s
+
+
+def query_variants(q: str) -> list[tuple[str, float, str]]:
+    """Concrete message plus ': '-suffixes (wrapped errors)."""
+    q = normalize_query(q)
+    if not q:
+        return []
+    out = [(q, 0.0, "full")]
+    parts = re.split(r": ", q)
+    if len(parts) > 1:
+        for i in range(1, len(parts)):
+            suf = ": ".join(parts[i:])
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.04 * i, f"suffix:{i}"))
+    # last ' — ' or ' - ' clause (some loggers)
+    for sep, name in ((" — ", "emdash"), (" - ", "dash")):
+        if sep in q:
+            suf = q.split(sep, 1)[1]
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.05, name))
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for item in out:
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        uniq.append(item)
+    return uniq
+
+
+def unescape_basic(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    escapes = {
+        "n": "\n",
+        "t": "\t",
+        "r": "\r",
+        "0": "\0",
+        "\\": "\\",
+        '"': '"',
+        "'": "'",
+        "`": "`",
+    }
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            # Keep Swift interpolation `\(... )` intact for tokenize_template.
+            if nxt == "(":
+                out.append("\\(")
+                i += 2
+                continue
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "x" and i + 3 < n:
+                try:
+                    out.append(chr(int(s[i + 2 : i + 4], 16)))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _matching_brace(s: str, open_at: int) -> int | None:
+    """open_at points at '{'. Return index of matching '}' or None."""
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == '"' or ch == "'":
+            # don't walk strings inside ${...} / {json}
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _matching_paren(s: str, open_at: int) -> int | None:
+    """open_at points at '('."""
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == '"' or ch == "'":
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _is_format_hole(s: str, i: int) -> int | None:
+    """If s[i] starts a `{name[:fmt]}` hole, return index after it."""
+    if i >= len(s) or s[i] != "{":
+        return None
+    n = len(s)
+    j = i + 1
+    if j < n and s[j] in '{"[ \n\t':
+        return None
+    if j < n and s[j] == "}":
+        return j + 1
+    if j < n and s[j].isdigit():
+        while j < n and s[j].isdigit():
+            j += 1
+    elif j < n and (s[j].isalpha() or s[j] == "_"):
+        while j < n and (s[j].isalnum() or s[j] in "_."):
+            j += 1
+    if j < n and s[j] == ":":
+        # format spec; stop at }
+        k = s.find("}", j)
+        if k < 0:
+            return None
+        return k + 1
+    if j < n and s[j] == "}":
+        return j + 1
+    return None
+
+
+def swift_string_value(raw: str) -> str:
+    """Apply Swift multiline rules: `\\` line join, then indent strip."""
+    s = SWIFT_CONTINUATION_RE.sub("", raw)
+    if "\n" not in s:
+        return s
+    if s.startswith("\n"):
+        s = s[1:]
+    lines = s.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty:
+        cut = min(len(ln) - len(ln.lstrip(" \t")) for ln in nonempty)
+        lines = [ln[cut:] if len(ln) >= cut else ln for ln in lines]
+    return "\n".join(lines).strip()
+
+
+def looks_like_data_literal(body: str, holes: int) -> bool:
+    if holes:
+        return False
+    s = body.strip()
+    if len(s) >= MAX_NOHOLE_CHARS:
+        return True
+    if DATA_LITERAL_RE.match(s) and (":" in s or "," in s):
+        return True
+    return False
+
+
+def is_test_path(path: str) -> bool:
+    return bool(TEST_PATH_RE.search(path.replace("\\", "/")))
+
+
+def tokenize_template(s: str) -> tuple[tuple[str, ...], int]:
+    buf: list[str] = []
+    parts: list[str] = []
+    holes = 0
+    i = 0
+    n = len(s)
+
+    def flush() -> None:
+        parts.append("".join(buf))
+        buf.clear()
+
+    while i < n:
+        if s.startswith("{{", i):
+            buf.append("{")
+            i += 2
+            continue
+        if s.startswith("}}", i):
+            buf.append("}")
+            i += 2
+            continue
+        if s.startswith("%%", i):
+            buf.append("%")
+            i += 2
+            continue
+        if s.startswith("${", i):
+            end = _matching_brace(s, i + 1)
+            if end is not None:
+                flush()
+                holes += 1
+                i = end + 1
+                continue
+        if s.startswith("\\(", i):
+            end = _matching_paren(s, i + 1)
+            if end is not None:
+                flush()
+                holes += 1
+                i = end + 1
+                continue
+        if s[i] == "{":
+            end = _is_format_hole(s, i)
+            if end is not None:
+                flush()
+                holes += 1
+                i = end
+                continue
+        m = PRINTF_RE.match(s, i)
+        if m:
+            if m.group(0) == "%%":
+                buf.append("%")
+                i = m.end()
+                continue
+            flush()
+            holes += 1
+            i = m.end()
+            continue
+        buf.append(s[i])
+        i += 1
+    flush()
+    return tuple(parts), holes
+
+
+def _line_starts(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _linecol(starts: list[int], index: int) -> tuple[int, int]:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= index:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    line_idx = hi
+    return line_idx + 1, index - starts[line_idx] + 1
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] != "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    n = len(text)
+    i += 2
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        i += 1
+    return min(n, i + 2)
+
+
+def _read_quoted(text: str, i: int, quote: str) -> tuple[int, str] | None:
+    """i points at opening quote. Return (index_after, inner_raw)."""
+    n = len(text)
+    i += 1
+    start = i
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1, text[start:i]
+        if ch == "\n" and quote != "`":
+            return None
+        i += 1
+    return None
+
+
+def _read_raw_hash(text: str, i: int) -> tuple[int, str] | None:
+    """Rust/Python-ish r#*\" ... \"#* starting at the first # or quote after r."""
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    start = i
+    close = '"' + ("#" * hashes)
+    while i < n:
+        if text.startswith(close, i):
+            return i + len(close), text[start:i]
+        i += 1
+    return None
+
+
+def _read_triple(text: str, i: int, quote: str) -> tuple[int, str] | None:
+    delim = quote * 3
+    if not text.startswith(delim, i):
+        return None
+    i += 3
+    start = i
+    n = len(text)
+    while i + 2 < n:
+        if text.startswith(delim, i):
+            return i + 3, text[start:i]
+        i += 1
+    return None
+
+
+def _read_js_template(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    start = i
+    chunks: list[str] = []
+    last = i
+    depth_expr = 0
+    in_expr = False
+    while i < n:
+        ch = text[i]
+        if not in_expr:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                chunks.append(text[last:i])
+                return i + 1, "".join(chunks)
+            if ch == "$" and i + 1 < n and text[i + 1] == "{":
+                chunks.append(text[last:i])
+                chunks.append("${")
+                i += 2
+                last = i
+                in_expr = True
+                depth_expr = 1
+                continue
+            i += 1
+            continue
+        # inside ${}
+        if ch == "{":
+            depth_expr += 1
+        elif ch == "}":
+            depth_expr -= 1
+            if depth_expr == 0:
+                chunks.append(text[last:i])
+                chunks.append("}")
+                i += 1
+                last = i
+                in_expr = False
+                continue
+        elif ch in ('"', "'", "`"):
+            # skip string in expression
+            q = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return None
+
+
+def extract_templates(text: str, lang: str, path: str) -> list[Template]:
+    starts = _line_starts(text)
+    n = len(text)
+    i = 0
+    out: list[Template] = []
+
+    def emit(raw_inner: str, at: int, unesc: bool) -> None:
+        body = raw_inner
+        if lang == "swift":
+            body = swift_string_value(body)
+        if unesc:
+            body = unescape_basic(body)
+        if not body or body.isspace():
+            return
+        # println! / format!("...\\n") — the log line usually has no trailing NL
+        if body.endswith("\r\n"):
+            body = body[:-2]
+        elif body.endswith("\n"):
+            body = body[:-1]
+        # skip obvious non-messages
+        if len(body.strip()) < MIN_STATIC_EXACT:
+            return
+        parts, holes = tokenize_template(body)
+        if looks_like_data_literal(body, holes):
+            return
+        if holes == 0 and sum(len(p) for p in parts) < MIN_STATIC_EXACT:
+            return
+        line, col = _linecol(starts, at)
+        out.append(
+            Template(
+                path=path,
+                line=line,
+                col=col,
+                lang=lang,
+                raw=body,
+                parts=parts,
+                holes=holes,
+            )
+        )
+
+    while i < n:
+        ch = text[i]
+
+        # comments
+        if lang in {"py", "sh", "rb"} and ch == "#":
+            i = _skip_line_comment(text, i)
+            continue
+        if lang != "py" and ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i = _skip_line_comment(text, i)
+                continue
+            if text[i + 1] == "*":
+                i = _skip_block_comment(text, i)
+                continue
+
+        # rust raw
+        if lang == "rust" and ch in {"r", "b", "c"}:
+            j = i
+            if text[j] == "b" or text[j] == "c":
+                j += 1
+            if j < n and text[j] == "r":
+                j += 1
+                got = _read_raw_hash(text, j)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=False)
+                    i = end
+                    continue
+
+        # python prefixes
+        if lang == "py" and ch.isalpha():
+            j = i
+            while j < n and text[j] in "rRfFbBuU":
+                j += 1
+            if j > i and j < n and text[j] in {'"', "'"}:
+                is_raw = any(c in "rR" for c in text[i:j])
+                if text.startswith(text[j] * 3, j):
+                    got = _read_triple(text, j, text[j])
+                else:
+                    got = _read_quoted(text, j, text[j])
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=not is_raw)
+                    i = end
+                    continue
+
+        # go raw
+        if lang == "go" and ch == "`":
+            j = text.find("`", i + 1)
+            if j >= 0:
+                emit(text[i + 1 : j], i, unesc=False)
+                i = j + 1
+                continue
+
+        # js template
+        if lang == "js" and ch == "`":
+            got = _read_js_template(text, i)
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+
+        # swift / python / generic triples
+        if ch in {'"', "'"} and text.startswith(ch * 3, i):
+            got = _read_triple(text, i, ch)
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+
+        # ordinary quoted
+        if ch == '"' or (ch == "'" and lang in {"js", "py", "sh", "rb", "go", "java", "kt", "c"}):
+            got = _read_quoted(text, i, ch)
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+
+        i += 1
+
+    return out
+
+
+def match_template(tmpl: Template, query: str) -> tuple[float, str, str] | None:
+    parts = tmpl.parts
+    static = tmpl.static_len
+    if tmpl.holes == 0:
+        body = parts[0] if parts else ""
+        if body == query:
+            return 1.0, "", ""
+        if query.startswith(body) and static >= MIN_STATIC_PREFIX:
+            return min(0.93, 0.55 + static / max(len(query), 1) * 0.4), "", query[len(body) :]
+        idx = query.find(body)
+        if idx >= 0 and static >= MIN_STATIC_INFIX:
+            prefix = query[:idx]
+            suffix = query[idx + len(body) :]
+            coverage = static / max(len(query), 1)
+            if coverage < 0.25 and static < 24:
+                return None
+            return min(0.88, 0.4 + coverage * 0.5), prefix, suffix
+        return None
+
+    min_static = MIN_STATIC_HOLE
+    if tmpl.holes >= 2 and any(len(p) >= 4 for p in parts):
+        min_static = 5
+    if static < min_static:
+        return None
+
+    pos = 0
+    prefix = ""
+    first = True
+    for i, part in enumerate(parts):
+        if part == "":
+            continue
+        idx = query.find(part, pos)
+        if idx < 0:
+            return None
+        if first:
+            prefix = query[:idx]
+            # first static chunk should not be a tiny accidental hit
+            if len(part) < 4 and static < 16:
+                return None
+            first = False
+        pos = idx + len(part)
+
+    suffix = query[pos:] if pos <= len(query) else ""
+    # template that ends with a static part should not leave a huge suffix
+    if parts and parts[-1] and len(suffix) > max(24, static):
+        return None
+
+    coverage = static / max(len(query), 1)
+    explained = static / max(static + len(prefix) + (0 if parts[-1] == "" else len(suffix)), 1)
+    score = 0.42 * min(coverage, 1.0) + 0.38 * explained + 0.20 * min(static / 40.0, 1.0)
+    # ending with a hole is typical of errors; slight bonus
+    if parts[-1] == "":
+        score += 0.04
+    # huge unmatched prefix means we latched onto a tail fragment
+    if len(prefix) > static * 2 and len(prefix) > 20:
+        score -= 0.12
+    return min(score, 0.99), prefix, suffix
+
+
+def score_query(tmpl: Template, query: str) -> Hit | None:
+    best: Hit | None = None
+    for variant, penalty, tag in query_variants(query):
+        got = match_template(tmpl, variant)
+        if got is None:
+            continue
+        score, prefix, suffix = got
+        score = max(0.0, score - penalty)
+        if best is None or score > best.score:
+            best = Hit(template=tmpl, score=score, variant=tag, prefix=prefix, suffix=suffix)
+    return best
+
+
+def git_toplevel(path: Path) -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if r.returncode != 0:
+        return None
+    top = r.stdout.strip()
+    return Path(top) if top else None
+
+
+def list_files(root: Path, walk: bool, cached_only: bool) -> list[Path]:
+    root = root.resolve()
+    files: list[Path] = []
+    top = None if walk else git_toplevel(root)
+    if top is not None:
+        args = ["git", "-C", str(top), "ls-files", "-z", "--cached"]
+        if not cached_only:
+            args.extend(["--others", "--exclude-standard"])
+        r = subprocess.run(args, capture_output=True)
+        if r.returncode == 0:
+            rels = [p.decode("utf-8", "surrogateescape") for p in r.stdout.split(b"\0") if p]
+            for rel in rels:
+                p = top / rel
+                try:
+                    p.relative_to(root)
+                except ValueError:
+                    continue
+                files.append(p)
+            return files
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            files.append(Path(dirpath) / name)
+    return files
+
+
+def lang_for(path: Path) -> str | None:
+    name = path.name.lower()
+    if name.endswith(tuple(SKIP_SUFFIXES)):
+        return None
+    suf = path.suffix.lower()
+    return SOURCE_EXTS.get(suf)
+
+
+def index_root(root: Path, walk: bool, cached_only: bool) -> list[Template]:
+    templates: list[Template] = []
+    for path in list_files(root, walk=walk, cached_only=cached_only):
+        lang = lang_for(path)
+        if not lang:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_size > MAX_FILE_BYTES or st.st_size == 0:
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in data[:8192]:
+            continue
+        text = data.decode("utf-8", "replace")
+        rel = str(path)
+        try:
+            rel = str(path.relative_to(root.resolve()))
+        except ValueError:
+            pass
+        templates.extend(extract_templates(text, lang, rel))
+    return templates
+
+
+def search(
+    templates: list[Template],
+    query: str,
+    min_score: float,
+    limit: int,
+) -> list[Hit]:
+    q = normalize_query(query)
+    if not q:
+        return []
+    hits: list[Hit] = []
+    for tmpl in templates:
+        hit = score_query(tmpl, q)
+        if hit is None or hit.score < min_score:
+            continue
+        hits.append(hit)
+    hits.sort(
+        key=lambda h: (
+            -h.score,
+            is_test_path(h.template.path),
+            -h.template.static_len,
+            h.template.path,
+            h.template.line,
+        )
+    )
+    return hits[:limit]
+
+
+def format_hit(query: str, hit: Hit) -> str:
+    t = hit.template
+    lines = [
+        f"{t.path}:{t.line}:{t.col}: score={hit.score:.2f} lang={t.lang} "
+        f"holes={t.holes} via={hit.variant}",
+        f"  query: {normalize_query(query)}",
+        f"  tmpl:  {t.display}",
+    ]
+    if hit.variant != "full" or hit.prefix or hit.suffix:
+        extra = []
+        if hit.variant != "full":
+            extra.append(f"via {hit.variant}")
+        if hit.prefix:
+            extra.append(f"prefix={hit.prefix!r}")
+        if hit.suffix and t.holes == 0:
+            extra.append(f"suffix={hit.suffix!r}")
+        if extra:
+            lines.append("  note:  " + "; ".join(extra))
+    return "\n".join(lines)
+
+
+def hit_json(query: str, hit: Hit) -> dict:
+    t = hit.template
+    return {
+        "path": t.path,
+        "line": t.line,
+        "col": t.col,
+        "lang": t.lang,
+        "holes": t.holes,
+        "score": round(hit.score, 4),
+        "via": hit.variant,
+        "template": t.display,
+        "raw": t.raw,
+        "query": normalize_query(query),
+        "prefix": hit.prefix,
+        "suffix": hit.suffix,
+    }
+
+
+def iter_stdin_queries(text: str) -> list[str]:
+    queries = []
+    for line in text.splitlines():
+        line = strip_ansi(line).rstrip()
+        if SKIP_STDIN_RE.match(line):
+            continue
+        cleaned = normalize_query(line)
+        if len(cleaned) < MIN_STATIC_HOLE:
+            continue
+        queries.append(line)
+    return queries
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="unfmt",
+        description="Inverse printf: locate source format templates that can produce a runtime string.",
+    )
+    p.add_argument("messages", nargs="*", help="runtime message(s); '-' reads stdin")
+    p.add_argument(
+        "-e",
+        "--message",
+        action="append",
+        default=[],
+        metavar="MSG",
+        help="runtime message (repeatable; use for strings that look like flags)",
+    )
+    p.add_argument("-C", "--root", default=".", help="tree to scan (default: .)")
+    p.add_argument("--walk", action="store_true", help="walk files; do not use git ls-files")
+    p.add_argument(
+        "--cached-only",
+        action="store_true",
+        help="index only git-cached files (default also includes untracked)",
+    )
+    p.add_argument(
+        "--untracked",
+        action="store_true",
+        help=argparse.SUPPRESS,  # default since v0.2; kept so old scripts do not die
+    )
+    p.add_argument("-n", "--max", type=int, default=DEFAULT_MAX_HITS, help="max hits per message")
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=DEFAULT_MIN_SCORE,
+        help=f"minimum score (default {DEFAULT_MIN_SCORE})",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--index", action="store_true", help="print extracted templates and exit")
+    p.add_argument("-q", "--quiet", action="store_true", help="exit status only")
+    p.add_argument("--any", action="store_true", help="succeed if any query matches")
+    p.add_argument("--selftest", action="store_true", help="run built-in tests")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def run_selftest() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    parts, holes = tokenize_template("git diff single file failed: {}")
+    expect(holes == 1 and parts == ("git diff single file failed: ", ""), f"rust {{}}: {parts} {holes}")
+
+    parts, holes = tokenize_template("unparseable `diff --git` header: {rest}")
+    expect(holes == 1 and parts[0].startswith("unparseable"), f"named: {parts} {holes}")
+
+    parts, holes = tokenize_template("Duplicate event ID: ${snapshot.id}")
+    expect(holes == 1 and parts == ("Duplicate event ID: ", ""), f"js: {parts} {holes}")
+
+    parts, holes = tokenize_template(
+        "session started profile=\\(self.activeProfile.name, privacy: .private)"
+    )
+    expect(holes == 1 and parts[0] == "session started profile=", f"swift: {parts} {holes}")
+
+    parts, holes = tokenize_template("open %s: %v")
+    expect(holes == 2 and parts == ("open ", ": ", ""), f"printf: {parts} {holes}")
+
+    parts, holes = tokenize_template('{"ok": true}')
+    expect(holes == 0, f"json braces should not be holes: {parts} {holes}")
+
+    parts, holes = tokenize_template("progress {0:.2f}%")
+    expect(holes == 1 and parts == ("progress ", "%"), f"fmt spec: {parts} {holes}")
+
+    rust = """
+        return Err(anyhow!("git diff single file failed: {}", stderr.trim()));
+        // decoy: git diff single file failed: should not be extracted from comment
+        let _ = format!("diff --git a/{display} b/{display}\\n");
+    """
+    tmpls = extract_templates(rust, "rust", "diff.rs")
+    kinds = {t.display for t in tmpls}
+    expect(any("git diff single file failed: {}" == d for d in kinds), f"extract rust: {kinds}")
+    expect(any(t.holes == 2 and t.display == "diff --git a/{} b/{}" for t in tmpls), f"named twice: {kinds}")
+    expect(all("decoy" not in t.raw for t in tmpls), "comment leaked")
+    git_diff = next(t for t in tmpls if t.display == "diff --git a/{} b/{}")
+    hit = score_query(git_diff, "diff --git a/src/weird.rs b/src/weird.rs")
+    expect(hit is not None and hit.score >= 0.5, f"trailing-nl format: {hit}")
+
+    go = Template("p.go", 1, 1, "go", "open %s: %v", ("open ", ": ", ""), 2)
+    hit = score_query(go, "open /tmp/x: permission denied")
+    expect(hit is not None and hit.score >= 0.34, f"short printf: {hit}")
+
+    js = 'throw new Error(`Duplicate event ID: ${snapshot.id}`);\nconst x = "Event id must not be empty";\n'
+    tmpls = extract_templates(js, "js", "eq.ts")
+    expect(any(t.holes == 1 and t.raw.startswith("Duplicate") for t in tmpls), f"js tmpl: {[t.raw for t in tmpls]}")
+    expect(any(t.raw == "Event id must not be empty" for t in tmpls), "js literal")
+
+    py = 'raise KeyError(f"user {uid} not found")\n'
+    tmpls = extract_templates(py, "py", "u.py")
+    expect(any(t.holes == 1 and t.parts[0] == "user " for t in tmpls), f"py f: {[t.raw for t in tmpls]}")
+
+    t = Template("a.rs", 1, 1, "rust", "git diff single file failed: {}", ("git diff single file failed: ", ""), 1)
+    hit = score_query(t, "git diff single file failed: fatal: not a git repository")
+    expect(hit is not None and hit.score >= 0.5, f"score filled: {hit}")
+
+    t2 = Template("b.rs", 1, 1, "rust", "unparseable `diff --git` header: {rest}", ("unparseable `diff --git` header: ", ""), 1)
+    hit = score_query(t2, "Error: unparseable `diff --git` header: diff --git a/x b/x")
+    expect(hit is not None and hit.score >= 0.45, f"wrapped: {hit}")
+
+    t3 = Template("c.ts", 1, 1, "js", "ok", ("ok",), 0)
+    hit = score_query(t3, "something else entirely went wrong today")
+    expect(hit is None or hit.score < 0.34, f"short false pos: {hit}")
+
+    qv = query_variants("ctx: git apply --reverse failed: boom")
+    expect(any(v[0].startswith("git apply") for v in qv), f"variants: {qv}")
+
+    swift_src = (
+        'Logger.dataStore.error("""\n'
+        "            cumulative save failed path=\\(path) \\\n"
+        "            error=\\(err)\n"
+        '            """)\n'
+    )
+    tmpls = extract_templates(swift_src, "swift", "JSONSessionStore.swift")
+    expect(
+        any(t.display == "cumulative save failed path={} error={}" for t in tmpls),
+        f"swift flatten: {[t.display for t in tmpls]}",
+    )
+    if tmpls:
+        hit = score_query(tmpls[0], "cumulative save failed path=/tmp/c.json error=disk full")
+        expect(hit is not None and hit.score >= 0.5, f"swift flattened match: {hit}")
+
+    js_data = 'const blob = \'{"schema_version":1,"has_more":false}\';\nconst msg = "real message here ok";\n'
+    tmpls = extract_templates(js_data, "js", "oracles.ts")
+    expect(all("schema_version" not in t.raw for t in tmpls), f"json skipped: {[t.raw for t in tmpls]}")
+    expect(any("real message here ok" == t.raw for t in tmpls), "kept normal literal")
+
+    ranked = search(
+        [
+            Template("packages/rules/src/execution.test.ts", 1, 1, "js", "code", ("code",), 0),
+            Template("packages/rules/src/execution.ts", 2, 1, "js", "code", ("code",), 0),
+        ],
+        "code",
+        min_score=0.3,
+        limit=5,
+    )
+    expect(
+        ranked and ranked[0].template.path.endswith("execution.ts"),
+        f"prod before test: {[h.template.path for h in ranked]}",
+    )
+
+    if failures:
+        for f in failures:
+            print(f"FAIL: {f}", file=sys.stderr)
+        print(f"{len(failures)} selftest failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"unfmt {VERSION}")
+        return 0
+    if args.selftest:
+        return run_selftest()
+
+    root = Path(args.root)
+    if not root.exists():
+        print(f"unfmt: root not found: {root}", file=sys.stderr)
+        return 2
+
+    templates = index_root(root, walk=args.walk, cached_only=args.cached_only)
+
+    if args.index:
+        if args.json:
+            payload = [
+                {
+                    "path": t.path,
+                    "line": t.line,
+                    "col": t.col,
+                    "lang": t.lang,
+                    "holes": t.holes,
+                    "template": t.display,
+                    "raw": t.raw,
+                    "static": t.static_len,
+                }
+                for t in templates
+            ]
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            for t in templates:
+                print(f"{t.path}:{t.line}:{t.col}: lang={t.lang} holes={t.holes} static={t.static_len} {t.display}")
+        return 0
+
+    messages: list[str] = []
+    messages.extend(args.message)
+    read_stdin = (
+        not args.messages and not args.message
+    ) or args.messages == ["-"] or "-" in args.messages
+    for m in args.messages:
+        if m == "-":
+            continue
+        messages.append(m)
+    if read_stdin and not sys.stdin.isatty():
+        messages.extend(iter_stdin_queries(sys.stdin.read()))
+    elif not messages:
+        print("unfmt: no message (pass args, -e, or pipe stdin)", file=sys.stderr)
+        return 2
+
+    any_hit = False
+    all_hit = True
+    json_rows: list[dict] = []
+
+    for msg in messages:
+        hits = search(templates, msg, min_score=args.min_score, limit=args.max)
+        if hits:
+            any_hit = True
+        else:
+            all_hit = False
+        if args.quiet:
+            continue
+        if args.json:
+            json_rows.append(
+                {
+                    "query": normalize_query(msg),
+                    "matches": [hit_json(msg, h) for h in hits],
+                }
+            )
+            continue
+        if not hits:
+            print(f"— no template for: {normalize_query(msg)}")
+            continue
+        for h in hits:
+            print(format_hit(msg, h))
+            print()
+
+    if args.json and not args.quiet:
+        json.dump(json_rows, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+
+    if args.any or (read_stdin and len(messages) > 1):
+        return 0 if any_hit else 1
+    return 0 if all_hit else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

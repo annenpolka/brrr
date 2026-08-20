@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""glean — 1-minimal dirty/untracked files that reproduce a command.
+
+A working tree is wheat + chaff relative to a command. Wheat is a 1-minimal
+set of whole files (tracked modifications, deletions, and untracked files)
+that reproduces the command's current behavior. Chaff can be restored or
+deleted without changing that behavior.
+
+The unit is a file, never a hunk. Faster and dumber than hunk isolation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+VERSION = "0.2.0"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)")
+TIME_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+DURATION_RE = re.compile(
+    r"\b\d+\.\d+\s*(?:s|ms|sec|secs|seconds)\b|\bin \d+\.\d+ seconds?\b",
+    re.I,
+)
+ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+PID_RE = re.compile(r"\bpid\s*[=:]?\s*\d+\b", re.I)
+TMP_RE = re.compile(r"(?:/private)?(?:/var/folders|/tmp)/[A-Za-z0-9._/-]+")
+PYTEST_DT_RE = re.compile(r"\b\d+\.\d{2}s\b")
+PY_FILELINE_RE = re.compile(r'(File "[^"]+", line )\d+')
+RUSTC_ARROW_RE = re.compile(r"(-->\s+\S+):(\d+):(\d+)")
+PATH_LOC_RE = re.compile(
+    r"((?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+\.[A-Za-z0-9_+-]+):(\d+)(?::(\d+))?"
+)
+
+GENERATED_DIR_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".eggs",
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    ".idea",
+    ".cache",
+}
+GENERATED_SUFFIXES = (".pyc", ".pyo", ".pyd")
+TEMP_PREFIX = ".glean-tmp-"
+DEFAULT_MAX_FILES = 400
+
+
+class GleanError(Exception):
+    def __init__(self, message: str, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: str
+    kind: str  # modify | add | delete | untracked
+    head: bytes | None
+    wip: bytes | None
+    head_mode: int | None = None
+    wip_mode: int | None = None
+
+    @property
+    def id(self) -> str:
+        return self.path
+
+    def label(self) -> str:
+        return f"{self.kind:9} {self.path}"
+
+
+@dataclass
+class Fingerprint:
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    duration_ms: int = 0
+
+    def key(self, mode: str) -> str:
+        if self.timed_out:
+            return "timeout"
+        if mode == "exit":
+            return f"exit={self.exit_code}"
+        if mode == "stderr":
+            return f"exit={self.exit_code}\nstderr:\n{self.stderr}"
+        return f"exit={self.exit_code}\nstdout:\n{self.stdout}\nstderr:\n{self.stderr}"
+
+    def digest(self, mode: str) -> str:
+        return hashlib.sha256(self.key(mode).encode()).hexdigest()[:10]
+
+    def summary(self, mode: str) -> str:
+        if self.timed_out:
+            return "timeout"
+        body = self.stderr.strip() or self.stdout.strip()
+        line = first_interesting_line(body)
+        if line:
+            return f"exit={self.exit_code} {line[:120]}"
+        return f"exit={self.exit_code} ({self.digest(mode)})"
+
+
+def first_interesting_line(text: str) -> str:
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(("===", "---", "***", "___")):
+            continue
+        if s.startswith("Traceback (most recent call last)"):
+            continue
+        if s.lower().startswith(("running ", "testing ", "collected ")):
+            continue
+        return s
+    return ""
+
+
+def normalize(data: bytes, mode: str) -> str:
+    if mode == "raw":
+        return data.decode("utf-8", "replace")
+    text = data.decode("utf-8", "replace")
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = TIME_RE.sub("<TIME>", text)
+    text = DURATION_RE.sub("<DT>", text)
+    text = PYTEST_DT_RE.sub("<DT>", text)
+    text = ADDR_RE.sub("<ADDR>", text)
+    text = PID_RE.sub("pid=<PID>", text)
+    text = TMP_RE.sub("<TMP>", text)
+    if mode != "strict":
+        text = PY_FILELINE_RE.sub(r"\1<N>", text)
+        text = RUSTC_ARROW_RE.sub(r"\1:<N>:<N>", text)
+        text = PATH_LOC_RE.sub(_repl_path_loc, text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + ("\n" if text.strip() else "")
+
+
+def _repl_path_loc(m: re.Match[str]) -> str:
+    if m.group(3):
+        return f"{m.group(1)}:<N>:<N>"
+    return f"{m.group(1)}:<N>"
+
+
+def is_generated(path: str) -> bool:
+    parts = Path(path).parts
+    if any(p in GENERATED_DIR_NAMES for p in parts):
+        return True
+    name = parts[-1] if parts else path
+    if name.startswith(TEMP_PREFIX):
+        return True
+    return path.endswith(GENERATED_SUFFIXES)
+
+
+def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=check,
+    )
+
+
+def discover_repo(cwd: Path) -> Path:
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip() or "not a git repository"
+        raise GleanError(err, 2)
+    return Path(r.stdout.decode().strip())
+
+
+def split_z(data: bytes) -> list[bytes]:
+    return [p for p in data.split(b"\0") if p]
+
+
+def git_blob(repo: Path, rev: str, path: str) -> bytes | None:
+    spec = f"{rev}:{path}"
+    exists = run_git(repo, "cat-file", "-e", spec, check=False)
+    if exists.returncode != 0:
+        return None
+    return run_git(repo, "show", spec).stdout
+
+
+def git_head_mode(repo: Path, rev: str, path: str) -> int | None:
+    r = run_git(repo, "ls-tree", "-z", rev, "--", path, check=False)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    rec = r.stdout.split(b"\0", 1)[0]
+    try:
+        mode_s = rec.split(b" ", 1)[0].decode("ascii")
+        return int(mode_s, 8)
+    except (ValueError, IndexError):
+        return None
+
+
+def read_worktree(path: Path) -> tuple[bytes | None, int | None]:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return None, None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None, st.st_mode
+    return path.read_bytes(), st.st_mode
+
+
+def write_worktree(path: Path, data: bytes | None, mode: int | None, stop: Path | None = None) -> None:
+    if data is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        _rmdir_parents_if_empty(path, stop)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{TEMP_PREFIX}{path.name}-{os.getpid()}")
+    tmp.write_bytes(data)
+    if mode is not None:
+        os.chmod(tmp, stat.S_IMODE(mode))
+    tmp.replace(path)
+
+
+def _rmdir_parents_if_empty(path: Path, stop: Path | None) -> None:
+    parent = path.parent
+    stop_resolved = stop.resolve() if stop is not None else None
+    while True:
+        if stop_resolved is not None and parent.resolve() == stop_resolved:
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def snapshot_paths(repo: Path) -> set[str]:
+    out: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(repo, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), repo)
+            out.add(rel.replace(os.sep, "/"))
+    return out
+
+
+def scrub_new_files(repo: Path, original: set[str]) -> None:
+    for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        rel_dir = os.path.relpath(dirpath, repo)
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            rel = rel.replace(os.sep, "/")
+            if rel in original:
+                continue
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+        for name in list(dirnames):
+            if name in GENERATED_DIR_NAMES and name != ".git":
+                full = os.path.join(dirpath, name)
+                rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+                rel = rel.replace(os.sep, "/")
+                if not any(p == rel or p.startswith(rel + "/") for p in original):
+                    _rmtree(full)
+                    dirnames.remove(name)
+
+
+def _rmtree(path: str) -> None:
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False, followlinks=False):
+        for name in filenames:
+            try:
+                os.unlink(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            try:
+                os.rmdir(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def expand_untracked(repo: Path, entries: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add_file(rel: str) -> None:
+        rel = rel.replace(os.sep, "/")
+        if rel in seen or is_generated(rel):
+            return
+        seen.add(rel)
+        out.append(rel)
+
+    for entry in entries:
+        if is_generated(entry):
+            continue
+        abs_path = repo / entry
+        try:
+            st = abs_path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            add_file(entry)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        for dirpath, dirnames, filenames in os.walk(abs_path, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d not in GENERATED_DIR_NAMES]
+            for name in filenames:
+                full = Path(dirpath) / name
+                try:
+                    fst = full.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(fst.st_mode):
+                    continue
+                rel = str(full.relative_to(repo)).replace(os.sep, "/")
+                add_file(rel)
+    return out
+
+
+def list_changes(repo: Path, base: str) -> list[FileChange]:
+    r = run_git(repo, "diff", "--name-status", "--no-renames", "-z", base)
+    raw = split_z(r.stdout)
+    if len(raw) % 2 != 0:
+        raise GleanError("unexpected git diff --name-status -z output")
+    tracked: list[tuple[str, str]] = []
+    for i in range(0, len(raw), 2):
+        status = raw[i].decode("ascii", "replace")
+        path = os.fsdecode(raw[i + 1])
+        kind = {"M": "modify", "A": "add", "D": "delete", "T": "modify"}.get(status[:1])
+        if kind is None:
+            continue
+        if is_generated(path):
+            continue
+        tracked.append((path, kind))
+
+    r = run_git(repo, "ls-files", "-z", "--others", "--exclude-standard")
+    untracked = expand_untracked(repo, [os.fsdecode(p) for p in split_z(r.stdout)])
+
+    files: list[FileChange] = []
+    seen: set[str] = set()
+    for path, kind in tracked:
+        if path in seen:
+            continue
+        seen.add(path)
+        head = git_blob(repo, base, path)
+        head_mode = git_head_mode(repo, base, path)
+        wip, wip_mode = read_worktree(repo / path)
+        if kind == "delete":
+            wip, wip_mode = None, None
+        if kind == "add" and head is not None:
+            kind = "modify"
+        if head == wip:
+            continue
+        files.append(
+            FileChange(
+                path=path,
+                kind=kind,
+                head=head,
+                wip=wip,
+                head_mode=head_mode,
+                wip_mode=wip_mode,
+            )
+        )
+
+    for path in untracked:
+        if path in seen or is_generated(path):
+            continue
+        seen.add(path)
+        wip, wip_mode = read_worktree(repo / path)
+        if wip is None:
+            continue
+        files.append(
+            FileChange(
+                path=path,
+                kind="untracked",
+                head=None,
+                wip=wip,
+                head_mode=None,
+                wip_mode=wip_mode,
+            )
+        )
+
+    files.sort(key=lambda f: f.path)
+    return files
+
+
+def selected_blob(change: FileChange, keep: bool) -> tuple[bytes | None, int | None]:
+    if keep:
+        return change.wip, change.wip_mode
+    return change.head, change.head_mode
+
+
+class TreeGuard:
+    """Apply subsets of files without touching the git index. Always restore."""
+
+    def __init__(self, repo: Path, changes: list[FileChange]) -> None:
+        self.repo = repo
+        self.changes = changes
+        self.by_path = {c.path: c for c in changes}
+        # Protect managed paths so a HEAD trial can resurrect a deleted file
+        # without the leftover-scrub treating it as command output.
+        self.original_paths = snapshot_paths(repo) | set(self.by_path)
+        self._restored = False
+        self._applied: set[str] | None = None
+
+    def restore(self) -> None:
+        if self._restored:
+            return
+        for change in self.changes:
+            write_worktree(self.repo / change.path, change.wip, change.wip_mode, stop=self.repo)
+        self._restored = True
+        self._applied = None
+
+    def apply(self, subset: Iterable[FileChange]) -> None:
+        wanted = {c.path for c in subset}
+        if self._applied is None:
+            todo = list(self.changes)
+        else:
+            todo = [c for c in self.changes if (c.path in wanted) != (c.path in self._applied)]
+        for change in todo:
+            blob, mode = selected_blob(change, change.path in wanted)
+            write_worktree(self.repo / change.path, blob, mode, stop=self.repo)
+        scrub_new_files(self.repo, self.original_paths)
+        self._restored = False
+        self._applied = wanted
+
+
+def run_command(
+    cmd: list[str],
+    cwd: Path,
+    timeout: float | None,
+    fp_mode: str,
+) -> Fingerprint:
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError as e:
+        raise GleanError(f"command not found: {cmd[0]}", 127) from e
+    except subprocess.TimeoutExpired:
+        return Fingerprint(
+            exit_code=124,
+            stdout="",
+            stderr="",
+            timed_out=True,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        )
+    dt = int((time.monotonic() - t0) * 1000)
+    norm_mode = "raw" if fp_mode == "raw" else fp_mode
+    return Fingerprint(
+        exit_code=r.returncode,
+        stdout=normalize(r.stdout, norm_mode),
+        stderr=normalize(r.stderr, norm_mode),
+        duration_ms=dt,
+    )
+
+
+def summarize_paths(changes: Iterable[FileChange], limit: int = 6) -> str:
+    paths = [c.path for c in changes]
+    if len(paths) <= limit:
+        return str(paths)
+    return f"{paths[:limit]} ... (+{len(paths) - limit} more)"
+
+
+def drop_script(chaff: list[FileChange]) -> str:
+    import shlex
+
+    restore = [c.path for c in chaff if c.kind in ("modify", "delete")]
+    remove = [c.path for c in chaff if c.kind in ("add", "untracked")]
+    lines: list[str] = []
+
+    def chunked(paths: list[str], n: int = 50) -> Iterable[list[str]]:
+        for i in range(0, len(paths), n):
+            yield paths[i : i + n]
+
+    for group in chunked(restore):
+        quoted = " ".join(shlex.quote(p) for p in group)
+        lines.append(f"git restore --worktree --source=HEAD -- {quoted}")
+    for group in chunked(remove):
+        quoted = " ".join(shlex.quote(p) for p in group)
+        lines.append(f"rm -f -- {quoted}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def split_n(items: list[FileChange], n: int) -> list[list[FileChange]]:
+    n = max(1, min(n, len(items)))
+    size, rem = divmod(len(items), n)
+    out: list[list[FileChange]] = []
+    i = 0
+    for k in range(n):
+        take = size + (1 if k < rem else 0)
+        out.append(items[i : i + take])
+        i += take
+    return [part for part in out if part]
+
+
+def ddmin(
+    changes: list[FileChange],
+    interesting: Callable[[list[FileChange]], bool],
+    log: Callable[[str], None],
+) -> list[FileChange]:
+    current = list(changes)
+    n = 2
+    while len(current) >= 2:
+        parts = split_n(current, n)
+        found = False
+        for part in parts:
+            log(f"  try {len(part)}/{len(current)} subset {summarize_paths(part)}")
+            if interesting(part):
+                current = part
+                n = 2
+                found = True
+                break
+        if found:
+            continue
+        for part in parts:
+            ids = {x.path for x in part}
+            complement = [c for c in current if c.path not in ids]
+            if not complement or len(complement) == len(current):
+                continue
+            log(f"  try {len(complement)}/{len(current)} complement {summarize_paths(complement)}")
+            if interesting(complement):
+                current = complement
+                n = max(n - 1, 2)
+                found = True
+                break
+        if found:
+            continue
+        if n >= len(current):
+            break
+        n = min(len(current), n * 2)
+        log(f"  increase granularity n={n}")
+    return current
+
+
+def wheat_patch(wheat: list[FileChange]) -> str:
+    import difflib
+
+    chunks: list[str] = []
+    for change in sorted(wheat, key=lambda c: c.path):
+        if change.head == change.wip:
+            continue
+        head, wip = change.head, change.wip
+        binary = (head is not None and b"\0" in head) or (wip is not None and b"\0" in wip)
+        if binary:
+            a = "a/" + change.path if head is not None else "/dev/null"
+            b = "b/" + change.path if wip is not None else "/dev/null"
+            chunks.append(f"diff --git {a} {b}\nBinary files differ\n")
+            continue
+        a = "" if head is None else head.decode("utf-8", "replace")
+        b = "" if wip is None else wip.decode("utf-8", "replace")
+        a_lines = a.splitlines(keepends=True)
+        b_lines = b.splitlines(keepends=True)
+        if a_lines and not a_lines[-1].endswith("\n"):
+            a_lines[-1] += "\n"
+        if b_lines and not b_lines[-1].endswith("\n"):
+            b_lines[-1] += "\n"
+        from_name = "/dev/null" if head is None else f"a/{change.path}"
+        to_name = "/dev/null" if wip is None else f"b/{change.path}"
+        text = "".join(difflib.unified_diff(a_lines, b_lines, fromfile=from_name, tofile=to_name))
+        if text:
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="glean",
+        description="Find the 1-minimal dirty/untracked files that reproduce a command's current behavior.",
+        epilog="Example: glean -- pytest tests/test_foo.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-C", "--repo", type=Path, default=None, help="git repository (default: discover from cwd); also the command cwd unless --cwd is set")
+    p.add_argument("--cwd", type=Path, default=None, help="directory to run the command in (default: -C or current directory)")
+    p.add_argument("--base", default="HEAD", help="baseline ref (default: HEAD)")
+    p.add_argument(
+        "--format",
+        choices=("text", "paths", "json", "patch", "drop"),
+        default="text",
+        help="output format (paths/patch/drop are stdout-composable; diagnostics go to stderr)",
+    )
+    p.add_argument(
+        "--drop",
+        action="store_true",
+        dest="do_drop",
+        help="leave only wheat in the worktree (restore/delete chaff); default is to restore all WIP",
+    )
+    p.add_argument(
+        "--fingerprint",
+        choices=("all", "strict", "stderr", "exit", "raw"),
+        default="all",
+        dest="fp_mode",
+        help="what counts as the same behavior (default: exit+stdout+stderr, with line numbers stripped)",
+    )
+    p.add_argument("--timeout", type=float, default=None, help="seconds per command trial")
+    p.add_argument("-v", "--verbose", action="store_true", help="print each trial")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--no-flake-check", action="store_true", help="do not run the WIP command twice")
+    p.add_argument("--max-trials", type=int, default=200)
+    p.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES, help="abort if more dirty/untracked files than this")
+    p.add_argument("--version", action="version", version=f"glean {VERSION}")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="command to run; use -- to disambiguate")
+    return p.parse_args(argv)
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    cmd = list(args.command)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        eprint("glean: missing command (try: glean -- pytest)")
+        return 2
+
+    here = Path.cwd()
+    try:
+        repo = args.repo.resolve() if args.repo else discover_repo(here)
+    except GleanError as e:
+        eprint(f"glean: {e}")
+        return e.exit_code
+    if args.cwd is not None:
+        cwd = args.cwd.resolve()
+    elif args.repo is not None:
+        cwd = repo
+    else:
+        cwd = here
+
+    try:
+        run_git(repo, "rev-parse", "--verify", args.base)
+    except subprocess.CalledProcessError:
+        eprint(f"glean: unknown base ref {args.base!r}")
+        return 2
+
+    try:
+        changes = list_changes(repo, args.base)
+    except GleanError as e:
+        eprint(f"glean: {e}")
+        return e.exit_code
+
+    if not changes:
+        if args.format == "text":
+            print("glean: clean working tree (nothing to partition)")
+        elif args.format == "json":
+            print(json.dumps({"wheat": [], "chaff": [], "trials": 0, "clean": True}))
+        return 0
+
+    if len(changes) > args.max_files:
+        eprint(
+            f"glean: {len(changes)} dirty/untracked files exceeds --max-files {args.max_files} "
+            "(gitignore generated trees, or raise the cap)"
+        )
+        return 2
+
+    log = eprint if args.verbose else (lambda _m: None)
+    guard = TreeGuard(repo, changes)
+    trials = 0
+    cache: dict[frozenset[str], Fingerprint] = {}
+    aborted = [False]
+    left_dropped = [False]
+
+    def finish_tree(keep: list[FileChange]) -> None:
+        if args.do_drop:
+            guard.apply(keep)
+            left_dropped[0] = True
+            log(f"dropped {len(changes) - len(keep)} chaff files; wheat remains")
+        else:
+            guard.restore()
+
+    def on_signal(signum: int, _frame: object | None) -> None:
+        aborted[0] = True
+        guard.restore()
+        eprint(f"glean: restored working tree after signal {signum}")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def trial(subset: list[FileChange]) -> Fingerprint:
+        nonlocal trials
+        key = frozenset(c.path for c in subset)
+        if key in cache:
+            return cache[key]
+        if trials >= args.max_trials:
+            raise GleanError(f"exceeded --max-trials {args.max_trials}", 2)
+        trials += 1
+        guard.apply(subset)
+        fp = run_command(cmd, cwd, args.timeout, args.fp_mode)
+        cache[key] = fp
+        log(f"  -> {fp.summary(args.fp_mode)} [{fp.duration_ms}ms]")
+        return fp
+
+    try:
+        log(f"snapshot {len(changes)} uncommitted files")
+        wip_fp = trial(changes)
+        if not args.no_flake_check:
+            cache.pop(frozenset(c.path for c in changes), None)
+            wip_fp2 = trial(changes)
+            if wip_fp.key(args.fp_mode) != wip_fp2.key(args.fp_mode):
+                raise GleanError(
+                    "command is flaky on the working tree (two runs differed). "
+                    "Retry, or pass --fingerprint exit, or --no-flake-check",
+                    3,
+                )
+        head_fp = trial([])
+        if head_fp.key(args.fp_mode) == wip_fp.key(args.fp_mode):
+            finish_tree([])
+            return emit(
+                args,
+                wheat=[],
+                chaff=changes,
+                head=head_fp,
+                wip=wip_fp,
+                trials=trials,
+                same=True,
+            )
+
+        log(f"HEAD {head_fp.summary(args.fp_mode)}")
+        log(f"WIP  {wip_fp.summary(args.fp_mode)}")
+        target = wip_fp.key(args.fp_mode)
+
+        def interesting(subset: list[FileChange]) -> bool:
+            return trial(subset).key(args.fp_mode) == target
+
+        wheat = ddmin(changes, interesting, log)
+        confirmed: list[FileChange] = []
+        for i, c in enumerate(wheat):
+            rest = wheat[:i] + wheat[i + 1 :]
+            if rest and interesting(rest):
+                continue
+            confirmed.append(c)
+        wheat = sorted(confirmed or wheat, key=lambda c: c.path)
+        wheat_ids = {c.path for c in wheat}
+        chaff = [c for c in changes if c.path not in wheat_ids]
+        finish_tree(wheat)
+        return emit(
+            args,
+            wheat=wheat,
+            chaff=chaff,
+            head=head_fp,
+            wip=wip_fp,
+            trials=trials,
+            same=False,
+        )
+    except GleanError as e:
+        guard.restore()
+        eprint(f"glean: {e}")
+        return e.exit_code
+    except Exception:
+        guard.restore()
+        raise
+    finally:
+        if not aborted[0] and not left_dropped[0]:
+            guard.restore()
+
+
+def emit(
+    args: argparse.Namespace,
+    wheat: list[FileChange],
+    chaff: list[FileChange],
+    head: Fingerprint,
+    wip: Fingerprint,
+    trials: int,
+    same: bool,
+) -> int:
+    if args.format == "paths":
+        for c in wheat:
+            print(c.path)
+        if args.verbose:
+            eprint(f"glean: {len(wheat)} wheat files, {len(chaff)} chaff files, {trials} trials")
+        return 0
+    if args.format == "patch":
+        sys.stdout.write(wheat_patch(wheat))
+        return 0
+    if args.format == "drop":
+        sys.stdout.write(drop_script(chaff))
+        if args.verbose:
+            eprint(f"glean: {len(chaff)} chaff files to drop, {len(wheat)} wheat files, {trials} trials")
+        return 0
+    if args.format == "json":
+        def dump_fp(fp: Fingerprint) -> dict[str, object]:
+            return {
+                "exit": fp.exit_code,
+                "digest": fp.digest(args.fp_mode),
+                "summary": fp.summary(args.fp_mode),
+                "timed_out": fp.timed_out,
+            }
+
+        def dump_c(c: FileChange) -> dict[str, object]:
+            return {"path": c.path, "kind": c.kind}
+
+        print(
+            json.dumps(
+                {
+                    "same": same,
+                    "trials": trials,
+                    "dropped": bool(args.do_drop),
+                    "head": dump_fp(head),
+                    "wip": dump_fp(wip),
+                    "wheat": [dump_c(c) for c in wheat],
+                    "chaff": [dump_c(c) for c in chaff],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"HEAD: {head.summary(args.fp_mode)}")
+    print(f"WIP:  {wip.summary(args.fp_mode)}")
+    print(f"trials: {trials}  fingerprint: {args.fp_mode}  unit: file")
+    if same:
+        print()
+        print("working tree does not change this command's behavior")
+        print(f"chaff: {len(chaff)} files (all of them)")
+        if args.do_drop:
+            print()
+            print(f"dropped {len(chaff)} chaff files; wheat left in the worktree")
+        return 0
+    print()
+    print(f"wheat ({len(wheat)} files):")
+    if not wheat:
+        print("  (empty)")
+    for c in wheat:
+        print(f"  {c.label()}")
+    if not args.quiet:
+        print(f"chaff ({len(chaff)} files):")
+        if not chaff:
+            print("  (empty)")
+        for c in chaff:
+            print(f"  {c.label()}")
+    if args.do_drop:
+        print()
+        print(f"dropped {len(chaff)} chaff files; wheat left in the worktree")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

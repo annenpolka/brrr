@@ -1,0 +1,1640 @@
+#!/usr/bin/env python3
+"""sic — a token is the serialized wire key, as written.
+
+JSON / YAML / TOML keys, HTTP header names, and quoted protocol strings.
+Not code identifiers. Not an inflection class. `has_more` and `hasMore`
+are different tokens; if both appear on the wire, that is a fork.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator, Sequence
+
+VERSION = "0.2.0"
+
+SKIP_DIR_PARTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "vendor",
+    ".cache",
+    ".idea",
+    ".vscode",
+    "Pods",
+    "Carthage",
+    ".app",
+}
+
+SKIP_SUFFIXES = {
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".wasm",
+    ".so",
+    ".dylib",
+    ".a",
+    ".o",
+    ".class",
+    ".jar",
+    ".pyc",
+    ".pyo",
+    ".svg",
+    ".mp4",
+    ".gif",
+}
+
+SKIP_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    ".DS_Store",
+}
+
+# Double-quoted strings are the JSON / Swift / TS wire dialect.
+DQ_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+# Single quotes only in languages that actually use them for strings.
+SQ_RE = re.compile(r"'(?:\\.|[^'\\])*'")
+STRING_RE = re.compile(
+    r"""(?P<dq>"(?:\\.|[^"\\])*")|(?P<sq>'(?:\\.|[^'\\])*')"""
+)
+
+# dict["key"] / obj['key'] — Swift/JS subscript is a wire-key witness.
+SUBSCRIPT_RE = re.compile(
+    r"""\[\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)\s*\]"""
+)
+# tool_input.get("file_path")
+GET_RE = re.compile(
+    r"""\.get\(\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)"""
+)
+# CodingKeys / serde rename: case hasMore = "has_more"
+ASSIGN_STR_RE = re.compile(
+    r"""=\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)"""
+)
+
+SINGLE_QUOTE_EXTS = {".py", ".rb", ".yaml", ".yml", ".toml", ".sh", ".bash", ".zsh"}
+
+# Object-key position: "key":
+JSON_KEY_RE = re.compile(r'"(?P<key>(?:\\.|[^"\\]){1,80})"\s*:')
+
+# YAML mapping keys. Do not swallow `http://`.
+YAML_KEY_RE = re.compile(
+    r"^[ \t]{0,32}(?:"
+    r"(?P<bare>[A-Za-z_][A-Za-z0-9_-]{0,80})|"
+    r'["\'](?P<quoted>[^"\']{1,80})["\']'
+    r")[ \t]*:(?!/)",
+    re.MULTILINE,
+)
+
+TOML_KEY_RE = re.compile(
+    r"^[ \t]{0,16}(?:"
+    r"(?P<bare>[A-Za-z_][A-Za-z0-9_-]{0,80})|"
+    r'["\'](?P<quoted>[^"\']{1,80})["\']'
+    r")[ \t]*=",
+    re.MULTILINE,
+)
+
+TOML_TABLE_RE = re.compile(
+    r"^[ \t]{0,8}\[{1,2}[ \t]*(?P<body>[^\]\n]{1,120})[ \t]*\]{1,2}",
+    re.MULTILINE,
+)
+
+HEADER_LINE_RE = re.compile(
+    r"^[ \t]*(?P<h>[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+)[ \t]*:",
+    re.MULTILINE,
+)
+
+BACKTICK_RE = re.compile(r"`([A-Za-z_$][A-Za-z0-9_.$-]{1,80})`")
+
+CAMEL_RE = re.compile(r"^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]+$")
+PASCAL_RE = re.compile(r"^[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]+$")
+SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*_[a-z0-9_]+$")
+CONST_RE = re.compile(r"^[A-Z][A-Z0-9]*_[A-Z0-9_]+$")
+KEBAB_RE = re.compile(r"^[a-z][a-z0-9]*-[a-z0-9-]+$")
+DOTTED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*[.][A-Za-z0-9._-]+$")
+URN_RE = re.compile(r"^urn:[A-Za-z0-9][A-Za-z0-9:._/-]{2,80}$")
+DOLLAR_RE = re.compile(r"^\$[A-Za-z][A-Za-z0-9_-]{1,40}$")
+
+SPLIT_CAMEL_1 = re.compile(r"([a-z0-9])([A-Z])")
+SPLIT_CAMEL_2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
+SEP_RE = re.compile(r"[_\-./:]+")
+
+YAML_SKIP_KEYS = {"http", "https", "mailto", "ftp", "file", "ws", "wss"}
+
+WELL_KNOWN_HEADERS = {
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "authorization",
+    "cache-control",
+    "connection",
+    "content-disposition",
+    "content-encoding",
+    "content-length",
+    "content-type",
+    "cookie",
+    "date",
+    "etag",
+    "expect",
+    "forwarded",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "location",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "retry-after",
+    "server",
+    "set-cookie",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "user-agent",
+    "vary",
+    "via",
+    "warning",
+    "www-authenticate",
+    "access-control-allow-origin",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "strict-transport-security",
+    "x-request-id",
+    "x-correlation-id",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-api-key",
+}
+
+# Exact tokens too generic to list (lookup still works).
+BORING_EXACT = {
+    "id",
+    "ids",
+    "name",
+    "type",
+    "kind",
+    "key",
+    "val",
+    "value",
+    "values",
+    "data",
+    "item",
+    "items",
+    "error",
+    "errors",
+    "message",
+    "status",
+    "code",
+    "ok",
+    "err",
+    "true",
+    "false",
+    "null",
+    "none",
+    "nil",
+    "undefined",
+    "self",
+    "this",
+    "title",
+    "text",
+    "body",
+    "head",
+    "header",
+    "headers",
+    "footer",
+    "content",
+    "description",
+    "desc",
+    "version",
+    "default",
+    "options",
+    "option",
+    "config",
+    "result",
+    "results",
+    "output",
+    "input",
+    "path",
+    "paths",
+    "file",
+    "files",
+    "url",
+    "uri",
+    "href",
+    "src",
+    "dst",
+    "index",
+    "count",
+    "size",
+    "length",
+    "width",
+    "height",
+    "time",
+    "date",
+    "year",
+    "day",
+    "user",
+    "users",
+    "test",
+    "tests",
+    "spec",
+    "main",
+    "init",
+    "info",
+    "meta",
+    "object",
+    "array",
+    "list",
+    "map",
+    "set",
+    "string",
+    "number",
+    "boolean",
+    "integer",
+    "properties",
+    "required",
+    "additionalproperties",
+    "definitions",
+    "items",
+    "enum",
+    "const",
+    "allof",
+    "anyof",
+    "oneof",
+    "not",
+    "if",
+    "then",
+    "else",
+    "minimum",
+    "maximum",
+    "pattern",
+    "format",
+    "examples",
+    "example",
+    "nullable",
+    "readOnly",
+    "writeOnly",
+    "uniqueItems",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "scripts",
+    "license",
+    "author",
+    "repository",
+    "private",
+    "package",
+    "module",
+    "export",
+    "import",
+    "from",
+    "class",
+    "struct",
+    "enum",
+    "func",
+    "function",
+    "return",
+    "public",
+    "private",
+    "static",
+    "async",
+    "await",
+    "command",
+    "args",
+    "argv",
+    "env",
+    "os",
+    "linux",
+    "darwin",
+    "windows",
+    "todo",
+    "fixme",
+    "note",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "as",
+    "at",
+    "by",
+    "is",
+    "it",
+    "be",
+    "a",
+    "an",
+    "the",
+}
+
+CODE_EXTS = {
+    ".rs",
+    ".go",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".swift",
+    ".m",
+    ".mm",
+    ".java",
+    ".kt",
+    ".kts",
+    ".rb",
+    ".php",
+    ".cs",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".scala",
+    ".hs",
+    ".lua",
+    ".r",
+    ".jl",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    ".pkl",
+    ".proto",
+    ".graphql",
+    ".vue",
+    ".svelte",
+    ".elm",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".clj",
+    ".cljs",
+    ".nim",
+    ".zig",
+    ".dart",
+}
+
+CONFIG_EXTS = {
+    ".json",
+    ".jsonc",
+    ".json5",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+}
+
+DOC_EXTS = {".md", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm"}
+
+JSON_EXTS = {".json", ".jsonc", ".json5"}
+YAML_EXTS = {".yaml", ".yml"}
+TOML_EXTS = {".toml"}
+HEADER_EXTS = {".http", ".eml", ".msg"}
+
+TEST_HINTS = (
+    "/test/",
+    "/tests/",
+    "/__tests__/",
+    "_test.",
+    ".test.",
+    ".spec.",
+    "test_",
+    "_spec.",
+)
+
+GENERATED_HINTS = (
+    ".generated.",
+    "_generated.",
+    "generated/",
+    "oraclesgenerated",
+)
+
+
+@dataclass(frozen=True)
+class Hit:
+    path: str
+    line: int
+    surface: str
+    kind: str  # json | yaml | toml | header | quoted
+    token: str  # identity (exact, or lowercased header)
+
+
+@dataclass
+class Pact:
+    token: str
+    hits: list[Hit] = field(default_factory=list)
+
+    @property
+    def files(self) -> list[str]:
+        return sorted({h.path for h in self.hits})
+
+    @property
+    def surfaces(self) -> list[str]:
+        return sorted({h.surface for h in self.hits})
+
+    @property
+    def kinds(self) -> set[str]:
+        return {h.kind for h in self.hits}
+
+    @property
+    def exts(self) -> set[str]:
+        return {Path(h.path).suffix.lower() for h in self.hits}
+
+
+@dataclass(frozen=True)
+class Split:
+    token: str
+    changed_files: tuple[str, ...]
+    leftover_files: tuple[str, ...]
+    leftover_surfaces: tuple[str, ...]
+    new_surfaces: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Fork:
+    canon: tuple[str, ...]
+    tokens: tuple[str, ...]  # distinct serialized identities
+
+
+def layer_of(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    low = "/" + path.replace("\\", "/").lower()
+    if any(h in low for h in TEST_HINTS):
+        return "test"
+    if ext in DOC_EXTS:
+        return "doc"
+    if ext in CODE_EXTS:
+        return "code"
+    if ext in CONFIG_EXTS:
+        return "config"
+    return "other"
+
+
+def generated_path(rel: str) -> bool:
+    low = rel.replace("\\", "/").lower()
+    return any(h in low for h in GENERATED_HINTS)
+
+
+def should_skip_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(p in SKIP_DIR_PARTS for p in parts):
+        return True
+    if any(p.endswith(".app") for p in parts):
+        return True
+    name = Path(rel).name
+    if name in SKIP_NAMES:
+        return True
+    lower = rel.lower()
+    if any(lower.endswith(suf) for suf in SKIP_SUFFIXES):
+        return True
+    return False
+
+
+def looks_binary(data: bytes) -> bool:
+    return b"\x00" in data[:8192]
+
+
+_SIMPLE_UNESCAPE = {
+    r"\\": "\\",
+    r"\"": '"',
+    r"\'": "'",
+    r"\n": "\n",
+    r"\t": "\t",
+    r"\r": "\r",
+    r"\0": "\0",
+}
+
+
+def unescape_quoted(q: str) -> str:
+    body = q[1:-1]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body):
+            pair = body[i : i + 2]
+            out.append(_SIMPLE_UNESCAPE.get(pair, body[i + 1]))
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def unescape_json_key(raw: str) -> str:
+    # JSON_KEY_RE captured the inside of quotes.
+    fake = '"' + raw + '"'
+    return unescape_quoted(fake)
+
+
+def is_header_name(surface: str) -> bool:
+    s = surface.strip()
+    if not re.match(r"^[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+$", s):
+        return False
+    low = s.lower()
+    if low.startswith("x-"):
+        return True
+    if low in WELL_KNOWN_HEADERS:
+        return True
+    # Canonical HTTP names title-case each segment (Content-Type, If-None-Match).
+    # Reject date formats (yyyy-MM-dd) and random mixed kebab.
+    parts = s.split("-")
+    return all(p and p[0].isupper() for p in parts)
+
+
+def identity_of(surface: str) -> str:
+    if is_header_name(surface):
+        return surface.lower()
+    return surface
+
+
+def inflection_canon(token: str) -> tuple[str, ...] | None:
+    """Used ONLY to detect forks of distinct wire spellings. Not identity."""
+    raw = token.strip().strip("`'\"")
+    if not raw or len(raw) > 80:
+        return None
+    if " " in raw or "\t" in raw:
+        return None
+    tmp = SPLIT_CAMEL_1.sub(r"\1 \2", raw)
+    tmp = SPLIT_CAMEL_2.sub(r"\1 \2", tmp)
+    tmp = SEP_RE.sub(" ", tmp)
+    parts = tuple(p.lower() for p in tmp.split() if p and p.isalnum())
+    if len(parts) < 2:
+        return None
+    if any(len(p) > 32 for p in parts):
+        return None
+    if len(parts) > 8:
+        return None
+    return parts
+
+
+def looks_like_url(s: str) -> bool:
+    low = s.lower()
+    return low.startswith(("http://", "https://", "ftp://", "file://", "ws://", "wss://"))
+
+
+def looks_like_path(s: str) -> bool:
+    if s.startswith("./") or s.startswith("../") or s.startswith("/"):
+        return True
+    if "\\" in s:
+        return True
+    if re.search(
+        r"\.(?:rs|py|ts|tsx|js|jsx|swift|json|ya?ml|toml|md|go|html|txt|lock)$",
+        s,
+        re.I,
+    ):
+        return True
+    if re.search(r"\.(?:com|org|net|io|dev|app|jp|edu|gov)$", s, re.I):
+        return True
+    if s.count("/") >= 2 and re.match(r"^[A-Za-z0-9_./+-]+$", s):
+        return True
+    return False
+
+
+def looks_like_hash(s: str) -> bool:
+    if re.fullmatch(r"[0-9a-fA-F]{32,}", s):
+        return True
+    if re.fullmatch(r"sha256:[0-9a-f]{32,}", s):
+        return True
+    return False
+
+
+def accept_structured_key(s: str) -> bool:
+    if not s or len(s) > 80:
+        return False
+    if " " in s or "\t" in s or "\n" in s:
+        return False
+    if looks_like_url(s) or looks_like_path(s) or looks_like_hash(s):
+        return False
+    if s.lower() in YAML_SKIP_KEYS:
+        return False
+    if s.startswith("-") or s[0].isdigit():
+        return False
+    return bool(
+        re.match(r"^[A-Za-z_$][A-Za-z0-9_.:$/@+-]{0,79}$", s)
+        or DOLLAR_RE.match(s)
+        or is_header_name(s)
+    )
+
+
+def is_keyish_protocol(s: str) -> bool:
+    """Quoted protocol string: wire-shaped, not an English sentence."""
+    if not s or len(s) < 3 or len(s) > 80:
+        return False
+    if " " in s or "\t" in s:
+        return False
+    if looks_like_url(s) or looks_like_path(s) or looks_like_hash(s):
+        return False
+    if s.lower() in BORING_EXACT:
+        return False
+    return bool(
+        SNAKE_RE.match(s)
+        or CONST_RE.match(s)
+        or KEBAB_RE.match(s)
+        or DOTTED_RE.match(s)
+        or CAMEL_RE.match(s)
+        or DOLLAR_RE.match(s)
+        or URN_RE.match(s)
+        or is_header_name(s)
+        or (s.startswith("@") and re.match(r"^@[A-Za-z][A-Za-z0-9_-]*$", s))
+    )
+
+
+def boring_token(s: str) -> bool:
+    if s.lower() in BORING_EXACT:
+        return True
+    if len(s) <= 2 and not is_header_name(s):
+        return True
+    return False
+
+
+def line_index(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def line_of(starts: list[int], idx: int) -> int:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return hi + 1
+
+
+def extract_hits(rel: str, text: str) -> list[Hit]:
+    """Pull serialized keys / quoted protocol strings. Never identifiers."""
+    hits: list[Hit] = []
+    starts = line_index(text)
+    ext = Path(rel).suffix.lower()
+    json_key_spans: list[tuple[int, int, str]] = []
+
+    def add(surface: str, kind: str, idx: int) -> None:
+        if kind in {"json", "yaml", "toml"}:
+            if not accept_structured_key(surface):
+                return
+        elif kind == "header":
+            if not is_header_name(surface):
+                return
+        elif kind == "quoted":
+            if not is_keyish_protocol(surface) and not is_header_name(surface):
+                return
+        else:
+            return
+        tok = identity_of(surface)
+        hits.append(Hit(rel, line_of(starts, idx), surface, kind, tok))
+
+    for m in JSON_KEY_RE.finditer(text):
+        key = unescape_json_key(m.group("key"))
+        json_key_spans.append((m.start(), m.end(), key))
+        add(key, "json", m.start())
+
+    if ext in YAML_EXTS:
+        for m in YAML_KEY_RE.finditer(text):
+            key = m.group("bare") or m.group("quoted") or ""
+            add(key, "yaml", m.start())
+
+    if ext in TOML_EXTS:
+        for m in TOML_KEY_RE.finditer(text):
+            key = m.group("bare") or m.group("quoted") or ""
+            add(key, "toml", m.start())
+        for m in TOML_TABLE_RE.finditer(text):
+            body = m.group("body").strip().strip("'\"")
+            # dotted table path: take each segment that looks like a key
+            for seg in body.split("."):
+                seg = seg.strip().strip("'\"")
+                if seg:
+                    add(seg, "toml", m.start())
+
+    if ext in HEADER_EXTS or ext in YAML_EXTS or ext in DOC_EXTS:
+        for m in HEADER_LINE_RE.finditer(text):
+            h = m.group("h")
+            if is_header_name(h):
+                add(h, "header", m.start("h"))
+
+    def accept_quoted_witness(s: str) -> bool:
+        if is_keyish_protocol(s) or is_header_name(s):
+            return True
+        # CodingKeys / serde short raw values ("t1", "t2").
+        if re.fullmatch(r"[A-Za-z][0-9]{1,3}", s):
+            return True
+        return False
+
+    def add_quoted_at(surface: str, idx: int, structured: bool) -> None:
+        del structured
+        if not accept_quoted_witness(surface):
+            return
+        kind = "header" if is_header_name(surface) else "quoted"
+        tok = identity_of(surface)
+        hits.append(Hit(rel, line_of(starts, idx), surface, kind, tok))
+
+    for m in SUBSCRIPT_RE.finditer(text):
+        add_quoted_at(unescape_json_key(m.group("key")), m.start("key"), True)
+    for m in GET_RE.finditer(text):
+        add_quoted_at(unescape_json_key(m.group("key")), m.start("key"), True)
+    for m in ASSIGN_STR_RE.finditer(text):
+        add_quoted_at(unescape_json_key(m.group("key")), m.start("key"), True)
+
+    quote_res = [DQ_RE]
+    if ext in SINGLE_QUOTE_EXTS:
+        quote_res.append(SQ_RE)
+    si = 0
+    njson = len(json_key_spans)
+    for qre in quote_res:
+        si = 0
+        for m in qre.finditer(text):
+            raw = m.group(0)
+            if len(raw) < 5:  # quotes + >=3
+                continue
+            start = m.start()
+            # Skip the key token of a `"key":` match (the string is the key itself).
+            while si < njson and json_key_spans[si][1] <= start:
+                si += 1
+            if si < njson:
+                js, je, _jk = json_key_spans[si]
+                if js <= start < je:
+                    continue
+            surface = unescape_quoted(raw)
+            add(surface, "header" if is_header_name(surface) else "quoted", start)
+
+    if ext in DOC_EXTS:
+        # Markdown / prose often quotes wire keys in backticks, not JSON.
+        covered = {(h.line, h.surface) for h in hits}
+        for m in BACKTICK_RE.finditer(text):
+            surface = m.group(1)
+            ln = line_of(starts, m.start())
+            if (ln, surface) in covered:
+                continue
+            if is_keyish_protocol(surface) or is_header_name(surface):
+                add(surface, "quoted", m.start())
+
+    uniq: list[Hit] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    for h in hits:
+        k = (h.path, h.line, h.surface, h.kind)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(h)
+    return uniq
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except (OSError, PermissionError):
+        return None
+    if len(data) > 1_500_000 or looks_binary(data):
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def iter_repo_files(root: Path, walk: bool) -> Iterator[str]:
+    if not walk and (root / ".git").exists():
+        try:
+            out = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "ls-files",
+                    "-zco",
+                    "--exclude-standard",
+                ],
+                stderr=subprocess.DEVNULL,
+            )
+            for raw in out.split(b"\0"):
+                if not raw:
+                    continue
+                rel = raw.decode("utf-8", "surrogateescape")
+                if not should_skip_path(rel):
+                    yield rel
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_PARTS and not d.endswith(".app")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = str(full.relative_to(root))
+            except ValueError:
+                continue
+            if not should_skip_path(rel):
+                yield rel
+
+
+def build_index(root: Path, walk: bool) -> dict[str, list[Hit]]:
+    index: dict[str, list[Hit]] = defaultdict(list)
+    for rel in iter_repo_files(root, walk):
+        text = read_text(root / rel)
+        if text is None:
+            continue
+        for hit in extract_hits(rel, text):
+            index[hit.token].append(hit)
+    return index
+
+
+def score_pact(p: Pact) -> float:
+    nfiles = len(p.files)
+    layers = {layer_of(f) for f in p.files}
+    kinds = p.kinds
+    score = 0.0
+    score += min(nfiles, 8) * 1.5
+    score += min(len(p.exts), 5) * 1.4
+    score += min(len(layers), 4) * 1.8
+    if "json" in kinds:
+        score += 2.4
+    if "yaml" in kinds:
+        score += 2.0
+    if "toml" in kinds:
+        score += 1.6
+    if "header" in kinds:
+        score += 3.0
+    if "quoted" in kinds and (kinds & {"json", "yaml", "toml", "header"}):
+        score += 2.2
+    if "_" in p.token or "-" in p.token:
+        score += 2.0
+    if CAMEL_RE.match(p.token) or PASCAL_RE.match(p.token):
+        score += 1.2
+    if "." in p.token:
+        score += 1.0
+    if layers <= {"doc"}:
+        score -= 4.5
+    if layers <= {"test"}:
+        score -= 1.2
+    if nfiles > 12:
+        score -= (nfiles - 12) * 0.5
+    if boring_token(p.token):
+        score -= 8.0
+    if generated_path(p.files[0]) and all(generated_path(f) for f in p.files):
+        score -= 3.0
+    if kinds <= {"quoted"} and layers <= {"doc"}:
+        score -= 3.0
+    # Prefer tokens that actually sit in a structured codec.
+    if kinds <= {"quoted"}:
+        score -= 1.5
+    return score
+
+
+def select_pacts(
+    index: dict[str, list[Hit]],
+    min_files: int,
+    max_files: int,
+    code_only: bool,
+) -> list[Pact]:
+    pacts: list[Pact] = []
+    for token, hits in index.items():
+        if boring_token(token):
+            continue
+        if code_only:
+            hits = [h for h in hits if layer_of(h.path) in {"code", "config", "test"}]
+            if not hits:
+                continue
+        files = {h.path for h in hits}
+        if len(files) < min_files or len(files) > max_files:
+            continue
+        pacts.append(Pact(token, hits))
+    pacts.sort(key=lambda p: (-score_pact(p), p.token.lower()))
+    return pacts
+
+
+def lookup(index: dict[str, list[Hit]], query: str) -> Pact | None:
+    q = query.strip().strip("'\"")
+    if not q:
+        return None
+    hits = index.get(q)
+    if not hits and is_header_name(q):
+        hits = index.get(q.lower())
+    if not hits:
+        # Header query written lowercase (x-request-id) against mixed-case surfaces.
+        hits = index.get(q.lower())
+    if not hits:
+        return None
+    return Pact(hits[0].token, hits)
+
+
+def fork_neighbors(index: dict[str, list[Hit]]) -> dict[str, list[str]]:
+    groups: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for token, hits in index.items():
+        if not fork_worthy(token, hits):
+            continue
+        c = inflection_canon(token)
+        if c is None:
+            continue
+        groups[c].add(token)
+    near: dict[str, list[str]] = {}
+    for _c, toks in groups.items():
+        if len(toks) < 2:
+            continue
+        for t in toks:
+            near[t] = sorted(x for x in toks if x != t)
+    return near
+
+
+def fork_worthy(token: str, hits: list[Hit]) -> bool:
+    """Drop Pascal type-name backticks and case-only doc ghosts from --forks."""
+    if any(h.kind in {"json", "yaml", "toml", "header"} for h in hits):
+        return True
+    return bool(
+        SNAKE_RE.match(token)
+        or CONST_RE.match(token)
+        or KEBAB_RE.match(token)
+        or CAMEL_RE.match(token)
+        or is_header_name(token)
+    )
+
+
+def find_forks(
+    index: dict[str, list[Hit]],
+    min_files: int,
+) -> list[Fork]:
+    groups: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for token, hits in index.items():
+        files = {h.path for h in hits if not should_skip_path(h.path)}
+        if not files:
+            continue
+        if not fork_worthy(token, hits):
+            continue
+        c = inflection_canon(token)
+        if c is None:
+            continue
+        groups[c].add(token)
+    forks: list[Fork] = []
+    for c, toks in groups.items():
+        if len(toks) < 2:
+            continue
+        # At least two identities, together covering min_files (usually 2).
+        all_files: set[str] = set()
+        for t in toks:
+            all_files |= {h.path for h in index[t]}
+        if len(all_files) < min_files and len(toks) < 2:
+            continue
+        ordered = tuple(
+            sorted(toks, key=lambda t: (-len({h.path for h in index[t]}), t))
+        )
+        forks.append(Fork(c, ordered))
+    forks.sort(key=lambda f: (-len(f.tokens), ".".join(f.canon)))
+    return forks
+
+
+DIFF_FILE_RE = re.compile(r"^\+\+\+ [ab]/(.+)$")
+DIFF_DEVNULL = re.compile(r"^\+\+\+ /dev/null$")
+HUNK_RE = re.compile(r"^@@ ")
+
+
+def parse_unified_diff(text: str) -> dict[str, dict[str, set[str]]]:
+    """Return {path: {'removed': set(surfaces), 'added': set(surfaces)}}."""
+    current: str | None = None
+    acc: dict[str, dict[str, set[str]]] = {}
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+            continue
+        m = DIFF_FILE_RE.match(line)
+        if m:
+            current = m.group(1)
+            acc.setdefault(current, {"removed": set(), "added": set()})
+            continue
+        if DIFF_DEVNULL.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("+++ ") or line.startswith("--- ") or HUNK_RE.match(line):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["added"].add(hit.surface)
+        elif line.startswith("-") and not line.startswith("---"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["removed"].add(hit.surface)
+    return acc
+
+
+def working_tree_diff(root: Path) -> str:
+    try:
+        staged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "--cached", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        unstaged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        return (staged + unstaged).decode("utf-8", "replace")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def is_checkable(hits: list[Hit], min_files: int) -> bool:
+    if not hits:
+        return False
+    if boring_token(hits[0].token):
+        return False
+    files = {h.path for h in hits if not should_skip_path(h.path)}
+    if len(files) < min_files:
+        return False
+    return any(h.kind in {"json", "yaml", "toml", "header", "quoted"} for h in hits)
+
+
+def find_splits(
+    index: dict[str, list[Hit]],
+    diffmap: dict[str, dict[str, set[str]]],
+    min_files: int,
+) -> list[Split]:
+    files_by_tok: dict[str, set[str]] = defaultdict(set)
+    surf_by_tok_file: dict[tuple[str, str], set[str]] = defaultdict(set)
+    eligible: set[str] = set()
+    for tok, hits in index.items():
+        if is_checkable(hits, min_files):
+            eligible.add(tok)
+        for h in hits:
+            if should_skip_path(h.path):
+                continue
+            files_by_tok[tok].add(h.path)
+            surf_by_tok_file[(tok, h.path)].add(h.surface)
+
+    touched: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {"removed_files": set(), "added_files": set(), "new_surfaces": set()}
+    )
+    for path, sides in diffmap.items():
+        if should_skip_path(path):
+            continue
+        add_ids = {identity_of(s) for s in sides["added"]}
+        for s in sides["added"]:
+            tok = identity_of(s)
+            touched[tok]["added_files"].add(path)
+            touched[tok]["new_surfaces"].add(s)
+        for s in sides["removed"]:
+            tok = identity_of(s)
+            if tok not in add_ids:
+                touched[tok]["removed_files"].add(path)
+
+    splits: list[Split] = []
+    seen: set[str] = set()
+    for tok, info in touched.items():
+        if tok in seen:
+            continue
+        if tok not in eligible:
+            continue
+        if not info["removed_files"]:
+            continue
+        files = files_by_tok.get(tok, set())
+        leftover = files - set(info["removed_files"])
+        if not leftover:
+            continue
+        leftover_surfaces = sorted(
+            {
+                form
+                for f in leftover
+                for form in surf_by_tok_file.get((tok, f), ())
+            }
+        )
+        new_surfaces = tuple(
+            sorted(s for s in info["new_surfaces"] if s not in leftover_surfaces)
+        )
+        splits.append(
+            Split(
+                token=tok,
+                changed_files=tuple(sorted(info["removed_files"])),
+                leftover_files=tuple(sorted(leftover)),
+                leftover_surfaces=tuple(leftover_surfaces),
+                new_surfaces=new_surfaces,
+            )
+        )
+        seen.add(tok)
+    splits.sort(key=lambda s: (-len(s.leftover_files), s.token.lower()))
+    return splits
+
+
+def format_pact_human(p: Pact, why: bool, neighbors: Sequence[str] | None) -> str:
+    kinds = ",".join(sorted(p.kinds))
+    layers = ",".join(sorted({layer_of(f) for f in p.files}))
+    surfaces = p.surfaces
+    extra = ""
+    if len(surfaces) > 1:
+        extra = f"  surfaces: {', '.join(surfaces)}"
+    lines = [
+        f"{p.token}  files: {len(p.files)}  kinds: {kinds}  layers: {layers}{extra}"
+    ]
+    if neighbors:
+        lines.append("  ~forks: " + ", ".join(neighbors))
+    shown = 0
+    per_file: dict[str, int] = defaultdict(int)
+    cap = 6 if why else 2
+    total_cap = 40 if why else 16
+    for h in sorted(p.hits, key=lambda x: (x.path, x.line, x.kind)):
+        if per_file[h.path] >= cap:
+            continue
+        per_file[h.path] += 1
+        surf = "" if h.surface == p.token else f"  {h.surface}"
+        lines.append(f"  {h.path}:{h.line}  {h.kind:<7}{surf}")
+        shown += 1
+        if not why and shown >= total_cap:
+            extra_n = len(p.hits) - shown
+            if extra_n > 0:
+                lines.append(f"  … {extra_n} more hits")
+            break
+    return "\n".join(lines)
+
+
+def format_split_human(s: Split, neighbors: Sequence[str] | None) -> str:
+    lines = [f"SPLIT  {s.token}"]
+    lines.append("  changed:   " + ", ".join(s.changed_files))
+    lines.append("  leftover:  " + ", ".join(s.leftover_files))
+    if s.leftover_surfaces and set(s.leftover_surfaces) != {s.token}:
+        lines.append("  still as:  " + ", ".join(s.leftover_surfaces))
+    if s.new_surfaces:
+        lines.append("  became:    " + ", ".join(s.new_surfaces))
+    if neighbors:
+        lines.append("  ~forks:    " + ", ".join(neighbors))
+    return "\n".join(lines)
+
+
+def format_fork_human(f: Fork, index: dict[str, list[Hit]]) -> str:
+    lines = [f"FORK  {'.'.join(f.canon)}"]
+    for t in f.tokens:
+        hits = index[t]
+        files = sorted({h.path for h in hits})
+        kinds = ",".join(sorted({h.kind for h in hits}))
+        lines.append(f"  {t}  files: {len(files)}  kinds: {kinds}")
+        for path in files[:4]:
+            lines.append(f"    {path}")
+        if len(files) > 4:
+            lines.append(f"    … {len(files) - 4} more files")
+    return "\n".join(lines)
+
+
+def pact_to_json(p: Pact, neighbors: Sequence[str] | None) -> dict:
+    return {
+        "token": p.token,
+        "surfaces": p.surfaces,
+        "files": p.files,
+        "kinds": sorted(p.kinds),
+        "score": round(score_pact(p), 3),
+        "forks": list(neighbors or ()),
+        "hits": [
+            {
+                "path": h.path,
+                "line": h.line,
+                "surface": h.surface,
+                "kind": h.kind,
+            }
+            for h in p.hits
+        ],
+    }
+
+
+def split_to_json(s: Split, neighbors: Sequence[str] | None) -> dict:
+    return {
+        "token": s.token,
+        "changed_files": list(s.changed_files),
+        "leftover_files": list(s.leftover_files),
+        "leftover_surfaces": list(s.leftover_surfaces),
+        "new_surfaces": list(s.new_surfaces),
+        "forks": list(neighbors or ()),
+    }
+
+
+def stdin_is_diff(text: str) -> bool:
+    head = text.lstrip()
+    return (
+        head.startswith("diff --git ")
+        or head.startswith("--- ")
+        or head.startswith("+++ ")
+        or head.startswith("@@ ")
+    )
+
+
+def find_root(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).resolve()
+    here = Path.cwd()
+    for p in [here, *here.parents]:
+        if (p / ".git").exists():
+            return p
+    return here
+
+
+def emit_pacts(
+    pacts: Sequence[Pact],
+    args: argparse.Namespace,
+    near: dict[str, list[str]],
+) -> None:
+    if args.json:
+        json.dump(
+            [pact_to_json(p, near.get(p.token)) for p in pacts],
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for p in pacts:
+            for h in p.hits:
+                sys.stdout.write(
+                    f"{p.token}\t{h.kind}\t{h.path}\t{h.line}\t{h.surface}\n"
+                )
+        return
+    if not pacts:
+        print("sic: no shared wire keys")
+        return
+    chunks = [
+        format_pact_human(p, args.why, near.get(p.token)) for p in pacts
+    ]
+    print("\n\n".join(chunks))
+
+
+def emit_splits(
+    splits: Sequence[Split],
+    args: argparse.Namespace,
+    near: dict[str, list[str]],
+) -> None:
+    if args.json:
+        json.dump(
+            [split_to_json(s, near.get(s.token)) for s in splits],
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for s in splits:
+            sys.stdout.write(
+                "split\t"
+                + s.token
+                + "\t"
+                + ",".join(s.changed_files)
+                + "\t"
+                + ",".join(s.leftover_files)
+                + "\n"
+            )
+        return
+    if not splits:
+        print("sic: no one-sided wire-key edits")
+        return
+    print(
+        "\n\n".join(
+            format_split_human(s, near.get(s.token)) for s in splits
+        )
+    )
+
+
+def emit_forks(
+    forks: Sequence[Fork],
+    index: dict[str, list[Hit]],
+    args: argparse.Namespace,
+) -> None:
+    if args.json:
+        payload = []
+        for f in forks:
+            payload.append(
+                {
+                    "canon": ".".join(f.canon),
+                    "tokens": [
+                        {
+                            "token": t,
+                            "files": sorted({h.path for h in index[t]}),
+                            "kinds": sorted({h.kind for h in index[t]}),
+                        }
+                        for t in f.tokens
+                    ],
+                }
+            )
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for f in forks:
+            sys.stdout.write("fork\t" + ".".join(f.canon) + "\t" + ",".join(f.tokens) + "\n")
+        return
+    if not forks:
+        print("sic: no wire-key forks")
+        return
+    print("\n\n".join(format_fork_human(f, index) for f in forks))
+
+
+def run_selftest() -> int:
+    failures = 0
+
+    def expect(name: str, cond: bool) -> None:
+        nonlocal failures
+        if not cond:
+            print(f"FAIL {name}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"ok   {name}")
+
+    expect("identity exact", identity_of("has_more") == "has_more")
+    expect("identity not inflected", identity_of("has_more") != identity_of("hasMore"))
+    expect("header folds", identity_of("X-Request-Id") == identity_of("x-request-id"))
+    expect(
+        "kebab json is not a header fold",
+        identity_of("has-more") == "has-more"
+        and identity_of("has-more") != identity_of("has_more"),
+    )
+    expect("canon only for forks", inflection_canon("has_more") == inflection_canon("hasMore"))
+    expect("keyish snake", is_keyish_protocol("source_text"))
+    expect("keyish camel", is_keyish_protocol("hookEventName"))
+    expect("not keyish Write", not is_keyish_protocol("Write"))
+    expect("not keyish the", not is_keyish_protocol("the"))
+    expect("header Content-Type", is_header_name("Content-Type"))
+    expect("not header has-more", not is_header_name("has-more"))
+    expect("not header date format", not is_header_name("yyyy-MM-dd"))
+    expect("not keyish Pascal product", not is_keyish_protocol("YouTube"))
+
+    sample = (
+        'const k = "has_more";\n'
+        "let hasMore = false;\n"
+        "has_more: true\n"
+        'obj = {"hasMore": 1, "X-Request-Id": "a"}\n'
+        'headers["X-Request-Id"] = x\n'
+    )
+    hits = extract_hits("x.ts", sample)
+    surfaces = {h.surface for h in hits}
+    kinds = {h.kind for h in hits}
+    tokens = {h.token for h in hits}
+    expect("quoted has_more", "has_more" in surfaces)
+    expect("json hasMore is a different token", "hasMore" in tokens)
+    expect("not the same token", "has_more" in tokens and "hasMore" in tokens)
+    expect("no identifier hasMore", not any(h.kind == "ident" for h in hits))
+    expect(
+        "identifier hasMore ignored",
+        not any(h.surface == "hasMore" and h.kind not in {"json", "quoted"} for h in hits),
+    )
+    # `let hasMore = false` must not produce a hit on hasMore unless quoted/json.
+    ident_line = [h for h in hits if h.line == 2]
+    expect("line 2 (let hasMore) empty", ident_line == [])
+    expect("header folded token", "x-request-id" in tokens)
+    expect("json kind present", "json" in kinds)
+    expect("quoted kind present", "quoted" in kinds)
+
+    yaml = "properties:\n  has_more: { type: boolean }\n  source_text: hi\n"
+    yhits = extract_hits("api.yaml", yaml)
+    expect("yaml has_more", any(h.surface == "has_more" and h.kind == "yaml" for h in yhits))
+
+    toml = 'has_more = true\nsource_text = "hi"\n'
+    thits = extract_hits("cfg.toml", toml)
+    expect("toml has_more", any(h.surface == "has_more" and h.kind == "toml" for h in thits))
+
+    expect(
+        "skip dist min.js",
+        should_skip_path("dist/app.min.js"),
+    )
+    expect("keep EditPlan.swift", not should_skip_path("Engine/Sources/TenaoshiEngine/EditPlan.swift"))
+    expect("spec dir is not a test", layer_of("spec/api.yaml") == "config")
+
+    diff = """\
+diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-TOKEN = "has_more"
++TOKEN = "has_extra"
+"""
+    dm = parse_unified_diff(diff)
+    expect("diff file", "a.py" in dm)
+    expect("diff removed", "has_more" in dm["a.py"]["removed"])
+    expect("diff added", "has_extra" in dm["a.py"]["added"])
+
+    idx = {
+        "has_more": [
+            Hit("a.py", 1, "has_more", "quoted", "has_more"),
+            Hit("b.yaml", 3, "has_more", "yaml", "has_more"),
+        ],
+        "hasMore": [
+            Hit("c.json", 1, "hasMore", "json", "hasMore"),
+        ],
+    }
+    splits = find_splits(idx, dm, min_files=2)
+    expect("split detected", len(splits) == 1 and splits[0].leftover_files == ("b.yaml",))
+    expect("split is exact token", splits[0].token == "has_more")
+
+    # Inflection in another file is a different token — not a leftover of has_more.
+    expect(
+        "hasMore is not leftover of has_more",
+        "c.json" not in splits[0].leftover_files,
+    )
+
+    dm2 = {
+        "a.py": {"removed": {"has_more"}, "added": {"has_extra"}},
+        "b.yaml": {"removed": {"has_more"}, "added": {"has_extra"}},
+    }
+    splits2 = find_splits(idx, dm2, min_files=2)
+    expect("complete rename clean", splits2 == [])
+
+    forks = find_forks(idx, min_files=2)
+    expect("fork has_more ~ hasMore", any(set(f.tokens) >= {"has_more", "hasMore"} for f in forks))
+
+    ident_only_src = "let backgroundColor = 1\nfunc hasMore() {}\n"
+    ihits = extract_hits("a.swift", ident_only_src)
+    expect("identifiers are not tokens", ihits == [])
+
+    swift_sub = (
+        "// default profile's leftover apostrophe\n"
+        'let awayRec = (dict["lifetimeAwayRecovered"] as? Int) ?? 0\n'
+        'enum CodingKeys: String, CodingKey { case flowThreshold = "t1" }\n'
+    )
+    shits = extract_hits("Core.swift", swift_sub)
+    expect(
+        "subscript camel key",
+        any(h.surface == "lifetimeAwayRecovered" for h in shits),
+    )
+    expect(
+        "CodingKeys raw value t1",
+        any(h.surface == "t1" for h in shits),
+    )
+    expect(
+        "apostrophe did not swallow subscript",
+        any(h.surface == "lifetimeAwayRecovered" for h in shits),
+    )
+
+    return 1 if failures else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="sic",
+        description=(
+            "Find serialized wire keys (JSON/YAML/TOML keys, headers, "
+            "quoted protocol strings) as written. Catch one-sided edits "
+            "and inflection forks (has_more vs hasMore as two wire names)."
+        ),
+    )
+    ap.add_argument("token", nargs="?", help="lookup one exact wire key")
+    ap.add_argument("-C", "--repo", help="repository root")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument(
+        "--porcelain",
+        action="store_true",
+        help="stable TSV: token<TAB>kind<TAB>path<TAB>line<TAB>surface",
+    )
+    ap.add_argument("--min-files", type=int, default=2)
+    ap.add_argument("--max-files", type=int, default=32)
+    ap.add_argument("--limit", type=int, default=40, help="max pacts to print")
+    ap.add_argument("--all", action="store_true", help="do not apply --limit")
+    ap.add_argument("--code", action="store_true", help="ignore markdown/text files")
+    ap.add_argument("--walk", action="store_true", help="walk the tree instead of git ls-files")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if a patch updates a wire key on only some of its files",
+    )
+    ap.add_argument(
+        "--forks",
+        action="store_true",
+        help="list distinct wire keys that share an inflection (protocol forks)",
+    )
+    ap.add_argument("--diff", metavar="FILE", help="patch file to check ('-' = stdin)")
+    ap.add_argument("--why", action="store_true", help="show more hit sites")
+    ap.add_argument("--selftest", action="store_true", help="run built-in tests")
+    ap.add_argument("--version", action="version", version=f"sic {VERSION}")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return run_selftest()
+
+    root = find_root(args.repo)
+    stdin_data = ""
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+
+    want_check = args.check or args.diff is not None
+    if stdin_data and stdin_is_diff(stdin_data):
+        want_check = True
+
+    index = build_index(root, walk=args.walk)
+    near = fork_neighbors(index)
+
+    if want_check:
+        if args.diff and args.diff != "-":
+            patch = Path(args.diff).read_text(encoding="utf-8", errors="replace")
+        elif stdin_data and stdin_is_diff(stdin_data):
+            patch = stdin_data
+        else:
+            patch = working_tree_diff(root)
+        diffmap = parse_unified_diff(patch)
+        splits = find_splits(index, diffmap, min_files=args.min_files)
+        emit_splits(splits, args, near)
+        return 1 if splits else 0
+
+    if args.forks:
+        forks = find_forks(index, min_files=args.min_files)
+        if args.token:
+            q = args.token.strip().strip("'\"")
+            qid = identity_of(q) if is_header_name(q) else q
+            forks = [f for f in forks if qid in f.tokens or q in f.tokens]
+            if not forks:
+                # lookup miss with a fork hint?
+                print(f"sic: no wire-key fork involving {q!r}", file=sys.stderr)
+                return 1
+        if not args.all:
+            forks = forks[: max(0, args.limit)]
+        emit_forks(forks, index, args)
+        return 0
+
+    if args.token:
+        p = lookup(index, args.token)
+        if not p:
+            q = args.token.strip().strip("'\"")
+            c = inflection_canon(q)
+            hint = ""
+            if c:
+                cousins = []
+                for tok in index:
+                    if inflection_canon(tok) == c:
+                        cousins.append(tok)
+                if cousins:
+                    hint = "\n  wire forks: " + ", ".join(sorted(cousins))
+            print(f"sic: no wire key {q!r}{hint}", file=sys.stderr)
+            return 1
+        emit_pacts([p], args, near)
+        return 0
+
+    if stdin_data and not stdin_is_diff(stdin_data):
+        wanted = {line.strip() for line in stdin_data.splitlines() if line.strip()}
+        pacts = select_pacts(index, args.min_files, args.max_files, args.code)
+        pacts = [p for p in pacts if wanted & set(p.files)]
+    else:
+        pacts = select_pacts(index, args.min_files, args.max_files, args.code)
+
+    if not args.all:
+        pacts = pacts[: max(0, args.limit)]
+    emit_pacts(pacts, args, near)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

@@ -1,0 +1,35 @@
+verdict	role	callee	param	default	passed	file	line
+
+paired e9b0f75 PresenceArbiter rows=54 BLAST=54 FOSSIL=0
+paired default samples: 0.35, 0.4→0.45
+name-only e9b0f75 PresenceArbiter rows=54 BLAST=54 FOSSIL=0
+name-only default samples: 0.35, 0.45
+fixture rename WITH pairing:
+  BLAST	TACIT	presentThreshold	0.4→0.45	—
+  FOSSIL	OVERRIDE	presentThreshold	0.4→0.45	0.4
+fixture rename NAME-ONLY:
+  BLAST	TACIT	presentThreshold	0.45	—
+  LOCK	OVERRIDE	presentThreshold	0.45	0.4
+values_equal('0.45', '0.450') = True
+values_equal('0.45', '.45') = True
+values_equal('15', '15.0') = True
+values_equal('0.4', '0.40') = True
+values_equal('"hi"', "'hi'") = True
+values_equal('"claude-code"', 'claude-code') = True
+values_equal('True', 'true') = False
+values_equal('None', 'nil') = False
+values_equal('Thresholds()', 'Thresholds()') = True
+values_equal('Thresholds(driftDelay: 15)', 'Thresholds()') = False
+values_equal('[]', '[ ]') = True
+is_literal('0.45') = True
+is_literal('Thresholds()') = True
+is_literal('Thresholds(driftDelay: 15)') = False
+is_literal('.init()') = False
+is_literal('provider') = False
+is_literal('["camera"]') = False
+is_literal("**{'timeout': 30}") = False
+is_literal('()') = True
+is_literal('[]') = True
+is_literal('{}') = True
+is_literal('.present') = True
+is_literal('nil') = True

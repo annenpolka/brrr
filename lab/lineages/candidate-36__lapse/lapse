@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""lapse — a duration is a disagreement between clocks.
+
+Wall, machine, awake, and proper time are four different objects.
+`time(1)` collapses them. lapse reports the cut and names the disagreement.
+
+  wall     CLOCK_REALTIME          (NTP can step it)
+  machine  CLOCK_MONOTONIC_RAW     (runs during host sleep; no NTP)
+           or CLOCK_BOOTTIME on Linux
+  awake    CLOCK_UPTIME_RAW        (pauses during host sleep; no NTP)
+           or CLOCK_MONOTONIC on Linux
+  proper   CPU time of the process tree (a process ages only on-CPU)
+
+On Darwin, Python's time.monotonic() is CLOCK_UPTIME_RAW: it does *not*
+include lid-close. That is the opposite of POSIX folklore.
+
+Verdicts (not a wait-for graph):
+  STEP    wall and machine disagree (clock stepped)
+  SLEEP   machine advanced while the host was not awake
+  STARVE  runnable samples with almost no proper-time gain
+  BOOST   tree proper time > awake (parallel age)
+  DILATE  world moved much farther than the tree aged
+  REST    proper time ≈ awake (serial on-CPU)
+  QUIET   too small to classify
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+VERSION = "0.2"
+
+STEP_MIN = 0.05
+STEP_PPM = 50e-6  # 50 ppm slew is not a step; 7s in 22 days is crystal wander
+SLEEP_MIN = 0.05
+BOOST_RATIO = 1.15
+DILATE_GAMMA = 3.0
+REST_GAMMA = 1.45
+STARVE_RUNNABLE_FRAC = 0.35
+STARVE_CPU_RATIO = 0.25
+STARVE_PCPU_MAX = 15.0  # mean %cpu; above this they *did* get scheduled
+EPS = 1e-9
+
+
+def step_min(machine: float) -> float:
+    """Absolute jump that still counts as STEP, scaled so long slews are not steps."""
+    return max(STEP_MIN, STEP_PPM * max(machine, 0.0))
+
+PS_RE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$"
+)
+SYSCTL_TIMEVAL_RE = re.compile(r"sec\s*=\s*(-?\d+),\s*usec\s*=\s*(-?\d+)")
+
+
+# ---------------------------------------------------------------------------
+# Clocks
+# ---------------------------------------------------------------------------
+
+def _has_clock(*names: str) -> bool:
+    return all(hasattr(time, n) for n in names)
+
+
+def clock_backend() -> dict[str, Any]:
+    """Pick the kernel clocks that separate sleep from NTP from awake time."""
+    if _has_clock("CLOCK_REALTIME", "CLOCK_MONOTONIC_RAW", "CLOCK_UPTIME_RAW"):
+        return {
+            "kind": "darwin",
+            "wall": time.CLOCK_REALTIME,
+            "machine": time.CLOCK_MONOTONIC_RAW,
+            "awake": time.CLOCK_UPTIME_RAW,
+            "machine_name": "CLOCK_MONOTONIC_RAW",
+            "awake_name": "CLOCK_UPTIME_RAW",
+            "python_monotonic": "awake",
+        }
+    if _has_clock("CLOCK_REALTIME", "CLOCK_BOOTTIME", "CLOCK_MONOTONIC"):
+        return {
+            "kind": "linux",
+            "wall": time.CLOCK_REALTIME,
+            "machine": time.CLOCK_BOOTTIME,
+            "awake": time.CLOCK_MONOTONIC,
+            "machine_name": "CLOCK_BOOTTIME",
+            "awake_name": "CLOCK_MONOTONIC",
+            "python_monotonic": "awake",
+        }
+    return {
+        "kind": "fallback",
+        "wall": getattr(time, "CLOCK_REALTIME", None),
+        "machine": getattr(time, "CLOCK_MONOTONIC", None),
+        "awake": getattr(time, "CLOCK_MONOTONIC", None),
+        "machine_name": "CLOCK_MONOTONIC",
+        "awake_name": "CLOCK_MONOTONIC",
+        "python_monotonic": "unknown",
+    }
+
+
+BACKEND = clock_backend()
+
+
+def _clock_gettime(clk: int | None) -> float:
+    if clk is None:
+        return time.time()
+    return time.clock_gettime(clk)
+
+
+def _sysctl_timeval(name: str) -> float | None:
+    try:
+        out = subprocess.check_output(["sysctl", name], text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    m = SYSCTL_TIMEVAL_RE.search(out)
+    if not m:
+        return None
+    return int(m.group(1)) + int(m.group(2)) / 1_000_000.0
+
+
+@dataclass
+class Cut:
+    """A simultaneous sample of every clock this machine exposes."""
+
+    wall: float
+    machine: float
+    awake: float
+    python_monotonic: float
+    proc_cpu: float
+    boottime: float | None = None
+    sleeptime: float | None = None
+    waketime: float | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def cut_now() -> Cut:
+    return Cut(
+        wall=_clock_gettime(BACKEND["wall"]),
+        machine=_clock_gettime(BACKEND["machine"]),
+        awake=_clock_gettime(BACKEND["awake"]),
+        python_monotonic=time.monotonic(),
+        proc_cpu=time.process_time(),
+        boottime=_sysctl_timeval("kern.boottime"),
+        sleeptime=_sysctl_timeval("kern.sleeptime"),
+        waketime=_sysctl_timeval("kern.waketime"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ps / worldlines
+# ---------------------------------------------------------------------------
+
+def parse_ps_time(s: str) -> float:
+    """Parse Darwin/BSD `ps` cputime/etime into seconds."""
+    s = s.strip()
+    if not s:
+        return 0.0
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = s.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, sec = parts
+            return days * 86400 + int(h) * 3600 + int(m) * 60 + float(sec)
+        if len(parts) == 2:
+            m, sec = parts
+            return days * 86400 + int(m) * 60 + float(sec)
+        return days * 86400 + float(parts[0])
+    except ValueError as e:
+        raise ValueError(f"unparsable ps time {s!r}") from e
+
+
+@dataclass
+class ProcSnap:
+    pid: int
+    ppid: int
+    pgid: int
+    state: str
+    cpu: float
+    pcpu: float
+    comm: str
+
+
+def _ps_snapshot() -> list[ProcSnap]:
+    # comm can contain spaces on Darwin; split first six columns, rest is command.
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,pgid=,state=,time=,pcpu=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    rows: list[ProcSnap] = []
+    for line in out.splitlines():
+        m = PS_RE.match(line)
+        if not m:
+            continue
+        pid, ppid, pgid, state, cputime, pcpu, comm = m.groups()
+        try:
+            cpu = parse_ps_time(cputime)
+            pcpu_f = float(pcpu)
+        except ValueError:
+            continue
+        rows.append(
+            ProcSnap(
+                pid=int(pid),
+                ppid=int(ppid),
+                pgid=int(pgid),
+                state=state,
+                cpu=cpu,
+                pcpu=pcpu_f,
+                comm=comm.strip(),
+            )
+        )
+    return rows
+
+
+def _label(comm: str) -> str:
+    base = os.path.basename(comm.split()[0]) if comm else "?"
+    return base[:18] or "?"
+
+
+def select_tree(rows: list[ProcSnap], leader: int) -> list[ProcSnap]:
+    """Union of session (pgid=leader) and the parent-pointer tree."""
+    by_pid = {p.pid: p for p in rows}
+    kids: dict[int, list[int]] = {}
+    for p in rows:
+        kids.setdefault(p.ppid, []).append(p.pid)
+    keep: set[int] = set()
+    stack = [leader]
+    while stack:
+        pid = stack.pop()
+        if pid in keep:
+            continue
+        keep.add(pid)
+        stack.extend(kids.get(pid, []))
+    for p in rows:
+        if p.pgid == leader:
+            keep.add(p.pid)
+    return [by_pid[p] for p in keep if p in by_pid]
+
+
+@dataclass
+class Sample:
+    t_wall: float
+    t_machine: float
+    t_awake: float
+    procs: list[ProcSnap]
+
+
+def glyph_for(state: str, cpu_delta: float, dt: float, pcpu: float, host_sleeping: bool) -> str:
+    if host_sleeping:
+        return "Z"
+    s = state[:1]
+    # %cpu is a ~1s rolling average: it stays high after a burst. Only trust it
+    # while the kernel still says the process is runnable.
+    on_cpu = cpu_delta > max(0.002, 0.15 * dt) or (s == "R" and pcpu >= 20)
+    if on_cpu:
+        return "#"
+    if s == "R":
+        return "%"
+    if s == "Z":
+        return "z"
+    if s in "T":
+        return "t"
+    return "~"
+
+
+def phase_of(glyphs: str) -> str:
+    """Collapse a worldline to run/block/runq/sleep phases. Mix fixtures should be run→block."""
+    names = {"#": "run", "%": "runq", "~": "block", "Z": "sleep", "t": "stop", "z": "exit"}
+    out: list[str] = []
+    for ch in glyphs:
+        if ch in "-":
+            continue
+        name = names.get(ch)
+        if not name or name == "exit":
+            continue
+        if not out or out[-1] != name:
+            out.append(name)
+    return "→".join(out)
+
+
+@dataclass
+class Worldline:
+    pid: int
+    ppid: int
+    comm: str
+    proper: float
+    first_t: float
+    last_t: float
+    glyphs: str
+    states: list[str] = field(default_factory=list)
+    runnable_s: float = 0.0
+    starved: bool = False
+    mean_pcpu: float = 0.0
+    phase: str = ""
+
+    @property
+    def coordinate(self) -> float:
+        return max(0.0, self.last_t - self.first_t)
+
+    @property
+    def gamma(self) -> float:
+        return self.coordinate / max(self.proper, EPS)
+
+
+def build_worldlines(samples: list[Sample], t0: float, t1: float, width: int = 48) -> list[Worldline]:
+    if t1 <= t0:
+        t1 = t0 + EPS
+    width = max(8, width)
+    by_pid: dict[int, list[tuple[Sample, ProcSnap]]] = {}
+    for samp in samples:
+        for p in samp.procs:
+            by_pid.setdefault(p.pid, []).append((samp, p))
+    lines: list[Worldline] = []
+    for pid, hits in sorted(by_pid.items(), key=lambda kv: kv[1][0][0].t_machine):
+        first = hits[0][1]
+        last = hits[-1][1]
+        first_t = hits[0][0].t_machine
+        last_t = hits[-1][0].t_machine
+        cols = ["-"] * width
+        states = [p.state for _, p in hits]
+        prev_s: Sample | None = None
+        prev_p: ProcSnap | None = None
+        runnable = 0.0
+        pcpu_int = 0.0
+        pcpu_sum = 0.0
+        for samp, p in hits:
+            frac = (samp.t_machine - t0) / (t1 - t0)
+            col = int(frac * (width - 1))
+            col = min(max(col, 0), width - 1)
+            dt_m = 0.0
+            dt_a = 0.0
+            cpu_d = 0.0
+            if prev_s is not None and prev_p is not None:
+                dt_m = samp.t_machine - prev_s.t_machine
+                dt_a = samp.t_awake - prev_s.t_awake
+                cpu_d = max(0.0, p.cpu - prev_p.cpu)
+                pcpu_int += (prev_p.pcpu + p.pcpu) / 2.0 / 100.0 * max(dt_a, 0.0)
+            host_sleeping = dt_m - dt_a >= 0.02 and dt_m > 0
+            cols[col] = glyph_for(p.state, cpu_d, max(dt_m, EPS), p.pcpu, host_sleeping)
+            if p.state[:1] == "R":
+                runnable += max(dt_m, 0.0)
+            pcpu_sum += p.pcpu
+            prev_s, prev_p = samp, p
+        cpu_span = max(0.0, last.cpu - first.cpu)
+        proper = max(cpu_span, pcpu_int)
+        mean_pcpu = pcpu_sum / max(len(hits), 1)
+        span = max(last_t - first_t, EPS)
+        # ps `time` lags; a runnable process with high %cpu is working, not starving.
+        starved = (
+            span >= 0.12
+            and runnable >= STARVE_RUNNABLE_FRAC * span
+            and proper < STARVE_CPU_RATIO * max(runnable, EPS)
+            and mean_pcpu < STARVE_PCPU_MAX
+        )
+        glyphs = "".join(cols)
+        lines.append(
+            Worldline(
+                pid=pid,
+                ppid=first.ppid,
+                comm=first.comm,
+                proper=proper,
+                first_t=first_t,
+                last_t=last_t,
+                glyphs=glyphs,
+                states=states,
+                runnable_s=runnable,
+                starved=starved,
+                mean_pcpu=mean_pcpu,
+                phase=phase_of(glyphs),
+            )
+        )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Lapse
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Lapse:
+    start: Cut
+    end: Cut
+    wall: float
+    machine: float
+    awake: float
+    sleep: float
+    ntp: float
+    proper: float
+    leader_cpu: float
+    sampled_cpu: float
+    n_pids: int
+    n_samples: int
+    starve: bool
+    argv: list[str]
+    exit_code: int | None
+    worldlines: list[Worldline] = field(default_factory=list)
+    backend: str = field(default_factory=lambda: BACKEND["kind"])
+    kind: str = "command"
+
+    @property
+    def gamma(self) -> float:
+        return self.machine / max(self.proper, EPS)
+
+    def tags(self) -> list[str]:
+        tags: list[str] = []
+        if abs(self.ntp) >= step_min(self.machine):
+            tags.append("STEP")
+        if self.sleep >= SLEEP_MIN:
+            tags.append("SLEEP")
+        if self.kind == "machine":
+            # A machine's proper time *is* awake time. REST/BOOST/STARVE are process verdicts.
+            if not tags:
+                tags.append("QUIET")
+            return tags
+        if self.starve:
+            tags.append("STARVE")
+        if self.awake > 1e-4 and self.proper / self.awake >= BOOST_RATIO:
+            tags.append("BOOST")
+        if "BOOST" not in tags:
+            if self.proper < 1e-4 and self.machine >= 0.05:
+                tags.append("DILATE")
+            elif self.gamma >= DILATE_GAMMA:
+                tags.append("DILATE")
+            elif self.gamma <= REST_GAMMA and self.proper >= 0.02:
+                tags.append("REST")
+            elif self.machine >= 0.05:
+                tags.append("DILATE")
+            else:
+                tags.append("QUIET")
+        return tags
+
+    def primary(self) -> str:
+        return self.tags()[0]
+
+
+def lapse_from_cuts(
+    start: Cut,
+    end: Cut,
+    *,
+    proper: float = 0.0,
+    leader_cpu: float = 0.0,
+    sampled_cpu: float = 0.0,
+    n_pids: int = 0,
+    n_samples: int = 0,
+    starve: bool = False,
+    argv: list[str] | None = None,
+    exit_code: int | None = None,
+    worldlines: list[Worldline] | None = None,
+    kind: str = "command",
+) -> Lapse:
+    wall = end.wall - start.wall
+    machine = end.machine - start.machine
+    awake = end.awake - start.awake
+    return Lapse(
+        start=start,
+        end=end,
+        wall=wall,
+        machine=machine,
+        awake=awake,
+        sleep=machine - awake,
+        ntp=wall - machine,
+        proper=proper,
+        leader_cpu=leader_cpu,
+        sampled_cpu=sampled_cpu,
+        n_pids=n_pids,
+        n_samples=n_samples,
+        starve=starve,
+        argv=list(argv or []),
+        exit_code=exit_code,
+        worldlines=worldlines or [],
+        kind=kind,
+    )
+
+
+def rusage_cpu(ru: Any) -> float:
+    ut = ru.ru_utime
+    st = ru.ru_stime
+    if isinstance(ut, tuple):
+        ut = ut[0] + ut[1] / 1e6
+    if isinstance(st, tuple):
+        st = st[0] + st[1] / 1e6
+    return float(ut) + float(st)
+
+
+def run_command(
+    argv: list[str],
+    hz: float,
+    width: int,
+    *,
+    stdout=None,
+    stderr=None,
+) -> Lapse:
+    start = cut_now()
+    try:
+        proc = subprocess.Popen(
+            argv, start_new_session=True, stdout=stdout, stderr=stderr
+        )
+    except OSError as e:
+        raise SystemExit(f"lapse: exec failed: {e}") from e
+    leader = proc.pid
+    samples: list[Sample] = []
+    interval = 1.0 / max(hz, 1.0)
+    ru = None
+    status = None
+    while True:
+        now = cut_now()
+        rows = select_tree(_ps_snapshot(), leader)
+        samples.append(
+            Sample(t_wall=now.wall, t_machine=now.machine, t_awake=now.awake, procs=rows)
+        )
+        try:
+            waited, status, ru = os.wait4(leader, os.WNOHANG)
+        except ChildProcessError:
+            waited, status, ru = leader, 0, None
+        if waited != 0:
+            break
+        time.sleep(interval)
+    end = cut_now()
+    leader_cpu = rusage_cpu(ru) if ru is not None else 0.0
+    lines = build_worldlines(samples, start.machine, end.machine, width=width)
+    # Single-pid trees: wait4 is the ground truth when ps `time` never ticked.
+    if len(lines) == 1 and leader_cpu > lines[0].proper:
+        lines[0].proper = leader_cpu
+    sampled_cpu = sum(w.proper for w in lines)
+    proper = max(sampled_cpu, leader_cpu)
+    starve = any(w.starved for w in lines)
+    if os.WIFEXITED(status or 0):
+        code = os.WEXITSTATUS(status or 0)
+    elif os.WIFSIGNALED(status or 0):
+        code = 128 + os.WTERMSIG(status or 0)
+    else:
+        code = 0
+    return lapse_from_cuts(
+        start,
+        end,
+        proper=proper,
+        leader_cpu=leader_cpu,
+        sampled_cpu=sampled_cpu,
+        n_pids=len(lines),
+        n_samples=len(samples),
+        starve=starve,
+        argv=argv,
+        exit_code=code,
+        worldlines=lines,
+        kind="command",
+    )
+
+
+def machine_lapse() -> Lapse:
+    """Lapse of the host from boot to this cut. Proper time of a machine is awake time."""
+    end = cut_now()
+    boot = end.boottime
+    if boot is None:
+        # No kern.boottime: machine/awake clocks already start at boot.
+        start = Cut(
+            wall=end.wall - end.machine,
+            machine=0.0,
+            awake=0.0,
+            python_monotonic=0.0,
+            proc_cpu=0.0,
+            boottime=None,
+        )
+    else:
+        # boottime is in the wall domain. Machine/awake clocks read ~seconds since boot.
+        start = Cut(
+            wall=boot,
+            machine=0.0,
+            awake=0.0,
+            python_monotonic=0.0,
+            proc_cpu=0.0,
+            boottime=boot,
+        )
+    proper = end.awake  # the machine ages only while awake
+    return lapse_from_cuts(
+        start,
+        end,
+        proper=proper,
+        sampled_cpu=proper,
+        n_pids=0,
+        n_samples=1,
+        argv=["[machine since boot]"],
+        exit_code=0,
+        kind="machine",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+def fmt_secs(x: float, signed: bool = False) -> str:
+    s = abs(x)
+    sign = "-" if x < 0 else ("+" if signed else "")
+    if s < 0.0005:
+        return f"{sign}0s"
+    if s < 1:
+        return f"{sign}{s:.3f}s"
+    if s < 60:
+        return f"{sign}{s:.3f}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{sign}{int(m)}m{sec:05.2f}s"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{sign}{int(h)}h{int(m):02d}m{sec:04.1f}s"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{sign}{int(d)}d{int(h):02d}h{int(m):02d}m"
+
+
+def fmt_gamma(g: float) -> str:
+    if g >= 1e6:
+        return "∞"
+    if g >= 100:
+        return f"{g:.0f}"
+    if g >= 10:
+        return f"{g:.1f}"
+    return f"{g:.2f}"
+
+
+def reason_text(lp: Lapse) -> str:
+    tags = lp.tags()
+    bits = []
+    if "STEP" in tags:
+        direction = "forward" if lp.ntp > 0 else "backward"
+        bits.append(f"wall {direction}-stepped {fmt_secs(abs(lp.ntp))} vs machine")
+    if "SLEEP" in tags:
+        bits.append(f"host slept {fmt_secs(lp.sleep)} ({100 * lp.sleep / max(lp.machine, EPS):.0f}% of machine)")
+    if "STARVE" in tags:
+        bits.append("runnable worldlines gained little proper time (scheduler starve)")
+    if "BOOST" in tags:
+        bits.append(
+            f"tree aged {fmt_secs(lp.proper)} while host was awake {fmt_secs(lp.awake)} "
+            f"({lp.proper / max(lp.awake, EPS):.2f}× parallel)"
+        )
+    if "DILATE" in tags:
+        bits.append(
+            f"world moved {fmt_gamma(lp.gamma)}× farther than the tree aged "
+            f"(proper {fmt_secs(lp.proper)} / machine {fmt_secs(lp.machine)})"
+        )
+    if "REST" in tags:
+        bits.append("proper time tracks the awake clock (serial on-CPU)")
+    if "QUIET" in tags:
+        bits.append("clocks agree (or the interval is too small to split)")
+    return "; ".join(bits)
+
+
+def sleep_overlaps(lp: Lapse) -> bool:
+    """True when the host's last sleep interval intersects this lapse's wall span."""
+    st, wt = lp.end.sleeptime, lp.end.waketime
+    if st is None or wt is None:
+        return False
+    lo, hi = min(st, wt), max(st, wt)
+    return not (hi < lp.start.wall or lo > lp.end.wall)
+
+
+def format_human(lp: Lapse, *, width: int = 48, clocks_note: bool = True) -> str:
+    tags = " ".join(lp.tags())
+    lines = []
+    title = " ".join(lp.argv) if lp.argv else "(cut)"
+    lines.append(f"lapse  {title}")
+    lines.append(
+        f"  wall     {fmt_secs(lp.wall):>12}   CLOCK_REALTIME"
+    )
+    lines.append(
+        f"  machine  {fmt_secs(lp.machine):>12}   {BACKEND['machine_name']}"
+    )
+    lines.append(
+        f"  awake    {fmt_secs(lp.awake):>12}   {BACKEND['awake_name']}"
+    )
+    lines.append(
+        f"  sleep    {fmt_secs(lp.sleep):>12}   machine − awake"
+    )
+    lines.append(
+        f"  ntp      {fmt_secs(lp.ntp, signed=True):>12}   wall − machine"
+    )
+    if lp.kind == "machine":
+        proper_note = "host awake (machine proper time)"
+    else:
+        proper_note = (
+            f"tree CPU  (sampled {fmt_secs(lp.sampled_cpu)}, leader {fmt_secs(lp.leader_cpu)})"
+        )
+    lines.append(f"  proper   {fmt_secs(lp.proper):>12}   {proper_note}")
+    lines.append(
+        f"  γ        {fmt_gamma(lp.gamma):>12}   machine / proper    pids {lp.n_pids}  samples {lp.n_samples}"
+    )
+    lines.append(f"verdict {tags}")
+    lines.append(f"reason  {reason_text(lp)}")
+    if lp.exit_code not in (None, 0):
+        lines.append(f"exit    {lp.exit_code}")
+    if clocks_note and BACKEND["kind"] == "darwin":
+        lines.append(
+            "note    time.monotonic() on Darwin is awake, not machine "
+            "(lid-close does not tick it)"
+        )
+    if lp.worldlines:
+        lines.append("worldlines  coordinate=machine   # on-CPU  ~ blocked  % runnable  Z host-sleep")
+        header = f"  {'pid':>6} {'τ':>8} {'γ':>6} {'phase':<16} {'comm':<18} "
+        lines.append(header + "line")
+        for w in lp.worldlines:
+            g = fmt_gamma(w.gamma)
+            lines.append(
+                f"  {w.pid:6d} {fmt_secs(w.proper):>8} {g:>6} {w.phase:<16} {_label(w.comm):<18} {w.glyphs}"
+            )
+    if sleep_overlaps(lp) and lp.end.sleeptime and lp.end.waketime:
+        last_sleep = abs(lp.end.waketime - lp.end.sleeptime)
+        ago = lp.end.wall - lp.end.waketime
+        lines.append(
+            f"last-sleep {fmt_secs(last_sleep)}  woke {fmt_secs(max(ago, 0))} ago"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_porcelain(lp: Lapse) -> str:
+    rows = [
+        ("clock", "wall", f"{lp.wall:.6f}"),
+        ("clock", "machine", f"{lp.machine:.6f}"),
+        ("clock", "awake", f"{lp.awake:.6f}"),
+        ("clock", "sleep", f"{lp.sleep:.6f}"),
+        ("clock", "ntp", f"{lp.ntp:.6f}"),
+        ("clock", "proper", f"{lp.proper:.6f}"),
+        ("clock", "gamma", f"{lp.gamma:.6f}"),
+        ("clock", "leader_cpu", f"{lp.leader_cpu:.6f}"),
+        ("clock", "sampled_cpu", f"{lp.sampled_cpu:.6f}"),
+        ("meta", "backend", BACKEND["kind"]),
+        ("meta", "machine_clock", BACKEND["machine_name"]),
+        ("meta", "awake_clock", BACKEND["awake_name"]),
+        ("meta", "python_monotonic", BACKEND["python_monotonic"]),
+        ("meta", "kind", lp.kind),
+        ("meta", "pids", str(lp.n_pids)),
+        ("meta", "samples", str(lp.n_samples)),
+        ("meta", "exit", str(lp.exit_code if lp.exit_code is not None else "")),
+        ("verdict", "primary", lp.primary()),
+        ("verdict", "tags", " ".join(lp.tags())),
+    ]
+    out = [f"{a}\t{b}\t{c}" for a, b, c in rows]
+    for w in lp.worldlines:
+        out.append(
+            f"line\t{w.pid}\t{_label(w.comm)}\t{w.proper:.6f}\t{w.gamma:.6f}\t{w.phase}\t{w.glyphs}\t{w.starved}"
+        )
+    return "\n".join(out) + "\n"
+
+
+def format_json(lp: Lapse) -> str:
+    payload = {
+        "version": VERSION,
+        "backend": BACKEND,
+        "argv": lp.argv,
+        "kind": lp.kind,
+        "exit_code": lp.exit_code,
+        "start": lp.start.to_json(),
+        "end": lp.end.to_json(),
+        "clock": {
+            "wall": lp.wall,
+            "machine": lp.machine,
+            "awake": lp.awake,
+            "sleep": lp.sleep,
+            "ntp": lp.ntp,
+            "proper": lp.proper,
+            "gamma": lp.gamma,
+            "leader_cpu": lp.leader_cpu,
+            "sampled_cpu": lp.sampled_cpu,
+        },
+        "verdict": {"primary": lp.primary(), "tags": lp.tags(), "reason": reason_text(lp)},
+        "worldlines": [
+            {
+                "pid": w.pid,
+                "ppid": w.ppid,
+                "comm": w.comm,
+                "label": _label(w.comm),
+                "proper": w.proper,
+                "coordinate": w.coordinate,
+                "gamma": w.gamma,
+                "glyphs": w.glyphs,
+                "phase": w.phase,
+                "starved": w.starved,
+                "mean_pcpu": w.mean_pcpu,
+            }
+            for w in lp.worldlines
+        ],
+        "n_pids": lp.n_pids,
+        "n_samples": lp.n_samples,
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def format_clocks(c: Cut) -> str:
+    sleep_since_boot = c.machine - c.awake
+    ntp_vs_boot = None
+    if c.boottime is not None:
+        ntp_vs_boot = (c.wall - c.boottime) - c.machine
+    lines = [
+        f"cut     backend={BACKEND['kind']}",
+        f"  wall              {c.wall:.9f}   CLOCK_REALTIME",
+        f"  machine           {c.machine:.9f}   {BACKEND['machine_name']}",
+        f"  awake             {c.awake:.9f}   {BACKEND['awake_name']}",
+        f"  python.monotonic  {c.python_monotonic:.9f}   mapped-to {BACKEND['python_monotonic']}",
+        f"  proc-cpu          {c.proc_cpu:.9f}   this process",
+        f"  sleep-since-boot  {fmt_secs(sleep_since_boot)}",
+    ]
+    if c.boottime is not None:
+        lines.append(f"  kern.boottime     {c.boottime:.6f}")
+    if ntp_vs_boot is not None:
+        lines.append(f"  ntp-since-boot    {fmt_secs(ntp_vs_boot, signed=True)}")
+    if c.sleeptime is not None:
+        lines.append(f"  kern.sleeptime    {c.sleeptime:.6f}")
+    if c.waketime is not None:
+        lines.append(f"  kern.waketime     {c.waketime:.6f}")
+    delta_pm = abs(c.python_monotonic - c.awake)
+    delta_wrong = abs(c.python_monotonic - c.machine)
+    lines.append(
+        f"  monotonic-vs-awake    {delta_pm:.6f}s"
+        + ("" if delta_pm < 0.05 else "  (unexpected)")
+    )
+    lines.append(
+        f"  monotonic-vs-machine  {delta_wrong:.6f}s"
+        + ("  (python monotonic is NOT the sleep-running clock)" if delta_wrong > 1 else "")
+    )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+class Fail(Exception):
+    pass
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise Fail(msg)
+
+
+def selftest() -> int:
+    n = 0
+
+    def check(name: str, fn) -> None:
+        nonlocal n
+        fn()
+        n += 1
+        print(f"PASS  {name}")
+
+    def test_parse() -> None:
+        _assert(abs(parse_ps_time("0:00.12") - 0.12) < 1e-9, "hundredths")
+        _assert(abs(parse_ps_time("1:02.03") - 62.03) < 1e-9, "mm:ss.ss")
+        _assert(abs(parse_ps_time("292:01.61") - (292 * 60 + 1.61)) < 1e-9, "fat mm")
+        _assert(abs(parse_ps_time("1:00:00") - 3600) < 1e-9, "hh:mm:ss")
+        _assert(abs(parse_ps_time("22-14:55:38") - (22 * 86400 + 14 * 3600 + 55 * 60 + 38)) < 1e-9, "dd-hh")
+        _assert(abs(parse_ps_time("00:39") - 39) < 1e-9, "etime mm:ss")
+
+    def test_backend() -> None:
+        c = cut_now()
+        _assert(c.wall > 1_000_000_000, "wall is unix epoch")
+        _assert(c.machine >= c.awake - 0.01, "machine includes sleep so >= awake")
+        if BACKEND["kind"] == "darwin":
+            _assert(abs(c.python_monotonic - c.awake) < 0.05, "python monotonic == awake on Darwin")
+            _assert(c.machine - c.awake > 1.0, "this host has slept since boot")
+
+    def test_synthetic() -> None:
+        base = Cut(wall=1000, machine=100, awake=80, python_monotonic=80, proc_cpu=0)
+
+        sleep = lapse_from_cuts(
+            base,
+            Cut(wall=1010, machine=110, awake=81, python_monotonic=81, proc_cpu=0),
+            proper=0.2,
+        )
+        _assert("SLEEP" in sleep.tags(), f"sleep tags {sleep.tags()}")
+        _assert(abs(sleep.sleep - 9) < 1e-9, "sleep=9")
+
+        step = lapse_from_cuts(
+            base,
+            Cut(wall=1005, machine=101, awake=81, python_monotonic=81, proc_cpu=0),
+            proper=0.5,
+        )
+        _assert("STEP" in step.tags(), f"step tags {step.tags()}")
+        _assert(abs(step.ntp - 4) < 1e-9, "ntp=4")
+
+        dil = lapse_from_cuts(
+            base,
+            Cut(wall=1002, machine=102, awake=82, python_monotonic=82, proc_cpu=0),
+            proper=0.01,
+        )
+        _assert(dil.primary() == "DILATE", f"dilate got {dil.primary()} {dil.tags()}")
+
+        boost = lapse_from_cuts(
+            base,
+            Cut(wall=1001, machine=101, awake=81, python_monotonic=81, proc_cpu=0),
+            proper=4.0,
+        )
+        _assert(boost.primary() == "BOOST", f"boost got {boost.primary()} {boost.tags()}")
+        _assert(boost.proper / boost.awake > 1.15, "parallel ratio")
+
+        rest = lapse_from_cuts(
+            base,
+            Cut(wall=1000.5, machine=100.5, awake=80.5, python_monotonic=80.5, proc_cpu=0),
+            proper=0.48,
+        )
+        _assert(rest.primary() == "REST", f"rest got {rest.primary()} γ={rest.gamma}")
+
+        # 7.5s NTP wander over 22 days is slew, not STEP.
+        long_host = lapse_from_cuts(
+            Cut(wall=0, machine=0, awake=0, python_monotonic=0, proc_cpu=0),
+            Cut(wall=22 * 86400 - 7.5, machine=22 * 86400, awake=21 * 86400, python_monotonic=21 * 86400, proc_cpu=0),
+            proper=21 * 86400,
+            kind="machine",
+        )
+        _assert("SLEEP" in long_host.tags(), f"long host {long_host.tags()}")
+        _assert("STEP" not in long_host.tags(), f"slew must not be STEP: ntp={long_host.ntp} min={step_min(long_host.machine)}")
+        _assert("REST" not in long_host.tags(), "machine must not use process REST")
+
+        _assert(abs(step_min(1.0) - STEP_MIN) < 1e-12, "short interval uses absolute floor")
+        _assert(step_min(22 * 86400) > 50, "long interval scales")
+        _assert(phase_of("%---##---~~--z--") == "runq→run→block", f"phase {phase_of('%---##---~~--z--')}")
+
+    def test_live_block() -> None:
+        here = os.path.dirname(os.path.abspath(__file__)) or "."
+        script = os.path.join(here, "fixtures", "block.py")
+        lp = run_command(
+            [sys.executable, script, "0.35"], hz=25, width=40, stdout=subprocess.DEVNULL
+        )
+        _assert(lp.primary() == "DILATE" or "DILATE" in lp.tags(), f"block verdict {lp.tags()} γ={lp.gamma}")
+        _assert(lp.gamma >= 5, f"sleep should dilate, γ={lp.gamma} proper={lp.proper}")
+        _assert(lp.sleep < 0.2, f"host should not have slept, sleep={lp.sleep}")
+        _assert(abs(lp.ntp) < 0.2, f"no ntp step, ntp={lp.ntp}")
+        _assert(lp.awake >= 0.25, f"awake={lp.awake}")
+        _assert("STARVE" not in lp.tags(), f"sleep is blocked, not starved: {lp.tags()}")
+        _assert("last-sleep" not in format_human(lp), "last lid-close must not leak onto a 0.35s command")
+
+    def test_live_busy() -> None:
+        here = os.path.dirname(os.path.abspath(__file__)) or "."
+        script = os.path.join(here, "fixtures", "busy.py")
+        lp = run_command(
+            [sys.executable, script, "0.30"], hz=25, width=40, stdout=subprocess.DEVNULL
+        )
+        _assert(lp.proper >= 0.12, f"busy proper={lp.proper}")
+        _assert(lp.gamma < 4.0, f"busy should age, γ={lp.gamma} tags={lp.tags()}")
+        _assert("SLEEP" not in lp.tags(), "busy must not report SLEEP")
+        _assert("STEP" not in lp.tags(), "busy must not report STEP")
+        _assert("STARVE" not in lp.tags(), f"busy is on-CPU, not starve: {lp.tags()} proper={lp.proper}")
+        _assert(lp.primary() in ("REST", "BOOST"), f"busy primary {lp.primary()} γ={lp.gamma}")
+
+    def test_live_parallel() -> None:
+        here = os.path.dirname(os.path.abspath(__file__)) or "."
+        script = os.path.join(here, "fixtures", "parallel.py")
+        lp = run_command(
+            [sys.executable, script, "3", "0.28"], hz=25, width=40, stdout=subprocess.DEVNULL
+        )
+        _assert(lp.n_pids >= 3, f"expected parent+3 children, pids={lp.n_pids}")
+        # Loaded hosts may serialize; BOOST is the intent, multi-pid is the floor.
+        if lp.proper / max(lp.awake, EPS) < 1.15:
+            print(
+                f"WARN  parallel ratio {lp.proper / max(lp.awake, EPS):.2f} "
+                f"(proper={lp.proper:.3f} awake={lp.awake:.3f}); host may be busy"
+            )
+        else:
+            _assert("BOOST" in lp.tags(), f"parallel tags {lp.tags()}")
+
+    def test_machine() -> None:
+        lp = machine_lapse()
+        _assert(lp.awake > 60, f"uptime {lp.awake}")
+        _assert(lp.machine + 0.01 >= lp.awake, "machine >= awake")
+        _assert(lp.sleep >= -0.01, "sleep not negative")
+        # proper of the machine *is* awake time, so γ = machine/awake ≥ 1
+        _assert(lp.gamma >= 0.99, f"machine γ={lp.gamma}")
+        _assert(lp.kind == "machine", "kind")
+        _assert("REST" not in lp.tags(), f"machine tags {lp.tags()}")
+        _assert("STEP" not in lp.tags() or abs(lp.ntp) >= step_min(lp.machine), "scaled STEP")
+        if lp.sleep >= SLEEP_MIN:
+            _assert(lp.primary() in ("SLEEP", "STEP"), f"sleeping host primary {lp.primary()}")
+
+    def test_live_mix() -> None:
+        here = os.path.dirname(os.path.abspath(__file__)) or "."
+        script = os.path.join(here, "fixtures", "mix.py")
+        lp = run_command(
+            [sys.executable, script, "0.18", "0.25"], hz=30, width=40, stdout=subprocess.DEVNULL
+        )
+        phases = {w.phase for w in lp.worldlines}
+        joined = " ".join(phases)
+        _assert(
+            any("run" in p and "block" in p for p in phases),
+            f"mix worldline should age then freeze, phases={phases} glyphs={[w.glyphs for w in lp.worldlines]}",
+        )
+        _assert("STARVE" not in lp.tags(), f"mix starve false-positive {lp.tags()} {joined}")
+
+    check("parse_ps_time", test_parse)
+    check("backend cut", test_backend)
+    check("synthetic STEP/SLEEP/DILATE/BOOST/REST", test_synthetic)
+    check("live block → DILATE", test_live_block)
+    check("live busy → ages", test_live_busy)
+    check("live parallel tree", test_live_parallel)
+    check("live mix phases", test_live_mix)
+    check("machine since boot", test_machine)
+    print(f"selftest {n}/{n} passed  backend={BACKEND['kind']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+USAGE = """lapse — a duration is a disagreement between clocks
+
+Usage:
+  lapse [--json|--porcelain] [--hz N] [--width N] [--] COMMAND...
+  lapse machine
+  lapse clocks
+  lapse selftest
+
+A lapse is two clock-cuts. Clocks that should have advanced together and
+did not get a name: STEP (NTP), SLEEP (host suspend), DILATE (tree aged
+little), BOOST (tree aged faster than the host, i.e. parallel), STARVE
+(runnable but not scheduled), REST (serial on-CPU).
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="lapse", add_help=False, usage=USAGE)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--hz", type=float, default=25.0)
+    p.add_argument("--width", type=int, default=48)
+    p.add_argument("--version", action="store_true")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    return p.parse_args(argv)
+
+
+def emit(lp: Lapse, ns: argparse.Namespace, stream) -> None:
+    if ns.json:
+        stream.write(format_json(lp))
+    elif ns.porcelain:
+        stream.write(format_porcelain(lp))
+    else:
+        stream.write(format_human(lp, width=ns.width))
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ns = parse_args(argv)
+    if ns.help:
+        print(USAGE)
+        return 0
+    if ns.version:
+        print(f"lapse {VERSION} backend={BACKEND['kind']}")
+        return 0
+    rest = list(ns.rest)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if not rest:
+        print(USAGE)
+        sys.stderr.write(format_clocks(cut_now()))
+        return 2
+
+    cmd = rest[0]
+    if cmd == "selftest":
+        try:
+            return selftest()
+        except Fail as e:
+            print(f"FAIL  {e}", file=sys.stderr)
+            return 1
+    if cmd == "clocks":
+        sys.stdout.write(format_clocks(cut_now()))
+        return 0
+    if cmd == "machine":
+        emit(machine_lapse(), ns, sys.stdout)
+        return 0
+
+    lp = run_command(rest, hz=ns.hz, width=ns.width)
+    emit(lp, ns, sys.stderr)
+    return int(lp.exit_code or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

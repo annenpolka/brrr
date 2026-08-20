@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""slip — relocate stale file:line addresses between two codebase snapshots."""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PY_TB_RE = re.compile(
+    r"""File\s+(?P<q>["'])(?P<path>.*?)(?P=q),\s+line\s+(?P<line>\d+)""",
+    re.IGNORECASE,
+)
+COLON_NUM_RE = re.compile(r":(\d+)(?::(\d+))?")
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "class",
+    "const",
+    "crate",
+    "def",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "i",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "int",
+    "let",
+    "mod",
+    "mut",
+    "n",
+    "none",
+    "not",
+    "of",
+    "or",
+    "pub",
+    "return",
+    "self",
+    "static",
+    "str",
+    "struct",
+    "t",
+    "the",
+    "this",
+    "to",
+    "true",
+    "type",
+    "use",
+    "var",
+    "void",
+    "where",
+    "with",
+}
+TRIVIAL_NORMS = {"", "{", "}", "};", "[", "]", "(", ")", "else", "else:", "pass", "break", "continue", "end", "end;", "//", "#", "*/", "/*"}
+
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+MAX_FILE_BYTES = 1_000_000
+
+
+@dataclass
+class Locator:
+    path: str
+    line: int
+    col: Optional[int] = None
+    ref: Optional[str] = None
+    span: Optional[tuple[int, int]] = None  # [start, end) in original text
+    form: str = "colon"  # colon | python
+    quote: str = '"'
+
+
+@dataclass
+class Resolution:
+    locator: Locator
+    status: str  # same|moved|edited|deleted|unresolved
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+    gap_path: Optional[str] = None
+    gap_line: Optional[int] = None
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def decode_bytes(data: bytes) -> Optional[str]:
+    if b"\x00" in data[:4096]:
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def load_git_paths(root: Path, ref: Optional[str]) -> list[str]:
+    if ref is None:
+        raw = git_ok(root, ["ls-files", "-z"])
+    else:
+        raw = git_ok(root, ["ls-tree", "-r", "--name-only", "-z", ref])
+    if raw is None:
+        return []
+    return [posix_rel(p) for p in raw.split("\0") if p and not should_skip_path(p)]
+
+
+def read_git_file(root: Path, ref: Optional[str], path: str) -> Optional[list[str]]:
+    if ref is None:
+        fp = root / path
+        try:
+            data = fp.read_bytes()
+        except OSError:
+            return None
+        text = decode_bytes(data)
+        if text is None:
+            return None
+        return split_lines(text)
+    try:
+        cp = git(root, ["show", f"{ref}:{path}"], check=True)
+    except subprocess.CalledProcessError:
+        return None
+    text = decode_bytes(cp.stdout)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def walk_dir_files(root: Path) -> Iterator[str]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield rel
+
+
+def read_dir_file(root: Path, path: str) -> Optional[list[str]]:
+    fp = root / path
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        return None
+    text = decode_bytes(data)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    untracked: bool,
+    label: str,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    if directory is not None:
+        for path in walk_dir_files(directory):
+            lines = read_dir_file(directory, path)
+            if lines is not None:
+                files[path] = lines
+        snap = Snapshot(label=label, files=files)
+        snap.index()
+        return snap
+    if git_root is None:
+        raise SystemExit("slip: not a git repository (use --repo or --from-dir/--to-dir)")
+    paths = load_git_paths(git_root, ref)
+    if ref is None and untracked:
+        extra = git_ok(git_root, ["ls-files", "-o", "--exclude-standard", "-z"]) or ""
+        for p in extra.split("\0"):
+            if p and not should_skip_path(p):
+                paths.append(posix_rel(p))
+    for path in paths:
+        lines = read_git_file(git_root, ref, path)
+        if lines is not None:
+            files[path] = lines
+    snap = Snapshot(label=label, files=files)
+    snap.index()
+    return snap
+
+
+def rename_map(root: Path, src_ref: Optional[str], dst_ref: Optional[str]) -> dict[str, str]:
+    """Best-effort path rename map from git (hint only)."""
+    if src_ref is None or dst_ref is None:
+        return {}
+    raw = git_ok(root, ["diff", "-M", "-C", "--name-status", "--diff-filter=R", src_ref, dst_ref])
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0].startswith("R"):
+            out[posix_rel(parts[1])] = posix_rel(parts[2])
+    return out
+
+
+def resolve_ref(root: Path, ref: str) -> Optional[str]:
+    raw = git_ok(root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    if raw is None:
+        raw = git_ok(root, ["rev-parse", "--verify", "--quiet", ref])
+    if raw is None:
+        return None
+    return raw.strip()
+
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    """Map a log path (absolute, ./prefixed, suffix) onto a snapshot path."""
+    p = raw.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = posix_rel(p)
+    known_set = known if isinstance(known, set) else set(known)
+    if p in known_set:
+        return p
+    best = None
+    for kp in known_set:
+        if p.endswith("/" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    return best
+
+
+def _boundary_ok(text: str, start: int, end: int) -> bool:
+    if start > 0 and text[start - 1] not in "/\\\"'({[< \t,:":
+        # allow the slash of an absolute prefix; reject mid-token matches
+        if text[start - 1].isalnum() or text[start - 1] in "._-":
+            return False
+    if end < len(text) and (text[end].isalnum() or text[end] in "._-"):
+        return False
+    return True
+
+
+def parse_arg_locator(
+    text: str,
+    git_root: Optional[Path],
+    known: Optional[Iterable[str]] = None,
+) -> Locator:
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        raise SystemExit(f"slip: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    ref = None
+    path = rest
+    known_set = set(known or ())
+    bound = bind_path(rest, known_set) if known_set else None
+    if bound:
+        path = bound
+    elif ":" in rest and git_root is not None:
+        # ref:path. The path may only exist *at that ref* (file split
+        # away from HEAD), so do not require it to be in `known`.
+        best = None  # (score, ref, path)
+        for i, ch in enumerate(rest):
+            if ch != ":":
+                continue
+            left, right = rest[:i], rest[i + 1 :]
+            if not left or not right:
+                continue
+            if not resolve_ref(git_root, left):
+                continue
+            b = bind_path(right, known_set) if known_set else None
+            score = 2 if b else 1
+            cand = b or posix_rel(right)
+            if best is None or score >= best[0]:
+                best = (score, left, cand)
+        if best:
+            ref, path = best[1], best[2]
+    path = posix_rel(path)
+    if not path:
+        raise SystemExit(f"slip: missing path in {text}")
+    return Locator(path=path, line=line, col=col, ref=ref)
+
+
+def find_stdin_locators(text: str, known: Iterable[str]) -> list[Locator]:
+    """Locate addresses by longest known path, then Python traceback grammar."""
+    known_list = list(known)
+    occupied: list[tuple[int, int]] = []
+    found: list[Locator] = []
+
+    def take(span: tuple[int, int]) -> bool:
+        s, e = span
+        for os, oe in occupied:
+            if not (e <= os or s >= oe):
+                return False
+        occupied.append(span)
+        return True
+
+    for m in PY_TB_RE.finditer(text):
+        bound = bind_path(m.group("path"), known_list)
+        if not bound:
+            continue
+        span = (m.start(), m.end())
+        if not take(span):
+            continue
+        found.append(
+            Locator(
+                path=bound,
+                line=int(m.group("line")),
+                span=span,
+                form="python",
+                quote=m.group("q"),
+            )
+        )
+
+    for path in known_list:
+        if not path:
+            continue
+        start = 0
+        while True:
+            i = text.find(path, start)
+            if i < 0:
+                break
+            j = i + len(path)
+            start = i + 1
+            if not _boundary_ok(text, i, j):
+                continue
+            m = COLON_NUM_RE.match(text, j)
+            if not m:
+                continue
+            span = (i, m.end())
+            if not take(span):
+                continue
+            col = int(m.group(2)) if m.group(2) else None
+            found.append(
+                Locator(
+                    path=path,
+                    line=int(m.group(1)),
+                    col=col,
+                    span=span,
+                    form="colon",
+                )
+            )
+
+    found.sort(key=lambda loc: loc.span[0] if loc.span else 0)
+    return found
+
+
+def path_score(src: str, dst: str) -> float:
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    score = 0.0
+    if s_base == d_base:
+        score += 0.55
+    s_stem, s_ext = os.path.splitext(src)
+    if dst.startswith(s_stem + "/") or f"/{os.path.basename(s_stem)}/" in f"/{dst}":
+        score += 0.35  # file split into a directory of the same stem
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.05
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.15 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def neighbor_score(src_lines: list[str], src_i: int, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    if ctx <= 0:
+        return 0.0
+    hits = 0
+    total = 0
+    for delta in range(-ctx, ctx + 1):
+        if delta == 0:
+            continue
+        sj = src_i + delta
+        if sj < 1 or sj > len(src_lines):
+            continue
+        sn = normalize(src_lines[sj - 1])
+        if sn in TRIVIAL_NORMS:
+            continue
+        total += 1
+        lo = max(1, dst_i - ctx)
+        hi = min(len(dst_lines), dst_i + ctx)
+        window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+        if sn in window:
+            hits += 1
+    if total == 0:
+        return 0.0
+    return hits / total
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta and not tb:
+        return 0.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def score_pair(
+    src_path: str,
+    src_lines: list[str],
+    src_i: int,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+) -> float:
+    sraw = src_lines[src_i - 1]
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_score(src_lines, src_i, dst_lines, dst_i, ctx)
+    ps = path_score(src_path, dst_path)
+    if sraw == draw:
+        # Exact copies must beat fuzzy neighbors. Same path → 1.0.
+        return min(1.0, 0.75 + 0.25 * ps + 0.05 * ns)
+    if normalize(sraw) == normalize(draw):
+        return min(1.0, 0.68 + 0.25 * ps + 0.07 * ns)
+    lr = line_ratio(sraw, draw)
+    ts = token_score(sraw, draw)
+    return W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps
+
+
+def candidates_for(src_path: str, src_lines: list[str], src_i: int, dst: Snapshot, renamed_to: Optional[str]) -> list[tuple[str, int]]:
+    raw = src_lines[src_i - 1]
+    n = normalize(raw)
+    toks = tokens(raw)
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(path, line)] = None
+
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    # Rarest tokens first.
+    ranked = sorted(set(toks), key=lambda t: (dst.token_df.get(t, 10**9), -len(t)))
+    for tok in ranked[:4]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+
+    preferred_paths = []
+    if src_path in dst.files:
+        preferred_paths.append(src_path)
+    if renamed_to and renamed_to in dst.files:
+        preferred_paths.append(renamed_to)
+    stem = os.path.splitext(src_path)[0]
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + os.path.basename(src_path)):
+            preferred_paths.append(p)
+    for p in preferred_paths:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(src_path: str, src_raw: str, dst_path: Optional[str], dst_raw: str, score: float) -> str:
+    if dst_path is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    if src_path == dst_path and normalize(src_raw) == normalize(dst_raw):
+        return "same"
+    if normalize(src_raw) == normalize(dst_raw) or line_ratio(src_raw, dst_raw) >= 0.96:
+        return "moved" if src_path != dst_path else "same"
+    return "edited"
+
+
+def describe_hole(
+    src_lines: list[str],
+    src_i: int,
+    dst: Snapshot,
+    ctx: int,
+) -> tuple[Optional[str], Optional[int], str]:
+    """Locate the surviving neighborhood of a deleted line."""
+    prev_hit: Optional[tuple[str, int]] = None
+    next_hit: Optional[tuple[str, int]] = None
+    reach = max(ctx * 4, 10)
+    for d in range(1, reach + 1):
+        if prev_hit is None:
+            j = src_i - d
+            if j >= 1:
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        prev_hit = locs[0]
+        if next_hit is None:
+            j = src_i + d
+            if j <= len(src_lines):
+                n = normalize(src_lines[j - 1])
+                if n not in TRIVIAL_NORMS:
+                    locs = dst.by_norm.get(n, [])
+                    if len(locs) == 1:
+                        next_hit = locs[0]
+        if prev_hit and next_hit:
+            break
+    if prev_hit and next_hit and prev_hit[0] == next_hit[0]:
+        lo, hi = sorted((prev_hit[1], next_hit[1]))
+        return prev_hit[0], min(hi, lo + 1), f"gap in {prev_hit[0]} between {lo} and {hi}"
+    if prev_hit and next_hit:
+        return (
+            next_hit[0],
+            next_hit[1],
+            f"last context at {prev_hit[0]}:{prev_hit[1]}; next context at {next_hit[0]}:{next_hit[1]}",
+        )
+    if prev_hit:
+        return prev_hit[0], prev_hit[1], f"last context at {prev_hit[0]}:{prev_hit[1]}"
+    if next_hit:
+        return next_hit[0], next_hit[1], f"next context at {next_hit[0]}:{next_hit[1]}"
+    return None, None, "no candidates"
+
+
+def resolve_locator(
+    loc: Locator,
+    src: Snapshot,
+    dst: Snapshot,
+    ctx: int,
+    renames: dict[str, str],
+    debug: bool,
+) -> Resolution:
+    src_lines = src.files.get(loc.path)
+    if src_lines is None:
+        # Try posix / basename salvage.
+        hits = [p for p in src.files if p == loc.path or p.endswith("/" + loc.path)]
+        if len(hits) == 1:
+            loc.path = hits[0]
+            src_lines = src.files[loc.path]
+        elif not hits:
+            return Resolution(locator=loc, status="unresolved", note="source path not in from-snapshot")
+        else:
+            return Resolution(locator=loc, status="unresolved", note="source path ambiguous")
+    if loc.line < 1 or loc.line > len(src_lines):
+        return Resolution(
+            locator=loc,
+            status="unresolved",
+            note=f"line {loc.line} out of range (file has {len(src_lines)} lines)",
+        )
+    src_raw = src_lines[loc.line - 1]
+    if normalize(src_raw) in TRIVIAL_NORMS:
+        return Resolution(locator=loc, status="unresolved", note="line is too trivial to fingerprint")
+
+    renamed_to = renames.get(loc.path)
+    cands = candidates_for(loc.path, src_lines, loc.line, dst, renamed_to)
+    best: Optional[tuple[float, str, int, str]] = None
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc = score_pair(loc.path, src_lines, loc.line, dpath, dlines, dline, ctx)
+        if best is None or sc > best[0]:
+            best = (sc, dpath, dline, dlines[dline - 1])
+    if debug and best:
+        print(
+            f"# debug {loc.path}:{loc.line} -> {best[1]}:{best[2]} score={best[0]:.3f} cands={len(cands)}",
+            file=sys.stderr,
+        )
+    if best is None:
+        gap_path, gap_line, note = describe_hole(src_lines, loc.line, dst, ctx)
+        return Resolution(
+            locator=loc,
+            status="deleted",
+            score=0.0,
+            note=note,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    sc, dpath, dline, draw = best
+    status = classify(loc.path, src_raw, dpath, draw, sc)
+    if status == "deleted":
+        gap_path, gap_line, note = describe_hole(src_lines, loc.line, dst, ctx)
+        if note == "no candidates":
+            note = "best candidate below threshold"
+        return Resolution(
+            locator=loc,
+            status="deleted",
+            dest_path=dpath,
+            dest_line=dline,
+            score=sc,
+            note=note,
+            dest_text=draw,
+            gap_path=gap_path,
+            gap_line=gap_line,
+        )
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    return Resolution(
+        locator=loc,
+        status=status,
+        dest_path=dpath,
+        dest_line=dline,
+        score=sc,
+        note=note,
+        dest_text=draw,
+    )
+
+
+def format_from(loc: Locator) -> str:
+    col = f":{loc.col}" if loc.col is not None else ""
+    return f"{loc.path}:{loc.line}{col}"
+
+
+def format_to(res: Resolution) -> str:
+    if res.dest_path is None or res.dest_line is None or res.status in {"deleted", "unresolved"}:
+        return "-"
+    col = f":{res.locator.col}" if res.locator.col is not None else ""
+    return f"{res.dest_path}:{res.dest_line}{col}"
+
+
+def replacement_text(res: Resolution) -> Optional[str]:
+    """Text that should replace the locator span in a log line."""
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    loc = res.locator
+    if loc.form == "python":
+        q = loc.quote or '"'
+        return f"File {q}{res.dest_path}{q}, line {res.dest_line}"
+    col = f":{loc.col}" if loc.col is not None else ""
+    return f"{res.dest_path}:{res.dest_line}{col}"
+
+
+def print_human(res: Resolution) -> None:
+    src = format_from(res.locator)
+    dst = format_to(res)
+    if res.status == "deleted":
+        dst = "(deleted)"
+    arrow = "→"
+    extra = f"  {res.note}" if res.note else ""
+    print(f"{src:40} {arrow} {dst:40} {res.status:11} {res.score:5.2f}{extra}")
+
+
+def print_porcelain(res: Resolution) -> None:
+    note = res.note.replace("\t", " ").replace("\n", " ")
+    print(f"{res.status}\t{format_from(res.locator)}\t{format_to(res)}\t{res.score:.3f}\t{note}")
+
+
+def print_json(res: Resolution) -> None:
+    obj = {
+        "from": {"path": res.locator.path, "line": res.locator.line, "col": res.locator.col, "ref": res.locator.ref},
+        "to": (
+            None
+            if res.dest_path is None or res.status in {"deleted", "unresolved"}
+            else {"path": res.dest_path, "line": res.dest_line, "col": res.locator.col}
+        ),
+        "status": res.status,
+        "score": round(res.score, 4),
+        "note": res.note,
+    }
+    if res.gap_path is not None:
+        obj["gap"] = {"path": res.gap_path, "line": res.gap_line}
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def rewrite_line(text: str, resolutions: list[Resolution]) -> str:
+    # Apply from the right so spans stay valid.
+    items = [res for res in resolutions if res.locator.span is not None]
+    items.sort(key=lambda r: r.locator.span[0], reverse=True)
+    out = text
+    for res in items:
+        start, end = res.locator.span
+        new = replacement_text(res)
+        if not new:
+            continue
+        out = out[:start] + new + out[end:]
+    return out
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="slip",
+        description="Relocate stale file:line addresses from one snapshot of a codebase onto another.",
+    )
+    p.add_argument("locations", nargs="*", help="path:line or ref:path:line (omit to filter stdin)")
+    p.add_argument("--from", dest="from_ref", default=None, help="source git ref (default: worktree)")
+    p.add_argument("--to", dest="to_ref", default=None, help="destination git ref (default: worktree)")
+    p.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory (skip git)")
+    p.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    p.add_argument("--repo", type=Path, default=None, help="git repository (default: discover from cwd)")
+    p.add_argument("--json", action="store_true", help="NDJSON output")
+    p.add_argument("--porcelain", action="store_true", help="TSV: status, from, to, score, note")
+    p.add_argument("--map", action="store_true", help="print mapping even when filtering stdin")
+    p.add_argument("--annotate", action="store_true", help="stdin: keep original text, append ' → newloc'")
+    p.add_argument("--strict", action="store_true", help="exit 1 if any locator is unresolved")
+    p.add_argument("--context", type=int, default=3, help="neighbor window used as anchors (default 3)")
+    p.add_argument("--untracked", action="store_true", help="include untracked files in worktree snapshots")
+    p.add_argument("--debug", action="store_true", help="print scorer traces to stderr")
+    p.add_argument("--version", action="version", version=f"slip {VERSION}")
+    return p
+
+
+def emit(res: Resolution, args: argparse.Namespace, default_human: bool) -> None:
+    if args.json:
+        print_json(res)
+    elif args.porcelain:
+        print_porcelain(res)
+    elif default_human or args.map:
+        print_human(res)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    cwd = Path.cwd()
+    git_root = None
+    if args.from_dir is None or args.to_dir is None:
+        start = args.repo if args.repo is not None else cwd
+        git_root = discover_repo(start)
+        if args.repo is not None:
+            git_root = args.repo.resolve()
+            if not (git_root / ".git").exists():
+                # allow worktree .git file
+                if not (git_root / ".git").is_file() and not (git_root / ".git").is_dir():
+                    print(f"slip: {git_root} is not a git repo", file=sys.stderr)
+                    return 2
+
+    src_ref = args.from_ref
+    dst_ref = args.to_ref
+    # Directory snapshots ignore refs.
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else src_ref,
+        directory=args.from_dir,
+        untracked=args.untracked,
+        label=str(args.from_dir or src_ref or "worktree"),
+    )
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else dst_ref,
+        directory=args.to_dir,
+        untracked=args.untracked,
+        label=str(args.to_dir or dst_ref or "worktree"),
+    )
+    renames: dict[str, str] = {}
+    if git_root is not None and args.from_dir is None and args.to_dir is None:
+        if src_ref and dst_ref:
+            renames = rename_map(git_root, src_ref, dst_ref)
+        elif src_ref:
+            renames = rename_map(git_root, src_ref, "HEAD")
+
+    locators: list[Locator] = []
+    stdin_mode = False
+    stdin_lines: list[str] = []
+    if args.locations:
+        for a in args.locations:
+            loc = parse_arg_locator(a, git_root, known=src.paths)
+            locators.append(loc)
+    else:
+        if sys.stdin.isatty():
+            build_parser().print_help()
+            return 2
+        stdin_mode = True
+        stdin_lines = sys.stdin.read().splitlines()
+        for line in stdin_lines:
+            locators.extend(find_stdin_locators(line, src.paths))
+
+    # Group stdin locators per line later; resolve uniquely by (path,line,col,span).
+    results: list[Resolution] = []
+    cache: dict[tuple[str, int], Resolution] = {}
+    for loc in locators:
+        key = (loc.path, loc.line)
+        if key in cache and loc.span is None:
+            results.append(cache[key])
+            continue
+        # A per-locator ref always overlays that file, even if the
+        # worktree still has the same path (typical after a split).
+        if loc.ref and git_root is not None:
+            lines = read_git_file(git_root, loc.ref, loc.path)
+            if lines is not None:
+                src.files[loc.path] = lines
+                src.index()
+        res = resolve_locator(loc, src, dst, args.context, renames, args.debug)
+        results.append(res)
+        cache[key] = res
+
+    unresolved = any(r.status == "unresolved" for r in results)
+
+    if stdin_mode and not args.map and not args.json and not args.porcelain:
+        # Rewrite each stdin line independently.
+        for line in stdin_lines:
+            locs = find_stdin_locators(line, src.paths)
+            line_res: list[Resolution] = []
+            for loc in locs:
+                key = (loc.path, loc.line)
+                base = cache.get(key)
+                if base is None:
+                    continue
+                r = Resolution(
+                    locator=Locator(
+                        path=base.locator.path,
+                        line=base.locator.line,
+                        col=loc.col,
+                        span=loc.span,
+                        form=loc.form,
+                        quote=loc.quote,
+                    ),
+                    status=base.status,
+                    dest_path=base.dest_path,
+                    dest_line=base.dest_line,
+                    score=base.score,
+                    note=base.note,
+                    dest_text=base.dest_text,
+                    gap_path=base.gap_path,
+                    gap_line=base.gap_line,
+                )
+                line_res.append(r)
+            if args.annotate:
+                extras = []
+                for r in line_res:
+                    dsts = format_to(r)
+                    if dsts != "-" and dsts != format_from(r.locator):
+                        extras.append(f"{format_from(r.locator)} → {dsts}")
+                    elif r.status in {"deleted", "unresolved"}:
+                        extras.append(f"{format_from(r.locator)} → {r.status}")
+                if extras:
+                    print(f"{line}  // slip: {', '.join(extras)}")
+                else:
+                    print(line)
+            else:
+                print(rewrite_line(line, line_res))
+    else:
+        default_human = not stdin_mode
+        seen = set()
+        for res in results:
+            key = (res.locator.path, res.locator.line, res.status, res.dest_path, res.dest_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            emit(res, args, default_human=default_human)
+
+    if args.strict and unresolved:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
+        print(f"slip: git failed: {err}", file=sys.stderr)
+        sys.exit(2)

@@ -1,0 +1,2307 @@
+#!/usr/bin/env python3
+"""preen — call-site relation to a default, constructed not signed.
+
+A slot with a default is not a value. Two calls that both result in 0.45
+are different objects: one omitted the argument (TACIT, rides a future
+default change) and one restated 0.45 (SHADOW, will not follow).
+
+Unfold reads the *constructed* nested default, not the type's init
+signature: PinProfile's `thresholds: Thresholds = Thresholds(driftDelay: 20)`
+inhabits OVERRIDE 20, not TACIT 15.
+
+Clap TACIT is an invocation that omitted `--flag`, not a command-shaped
+line. Comments and `.contains("kebab")` are not riders.
+
+    TACIT     omitted; inherits the current default
+    SHADOW    passed a literal equal to the default
+    OVERRIDE  passed a literal different from the default
+    BOUND     passed a non-literal (name, expression, collection)
+
+Diff mode names the blast of a default change:
+
+    BLAST   TACIT on a slot whose default moved (or was born)
+    FOSSIL  still passes the old default
+    PRE     already restates the new default
+    LOCK    passes some other literal
+    BOUND   passes an expression
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+VERSION = "0.2"
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "vendor",
+    ".build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "coverage",
+    ".next",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+}
+CODE_EXTS = {".swift", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs"}
+MAX_BYTES = 2_000_000
+
+SWIFT_MOD = (
+    r"(?:(?:public|private|internal|fileprivate|open|static|override|"
+    r"mutating|convenience|required|final|nonisolated|distributed)\s+)*"
+)
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+def role_of(path: str) -> str:
+    p = path.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    if (
+        "/test" in p
+        or "/spec" in p
+        or base.endswith("_test.py")
+        or base.endswith("_test.rs")
+        or ".test." in base
+        or base.endswith("tests.swift")
+        or base.endswith("tests.py")
+        or base.endswith("tests.rs")
+        or base.endswith("tests.ts")
+    ):
+        return "test"
+    if p.endswith(".md"):
+        return "docs"
+    return "prod"
+
+
+def relpath(path: str, root: str | None) -> str:
+    if root:
+        try:
+            return str(Path(path).resolve().relative_to(Path(root).resolve()))
+        except Exception:
+            pass
+    return path
+
+
+def is_literal(src: str) -> bool:
+    s = src.strip()
+    if not s:
+        return False
+    if s in {
+        "None",
+        "nil",
+        "true",
+        "false",
+        "True",
+        "False",
+        "null",
+        "undefined",
+        "()",
+        "[]",
+        "{}",
+        "[:] ",
+        "[:]",
+    }:
+        return True
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s):
+        return True
+    if re.fullmatch(r"\.[A-Za-z_][A-Za-z0-9_]*", s):
+        return True
+    if re.fullmatch(r'["\']([^"\'\\]|\\.)*["\']', s):
+        return True
+    # empty constructed default: Foo() / Foo{}
+    if re.fullmatch(rf"{IDENT}\s*\(\s*\)", s):
+        return True
+    if re.fullmatch(r"b['\"]([^\"'\\\\]|\\\\.)*['\"]", s):
+        return True
+    return False
+
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in {'"', "'"}:
+        return s[1:-1]
+    return s
+
+
+def values_equal(a: str, b: str) -> bool:
+    a = a.strip()
+    b = b.strip()
+    if a == b:
+        return True
+    if re.sub(r"\s+", "", a) == re.sub(r"\s+", "", b):
+        return True
+    try:
+        if float(a) == float(b):
+            return True
+    except ValueError:
+        pass
+    ua, ub = _unquote(a), _unquote(b)
+    if ua != a or ub != b:
+        if ua == ub:
+            return True
+        try:
+            if float(ua) == float(ub):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def ctor_name(default: str) -> str | None:
+    """If default looks like Foo() or Foo(...), return Foo."""
+    parsed = parse_constructed(default)
+    return parsed[0] if parsed else None
+
+
+def parse_constructed(
+    expr: str, typ: str | None = None
+) -> tuple[str, str] | None:
+    """Foo(...) or .init(...) → (ctor, inner args). .init uses typ."""
+    s = (expr or "").strip()
+    if not s:
+        return None
+    m = re.fullmatch(rf"({IDENT})\s*\((.*)\)", s, re.S)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.fullmatch(r"\.init\s*\((.*)\)", s, re.S)
+    if m and typ:
+        return typ, m.group(1)
+    return None
+
+
+def sniff_call_lang(inner: str) -> str:
+    for chunk in split_top(inner):
+        chunk = chunk.strip()
+        if re.match(rf"{IDENT}\s*:", chunk, re.S):
+            return "swift"
+        if re.match(rf"{IDENT}\s*=", chunk, re.S):
+            return "py"
+    return "swift"
+
+
+# ---------------------------------------------------------------------------
+# mask comments/strings so searches don't fire in them
+# ---------------------------------------------------------------------------
+
+def mask(src: str, lang: str) -> str:
+    n = len(src)
+    out = [" "] * n
+    i = 0
+    py = lang == "py"
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if ch == "\n":
+            out[i] = "\n"
+            i += 1
+            continue
+        # line comments
+        if ch == "#" and py:
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "/" and not py:
+            i += 2
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*" and not py:
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                if src[i] == "\n":
+                    out[i] = "\n"
+                i += 1
+            i = min(n, i + 2)
+            continue
+        # python triple quotes
+        if py and src[i : i + 3] in ('"""', "'''"):
+            q = src[i : i + 3]
+            i += 3
+            while i + 2 < n and src[i : i + 3] != q:
+                if src[i] == "\n":
+                    out[i] = "\n"
+                i += 1
+            i = min(n, i + 3)
+            continue
+        # rust raw strings r#"..."#
+        if lang == "rs" and ch == "r" and nxt in ('#', '"'):
+            j = i + 1
+            hashes = 0
+            while j < n and src[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and src[j] == '"':
+                i = j + 1
+                close = '"' + ("#" * hashes)
+                while i < n and src[i : i + len(close)] != close:
+                    if src[i] == "\n":
+                        out[i] = "\n"
+                    i += 1
+                i = min(n, i + len(close))
+                continue
+        if ch in ('"', "'", "`"):
+            q = ch
+            i += 1
+            while i < n:
+                if src[i] == "\n":
+                    out[i] = "\n"
+                    # unclosed single-line (python/swift) — stop at newline
+                    if q != "`" and lang in {"py", "swift"}:
+                        i += 1
+                        break
+                    i += 1
+                    continue
+                if src[i] == "\\" and lang != "swift":
+                    i += 2
+                    continue
+                if lang == "swift" and src[i] == "\\" and i + 1 < n and src[i + 1] != "(":
+                    i += 2
+                    continue
+                if src[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out[i] = ch
+        i += 1
+    return "".join(out)
+
+
+def line_at(src: str, idx: int) -> int:
+    return src.count("\n", 0, idx) + 1
+
+
+def match_paren(src: str, open_idx: int) -> int | None:
+    """Return index of closing paren, or None. Respects strings."""
+    n = len(src)
+    if open_idx >= n or src[open_idx] not in "([{":
+        return None
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack = [src[open_idx]]
+    i = open_idx + 1
+    while i < n:
+        ch = src[i]
+        if ch in "\"'`":
+            q = ch
+            i += 1
+            while i < n and src[i] != q:
+                if src[i] == "\\" and q != "`":
+                    i += 2
+                    continue
+                if src[i] == "\n" and q != "`":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "#" and stack[-1] != '"':
+            # only treat as comment if we are in python; harmless elsewhere
+            # inside ( ) of swift it would be wrong for #available
+            pass
+        if ch in pairs:
+            stack.append(ch)
+        elif ch in pairs.values():
+            if not stack or pairs.get(stack[-1]) != ch:
+                return None
+            stack.pop()
+            if not stack:
+                return i
+        i += 1
+    return None
+
+
+def split_top(inner: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch in "\"'`":
+            q = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                buf.append(inner[i])
+                if inner[i] == "\\" and q != "`":
+                    i += 1
+                    if i < n:
+                        buf.append(inner[i])
+                    i += 1
+                    continue
+                if inner[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        elif ch == "/" and i + 1 < n and inner[i + 1] == "/" and depth == 0:
+            while i < n and inner[i] != "\n":
+                i += 1
+            continue
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip() and p.strip() != ","]
+
+
+def strip_line_comment(chunk: str) -> str:
+    out = []
+    i = 0
+    n = len(chunk)
+    depth = 0
+    while i < n:
+        ch = chunk[i]
+        if ch in "\"'`":
+            q = ch
+            out.append(ch)
+            i += 1
+            while i < n and chunk[i] != q:
+                out.append(chunk[i])
+                if chunk[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(chunk[i])
+                i += 1
+            if i < n:
+                out.append(chunk[i])
+                i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "/" and i + 1 < n and chunk[i + 1] == "/" and depth == 0:
+            break
+        if ch == "#" and depth == 0:
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out).strip().rstrip(",").strip()
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Param:
+    name: str
+    default: str | None
+    index: int
+    typ: str | None = None
+
+
+@dataclass
+class Sig:
+    callee: str
+    params: list[Param]
+    path: str
+    line: int
+    lang: str
+    kind: str
+    open_idx: int = -1
+    flag: str | None = None  # clap long flag without dashes
+
+
+@dataclass
+class Call:
+    callee: str
+    # name -> raw source; omitted names are absent
+    passed: dict[str, str]
+    bound: set[str]
+    path: str
+    line: int
+    role: str
+
+
+@dataclass
+class Row:
+    verdict: str
+    role: str
+    callee: str
+    param: str
+    default: str
+    passed: str
+    path: str
+    line: int
+    why: str = ""  # BLAST/FOSSIL/PRE/LOCK/BOUND/ or empty
+
+
+# ---------------------------------------------------------------------------
+# signature extraction
+# ---------------------------------------------------------------------------
+
+def enclosing_type(prefix: str, lang: str) -> str | None:
+    if lang == "swift":
+        pat = rf"(?:struct|class|enum|actor|extension|protocol)\s+({IDENT})"
+    elif lang == "py":
+        pat = rf"class\s+({IDENT})"
+    elif lang == "rs":
+        pat = rf"(?:struct|enum|impl(?:\s*<[^>]*>)?)\s+({IDENT})"
+    else:
+        pat = rf"(?:class|interface|type|enum)\s+({IDENT})"
+    last = None
+    for m in re.finditer(pat, prefix):
+        last = m.group(1)
+    return last
+
+
+def enclosing_variant(prefix: str) -> str | None:
+    """Last Ident {{ before here — clap lives on enum variants, not the enum name."""
+    last = None
+    for m in re.finditer(rf"({IDENT})\s*\{{", prefix):
+        last = m.group(1)
+    if last in {
+        "enum",
+        "struct",
+        "impl",
+        "mod",
+        "match",
+        "if",
+        "else",
+        "for",
+        "while",
+        "unsafe",
+        "pub",
+    }:
+        return None
+    return last
+
+
+def parse_swift_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk)
+    if not chunk or chunk.startswith("@"):
+        # attributes like @escaping may prefix; keep going
+        chunk = re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s*)+", "", chunk).strip()
+    if not chunk:
+        return None
+    default = None
+    # split default at depth-0 '='
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    # name: Type   or  ext int: Type  or  _ int: Type
+    m = re.match(
+        rf"(?:({IDENT}|_)\s+)?({IDENT})\s*:\s*(.*)$",
+        chunk,
+        re.S,
+    )
+    if not m:
+        return None
+    ext, name, typ_src = m.group(1), m.group(2), m.group(3)
+    if ext and ext != "_" and name:
+        # external internal:  the *call* uses external label
+        call_name = ext
+    else:
+        call_name = name
+    if call_name == "_":
+        call_name = name
+    tm = re.match(rf"({IDENT})", (typ_src or "").strip())
+    typ = tm.group(1) if tm else None
+    return Param(name=call_name, default=default, index=index, typ=typ)
+
+
+def parse_py_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk).strip()
+    if not chunk:
+        return None
+    if chunk.startswith("**") or chunk.startswith("*"):
+        return None
+    if chunk in {"self", "cls", "/", "*"}:
+        return None
+    if chunk.startswith("/") or chunk == "*":
+        return None
+    default = None
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    # drop annotation
+    if ":" in chunk:
+        name = chunk.split(":", 1)[0].strip()
+    else:
+        name = chunk.strip()
+    if not re.fullmatch(IDENT, name) or name in {"self", "cls"}:
+        return None
+    return Param(name=name, default=default, index=index)
+
+
+def parse_ts_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk).strip()
+    if not chunk or chunk.startswith("..."):
+        return None
+    default = None
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    chunk = re.sub(r"[?:].*$", "", chunk).strip()
+    chunk = chunk.lstrip("{").strip()
+    if not re.fullmatch(IDENT, chunk):
+        return None
+    return Param(name=chunk, default=default, index=index)
+
+
+def parse_params(inner: str, lang: str) -> list[Param]:
+    out: list[Param] = []
+    idx = 0
+    for chunk in split_top(inner):
+        if lang == "swift":
+            p = parse_swift_param(chunk, idx)
+        elif lang == "py":
+            p = parse_py_param(chunk, idx)
+        else:
+            p = parse_ts_param(chunk, idx)
+        if p:
+            out.append(p)
+            idx += 1
+    return out
+
+
+def extract_swift_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pat = re.compile(
+        rf"{SWIFT_MOD}(func|init)\s*(?:<[^>\n]*>)?\s*({IDENT})?\s*\(",
+        re.M,
+    )
+    for m in pat.finditer(masked):
+        kind, name = m.group(1), m.group(2)
+        open_idx = m.end() - 1
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = parse_params(inner, "swift")
+        if kind == "init":
+            callee = enclosing_type(masked[: m.start()], "swift")
+            if not callee:
+                continue
+            skind = "init"
+        else:
+            callee = name
+            if not callee:
+                continue
+            skind = "func"
+        if not any(p.default is not None for p in params):
+            continue
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=params,
+                path=path,
+                line=line_at(src, m.start()),
+                lang="swift",
+                kind=skind,
+                open_idx=open_idx,
+            )
+        )
+    return sigs
+
+
+def extract_py_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pat = re.compile(rf"(?:async\s+)?def\s+({IDENT})\s*\(", re.M)
+    for m in pat.finditer(masked):
+        name = m.group(1)
+        open_idx = m.end() - 1
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = parse_params(inner, "py")
+        kind = "func"
+        callee = name
+        if name == "__init__":
+            cls = enclosing_type(masked[: m.start()], "py")
+            if not cls:
+                continue
+            callee = cls
+            kind = "init"
+        if not any(p.default is not None for p in params):
+            continue
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=params,
+                path=path,
+                line=line_at(src, m.start()),
+                lang="py",
+                kind=kind,
+                open_idx=open_idx,
+            )
+        )
+    # dataclass fields
+    for m in re.finditer(
+        rf"@dataclass(?:\([^)]*\))?\s*\nclass\s+({IDENT})\s*(?:\([^)]*\))?\s*:",
+        masked,
+    ):
+        cls = m.group(1)
+        # body: until next class/def at column 0
+        rest = src[m.end() :]
+        params: list[Param] = []
+        idx = 0
+        for line in rest.splitlines():
+            if re.match(r"^(class|def|async def)\b", line):
+                break
+            fm = re.match(
+                rf"\s+({IDENT})\s*:\s*[^=\n]+?=\s*(.+?)\s*$",
+                line,
+            )
+            if not fm:
+                continue
+            default = strip_line_comment(fm.group(2))
+            params.append(Param(name=fm.group(1), default=default, index=idx))
+            idx += 1
+        if params:
+            sigs.append(
+                Sig(
+                    callee=cls,
+                    params=params,
+                    path=path,
+                    line=line_at(src, m.start()),
+                    lang="py",
+                    kind="class",
+                )
+            )
+    return sigs
+
+
+def extract_ts_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pats = [
+        re.compile(rf"(?:export\s+)?(?:async\s+)?function\s+({IDENT})\s*(?:<[^>]*>)?\s*\("),
+        re.compile(rf"(?:export\s+)?(?:const|let|var)\s+({IDENT})\s*=\s*(?:async\s+)?(?:<[^>]*>)?\("),
+        re.compile(
+            rf"(?:(?:public|private|protected|static|async|readonly)\s+)*(constructor)\s*\("
+        ),
+        # class/object methods with a default, but not every ident(
+        re.compile(
+            rf"(?:(?:public|private|protected|static|async|readonly)\s+)+({IDENT})\s*(?:<[^>]*>)?\s*\("
+        ),
+    ]
+    seen_opens: set[int] = set()
+    for pat in pats:
+        for m in pat.finditer(masked):
+            open_idx = m.end() - 1
+            if open_idx in seen_opens:
+                continue
+            # constructor / method: skip control keywords
+            name = m.group(1)
+            if name in {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "catch",
+                "function",
+                "return",
+                "await",
+                "new",
+            }:
+                continue
+            close = match_paren(src, open_idx)
+            if close is None:
+                continue
+            inner = src[open_idx + 1 : close]
+            params = parse_params(inner, "ts")
+            if not any(p.default is not None for p in params):
+                continue
+            seen_opens.add(open_idx)
+            callee = name
+            kind = "func"
+            if name == "constructor":
+                cls = enclosing_type(masked[: m.start()], "ts")
+                if not cls:
+                    continue
+                callee = cls
+                kind = "init"
+            sigs.append(
+                Sig(
+                    callee=callee,
+                    params=params,
+                    path=path,
+                    line=line_at(src, m.start()),
+                    lang="ts",
+                    kind=kind,
+                    open_idx=open_idx,
+                )
+            )
+    return sigs
+
+
+def extract_clap_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    """Rust clap #[arg(default_value = ...)] field → a defaulted slot.
+
+    Structure is matched on the masked file (strings are spaces); the
+    default *value* is read from the original, because it lives in a string.
+    """
+    sigs: list[Sig] = []
+    pat = re.compile(
+        r"#\[arg\((.*?)\)\]\s*(?:pub\s+)?(" + IDENT + r")\s*:",
+        re.S,
+    )
+    for m in pat.finditer(masked):
+        orig = src[m.start() : m.end()]
+        field = m.group(2)
+        dm = re.search(
+            r'default_value(?:_t)?\s*=\s*("(?:\\.|[^"])*"|[A-Za-z0-9_.]+)',
+            orig,
+        )
+        if not dm:
+            continue
+        default = dm.group(1)
+        long_m = re.search(r'\blong\s*=\s*"([^"]+)"', orig)
+        flag = long_m.group(1) if long_m else field.replace("_", "-")
+        callee = enclosing_variant(masked[: m.start()]) or enclosing_type(
+            masked[: m.start()], "rs"
+        ) or field
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=[Param(name=field, default=default, index=0)],
+                path=path,
+                line=line_at(src, m.start()),
+                lang="rs",
+                kind="clap",
+                flag=flag,
+            )
+        )
+    return sigs
+
+
+def extract_sigs(src: str, path: str, lang: str) -> list[Sig]:
+    masked = mask(src, lang)
+    if lang == "swift":
+        return extract_swift_sigs(src, masked, path)
+    if lang == "py":
+        return extract_py_sigs(src, masked, path)
+    if lang == "rs":
+        return extract_clap_sigs(src, masked, path)
+    return extract_ts_sigs(src, masked, path)
+
+
+# ---------------------------------------------------------------------------
+# call extraction
+# ---------------------------------------------------------------------------
+
+def parse_call_args(inner: str, lang: str, params: list[Param]) -> tuple[dict[str, str], set[str]]:
+    """Return (passed, bound)."""
+    passed: dict[str, str] = {}
+    bound: set[str] = set()
+    chunks = split_top(inner)
+    positional_names = [p.name for p in params]
+    pos_i = 0
+    for chunk in chunks:
+        chunk = strip_line_comment(chunk)
+        if not chunk:
+            continue
+        # keyword: name: value  (swift) or name = value (py/ts)
+        kw = None
+        val = None
+        if lang == "swift":
+            m = re.match(rf"({IDENT})\s*:\s*(.*)$", chunk, re.S)
+            if m:
+                kw, val = m.group(1), m.group(2).strip()
+        else:
+            m = re.match(rf"({IDENT})\s*=\s*(.*)$", chunk, re.S)
+            if m:
+                kw, val = m.group(1), m.group(2).strip()
+        if kw is None:
+            # positional
+            if pos_i >= len(positional_names):
+                continue
+            # swift inits are labeled; a positional unlabeled arg is
+            # almost always a comment residue or type-cast, not a call.
+            if lang == "swift":
+                continue
+            kw = positional_names[pos_i]
+            val = chunk
+            pos_i += 1
+        else:
+            # keyword: consume this name; positional index skips past it
+            if kw in positional_names:
+                ni = positional_names.index(kw)
+                if ni >= pos_i:
+                    pos_i = ni + 1
+        passed[kw] = val
+        if not is_literal(val):
+            bound.add(kw)
+    return passed, bound
+
+
+def find_calls(
+    src: str,
+    path: str,
+    lang: str,
+    callees: set[str],
+    merged: dict[str, list[Param]],
+    sig_opens: set[int] | None = None,
+) -> list[Call]:
+    if not callees:
+        return []
+    masked = mask(src, lang)
+    names = sorted(callees, key=len, reverse=True)
+    # longest-first so PresenceArbiter wins over Arbiter if both exist
+    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\s*\(")
+    role = role_of(path)
+    calls: list[Call] = []
+    opens = sig_opens or set()
+    for m in pat.finditer(masked):
+        name = m.group(1)
+        open_idx = m.end() - 1
+        if open_idx in opens:
+            continue  # this paren belongs to the signature, not a call
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = merged.get(name, [])
+        passed, bound = parse_call_args(inner, lang, params)
+        # swift: require at least one labeled arg OR empty ()
+        # unlabeled-only was filtered; empty is a real call (Thresholds())
+        if lang == "swift" and inner.strip() and not passed:
+            continue
+        calls.append(
+            Call(
+                callee=name,
+                passed=passed,
+                bound=bound,
+                path=path,
+                line=line_at(src, m.start()),
+                role=role,
+            )
+        )
+    return calls
+
+
+def kebab(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "-", name).replace("_", "-").lower()
+
+
+def clap_bound_token(val: str) -> bool:
+    """Format/interpolation/path-expr tokens are BOUND, not OVERRIDE."""
+    if not val:
+        return True
+    if val[0] in "{$\\":
+        return True
+    if "{" in val or "}" in val or "$" in val:
+        return True
+    if val.endswith("\\n") or "\\n" in val:
+        return True
+    return False
+
+
+NEEDLE_BEFORE = re.compile(
+    r"(?:contains|starts_with|ends_with|find|matches!)\s*\("
+)
+
+
+def _decode_rust_string(body: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n:
+            nxt = body[i + 1]
+            if nxt == "\n":
+                i += 2
+                while i < n and body[i] in " \t":
+                    i += 1
+                continue
+            trans = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\"}
+            out.append(trans.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def iter_rs_strings(src: str) -> Iterator[tuple[int, str]]:
+    """Yield (start_index, decoded content) of Rust string literals. Skip comments."""
+    n = len(src)
+    i = 0
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                i += 1
+            i = min(n, i + 2)
+            continue
+        if ch == "r" and nxt in ("#", '"'):
+            j = i + 1
+            hashes = 0
+            while j < n and src[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and src[j] == '"':
+                start = j + 1
+                i = start
+                close = '"' + ("#" * hashes)
+                while i < n and src[i : i + len(close)] != close:
+                    i += 1
+                yield start, src[start:i]
+                i = min(n, i + len(close))
+                continue
+        if ch == '"':
+            start = i + 1
+            i += 1
+            body: list[str] = []
+            while i < n:
+                if src[i] == "\\":
+                    body.append(src[i : i + 2])
+                    i += 2
+                    continue
+                if src[i] == '"':
+                    break
+                body.append(src[i])
+                i += 1
+            yield start, _decode_rust_string("".join(body))
+            i = min(n, i + 1)
+            continue
+        i += 1
+
+
+def clap_payloads(content: str) -> list[str]:
+    """Whole string plus inner quoted argv (JSON command values)."""
+    out = [content]
+    for m in re.finditer(r'"((?:\\.|[^"\\])*)"', content):
+        inner = _decode_rust_string(m.group(1))
+        if inner and inner not in out:
+            out.append(inner)
+    return out
+
+
+def tokenize_cmd(s: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "\"'":
+            q = ch
+            i += 1
+            buf: list[str] = []
+            while i < n and s[i] != q:
+                if s[i] == "\\" and i + 1 < n:
+                    i += 1
+                    buf.append(s[i])
+                    i += 1
+                    continue
+                buf.append(s[i])
+                i += 1
+            if i < n:
+                i += 1
+            tok = "".join(buf).strip()
+            if tok:
+                tokens.append(tok)
+            continue
+        buf = []
+        while i < n and not s[i].isspace() and s[i] not in "\"'":
+            buf.append(s[i])
+            i += 1
+        tok = "".join(buf)
+        if tok.startswith("{") and "}" in tok:
+            tokens.append(tok)
+        elif tok.startswith("$"):
+            tokens.append(tok)
+        else:
+            tok = tok.strip("[],();:")
+            if tok:
+                tokens.append(tok)
+    return tokens
+
+
+def kebab_cmd_index(tokens: list[str], kb: str) -> int | None:
+    """Kebab as an invoked subcommand, not English and not --flag.
+
+    With flags: kebab followed by --flag / {interp} / $interp, anywhere
+    (shebang `{} hook-post-tool --agent cline` is an invoke at argv[2]).
+    Bare omit: kebab is the last token and has at most one predecessor
+    (`kizu hook-post-tool`, not `please run hook-post-tool`).
+    """
+    for i, t in enumerate(tokens):
+        raw = t.rstrip(",;")
+        base = raw.rsplit("/", 1)[-1]
+        if base != kb and raw != kb:
+            continue
+        if raw.startswith("-"):
+            continue
+        if i > 0 and tokens[i - 1].startswith("-"):
+            continue
+        rest = tokens[i + 1 :]
+        if rest and (
+            rest[0].startswith("-") or rest[0].startswith("{") or rest[0].startswith("$")
+        ):
+            return i
+        if not rest and i <= 1:
+            return i
+        return None
+    return None
+
+
+def flags_from_argv(argv: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if not t.startswith("--"):
+            i += 1
+            continue
+        body = t[2:]
+        if "=" in body:
+            k, v = body.split("=", 1)
+            out[k] = _unquote(v)
+            i += 1
+            continue
+        if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            out[body] = _unquote(argv[i + 1])
+            i += 2
+            continue
+        out[body] = ""
+        i += 1
+    return out
+
+
+def clap_call_from_flags(
+    sig: Sig, field: str, flag: str, parsed: dict[str, str], path: str, line: int, role: str
+) -> Call:
+    if flag not in parsed:
+        return Call(
+            callee=sig.callee, passed={}, bound=set(), path=path, line=line, role=role
+        )
+    val = parsed[flag]
+    if val.endswith("\\n") or val.endswith("\\t"):
+        val = val[:-2]
+    bound: set[str] = set()
+    if clap_bound_token(val):
+        passed_val = val
+        bound.add(field)
+    else:
+        passed_val = val if val.startswith(("'", '"')) else f'"{val}"'
+    return Call(
+        callee=sig.callee,
+        passed={field: passed_val},
+        bound=bound,
+        path=path,
+        line=line,
+        role=role,
+    )
+
+
+def find_clap_uses(src: str, path: str, flags: dict[str, list[Sig]]) -> list[Call]:
+    """Clap TACIT is an invocation that omitted --flag, not a command-shaped line."""
+    if not flags:
+        return []
+    role = role_of(path)
+    calls: list[Call] = []
+    kebabs: dict[str, list[tuple[str, str, Sig]]] = {}
+    for field, sigs in flags.items():
+        for sig in sigs:
+            flag = sig.flag or field.replace("_", "-")
+            kb = kebab(sig.callee)
+            kebabs.setdefault(kb, []).append((field, flag, sig))
+
+    for start, content in iter_rs_strings(src):
+        prefix = src[max(0, start - 80) : start]
+        is_needle = bool(NEEDLE_BEFORE.search(prefix))
+        line_no = line_at(src, start)
+        for payload in clap_payloads(content):
+            tokens = tokenize_cmd(payload)
+            if not tokens:
+                continue
+            for kb, items in kebabs.items():
+                idx = kebab_cmd_index(tokens, kb)
+                if idx is None:
+                    continue
+                argv = tokens[idx:]
+                parsed = flags_from_argv(argv)
+                for field, flag, sig in items:
+                    if is_needle and flag not in parsed:
+                        # .contains("kebab") is a mention, not an omitted-flag invoke
+                        continue
+                    calls.append(
+                        clap_call_from_flags(
+                            sig, field, flag, parsed, path, line_no, role
+                        )
+                    )
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# walk / git
+# ---------------------------------------------------------------------------
+
+def lang_of(path: str) -> str | None:
+    ext = Path(path).suffix.lower()
+    return {
+        ".swift": "swift",
+        ".py": "py",
+        ".ts": "ts",
+        ".tsx": "ts",
+        ".js": "ts",
+        ".jsx": "ts",
+        ".rs": "rs",
+    }.get(ext)
+
+
+def iter_files(root: Path) -> Iterator[Path]:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            if p.suffix.lower() in CODE_EXTS:
+                yield p
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def git(repo: str, *args: str) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"git {' '.join(args)} failed")
+    return r.stdout
+
+
+def git_ok(repo: str, *args: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def tree_files(repo: str, rev: str) -> list[str]:
+    out = git(repo, "ls-tree", "-r", "--name-only", rev)
+    files = []
+    for line in out.splitlines():
+        if Path(line).suffix.lower() in CODE_EXTS:
+            files.append(line)
+    return files
+
+
+def tree_text(repo: str, rev: str, path: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, "show", f"{rev}:{path}"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return None
+    if len(r.stdout) > MAX_BYTES:
+        return None
+    return r.stdout.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# harvest a tree
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Harvest:
+    sigs: list[Sig] = field(default_factory=list)
+    calls: list[Call] = field(default_factory=list)
+
+    def merged_params(self) -> dict[str, list[Param]]:
+        """Union of params per callee. A name is defaultable if any overload
+        gives it a default; required-only names stay required."""
+        order: dict[str, list[str]] = {}
+        defs: dict[tuple[str, str], str | None] = {}
+        types: dict[tuple[str, str], str | None] = {}
+        idx_of: dict[tuple[str, str], int] = {}
+        for s in self.sigs:
+            if s.callee not in order:
+                order[s.callee] = []
+            for p in s.params:
+                key = (s.callee, p.name)
+                if p.name not in order[s.callee]:
+                    order[s.callee].append(p.name)
+                    idx_of[key] = p.index
+                if key not in defs:
+                    defs[key] = p.default
+                elif defs[key] is None and p.default is not None:
+                    defs[key] = p.default
+                if key not in types and p.typ:
+                    types[key] = p.typ
+        merged: dict[str, list[Param]] = {}
+        for callee, names in order.items():
+            merged[callee] = [
+                Param(
+                    name=n,
+                    default=defs[(callee, n)],
+                    index=i,
+                    typ=types.get((callee, n)),
+                )
+                for i, n in enumerate(names)
+            ]
+        return merged
+
+
+def harvest_texts(items: list[tuple[str, str, str]]) -> Harvest:
+    """items: (path, src, lang)"""
+    h = Harvest()
+    for path, src, lang in items:
+        h.sigs.extend(extract_sigs(src, path, lang))
+    merged = h.merged_params()
+    callees = {s.callee for s in h.sigs if s.kind != "clap"}
+    clap_flags: dict[str, list[Sig]] = {}
+    sig_opens: dict[str, set[int]] = {}
+    for s in h.sigs:
+        if s.open_idx >= 0:
+            sig_opens.setdefault(s.path, set()).add(s.open_idx)
+        if s.kind == "clap" and s.params:
+            clap_flags.setdefault(s.params[0].name, []).append(s)
+    seen_call: set[tuple[str, str, int, tuple]] = set()
+    for path, src, lang in items:
+        if lang == "rs":
+            for c in find_clap_uses(src, path, clap_flags):
+                key = (c.callee, c.path, c.line, tuple(sorted(c.passed.items())))
+                if key in seen_call:
+                    continue
+                seen_call.add(key)
+                h.calls.append(c)
+            continue
+        for c in find_calls(
+            src, path, lang, callees, merged, sig_opens.get(path, set())
+        ):
+            key = (c.callee, c.path, c.line, tuple(sorted(c.passed.items())))
+            if key in seen_call:
+                continue
+            seen_call.add(key)
+            h.calls.append(c)
+    return h
+
+
+def harvest_root(root: Path) -> Harvest:
+    items: list[tuple[str, str, str]] = []
+    for p in iter_files(root):
+        lang = lang_of(str(p))
+        if not lang:
+            continue
+        src = read_text(p)
+        if src is None:
+            continue
+        items.append((str(p), src, lang))
+    return harvest_texts(items)
+
+
+def harvest_rev(repo: str, rev: str) -> Harvest:
+    items: list[tuple[str, str, str]] = []
+    for path in tree_files(repo, rev):
+        lang = lang_of(path)
+        if not lang:
+            continue
+        src = tree_text(repo, rev, path)
+        if src is None:
+            continue
+        items.append((path, src, lang))
+    return harvest_texts(items)
+
+
+# ---------------------------------------------------------------------------
+# classify
+# ---------------------------------------------------------------------------
+
+def classify_call(call: Call, params: list[Param]) -> list[Row]:
+    rows: list[Row] = []
+    defaultable = [p for p in params if p.default is not None]
+    for p in defaultable:
+        default = p.default or ""
+        if p.name not in call.passed:
+            verdict = "TACIT"
+            passed = "—"
+        elif p.name in call.bound:
+            verdict = "BOUND"
+            passed = call.passed[p.name]
+        elif values_equal(call.passed[p.name], default):
+            verdict = "SHADOW"
+            passed = call.passed[p.name]
+        else:
+            verdict = "OVERRIDE"
+            passed = call.passed[p.name]
+        rows.append(
+            Row(
+                verdict=verdict,
+                role=call.role,
+                callee=call.callee,
+                param=p.name,
+                default=default,
+                passed=passed,
+                path=call.path,
+                line=call.line,
+            )
+        )
+    return rows
+
+
+def _param_of(merged: dict[str, list[Param]], callee: str, name: str) -> Param | None:
+    for p in merged.get(callee, []):
+        if p.name == name:
+            return p
+    return None
+
+
+def unfold_rows(rows: list[Row], merged: dict[str, list[Param]]) -> list[Row]:
+    """Unfold a nested constructed default, not the ctor type signature.
+
+    PinProfile(..., thresholds: Thresholds = Thresholds(driftDelay: 20))
+    omitted → thresholds.driftDelay OVERRIDE 20, not TACIT 15.
+
+    Passing Thresholds(driftDelay: 15) is SHADOW of the nested slot
+    (filter `SessionProfile driftDelay` sees it), not only BOUND of the
+    outer token.
+    """
+    extra: list[Row] = []
+    for r in rows:
+        if "." in r.param:
+            continue
+        parent = _param_of(merged, r.callee, r.param)
+        typ = parent.typ if parent else None
+        if r.verdict == "TACIT":
+            expr = r.default
+        elif r.passed and r.passed != "—":
+            expr = r.passed
+        else:
+            continue
+        parsed = parse_constructed(expr, typ)
+        if not parsed:
+            continue
+        ctor, inner = parsed
+        if ctor not in merged:
+            continue
+        ctor_params = merged[ctor]
+        passed, bound = parse_call_args(inner, sniff_call_lang(inner), ctor_params)
+        for p in ctor_params:
+            if p.default is None:
+                continue
+            default = p.default or ""
+            if p.name not in passed:
+                verdict = "TACIT"
+                pval = "—"
+            elif p.name in bound:
+                verdict = "BOUND"
+                pval = passed[p.name]
+            elif values_equal(passed[p.name], default):
+                verdict = "SHADOW"
+                pval = passed[p.name]
+            else:
+                verdict = "OVERRIDE"
+                pval = passed[p.name]
+            extra.append(
+                Row(
+                    verdict=verdict,
+                    role=r.role,
+                    callee=r.callee,
+                    param=f"{r.param}.{p.name}",
+                    default=default,
+                    passed=pval,
+                    path=r.path,
+                    line=r.line,
+                )
+            )
+    return rows + extra
+
+
+def classify_harvest(h: Harvest, unfold: bool) -> list[Row]:
+    merged = h.merged_params()
+    rows: list[Row] = []
+    for c in h.calls:
+        params = merged.get(c.callee, [])
+        if not params:
+            continue
+        rows.extend(classify_call(c, params))
+    if unfold:
+        rows = unfold_rows(rows, merged)
+    return rows
+
+
+def pair_renames(old: list[Param], new: list[Param]) -> dict[str, str]:
+    """Map new-param-name → old-param-name when a defaulted slot kept its
+    position but changed identity (threshold → presentThreshold)."""
+    mapping: dict[str, str] = {}
+    old_by_i = {p.index: p for p in old}
+    new_names = {p.name for p in new}
+    old_names = {p.name for p in old}
+    for p in new:
+        if p.name in old_names:
+            mapping[p.name] = p.name
+            continue
+        cand = old_by_i.get(p.index)
+        if (
+            cand
+            and cand.name not in new_names
+            and cand.default is not None
+            and p.default is not None
+        ):
+            mapping[p.name] = cand.name
+    return mapping
+
+
+def diff_rows(
+    old_h: Harvest,
+    new_h: Harvest,
+    unfold: bool,
+) -> list[Row]:
+    old_m = old_h.merged_params()
+    new_m = new_h.merged_params()
+    rows = classify_harvest(new_h, unfold=unfold)
+    # defaults per (callee, param)
+    def defmap(m: dict[str, list[Param]]) -> dict[tuple[str, str], str | None]:
+        out: dict[tuple[str, str], str | None] = {}
+        for callee, params in m.items():
+            for p in params:
+                out[(callee, p.name)] = p.default
+        return out
+
+    old_d = defmap(old_m)
+    new_d = defmap(new_m)
+    rename: dict[tuple[str, str], str] = {}  # (callee, new_name) -> old_name
+    for callee, params in new_m.items():
+        if callee not in old_m:
+            continue
+        mapping = pair_renames(old_m[callee], params)
+        for new_n, old_n in mapping.items():
+            if new_n != old_n:
+                rename[(callee, new_n)] = old_n
+
+    tagged: list[Row] = []
+    for r in rows:
+        # unfold params: look at the leaf ctor? treat as nested; skip rename
+        key = (r.callee, r.param.split(".")[0] if "." in r.param else r.param)
+        # for unfolded, why follows the parent slot's default change only
+        # if the parent ctor default itself moved. Usually Thresholds() is stable.
+        param = r.param
+        leaf = param.split(".")[-1]
+        old_name = rename.get((r.callee, param), param)
+        if "." in param:
+            old_val = old_d.get((ctor_name(r.default) or "", leaf))
+            # unfolded: compare inner default across trees
+            parent = param.split(".")[0]
+            ctor = ctor_name(
+                next(
+                    (
+                        p.default
+                        for p in new_m.get(r.callee, [])
+                        if p.name == parent
+                    ),
+                    r.default,
+                )
+                or r.default
+            )
+            old_val = old_d.get((ctor or "", leaf)) if ctor else None
+            new_val = new_d.get((ctor or "", leaf)) if ctor else r.default
+        else:
+            old_val = old_d.get((r.callee, old_name))
+            if old_val is None and old_name != param:
+                old_val = old_d.get((r.callee, old_name))
+            new_val = new_d.get((r.callee, param))
+
+        changed = (old_val is not None and new_val is not None and not values_equal(str(old_val), str(new_val)))
+        born = old_val is None and new_val is not None
+        died = old_val is not None and new_val is None
+        if not (changed or born or died) and old_name == param:
+            continue  # stable slot: omit from diff view
+        why = ""
+        if r.verdict == "TACIT" and (changed or born):
+            why = "BLAST"
+        elif r.verdict in {"SHADOW", "OVERRIDE"} and old_val is not None and values_equal(r.passed, str(old_val)):
+            why = "FOSSIL"
+        elif r.verdict == "SHADOW" and (changed or born):
+            why = "PRE"
+        elif r.verdict == "OVERRIDE" and (changed or born):
+            why = "LOCK"
+        elif r.verdict == "BOUND" and (changed or born):
+            why = "BOUND"
+        elif died:
+            why = "DIED"
+        else:
+            why = "BLAST" if r.verdict == "TACIT" else r.verdict
+        rr = Row(**{**r.__dict__, "why": why})
+        if changed and old_val is not None:
+            rr.default = f"{old_val}→{new_val}"
+        tagged.append(rr)
+    return tagged
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def _needle_is_path(n: str) -> bool:
+    if "/" in n or n.startswith("."):
+        return True
+    lower = n.lower()
+    return any(lower.endswith(ext) for ext in CODE_EXTS)
+
+
+def filter_rows(rows: list[Row], needles: list[str], kinds: set[str], why: set[str]) -> list[Row]:
+    out = []
+    for r in rows:
+        if kinds and r.verdict not in kinds:
+            continue
+        if why and r.why not in why:
+            continue
+        ok = True
+        for n in needles:
+            nl = n.lower()
+            if _needle_is_path(n):
+                if nl not in r.path.lower():
+                    ok = False
+                    break
+            else:
+                if nl not in r.callee.lower() and nl not in r.param.lower():
+                    ok = False
+                    break
+        if not ok:
+            continue
+        out.append(r)
+    return out
+
+
+def emit_tsv(rows: list[Row], header: bool, diff: bool) -> None:
+    cols = ["verdict", "role", "callee", "param", "default", "passed", "file", "line"]
+    if diff:
+        cols = ["why"] + cols
+    if header:
+        print("\t".join(cols))
+    for r in rows:
+        rec = [
+            r.verdict,
+            r.role,
+            r.callee,
+            r.param,
+            r.default.replace("\t", " ").replace("\n", " "),
+            r.passed.replace("\t", " ").replace("\n", " "),
+            r.path,
+            str(r.line),
+        ]
+        if diff:
+            rec = [r.why or ""] + rec
+        print("\t".join(rec))
+
+
+def emit_json(rows: list[Row], diff: bool) -> None:
+    payload = []
+    for r in rows:
+        d = {
+            "verdict": r.verdict,
+            "role": r.role,
+            "callee": r.callee,
+            "param": r.param,
+            "default": r.default,
+            "passed": None if r.passed == "—" else r.passed,
+            "file": r.path,
+            "line": r.line,
+        }
+        if diff:
+            d["why"] = r.why
+        payload.append(d)
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def emit_summary(rows: list[Row], diff: bool) -> None:
+    from collections import Counter
+
+    if diff:
+        c = Counter(r.why for r in rows)
+        print("why\tcount")
+        for k in ("BLAST", "FOSSIL", "PRE", "LOCK", "BOUND", "DIED"):
+            if c[k]:
+                print(f"{k}\t{c[k]}")
+        # per-slot
+        slot: dict[tuple[str, str], Counter] = {}
+        for r in rows:
+            slot.setdefault((r.callee, r.param), Counter())[r.why] += 1
+        if slot:
+            print("callee\tparam\tBLAST\tFOSSIL\tPRE\tLOCK\tBOUND")
+            for (callee, param), cc in sorted(slot.items()):
+                print(
+                    f"{callee}\t{param}\t{cc['BLAST']}\t{cc['FOSSIL']}\t"
+                    f"{cc['PRE']}\t{cc['LOCK']}\t{cc['BOUND']}"
+                )
+        return
+    slot = {}
+    for r in rows:
+        key = (r.callee, r.param, r.default)
+        slot.setdefault(key, Counter())[r.verdict] += 1
+    print("callee\tparam\tdefault\tTACIT\tSHADOW\tOVERRIDE\tBOUND")
+    for (callee, param, default), cc in sorted(slot.items()):
+        print(
+            f"{callee}\t{param}\t{default.replace(chr(9), ' ')}\t"
+            f"{cc['TACIT']}\t{cc['SHADOW']}\t{cc['OVERRIDE']}\t{cc['BOUND']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+SWIFT_FIX = r"""
+public struct Thresholds {
+    public init(
+        driftDelay: Double = 15,
+        awayDelay: Double = 90
+    ) {
+        self.driftDelay = driftDelay
+        self.awayDelay = awayDelay
+    }
+    public let driftDelay: Double
+    public let awayDelay: Double
+}
+
+public final class PresenceArbiter {
+    public init(
+        sensors: [String],
+        presentThreshold: Double = 0.45,
+        absentThreshold: Double = 0.35,
+        emaAlpha: Double = 0.3,
+        frameProvider: String? = nil
+    ) {}
+}
+
+// comment residue must not be a call: PresenceArbiter(SitboneCore)
+public func seed() {
+    let a = PresenceArbiter(sensors: ["camera"])
+    let b = PresenceArbiter(sensors: ["camera"], presentThreshold: 0.45)
+    let c = PresenceArbiter(sensors: ["camera"], presentThreshold: 0.50, emaAlpha: 1.0)
+    let d = PresenceArbiter(sensors: list, frameProvider: provider)
+    let t = Thresholds()
+    let t2 = Thresholds(driftDelay: 15)
+    let t3 = Thresholds(driftDelay: 20)
+}
+
+public struct SessionProfile {
+    public init(
+        name: String,
+        colorHue: Double = 0.45,
+        thresholds: Thresholds = Thresholds()
+    ) {}
+}
+
+public func profiles() {
+    let p = SessionProfile(name: "coding")
+    let q = SessionProfile(name: "default", colorHue: 0.45)
+    let b = SessionProfile(name: "x", thresholds: Thresholds())
+    let c = SessionProfile(name: "y", thresholds: Thresholds(driftDelay: 15))
+    let d = SessionProfile(name: "z", thresholds: Thresholds(driftDelay: 20))
+}
+
+public struct PinProfile {
+    public init(name: String, thresholds: Thresholds = Thresholds(driftDelay: 20)) {}
+}
+
+public struct DotInit {
+    public init(name: String, thresholds: Thresholds = .init()) {}
+}
+
+public func nested() {
+    let e = PinProfile(name: "p")
+    let f = DotInit(name: "d")
+}
+
+public struct SensorReading {
+    public init(confidence: Double = 1.0) {}
+}
+
+public mutating func reopenUnit(id: String, returningToFinal: Bool = true) {}
+
+public func seedMore() {
+    let r = SensorReading()
+    reopenUnit(id: "x")
+    reopenUnit(id: "x", returningToFinal: true)
+}
+"""
+
+PY_FIX = '''
+def greet(name, greeting="hi", times=1):
+    return greeting * times
+
+class Box:
+    def __init__(self, width, height=10, label="box"):
+        self.width = width
+
+from dataclasses import dataclass
+
+@dataclass
+class Cfg:
+    timeout: int = 30
+    retries: int = 3
+
+def use():
+    greet("x")
+    greet("x", "yo")
+    greet("x", times=2)
+    Box(1)
+    Box(1, height=10)
+    Box(1, height=20, label="crate")
+    Cfg()
+    Cfg(timeout=30)
+    Cfg(timeout=5)
+'''
+
+RS_FIX = r'''
+use clap::{Parser, Subcommand};
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    HookPostTool {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+    HookStop {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+}
+
+fn examples() {
+    let cmd = "kizu hook-post-tool --agent claude-code";
+    let other = "kizu hook-stop --agent cursor";
+    let interp = format!("hook-post-tool --agent {agent_arg}");
+    let omit = "kizu hook-post-tool";
+    let continued = "kizu hook-post-tool \
+        --agent claude-code";
+    let quoted = "kizu hook-post-tool --agent \"claude-code\"";
+    let _ = "please run hook-post-tool";
+    let _ = cmd.contains("kizu hook-post-tool");
+    let _ = format!("#!/bin/sh\n{} hook-post-tool --agent cline\n", bin);
+    let _ = "pre-existing hook-post-tool must remain";
+    // comment: kizu hook-post-tool must not be TACIT
+}
+
+#[derive(Subcommand, Debug)]
+enum More {
+    HookNamed {
+        #[arg(long = "agent-id", default_value = "claude-code")]
+        agent: String,
+    },
+    Timeout {
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+}
+
+fn more() {
+    let _ = "kizu hook-named --agent-id claude-code";
+    let _ = "kizu timeout --timeout 30";
+}
+'''
+
+TS_FIX = r'''
+export function retry(fn: Function, attempts: number = 3, delay: number = 100) {
+  return fn();
+}
+retry(() => 1);
+retry(() => 1, 3);
+retry(() => 1, 5, 200);
+'''
+
+
+def _selftest() -> int:
+    import tempfile
+
+    fails: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            fails.append(name)
+            print(f"  FAIL {name} {detail}", file=sys.stderr)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "arbiter.swift").write_text(SWIFT_FIX)
+        (root / "box.py").write_text(PY_FIX)
+        (root / "cli.rs").write_text(RS_FIX)
+        (root / "retry.ts").write_text(TS_FIX)
+        h = harvest_root(root)
+        rows = classify_harvest(h, unfold=True)
+        def sel(callee, param, verdict=None):
+            out = [
+                r
+                for r in rows
+                if r.callee == callee and r.param == param and (verdict is None or r.verdict == verdict)
+            ]
+            return out
+
+        # swift TACIT omitted presentThreshold
+        check(
+            "swift tacit presentThreshold",
+            any(r.verdict == "TACIT" and r.line > 0 for r in sel("PresenceArbiter", "presentThreshold")),
+        )
+        # SHADOW restates 0.45
+        check(
+            "swift shadow presentThreshold 0.45",
+            any(r.verdict == "SHADOW" for r in sel("PresenceArbiter", "presentThreshold")),
+        )
+        # OVERRIDE 0.50
+        check(
+            "swift override presentThreshold 0.50",
+            any(r.verdict == "OVERRIDE" and "0.50" in r.passed for r in sel("PresenceArbiter", "presentThreshold")),
+        )
+        # BOUND frameProvider
+        check(
+            "swift bound frameProvider",
+            any(r.verdict == "BOUND" for r in sel("PresenceArbiter", "frameProvider")),
+        )
+        # comment residue is not a call
+        comment_hits = [
+            r
+            for r in rows
+            if r.callee == "PresenceArbiter" and "SitboneCore" in (r.passed or "")
+        ]
+        check("swift ignores comment residue", not comment_hits)
+        # Thresholds() all tacit
+        check(
+            "swift Thresholds() tacit driftDelay",
+            any(r.verdict == "TACIT" for r in sel("Thresholds", "driftDelay")),
+        )
+        check(
+            "swift Thresholds(driftDelay: 15) shadow",
+            any(r.verdict == "SHADOW" for r in sel("Thresholds", "driftDelay")),
+        )
+        check(
+            "swift Thresholds(driftDelay: 20) override",
+            any(r.verdict == "OVERRIDE" for r in sel("Thresholds", "driftDelay")),
+        )
+        # unfold SessionProfile → thresholds.driftDelay (constructed Thresholds() omits 15)
+        check(
+            "unfold SessionProfile.thresholds.driftDelay tacit",
+            any(
+                r.param == "thresholds.driftDelay" and r.verdict == "TACIT" and r.default.strip() == "15"
+                for r in rows
+                if r.callee == "SessionProfile"
+            ),
+        )
+        check(
+            "passed Thresholds(driftDelay: 15) is nested SHADOW",
+            any(
+                r.param == "thresholds.driftDelay" and r.verdict == "SHADOW" and "15" in r.passed
+                for r in rows
+                if r.callee == "SessionProfile"
+            ),
+        )
+        check(
+            "passed Thresholds(driftDelay: 20) is nested OVERRIDE",
+            any(
+                r.param == "thresholds.driftDelay" and r.verdict == "OVERRIDE" and "20" in r.passed
+                for r in rows
+                if r.callee == "SessionProfile"
+            ),
+        )
+        # constructed default ≠ signature default
+        check(
+            "PinProfile constructed Thresholds(driftDelay: 20) is OVERRIDE 20",
+            any(
+                r.param == "thresholds.driftDelay"
+                and r.verdict == "OVERRIDE"
+                and "20" in r.passed
+                and r.default.strip() == "15"
+                for r in rows
+                if r.callee == "PinProfile"
+            ),
+        )
+        check(
+            "PinProfile is not TACIT 15 of the type signature",
+            not any(
+                r.param == "thresholds.driftDelay" and r.verdict == "TACIT"
+                for r in rows
+                if r.callee == "PinProfile"
+            ),
+        )
+        check(
+            "DotInit .init() unfolds as Thresholds TACIT 15",
+            any(
+                r.param == "thresholds.driftDelay" and r.verdict == "TACIT" and r.default.strip() == "15"
+                for r in rows
+                if r.callee == "DotInit"
+            ),
+        )
+        check(
+            "shadow colorHue 0.45 on make-like call",
+            any(r.verdict == "SHADOW" for r in sel("SessionProfile", "colorHue")),
+        )
+        check(
+            "tacit colorHue on SessionProfile(name:)",
+            any(r.verdict == "TACIT" for r in sel("SessionProfile", "colorHue")),
+        )
+
+        # python
+        check("py greet tacit greeting", any(r.verdict == "TACIT" for r in sel("greet", "greeting")))
+        check("py greet override greeting", any(r.verdict == "OVERRIDE" for r in sel("greet", "greeting")))
+        check("py greet override times", any(r.verdict == "OVERRIDE" and r.passed.strip() == "2" for r in sel("greet", "times")))
+        check("py Box shadow height", any(r.verdict == "SHADOW" for r in sel("Box", "height")))
+        check("py Box override height", any(r.verdict == "OVERRIDE" for r in sel("Box", "height")))
+        check("py Cfg tacit timeout", any(r.verdict == "TACIT" for r in sel("Cfg", "timeout")))
+        check("py Cfg shadow timeout", any(r.verdict == "SHADOW" for r in sel("Cfg", "timeout")))
+        check("py Cfg override timeout", any(r.verdict == "OVERRIDE" for r in sel("Cfg", "timeout")))
+
+        # clap: two variants share --agent; bind by subcommand on the line
+        check(
+            "clap shadow claude-code on HookPostTool",
+            any(r.verdict == "SHADOW" for r in sel("HookPostTool", "agent")),
+        )
+        check(
+            "clap override cursor on HookStop not PostTool",
+            any(r.verdict == "OVERRIDE" and "cursor" in r.passed for r in sel("HookStop", "agent"))
+            and not any(r.verdict == "OVERRIDE" and "cursor" in r.passed for r in sel("HookPostTool", "agent")),
+        )
+        check(
+            "clap interpolation is BOUND",
+            any(r.verdict == "BOUND" for r in sel("HookPostTool", "agent")),
+        )
+        post_agent = sel("HookPostTool", "agent")
+        tacit_post = [r for r in post_agent if r.verdict == "TACIT"]
+        check(
+            "clap omit --agent is TACIT of the invocation",
+            len(tacit_post) == 1,
+        )
+        check(
+            "clap continued --agent is SHADOW not TACIT",
+            any(r.verdict == "SHADOW" for r in post_agent),
+        )
+        check(
+            "clap quoted --agent is SHADOW",
+            any(r.verdict == "SHADOW" for r in post_agent),
+        )
+        check(
+            "clap contains/prose kebab is not TACIT",
+            len(tacit_post) == 1,
+        )
+        check(
+            "clap shebang {} hook-post-tool --agent cline is OVERRIDE",
+            any(r.verdict == "OVERRIDE" and "cline" in r.passed for r in post_agent),
+        )
+        check(
+            "clap long= agent-id SHADOW HookNamed",
+            any(r.verdict == "SHADOW" for r in sel("HookNamed", "agent")),
+        )
+        check(
+            "clap --timeout is not a tacit timeout command",
+            not any(r.verdict == "TACIT" for r in sel("Timeout", "timeout"))
+            and any(r.verdict == "SHADOW" for r in sel("Timeout", "timeout")),
+        )
+
+        # signature is not a call (returningToFinal: Bool = true)
+        check(
+            "signature of reopenUnit is not a call",
+            not any("Bool" in r.passed for r in sel("reopenUnit", "returningToFinal")),
+        )
+        check(
+            "reopenUnit tacit at call site",
+            any(r.verdict == "TACIT" for r in sel("reopenUnit", "returningToFinal")),
+        )
+        check(
+            "reopenUnit shadow at call site",
+            any(r.verdict == "SHADOW" for r in sel("reopenUnit", "returningToFinal")),
+        )
+
+        # filter matches callee/param, not path (SensorReading lives in same file)
+        filtered = filter_rows(rows, ["PresenceArbiter"], set(), set())
+        check(
+            "filter PresenceArbiter ignores SensorReading in same file",
+            not any(r.callee == "SensorReading" for r in filtered)
+            and any(r.callee == "PresenceArbiter" for r in filtered),
+        )
+
+        # ts
+        check("ts retry tacit attempts", any(r.verdict == "TACIT" for r in sel("retry", "attempts")))
+        check("ts retry shadow attempts", any(r.verdict == "SHADOW" for r in sel("retry", "attempts")))
+        check("ts retry override attempts", any(r.verdict == "OVERRIDE" for r in sel("retry", "attempts")))
+
+        # diff: presentThreshold 0.45 → 0.50 should BLAST tacit callers
+        old = SWIFT_FIX
+        new = SWIFT_FIX.replace(
+            "presentThreshold: Double = 0.45",
+            "presentThreshold: Double = 0.50",
+        )
+        old_h = harvest_texts([("a.swift", old, "swift")])
+        new_h = harvest_texts([("a.swift", new, "swift")])
+        drows = diff_rows(old_h, new_h, unfold=True)
+        blast = [r for r in drows if r.why == "BLAST" and r.param == "presentThreshold"]
+        fossil = [
+            r
+            for r in drows
+            if r.why == "FOSSIL" and r.param == "presentThreshold"
+        ]
+        check("diff BLAST tacit riders", len(blast) >= 1)
+        check(
+            "diff FOSSIL restated 0.45",
+            any("0.45" in r.passed for r in fossil),
+        )
+
+        # rename threshold → presentThreshold at same index
+        old_r = """
+public final class PresenceArbiter {
+    public init(sensors: [String], threshold: Double = 0.4, emaAlpha: Double = 0.3) {}
+}
+public func seed() {
+    let a = PresenceArbiter(sensors: ["camera"])
+    let b = PresenceArbiter(sensors: ["camera"], threshold: 0.4)
+}
+"""
+        new_r = """
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45, emaAlpha: Double = 0.3) {}
+}
+public func seed() {
+    let a = PresenceArbiter(sensors: ["camera"])
+    let b = PresenceArbiter(sensors: ["camera"], presentThreshold: 0.4)
+}
+"""
+        d2 = diff_rows(
+            harvest_texts([("a.swift", old_r, "swift")]),
+            harvest_texts([("a.swift", new_r, "swift")]),
+            unfold=True,
+        )
+        check(
+            "rename BLAST tacit on presentThreshold",
+            any(r.why == "BLAST" and r.param == "presentThreshold" for r in d2),
+        )
+        check(
+            "rename FOSSIL still passes 0.4",
+            any(r.why == "FOSSIL" and r.param == "presentThreshold" for r in d2),
+        )
+
+    if fails:
+        print(f"selftest: {len(fails)} failed", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """preen — who rides a default, who restates it, who overrides it.
+
+  preen -C <tree> [filter...]
+  preen -C <tree> --summary [filter...]
+  preen -C <tree> --git OLD NEW [filter...]
+  preen --selftest
+
+Unfold uses the constructed nested default, not the type signature.
+Clap TACIT is an invocation that omitted --flag.
+
+Verdicts: TACIT (omitted) SHADOW (passed == default) OVERRIDE BOUND
+Diff why: BLAST (tacit on a moved default) FOSSIL (still the old literal)
+          PRE (already the new default) LOCK (other literal)
+
+Exit: 0 ok, 1 --check found TACIT/BLAST, 2 error.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="preen",
+        description="Call-site relation to a default (TACIT/SHADOW/OVERRIDE/BOUND).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP,
+    )
+    p.add_argument("-C", "--directory", default=".", help="tree to scan")
+    p.add_argument("--git", nargs="+", metavar="REV", help="compare signatures OLD NEW (NEW defaults to worktree)")
+    p.add_argument("--summary", action="store_true", help="counts per slot")
+    p.add_argument("--json", action="store_true", help="JSON array")
+    p.add_argument("--header", action="store_true", help="TSV header")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="include OVERRIDE and BOUND (default: TACIT+SHADOW)",
+    )
+    p.add_argument(
+        "--only",
+        default="",
+        help="comma verdicts (tacit,shadow,override,bound)",
+    )
+    p.add_argument("--why", default="", help="comma diff tags (blast,fossil,pre,lock,bound)")
+    p.add_argument("--no-unfold", action="store_true", help="do not expand Foo() defaults")
+    p.add_argument("--check", action="store_true", help="exit 1 if TACIT/BLAST remains")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("filter", nargs="*", help="AND substrings against callee/param/path")
+    return p.parse_args(argv)
+
+
+def kinds_from(ns: argparse.Namespace) -> set[str]:
+    if ns.only:
+        m = {
+            "tacit": "TACIT",
+            "shadow": "SHADOW",
+            "override": "OVERRIDE",
+            "bound": "BOUND",
+        }
+        out = set()
+        for part in ns.only.split(","):
+            part = part.strip().lower()
+            if part in m:
+                out.add(m[part])
+            else:
+                out.add(part.upper())
+        return out
+    if ns.all or ns.summary:
+        return set()
+    return {"TACIT", "SHADOW"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in {"selftest", "--self-test"}:
+        argv = ["--selftest"]
+    ns = parse_args(argv)
+    if ns.version:
+        print(f"preen {VERSION}")
+        return 0
+    if ns.selftest:
+        return _selftest()
+
+    root = str(Path(ns.directory).resolve())
+    unfold = not ns.no_unfold
+    diff_mode = False
+    try:
+        if ns.git is not None:
+            if len(ns.git) == 0:
+                print("preen: --git needs OLD [NEW]", file=sys.stderr)
+                return 2
+            old_rev = ns.git[0]
+            new_rev = ns.git[1] if len(ns.git) > 1 else None
+            old_h = harvest_rev(root, old_rev)
+            if new_rev:
+                new_h = harvest_rev(root, new_rev)
+            else:
+                new_h = harvest_root(Path(root))
+            rows = diff_rows(old_h, new_h, unfold=unfold)
+            diff_mode = True
+        else:
+            h = harvest_root(Path(root))
+            rows = classify_harvest(h, unfold=unfold)
+    except RuntimeError as e:
+        print(f"preen: {e}", file=sys.stderr)
+        return 2
+
+    # relativize paths
+    for r in rows:
+        r.path = relpath(r.path, root)
+
+    why = set()
+    if ns.why:
+        why = {w.strip().upper() for w in ns.why.split(",") if w.strip()}
+    kinds = kinds_from(ns)
+    rows = filter_rows(rows, ns.filter, kinds, why)
+    rows.sort(key=lambda r: (r.callee, r.param, r.path, r.line, r.verdict))
+
+    if ns.json:
+        emit_json(rows, diff_mode)
+    elif ns.summary:
+        emit_summary(rows, diff_mode)
+    else:
+        emit_tsv(rows, ns.header, diff_mode)
+
+    if ns.check:
+        if diff_mode:
+            if any(r.why == "BLAST" for r in rows):
+                return 1
+        elif any(r.verdict == "TACIT" for r in rows):
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

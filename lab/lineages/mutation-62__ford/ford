@@ -1,0 +1,2354 @@
+#!/usr/bin/env python3
+"""ford — occupancy of a merge is a join of parent statuses.
+
+held / roost / stead sample the merge SHA. A TRUE tree at a merge looks
+like birth even when one parent already held the predicate (kizu CLAUDE.md
+at 0ea3916 hiding e1098c8).
+
+ford's occupancy at a merge is the lattice of the *parent* statuses, not
+a boolean sample on the merge. Default meet (--all): TRUE iff every parent
+is TRUE (the merge preserves). --any: TRUE if any parent is TRUE (the
+merge introduces via a side). Statuses stay TRUE / FALSE / UNKNOWN /
+SHALLOW / EMPTY; a failed probe is not FALSE.
+
+git log --reverse is --list. Do not pretend it is the lattice.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from fnmatch import fnmatch
+from typing import Iterable, Optional, Sequence
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GLOB_CHARS = frozenset("*?[")
+TOOL = "ford"
+
+
+class FordError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class Status(str, Enum):
+    TRUE = "TRUE"
+    FALSE = "FALSE"
+    UNKNOWN = "UNKNOWN"
+    SHALLOW = "SHALLOW"
+    EMPTY = "EMPTY"
+
+
+# Presence chain. meet = inf, join = sup. A real lattice (total order).
+# FALSE: measured absence
+# SHALLOW: parent/history missing (unmeasured)
+# UNKNOWN: probe failed (timeout, regex, checkout)
+# EMPTY: occupied, not as text
+# TRUE: occupied as asked
+RANK = {
+    Status.FALSE: 0,
+    Status.SHALLOW: 1,
+    Status.UNKNOWN: 2,
+    Status.EMPTY: 3,
+    Status.TRUE: 4,
+}
+
+MEET_SYM = "⊓"
+JOIN_SYM = "⊔"
+NON_TF = frozenset({Status.UNKNOWN, Status.SHALLOW, Status.EMPTY})
+
+
+def meet(*xs: Status) -> Status:
+    if not xs:
+        return Status.FALSE
+    return min(xs, key=lambda s: RANK[s])
+
+
+def join(*xs: Status) -> Status:
+    if not xs:
+        return Status.FALSE
+    return max(xs, key=lambda s: RANK[s])
+
+
+def lattice_apply(op: str, xs: Sequence[Status]) -> Status:
+    if op == "any":
+        return join(*xs)
+    return meet(*xs)
+
+
+def lattice_symbol(op: str) -> str:
+    return JOIN_SYM if op == "any" else MEET_SYM
+
+
+@dataclass(frozen=True)
+class Sample:
+    sha: str
+    tree: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str = "commit"  # commit | worktree | index | empty
+    parents: tuple[str, ...] = ()
+
+    @property
+    def short(self) -> str:
+        if self.kind != "commit":
+            return self.sha
+        return self.sha[:7]
+
+
+@dataclass
+class ParentJoin:
+    sha: str
+    short: str
+    status: Status
+    subject: str
+    witnesses: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Probe:
+    status: Status
+    raw: Status
+    witnesses: list[str] = field(default_factory=list)
+    tree: Optional[Status] = None
+    is_merge: bool = False
+    is_ford: bool = False
+    ford_reason: str = ""  # disagree | tree | ""
+    join_op: Optional[str] = None
+    join_parents: list[ParentJoin] = field(default_factory=list)
+    join_result: Optional[Status] = None
+
+
+@dataclass
+class Era:
+    status: Status
+    start: Sample
+    end: Sample
+    count: int
+    members: list[Sample] = field(default_factory=list)
+    witnesses_start: list[str] = field(default_factory=list)
+    witnesses_end: list[str] = field(default_factory=list)
+    chain: bool = True
+    raw: Optional[Status] = None
+    kind: str = "run"  # run | ford | worktree | unborn
+    is_ford: bool = False
+    join_op: Optional[str] = None
+    join_parents: list[ParentJoin] = field(default_factory=list)
+    join_result: Optional[Status] = None
+    tree: Optional[Status] = None
+    ford_reason: str = ""
+    origin: Optional[ParentJoin] = None
+    continued_from: Optional[Sample] = None
+
+
+@dataclass
+class Report:
+    repo: str
+    predicate: str
+    end_rev: str
+    first_parent: bool
+    include_now: bool
+    holds_now: Status
+    tree_now: Optional[Status]
+    never_held: bool
+    always_held: bool
+    commits_scanned: int
+    reachable: int
+    probes: int
+    true_commits: int
+    shallow_commits: int
+    unknown_commits: int
+    empty_commits: int
+    fords: int
+    eras: list[Era]
+    walk: str
+    probe_kind: str
+    cost: str
+    horizon: bool
+    bare: bool
+    boolean: bool
+    join_op: str
+    tree_mode: bool
+    hint: Optional[str] = None
+    hints: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: Optional[str] = None,
+    input_text: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        input=input_text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+        timeout=timeout,
+    )
+
+
+def git(
+    repo: str,
+    *args: str,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    return run(
+        ["git", "-c", "core.quotepath=false", "-C", repo, *args],
+        input_text=input_text,
+    )
+
+
+def resolve_repo(path: Optional[str]) -> tuple[str, bool]:
+    start = os.path.abspath(path or os.getcwd())
+    if not os.path.isdir(start):
+        raise FordError(f"not a directory: {start}")
+    inside = run(["git", "-C", start, "rev-parse", "--is-inside-work-tree"])
+    if inside.returncode == 0 and inside.stdout.strip() == "true":
+        top = run(["git", "-C", start, "rev-parse", "--show-toplevel"])
+        if top.returncode != 0:
+            raise FordError(f"not a git repository: {start}")
+        return top.stdout.strip(), False
+    bare = run(["git", "-C", start, "rev-parse", "--is-bare-repository"])
+    if bare.returncode == 0 and bare.stdout.strip() == "true":
+        gitdir = run(["git", "-C", start, "rev-parse", "--absolute-git-dir"])
+        if gitdir.returncode != 0:
+            raise FordError(f"not a git repository: {start}")
+        return gitdir.stdout.strip(), True
+    raise FordError(f"not a git repository: {start}")
+
+
+def color_enabled(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never" or args.json or args.tsv or args.oneline or args.revs:
+        return False
+    if args.human:
+        return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    return False
+
+
+def paint(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def status_color(status: Status) -> str:
+    return {
+        Status.TRUE: "32;1",
+        Status.FALSE: "31",
+        Status.UNKNOWN: "33;1",
+        Status.SHALLOW: "36;1",
+        Status.EMPTY: "35;1",
+    }[status]
+
+
+def is_glob(path: str) -> bool:
+    return any(ch in path for ch in GLOB_CHARS)
+
+
+def _parse_log_line(line: str) -> Optional[Sample]:
+    parts = line.split("\0")
+    if len(parts) < 5:
+        return None
+    sha, tree, ct, iso, subject = parts[:5]
+    parent_s = parts[5] if len(parts) > 5 else ""
+    parents = tuple(p for p in parent_s.split() if p)
+    try:
+        timestamp = int(ct)
+    except ValueError:
+        timestamp = 0
+    return Sample(
+        sha=sha,
+        tree=tree,
+        timestamp=timestamp,
+        iso=iso,
+        subject=subject,
+        parents=parents,
+    )
+
+
+def list_samples(
+    repo: str,
+    *,
+    end_rev: str,
+    rev_range: Optional[str],
+    first_parent: bool,
+    limit: Optional[int],
+) -> list[Sample]:
+    spec = rev_range if rev_range else end_rev
+    fmt = "%H%x00%T%x00%ct%x00%ci%x00%s%x00%P"
+    cmd = ["log", "--reverse", f"--format={fmt}"]
+    if first_parent:
+        cmd.append("--first-parent")
+    cmd.append(spec)
+    proc = git(repo, *cmd)
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or f"cannot walk {spec}"
+        raise FordError(err)
+    samples: list[Sample] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        got = _parse_log_line(line)
+        if got is not None:
+            samples.append(got)
+    if limit is not None and limit >= 0 and len(samples) > limit:
+        samples = samples[-limit:]
+    return samples
+
+
+def load_commits(repo: str, shas: Sequence[str]) -> dict[str, Optional[Sample]]:
+    """Load commit metadata. Missing objects map to None (SHALLOW parent)."""
+    out: dict[str, Optional[Sample]] = {s: None for s in shas}
+    if not shas:
+        return out
+    payload = "".join(f"{s}\n" for s in shas)
+    chk = git(repo, "cat-file", "--batch-check", input_text=payload)
+    existing: list[str] = []
+    if chk.returncode == 0:
+        lines = chk.stdout.splitlines()
+        for sha, line in zip(shas, lines):
+            if line.endswith(" missing") or " missing" in line:
+                out[sha] = None
+            else:
+                existing.append(sha)
+    else:
+        for sha in shas:
+            one = git(repo, "cat-file", "-t", sha)
+            if one.returncode == 0 and one.stdout.strip():
+                existing.append(sha)
+            else:
+                out[sha] = None
+    if not existing:
+        return out
+    fmt = "%H%x00%T%x00%ct%x00%ci%x00%s%x00%P"
+    proc = git(repo, "log", "--no-walk", f"--format={fmt}", *existing)
+    if proc.returncode != 0:
+        for sha in existing:
+            one = git(repo, "log", "-1", f"--format={fmt}", sha)
+            if one.returncode == 0:
+                got = _parse_log_line(one.stdout.strip())
+                if got is not None:
+                    out[got.sha] = got
+        return out
+    for line in proc.stdout.splitlines():
+        got = _parse_log_line(line)
+        if got is not None:
+            out[got.sha] = got
+    return out
+
+
+def worktree_sample() -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        tree="",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def index_sample() -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="INDEX",
+        tree="",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="staged index",
+        kind="index",
+    )
+
+
+def empty_sample() -> Sample:
+    return Sample(
+        sha="UNBORN",
+        tree="",
+        timestamp=0,
+        iso="",
+        subject="unborn HEAD (no commits)",
+        kind="empty",
+    )
+
+
+def read_shallow_shas(repo: str) -> set[str]:
+    out: set[str] = set()
+    flag = git(repo, "rev-parse", "--is-shallow-repository")
+    path_proc = git(repo, "rev-parse", "--git-path", "shallow")
+    if path_proc.returncode != 0:
+        return out
+    path = path_proc.stdout.strip()
+    if not os.path.isabs(path):
+        path = os.path.join(repo, path)
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                sha = line.strip()
+                if SHA_RE.match(sha):
+                    out.add(sha)
+    if flag.returncode == 0 and flag.stdout.strip() == "true" and not out:
+        roots = git(repo, "rev-list", "--max-parents=0", "HEAD")
+        if roots.returncode == 0:
+            for line in roots.stdout.splitlines():
+                if SHA_RE.match(line.strip()):
+                    out.add(line.strip())
+    return out
+
+
+def _chunked(items: Sequence[str], size: int) -> Iterable[list[str]]:
+    for i in range(0, len(items), size):
+        yield list(items[i : i + size])
+
+
+def _uniq(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _copy_probe(p: Probe) -> Probe:
+    return Probe(
+        status=p.status,
+        raw=p.raw,
+        witnesses=list(p.witnesses),
+        tree=p.tree,
+        is_merge=p.is_merge,
+        is_ford=p.is_ford,
+        ford_reason=p.ford_reason,
+        join_op=p.join_op,
+        join_parents=list(p.join_parents),
+        join_result=p.join_result,
+    )
+
+
+def probe_exists(
+    repo: str,
+    samples: Sequence[Sample],
+    path: str,
+) -> tuple[list[Probe], int]:
+    probes_out: list[Probe] = [
+        Probe(status=Status.FALSE, raw=Status.FALSE) for _ in samples
+    ]
+    nprobe = 0
+    commit_idx = [i for i, s in enumerate(samples) if s.kind == "commit"]
+    if commit_idx:
+        payload = "".join(f"{samples[i].sha}:{path}\n" for i in commit_idx)
+        proc = git(repo, "cat-file", "--batch-check", input_text=payload)
+        nprobe += 1
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or "git cat-file --batch-check failed"
+            raise FordError(err)
+        lines = proc.stdout.splitlines()
+        if len(lines) != len(commit_idx):
+            for i in commit_idx:
+                probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(cat-file)"])
+        else:
+            for i, line in zip(commit_idx, lines):
+                exists = not line.endswith(" missing")
+                st = Status.TRUE if exists else Status.FALSE
+                wits = [path] if exists else []
+                probes_out[i] = Probe(st, st, wits)
+
+    for i, sample in enumerate(samples):
+        if sample.kind == "worktree":
+            nprobe += 1
+            exists = os.path.lexists(os.path.join(repo, path))
+            st = Status.TRUE if exists else Status.FALSE
+            probes_out[i] = Probe(st, st, [path] if exists else [])
+        elif sample.kind == "index":
+            nprobe += 1
+            proc = git(repo, "ls-files", "--cached", "--error-unmatch", "--", path)
+            exists = proc.returncode == 0
+            st = Status.TRUE if exists else Status.FALSE
+            probes_out[i] = Probe(st, st, [path] if exists else [])
+        elif sample.kind == "empty":
+            probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, [])
+    return probes_out, nprobe
+
+
+def probe_glob(
+    repo: str,
+    samples: Sequence[Sample],
+    pattern: str,
+) -> tuple[list[Probe], int]:
+    probes_out: list[Probe] = [
+        Probe(status=Status.FALSE, raw=Status.FALSE) for _ in samples
+    ]
+    nprobe = 0
+    tree_cache: dict[str, Probe] = {}
+
+    for i, sample in enumerate(samples):
+        if sample.kind != "commit":
+            continue
+        cached = tree_cache.get(sample.tree)
+        if cached is not None:
+            probes_out[i] = Probe(cached.status, cached.raw, list(cached.witnesses))
+            continue
+        proc = git(repo, "ls-tree", "-r", "--name-only", sample.sha)
+        nprobe += 1
+        if proc.returncode != 0:
+            got = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(ls-tree)"])
+        else:
+            hits = [p for p in proc.stdout.splitlines() if fnmatch(p, pattern)]
+            st = Status.TRUE if hits else Status.FALSE
+            got = Probe(st, st, hits[:12])
+        tree_cache[sample.tree] = got
+        probes_out[i] = Probe(got.status, got.raw, list(got.witnesses))
+
+    for i, sample in enumerate(samples):
+        if sample.kind == "worktree":
+            nprobe += 1
+            hits = _walk_worktree(repo, pattern)
+            st = Status.TRUE if hits else Status.FALSE
+            probes_out[i] = Probe(st, st, hits[:12])
+        elif sample.kind == "index":
+            nprobe += 1
+            proc = git(repo, "ls-files", "-z", "--cached")
+            if proc.returncode != 0:
+                probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(ls-files)"])
+                continue
+            hits = [p for p in proc.stdout.split("\0") if p and fnmatch(p, pattern)]
+            st = Status.TRUE if hits else Status.FALSE
+            probes_out[i] = Probe(st, st, hits[:12])
+        elif sample.kind == "empty":
+            probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, [])
+    return probes_out, nprobe
+
+
+def _walk_worktree(repo: str, pattern: str) -> list[str]:
+    hits: list[str] = []
+    for root, dirs, files in os.walk(repo):
+        rel_root = os.path.relpath(root, repo)
+        if rel_root == ".git" or rel_root.startswith(".git" + os.sep):
+            dirs[:] = []
+            continue
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for name in files:
+            rel = name if rel_root == "." else os.path.join(rel_root, name)
+            rel = rel.replace(os.sep, "/")
+            if fnmatch(rel, pattern):
+                hits.append(rel)
+    return hits
+
+
+def _split_grep_line(line: str) -> tuple[str, str]:
+    if len(line) >= 41 and line[40] == ":" and SHA_RE.match(line[:40]):
+        return line[:40], line[41:]
+    sha, _, rest = line.partition(":")
+    return sha, rest
+
+
+def _parse_grep_paths(stdout: str, expected_sha: Optional[str] = None) -> list[str]:
+    hits: list[str] = []
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        if line.startswith("Binary file ") and line.endswith(" matches"):
+            mid = line[len("Binary file ") : -len(" matches")]
+            _, _, path = mid.partition(":")
+            path = path or mid
+            if path and path not in hits:
+                hits.append(path)
+            continue
+        sha, path = _split_grep_line(line)
+        if expected_sha and SHA_RE.match(sha) and sha != expected_sha:
+            if path and path not in hits:
+                if not SHA_RE.match(sha):
+                    hits.append(sha)
+            continue
+        if path and path not in hits:
+            hits.append(path)
+        elif not path and sha and sha not in hits:
+            hits.append(sha)
+    return hits
+
+
+def _parse_worktree_grep(stdout: str) -> list[str]:
+    hits: list[str] = []
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        if line.startswith("Binary file ") and line.endswith(" matches"):
+            path = line[len("Binary file ") : -len(" matches")]
+            if path and path not in hits:
+                hits.append(path)
+            continue
+        path = line.split(":", 1)[0] if ":" in line else line
+        if path and path not in hits:
+            hits.append(path)
+    return hits
+
+
+def _grep_error_kind(stderr: str, rc: int) -> str:
+    if rc in (0, 1):
+        return "ok"
+    err = stderr.lower()
+    if any(
+        tok in err
+        for tok in (
+            "not balanced",
+            "unmatched",
+            "invalid regular expression",
+            "trailing backslash",
+            "repetition-operator operand invalid",
+        )
+    ):
+        return "bad_pattern"
+    if "did not match any file" in err:
+        return "no_path"
+    return "error"
+
+
+def probe_grep(
+    repo: str,
+    samples: Sequence[Sample],
+    pattern: str,
+    paths: Sequence[str],
+    *,
+    ignore_case: bool,
+    fixed: bool,
+    word: bool,
+    invert: bool,
+) -> tuple[list[Probe], int, Optional[str]]:
+    n = len(samples)
+    probes_out: list[Probe] = [Probe(Status.FALSE, Status.FALSE) for _ in range(n)]
+    nprobe = 0
+    path_args: list[str] = ["--", *paths] if paths else []
+
+    def flags(*, text_only: bool, treat_binary: bool) -> list[str]:
+        out = ["-l", "--full-name", "-e", pattern]
+        if text_only:
+            out.append("-I")
+        if treat_binary:
+            out.append("-a")
+        if ignore_case:
+            out.append("-i")
+        if fixed:
+            out.append("-F")
+        if word:
+            out.append("-w")
+        return out
+
+    commit_idx = [i for i, s in enumerate(samples) if s.kind == "commit"]
+    by_sha = {samples[i].sha: i for i in commit_idx}
+    tree_rep: dict[str, str] = {}
+    sha_to_tree = {samples[i].sha: samples[i].tree for i in commit_idx}
+    for i in commit_idx:
+        tree_rep.setdefault(samples[i].tree, samples[i].sha)
+    reps = list(tree_rep.values())
+
+    def apply_tree(rep_sha: str, probe: Probe) -> None:
+        tree = sha_to_tree[rep_sha]
+        for sha, t in sha_to_tree.items():
+            if t == tree:
+                probes_out[by_sha[sha]] = Probe(
+                    probe.status, probe.raw, list(probe.witnesses)
+                )
+
+    def run_chunk(
+        shas: Sequence[str], extra_flags: list[str]
+    ) -> tuple[dict[str, list[str]], Optional[str], int]:
+        hits: dict[str, list[str]] = {s: [] for s in shas}
+        extra = 0
+        for chunk in _chunked(list(shas), 80) if shas else []:
+            proc = git(repo, "grep", *extra_flags, *chunk, *path_args)
+            extra += 1
+            kind = _grep_error_kind(proc.stderr, proc.returncode)
+            if kind == "bad_pattern":
+                msg = proc.stderr.strip() or "invalid regular expression"
+                return {}, msg, extra
+            if kind == "error" or kind == "no_path":
+                for sha in chunk:
+                    one = git(repo, "grep", *extra_flags, sha, *path_args)
+                    extra += 1
+                    k2 = _grep_error_kind(one.stderr, one.returncode)
+                    if k2 == "bad_pattern":
+                        return (
+                            {},
+                            one.stderr.strip() or "invalid regular expression",
+                            extra,
+                        )
+                    if k2 == "ok" and one.returncode == 0:
+                        hits[sha] = _parse_grep_paths(one.stdout, expected_sha=sha)
+                    elif k2 == "error":
+                        hits[sha] = ["\x00UNKNOWN"]
+                    else:
+                        hits[sha] = []
+                continue
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    sha, path = _split_grep_line(line)
+                    if sha not in hits:
+                        continue
+                    if path and path not in hits[sha]:
+                        hits[sha].append(path)
+        return hits, None, extra
+
+    if reps:
+        text_hits, bad, extra = run_chunk(reps, flags(text_only=True, treat_binary=False))
+        nprobe += extra
+        if bad:
+            unk = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(invalid regex)"])
+            for i in range(n):
+                probes_out[i] = Probe(unk.status, unk.raw, list(unk.witnesses))
+            return probes_out, nprobe, bad
+
+        need_bin: list[str] = []
+        for sha, paths_hit in text_hits.items():
+            if paths_hit == ["\x00UNKNOWN"]:
+                apply_tree(sha, Probe(Status.UNKNOWN, Status.UNKNOWN, ["(grep)"]))
+            elif paths_hit:
+                apply_tree(sha, Probe(Status.TRUE, Status.TRUE, paths_hit[:12]))
+            else:
+                need_bin.append(sha)
+
+        if need_bin:
+            bin_hits, bad2, extra2 = run_chunk(
+                need_bin, flags(text_only=False, treat_binary=True)
+            )
+            nprobe += extra2
+            if bad2:
+                unk = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(invalid regex)"])
+                for i in range(n):
+                    probes_out[i] = Probe(unk.status, unk.raw, list(unk.witnesses))
+                return probes_out, nprobe, bad2
+            for sha in need_bin:
+                paths_hit = bin_hits.get(sha, [])
+                if paths_hit == ["\x00UNKNOWN"]:
+                    apply_tree(sha, Probe(Status.UNKNOWN, Status.UNKNOWN, ["(grep)"]))
+                elif paths_hit:
+                    apply_tree(sha, Probe(Status.EMPTY, Status.EMPTY, paths_hit[:12]))
+                else:
+                    apply_tree(sha, Probe(Status.FALSE, Status.FALSE, []))
+
+    if invert:
+        for i, s in enumerate(samples):
+            if s.kind != "commit":
+                continue
+            st = probes_out[i].status
+            if st == Status.TRUE:
+                probes_out[i] = Probe(Status.FALSE, Status.FALSE, probes_out[i].witnesses)
+            elif st == Status.FALSE:
+                probes_out[i] = Probe(Status.TRUE, Status.TRUE, ["(no match)"])
+
+    for i, sample in enumerate(samples):
+        if sample.kind not in ("worktree", "index"):
+            if sample.kind == "empty":
+                probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, [])
+            continue
+        nprobe += 1
+        extra = flags(text_only=True, treat_binary=False)
+        if sample.kind == "index":
+            cmd = ["grep", *extra, "--cached", *path_args]
+        else:
+            cmd = ["grep", *extra, *path_args]
+        proc = git(repo, *cmd)
+        kind = _grep_error_kind(proc.stderr, proc.returncode)
+        if kind == "bad_pattern":
+            probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(invalid regex)"])
+            continue
+        if kind == "error":
+            probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(grep)"])
+            continue
+        text_hits = _parse_worktree_grep(proc.stdout) if proc.returncode == 0 else []
+        if text_hits:
+            if invert:
+                probes_out[i] = Probe(Status.FALSE, Status.FALSE, text_hits[:12])
+            else:
+                probes_out[i] = Probe(Status.TRUE, Status.TRUE, text_hits[:12])
+            continue
+        extra_a = flags(text_only=False, treat_binary=True)
+        if sample.kind == "index":
+            cmd_a = ["grep", *extra_a, "--cached", *path_args]
+        else:
+            cmd_a = ["grep", *extra_a, *path_args]
+        proc_a = git(repo, *cmd_a)
+        nprobe += 1
+        kind_a = _grep_error_kind(proc_a.stderr, proc_a.returncode)
+        if kind_a == "bad_pattern":
+            probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(invalid regex)"])
+            continue
+        if kind_a == "error":
+            probes_out[i] = Probe(Status.UNKNOWN, Status.UNKNOWN, ["(grep)"])
+            continue
+        bin_hits = _parse_worktree_grep(proc_a.stdout) if proc_a.returncode == 0 else []
+        if bin_hits:
+            probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, bin_hits[:12])
+        else:
+            if invert:
+                probes_out[i] = Probe(Status.TRUE, Status.TRUE, ["(no match)"])
+            else:
+                probes_out[i] = Probe(Status.FALSE, Status.FALSE, [])
+    return probes_out, nprobe, None
+
+
+def probe_exec(
+    repo: str,
+    samples: Sequence[Sample],
+    command: Sequence[str],
+    *,
+    timeout: float,
+) -> tuple[list[Probe], int]:
+    probes_out: list[Probe] = [Probe(Status.FALSE, Status.FALSE) for _ in samples]
+    nprobe = 0
+    tmp: Optional[str] = None
+    created_worktree = False
+    try:
+        first_commit = next((s.sha for s in samples if s.kind == "commit"), None)
+        if first_commit is None:
+            for i, sample in enumerate(samples):
+                if sample.kind == "empty":
+                    probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, [])
+                    continue
+                nprobe += 1
+                probes_out[i] = _run_exec_command(
+                    command, cwd=repo, sample=sample, timeout=timeout
+                )
+            return probes_out, nprobe
+
+        tmp = tempfile.mkdtemp(prefix="ford-wt-")
+        add = git(repo, "worktree", "add", "--detach", "-f", tmp, first_commit)
+        if add.returncode != 0:
+            raise FordError(add.stderr.strip() or "git worktree add failed")
+        created_worktree = True
+        git(tmp, "config", "core.hooksPath", "/dev/null")
+
+        for i, sample in enumerate(samples):
+            nprobe += 1
+            if sample.kind == "commit":
+                chk = git(tmp, "checkout", "--detach", "-f", "-q", sample.sha)
+                if chk.returncode != 0:
+                    probes_out[i] = Probe(
+                        Status.UNKNOWN, Status.UNKNOWN, ["(checkout failed)"]
+                    )
+                    continue
+                cwd = tmp
+            elif sample.kind == "empty":
+                probes_out[i] = Probe(Status.EMPTY, Status.EMPTY, [])
+                continue
+            else:
+                cwd = repo
+            probes_out[i] = _run_exec_command(
+                command, cwd=cwd, sample=sample, timeout=timeout
+            )
+    finally:
+        if created_worktree:
+            git(repo, "worktree", "remove", "--force", tmp or "")
+        elif tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return probes_out, nprobe
+
+
+def _run_exec_command(
+    command: Sequence[str],
+    *,
+    cwd: str,
+    sample: Sample,
+    timeout: float,
+) -> Probe:
+    env = os.environ.copy()
+    env["FORD_COMMIT"] = sample.sha
+    env["FORD_KIND"] = sample.kind
+    env["FORD_SUBJECT"] = sample.subject
+    env["STEAD_COMMIT"] = sample.sha
+    env["HELD_COMMIT"] = sample.sha
+    try:
+        proc = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise FordError(f"exec command not found: {exc}") from exc
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        return Probe(Status.UNKNOWN, Status.UNKNOWN, ["(timeout)"])
+    ok = proc.returncode == 0
+    witness: list[str] = []
+    if stdout and stdout.strip():
+        witness.append(stdout.strip().splitlines()[0][:120])
+    elif not ok and stderr and stderr.strip():
+        witness.append(stderr.strip().splitlines()[0][:120])
+    st = Status.TRUE if ok else Status.FALSE
+    return Probe(st, st, witness)
+
+
+def apply_horizon_trees(
+    samples: Sequence[Sample],
+    by_sha: dict[str, Probe],
+    *,
+    shallow: set[str],
+    probed: set[str],
+) -> set[str]:
+    """Rewrite measurable occupancy at a graft into SHALLOW.
+
+    A second parent that we extra-probed is *not* a horizon — that is the
+    whole point of a ford. Horizon is: sha in .git/shallow, missing object,
+    or a walked commit whose parents were never measured.
+    """
+    horizon: set[str] = set()
+    walked = {s.sha for s in samples if s.kind == "commit"}
+    for s in samples:
+        if s.kind != "commit":
+            continue
+        if s.sha in shallow:
+            horizon.add(s.sha)
+            continue
+        unmeasured = [p for p in s.parents if p not in probed]
+        if s.parents and unmeasured:
+            horizon.add(s.sha)
+        _ = walked
+    for sha in list(by_sha):
+        if sha in shallow:
+            horizon.add(sha)
+
+    saw_true = False
+    for s in samples:
+        if s.kind != "commit":
+            continue
+        p = by_sha.get(s.sha)
+        if p is not None and p.raw == Status.TRUE:
+            saw_true = True
+            break
+    for sha in horizon:
+        p = by_sha.get(sha)
+        if p is not None and p.status in (Status.TRUE, Status.EMPTY):
+            p.status = Status.SHALLOW
+    if not saw_true and horizon:
+        for s in samples:
+            if s.kind != "commit":
+                continue
+            p = by_sha.get(s.sha)
+            if p is not None and p.status == Status.FALSE:
+                p.status = Status.SHALLOW
+    return horizon
+
+
+def extra_parent_shas(samples: Sequence[Sample]) -> list[str]:
+    walked = {s.sha for s in samples if s.kind == "commit"}
+    extra: list[str] = []
+    seen: set[str] = set()
+    for s in samples:
+        if s.kind != "commit" or len(s.parents) < 2:
+            continue
+        for p in s.parents:
+            if p not in walked and p not in seen:
+                seen.add(p)
+                extra.append(p)
+    return extra
+
+
+def apply_join(
+    samples: Sequence[Sample],
+    tree_by_sha: dict[str, Probe],
+    tree_walk: Sequence[Probe],
+    *,
+    op: str,
+    tree_mode: bool,
+    boolean: bool,
+    extra_meta: dict[str, Optional[Sample]],
+) -> list[Probe]:
+    """Occupancy of a merge is the lattice of parent *tree* statuses."""
+    out: list[Probe] = []
+    for i, s in enumerate(samples):
+        base = _copy_probe(tree_walk[i])
+        base.tree = tree_walk[i].status
+        if s.kind != "commit" or tree_mode or boolean:
+            out.append(base)
+            continue
+        if len(s.parents) < 2:
+            out.append(base)
+            continue
+        parents: list[ParentJoin] = []
+        pst: list[Status] = []
+        for psha in s.parents:
+            tp = tree_by_sha.get(psha)
+            if tp is None:
+                st = Status.SHALLOW
+                wits: list[str] = ["(missing parent)"]
+                meta = extra_meta.get(psha)
+                subj = meta.subject if meta is not None else "missing"
+            else:
+                st = tp.status
+                wits = list(tp.witnesses)
+                meta = extra_meta.get(psha)
+                if meta is None:
+                    # parent is on the walk
+                    subj = ""
+                    for w in samples:
+                        if w.sha == psha:
+                            subj = w.subject
+                            break
+                else:
+                    subj = meta.subject
+            pst.append(st)
+            parents.append(
+                ParentJoin(
+                    sha=psha,
+                    short=psha[:7],
+                    status=st,
+                    subject=subj,
+                    witnesses=wits,
+                )
+            )
+        result = lattice_apply(op, pst)
+        reason = ""
+        is_ford = False
+        if len(set(pst)) > 1:
+            is_ford = True
+            reason = "disagree"
+        elif base.tree is not None and base.tree != result:
+            is_ford = True
+            reason = "tree"
+        wits = []
+        for pj in parents:
+            if pj.status in (Status.TRUE, Status.EMPTY):
+                wits.extend(pj.witnesses)
+        wits = _uniq(wits)
+        if result == Status.UNKNOWN and not wits:
+            wits = ["(join)"]
+        got = Probe(
+            status=result,
+            raw=result,
+            witnesses=wits,
+            tree=base.tree,
+            is_merge=True,
+            is_ford=is_ford,
+            ford_reason=reason,
+            join_op=op,
+            join_parents=parents,
+            join_result=result,
+        )
+        out.append(got)
+    return out
+
+
+def booleanize(probes: Sequence[Probe]) -> list[Probe]:
+    """Lossy held recovery: tree TRUE stays, everything else is FALSE."""
+    out: list[Probe] = []
+    for p in probes:
+        tree = p.tree if p.tree is not None else p.raw
+        if tree == Status.TRUE:
+            out.append(Probe(Status.TRUE, Status.TRUE, list(p.witnesses), tree=p.tree))
+        else:
+            wits = list(p.witnesses) if tree != Status.FALSE else []
+            out.append(Probe(Status.FALSE, tree, wits, tree=p.tree))
+    return out
+
+
+def _is_chain(members: Sequence[int], samples: Sequence[Sample]) -> bool:
+    if len(members) <= 1:
+        return True
+    if members[-1] - members[0] + 1 != len(members):
+        return False
+    for pos in range(1, len(members)):
+        cur = samples[members[pos]]
+        prev = samples[members[pos - 1]]
+        if cur.kind == "commit" and prev.kind == "commit":
+            if prev.sha not in cur.parents and cur.sha not in prev.parents:
+                return False
+    return True
+
+
+def _era_from_members(
+    members: list[int],
+    samples: Sequence[Sample],
+    probes: Sequence[Probe],
+) -> Era:
+    first = probes[members[0]]
+    kind = "run"
+    if first.is_ford:
+        kind = "ford"
+    elif samples[members[0]].kind == "worktree":
+        kind = "worktree"
+    elif samples[members[0]].kind == "empty":
+        kind = "unborn"
+    origin = None
+    if first.is_ford and first.join_op == "any":
+        for pj in first.join_parents:
+            if pj.status == Status.TRUE:
+                origin = pj
+                break
+    elif first.is_ford and first.join_op == "all":
+        # introducing side still named: a TRUE parent when the meet is not TRUE
+        for pj in first.join_parents:
+            if pj.status == Status.TRUE:
+                origin = pj
+                break
+    return Era(
+        status=first.status,
+        start=samples[members[0]],
+        end=samples[members[-1]],
+        count=len(members),
+        members=[samples[j] for j in members],
+        witnesses_start=list(probes[members[0]].witnesses),
+        witnesses_end=list(probes[members[-1]].witnesses),
+        chain=_is_chain(members, samples),
+        raw=first.raw,
+        kind=kind,
+        is_ford=first.is_ford,
+        join_op=first.join_op,
+        join_parents=list(first.join_parents),
+        join_result=first.join_result,
+        tree=first.tree,
+        ford_reason=first.ford_reason,
+        origin=origin,
+    )
+
+
+def compress_list(samples: Sequence[Sample], probes: Sequence[Probe]) -> list[Era]:
+    """Compress adjacent samples. A ford is always its own era."""
+    if not samples:
+        return []
+    eras: list[Era] = []
+    start = 0
+    for i in range(1, len(samples) + 1):
+        same = False
+        if i < len(samples):
+            same = (
+                probes[i].status == probes[start].status
+                and not probes[i].is_ford
+                and not probes[start].is_ford
+            )
+        if same:
+            continue
+        eras.append(_era_from_members(list(range(start, i)), samples, probes))
+        start = i
+    return eras
+
+
+def compress_lattice(samples: Sequence[Sample], probes: Sequence[Probe]) -> list[Era]:
+    n = len(samples)
+    if n == 0:
+        return []
+    parent_uf = list(range(n))
+
+    def find(x: int) -> int:
+        while parent_uf[x] != x:
+            parent_uf[x] = parent_uf[parent_uf[x]]
+            x = parent_uf[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent_uf[rb] = ra
+
+    idx_by_sha = {s.sha: i for i, s in enumerate(samples) if s.kind == "commit"}
+    last_commit = None
+    for i, s in enumerate(samples):
+        if s.kind == "commit":
+            last_commit = i
+
+    for i, s in enumerate(samples):
+        if probes[i].is_ford:
+            continue
+        if s.kind == "commit":
+            for p in s.parents:
+                j = idx_by_sha.get(p)
+                if j is None or probes[j].is_ford:
+                    continue
+                if probes[i].status == probes[j].status:
+                    union(i, j)
+        elif last_commit is not None and probes[i].status == probes[last_commit].status:
+            if not probes[last_commit].is_ford:
+                union(i, last_commit)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    eras: list[Era] = []
+    for members in sorted(groups.values(), key=lambda m: (min(m), m[0])):
+        members = sorted(members)
+        eras.append(_era_from_members(members, samples, probes))
+    return eras
+
+
+def annotate_continuations(eras: list[Era]) -> None:
+    """A TRUE run after a ford is preserved occupancy, not a birth.
+
+    kizu first-parent --all: the ford at 0ea3916 is FALSE ⊓ TRUE, then
+    TRUE starts at 21ae074 (the next merge, T⊓T). Reading that start as
+    birth is the same lie roost told, one merge later.
+    """
+    pending_origin: Optional[ParentJoin] = None
+    pending_ford: Optional[Sample] = None
+    for era in eras:
+        if era.is_ford and era.origin is not None:
+            pending_origin = era.origin
+            pending_ford = era.start
+            continue
+        if era.status == Status.FALSE and not era.is_ford:
+            pending_origin = None
+            pending_ford = None
+            continue
+        if (
+            era.status == Status.TRUE
+            and not era.is_ford
+            and pending_origin is not None
+        ):
+            era.origin = pending_origin
+            era.continued_from = pending_ford
+            if era.start.kind == "commit" and len(era.start.parents) >= 2:
+                era.kind = "preserve"
+            else:
+                era.kind = "continue"
+            pending_origin = None
+            pending_ford = None
+
+
+def count_reachable(repo: str, spec: str) -> int:
+    proc = git(repo, "rev-list", "--count", spec)
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _hit_span(samples: Sequence[Sample], probes: Sequence[Probe]) -> tuple[int, str]:
+    hits = [
+        s
+        for s, p in zip(samples, probes)
+        if p.status == Status.TRUE and s.kind == "commit"
+    ]
+    if not hits:
+        return 0, ""
+    first, last = hits[0], hits[-1]
+    if first.sha == last.sha:
+        span = f"{first.short} {first.subject}"
+    else:
+        span = f"{first.short}..{last.short}  {first.iso[:10]} → {last.iso[:10]}"
+    return len(hits), span
+
+
+def _shell_single_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def join_equation(era: Era) -> str:
+    if not era.join_parents:
+        return ""
+    sym = lattice_symbol(era.join_op or "all")
+    bits = f" {sym} ".join(pj.status.value for pj in era.join_parents)
+    res = (era.join_result or era.status).value
+    return f"{bits} = {res}"
+
+
+def diagnose(
+    *,
+    args: argparse.Namespace,
+    repo: str,
+    samples: Sequence[Sample],
+    probes: Sequence[Probe],
+    end_rev: str,
+    horizon: set[str],
+) -> tuple[list[str], list[str], int]:
+    warnings: list[str] = []
+    hints: list[str] = []
+    extra = 0
+    first_parent = not args.full
+    statuses = [p.status for p in probes]
+    saw_true = any(s == Status.TRUE for s in statuses)
+    saw_shallow = any(s == Status.SHALLOW for s in statuses)
+    saw_unknown = any(s == Status.UNKNOWN for s in statuses)
+    saw_empty = any(s == Status.EMPTY for s in statuses)
+    fords = [p for p in probes if p.is_ford]
+
+    if saw_shallow:
+        hints.append(
+            "SHALLOW: the walk starts at a graft or --limit/--range horizon; "
+            "this is not birth and not never-held. unshallow, drop --limit, or clone full history"
+        )
+    if saw_unknown:
+        hints.append(
+            "UNKNOWN: a probe failed (timeout, invalid regex, checkout). "
+            "that is not FALSE and does not compress into a never-held era"
+        )
+    if saw_empty and args.cmd == "grep":
+        hints.append(
+            "EMPTY: the token occupies a binary/NUL blob only. "
+            "that is not text occupancy and not a FALSE death"
+        )
+    for p in fords:
+        if not p.join_parents:
+            continue
+        eq = f" {lattice_symbol(p.join_op or 'all')} ".join(
+            pj.status.value for pj in p.join_parents
+        )
+        eq += f" = {(p.join_result or p.status).value}"
+        sides = ", ".join(f"{pj.short}={pj.status.value}" for pj in p.join_parents)
+        tree = p.tree.value if p.tree else "?"
+        if (p.join_op or "all") == "all" and p.status != Status.TRUE:
+            intro = next((pj for pj in p.join_parents if pj.status == Status.TRUE), None)
+            via = f" introduced via {intro.short}" if intro else ""
+            hints.append(
+                f"ford {eq} (does not preserve; tree={tree}{via}; parents {sides}). "
+                "not a boolean birth at the merge. --any to treat introduce-via-side as TRUE"
+            )
+        elif (p.join_op or "all") == "any" and p.status == Status.TRUE:
+            intro = next((pj for pj in p.join_parents if pj.status == Status.TRUE), None)
+            via = f" via {intro.short} {intro.subject}".rstrip() if intro else ""
+            hints.append(
+                f"ford {eq} (introduced{via}; parents {sides}). "
+                "the merge is a join, not a birth"
+            )
+
+    dead_paths: list[str] = []
+    if args.cmd == "grep" and args.paths and not saw_unknown:
+        for path in args.paths:
+            if is_glob(path):
+                continue
+            vals, n = probe_exists(repo, samples, path)
+            extra += n
+            if not any(p.status == Status.TRUE for p in vals):
+                dead_paths.append(path)
+        if dead_paths:
+            phrase = " ".join([args.pattern, *dead_paths])
+            warnings.append(
+                "pathspec "
+                + ", ".join(repr(p) for p in dead_paths)
+                + " matched no file in any scanned commit. "
+                + "If you meant a phrase, quote it: ford grep "
+                + _shell_single_quote(phrase)
+            )
+
+    never_measurable = (
+        not saw_true and not saw_shallow and not saw_unknown and not saw_empty
+    )
+    has_commits = any(s.kind == "commit" for s in samples)
+    last = probes[-1] if probes else None
+    if (
+        last is not None
+        and last.tree == Status.TRUE
+        and last.status != Status.TRUE
+        and last.is_merge
+        and not args.any
+        and not args.tree
+    ):
+        hints.append(
+            "HEAD tree is TRUE but occupancy is the parent join "
+            f"({last.status.value}). --any for introduce-via-side, --tree for the snapshot"
+        )
+
+    if (
+        args.cmd in ("exists", "glob")
+        and first_parent
+        and never_measurable
+        and has_commits
+    ):
+        path = args.path if args.cmd == "exists" else args.pattern
+        if path:
+            full_samples = list_samples(
+                repo,
+                end_rev=end_rev,
+                rev_range=args.rev_range,
+                first_parent=False,
+                limit=None,
+            )
+            if args.cmd == "exists" and not is_glob(path):
+                vals, n = probe_exists(repo, full_samples, path)
+            else:
+                vals, n = probe_glob(repo, full_samples, path)
+            extra += n
+            n_hit, span = _hit_span(full_samples, vals)
+            if n_hit:
+                hints.append(
+                    f"never held on first-parent, but existed in {n_hit} reachable commit"
+                    f"{'' if n_hit == 1 else 's'} off the mainline ({span}). rerun with --full"
+                )
+
+    if (
+        args.cmd == "grep"
+        and never_measurable
+        and not args.invert_match
+        and not dead_paths
+        and has_commits
+    ):
+        if not args.ignore_case:
+            vals, n, bad = probe_grep(
+                repo,
+                samples,
+                args.pattern,
+                args.paths,
+                ignore_case=True,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=False,
+            )
+            extra += n
+            if not bad:
+                ci_hits = sum(
+                    1
+                    for s, p in zip(samples, vals)
+                    if p.status in (Status.TRUE, Status.EMPTY) and s.kind == "commit"
+                )
+                if ci_hits:
+                    example = ""
+                    for p in vals:
+                        if p.witnesses:
+                            example = p.witnesses[0]
+                            break
+                    extra_ex = f" (e.g. {example})" if example else ""
+                    hints.append(
+                        f"0 case-sensitive matches; {ci_hits} commit"
+                        f"{'' if ci_hits == 1 else 's'} match with -i{extra_ex}. rerun with -i"
+                    )
+        if first_parent:
+            full_samples = list_samples(
+                repo,
+                end_rev=end_rev,
+                rev_range=args.rev_range,
+                first_parent=False,
+                limit=None,
+            )
+            vals, n, bad = probe_grep(
+                repo,
+                full_samples,
+                args.pattern,
+                args.paths,
+                ignore_case=args.ignore_case,
+                fixed=args.fixed_strings,
+                word=args.word_regexp,
+                invert=False,
+            )
+            extra += n
+            if not bad:
+                n_hit, span = _hit_span(full_samples, vals)
+                if n_hit:
+                    hints.append(
+                        f"never held on first-parent, but matched in {n_hit} reachable commit"
+                        f"{'' if n_hit == 1 else 's'} off the mainline ({span}). rerun with --full"
+                    )
+    _ = horizon
+    return warnings, hints, extra
+
+
+def era_span(era: Era) -> str:
+    if era.count == 1 or era.start.sha == era.end.sha:
+        return era.start.short
+    if era.chain:
+        return f"{era.start.short}..{era.end.short}"
+    shorts = [s.short for s in era.members]
+    if len(shorts) <= 6:
+        return ", ".join(shorts)
+    return ", ".join(shorts[:3]) + f", … (+{len(shorts) - 3})"
+
+
+def _date_span(a: Sample, b: Sample) -> str:
+    da = a.iso[:10] if a.iso else ""
+    db = b.iso[:10] if b.iso else ""
+    if not da and not db:
+        return ""
+    if da == db or not db:
+        return da
+    return f"{da} → {db}"
+
+
+def format_tsv(report: Report, *, header: bool = True) -> str:
+    rows: list[str] = []
+    if header:
+        rows.append(
+            "status\tcount\tstart\tend\tstart_iso\tend_iso\tchain\tkind\tjoin\twitnesses"
+        )
+    for era in report.eras:
+        wits = _uniq(era.witnesses_start + era.witnesses_end)
+        wcol = ",".join(w.replace("\t", " ") for w in wits[:8])
+        if len(wits) > 8:
+            wcol += f",+{len(wits) - 8}"
+        start_iso = era.start.iso[:19] if era.start.iso else ""
+        end_iso = era.end.iso[:19] if era.end.iso else ""
+        rows.append(
+            "\t".join(
+                [
+                    era.status.value,
+                    str(era.count),
+                    era.start.short,
+                    era.end.short,
+                    start_iso,
+                    end_iso,
+                    "1" if era.chain else "0",
+                    era.kind,
+                    join_equation(era).replace("\t", " "),
+                    wcol,
+                ]
+            )
+        )
+    return "\n".join(rows)
+
+
+def format_oneline(report: Report) -> str:
+    rows = []
+    for era in report.eras:
+        extra = ""
+        if era.is_ford:
+            extra = "  ford " + join_equation(era)
+        rows.append(
+            f"{era.status.value}\t{era.count}\t{era_span(era)}\t{_date_span(era.start, era.end)}{extra}"
+        )
+    return "\n".join(rows)
+
+
+def format_human(report: Report, *, color: bool, show_witnesses: bool) -> str:
+    lines: list[str] = []
+    if report.reachable > report.commits_scanned:
+        scanned = (
+            f"{report.commits_scanned} of {report.reachable} commit"
+            + ("" if report.reachable == 1 else "s")
+        )
+    else:
+        scanned = (
+            f"{report.commits_scanned} commit"
+            + ("" if report.commits_scanned == 1 else "s")
+        )
+    bits = [
+        os.path.basename(report.repo) or report.repo,
+        scanned,
+        report.walk,
+        f"join={report.join_op}",
+    ]
+    if report.include_now:
+        bits.append("now")
+    if report.bare:
+        bits.append("bare")
+    if report.boolean:
+        bits.append("boolean")
+    if report.tree_mode:
+        bits.append("tree")
+    lines.append(f"# {report.predicate}  (" + ", ".join(bits) + ")")
+    if not report.eras:
+        lines.append("  (no samples)")
+        return "\n".join(lines)
+
+    label_w = 8
+    count_w = max(len(str(e.count)) for e in report.eras) + len(" commits")
+    for era in report.eras:
+        raw = era.status.value
+        label = paint(color, status_color(era.status), f"{raw:<{label_w}}")
+        unit = "commit" if era.count == 1 else "commits"
+        if era.start.kind != "commit" or era.end.kind != "commit":
+            unit = "sample" if era.count == 1 else "samples"
+        count = f"{era.count} {unit}".ljust(count_w)
+        span = era_span(era)
+        dates = _date_span(era.start, era.end)
+        lines.append(f"{label}  {count}  {span}  {dates}".rstrip())
+        if era.start.sha != era.end.sha:
+            lines.append(f"       {era.start.short}  {era.start.subject}")
+            lines.append(f"       {era.end.short}  {era.end.subject}")
+        else:
+            lines.append(f"       {era.start.subject}")
+        if era.is_ford:
+            eq = join_equation(era)
+            op = era.join_op or report.join_op
+            if op == "all" and era.status != Status.TRUE:
+                verb = "does not preserve"
+            elif op == "any" and era.status == Status.TRUE:
+                verb = "introduced via a side"
+            elif era.ford_reason == "tree":
+                verb = "tree disagrees with parent join"
+            else:
+                verb = "parent join"
+            lines.append(f"       ford  {eq}  ({verb})")
+            for pj in era.join_parents:
+                lines.append(
+                    f"       parent {pj.short}={pj.status.value}  {pj.subject}".rstrip()
+                )
+            if era.tree is not None:
+                note = ""
+                if era.tree == Status.TRUE and era.status != Status.TRUE:
+                    if era.ford_reason == "tree":
+                        note = "  born in the merge snapshot, not from a parent"
+                    else:
+                        note = "  snapshot has it; occupancy is the parent join, not a birth"
+                lines.append(f"       tree={era.tree.value}{note}")
+            if era.origin is not None:
+                lines.append(
+                    f"       origin: {era.origin.short}  {era.origin.subject}".rstrip()
+                    + f"  ({era.origin.status.value} parent)"
+                )
+        elif era.kind in ("preserve", "continue") and era.continued_from is not None:
+            lines.append(
+                f"       {era.kind} after ford {era.continued_from.short}; not birth"
+            )
+            if era.origin is not None:
+                lines.append(
+                    f"       origin: {era.origin.short}  {era.origin.subject}".rstrip()
+                    + f"  ({era.origin.status.value} parent)"
+                )
+        if not era.chain and era.count > 1:
+            lines.append(
+                "       lattice component (not adjacent in git log --reverse)"
+            )
+        show = show_witnesses and era.status != Status.FALSE
+        if show:
+            w = _uniq(era.witnesses_start + era.witnesses_end)
+            if w:
+                shown = w[:5]
+                extra = f" (+{len(w) - 5})" if len(w) > 5 else ""
+                lines.append("       witnesses: " + ", ".join(shown) + extra)
+        if era.status == Status.SHALLOW:
+            lines.append("       graft/horizon: not birth, not never-held")
+        elif era.status == Status.EMPTY and report.probe_kind == "grep":
+            lines.append("       binary/NUL occupancy, not text FALSE")
+        elif era.status == Status.UNKNOWN:
+            lines.append("       failed probe, not FALSE")
+    if report.commits_scanned:
+        true_bit = f"true={report.true_commits}/{report.commits_scanned}"
+    else:
+        true_n = sum(1 for e in report.eras if e.status == Status.TRUE for _ in e.members)
+        sample_n = sum(e.count for e in report.eras)
+        true_bit = f"true={true_n}/{sample_n} samples"
+    summary = (
+        f"now={report.holds_now.value}  "
+        f"{true_bit}  "
+        f"eras={len(report.eras)}  fords={report.fords}  probes={report.probes}  "
+        f"walk={report.walk}  join={report.join_op}"
+    )
+    extra_bits = []
+    if report.tree_now is not None:
+        extra_bits.append(f"tree_now={report.tree_now.value}")
+    if report.shallow_commits:
+        extra_bits.append(f"shallow={report.shallow_commits}")
+    if report.unknown_commits:
+        extra_bits.append(f"unknown={report.unknown_commits}")
+    if report.empty_commits:
+        extra_bits.append(f"empty={report.empty_commits}")
+    if extra_bits:
+        summary += "  " + " ".join(extra_bits)
+    lines.append(summary)
+    for warning in report.warnings:
+        lines.append("warning: " + warning)
+    for hint in report.hints or ([report.hint] if report.hint else []):
+        lines.append("hint: " + hint)
+    return "\n".join(lines)
+
+
+def format_bounds(report: Report, *, only_true: bool) -> str:
+    rows = []
+    for era in report.eras:
+        if only_true and era.status != Status.TRUE:
+            continue
+        rows.append(
+            f"{era.start.sha} {era.end.sha} {era.status.value} {era.count}"
+        )
+    return "\n".join(rows)
+
+
+def parent_dict(pj: ParentJoin) -> dict:
+    return {
+        "sha": pj.sha,
+        "short": pj.short,
+        "status": pj.status.value,
+        "subject": pj.subject,
+        "witnesses": pj.witnesses,
+    }
+
+
+def report_to_json(report: Report) -> dict:
+    def sample_dict(s: Sample) -> dict:
+        return {
+            "sha": s.sha,
+            "short": s.short,
+            "tree": s.tree,
+            "timestamp": s.timestamp,
+            "iso": s.iso,
+            "subject": s.subject,
+            "kind": s.kind,
+            "parents": list(s.parents),
+        }
+
+    return {
+        "repo": report.repo,
+        "predicate": report.predicate,
+        "end_rev": report.end_rev,
+        "first_parent": report.first_parent,
+        "include_now": report.include_now,
+        "holds_now": report.holds_now.value,
+        "holds_now_true": report.holds_now == Status.TRUE,
+        "tree_now": report.tree_now.value if report.tree_now else None,
+        "never_held": report.never_held,
+        "always_held": report.always_held,
+        "commits_scanned": report.commits_scanned,
+        "reachable": report.reachable,
+        "probes": report.probes,
+        "true_commits": report.true_commits,
+        "shallow_commits": report.shallow_commits,
+        "unknown_commits": report.unknown_commits,
+        "empty_commits": report.empty_commits,
+        "fords": report.fords,
+        "walk": report.walk,
+        "probe_kind": report.probe_kind,
+        "cost": report.cost,
+        "horizon": report.horizon,
+        "bare": report.bare,
+        "boolean": report.boolean,
+        "join": report.join_op,
+        "tree_mode": report.tree_mode,
+        "eras": [
+            {
+                "status": e.status.value,
+                "holds": e.status == Status.TRUE,
+                "count": e.count,
+                "chain": e.chain,
+                "kind": e.kind,
+                "is_ford": e.is_ford,
+                "ford_reason": e.ford_reason or None,
+                "span": era_span(e),
+                "join": join_equation(e) or None,
+                "join_op": e.join_op,
+                "join_result": e.join_result.value if e.join_result else None,
+                "tree": e.tree.value if e.tree else None,
+                "parents": [parent_dict(p) for p in e.join_parents],
+                "origin": parent_dict(e.origin) if e.origin else None,
+                "continued_from": (
+                    {
+                        "sha": e.continued_from.sha,
+                        "short": e.continued_from.short,
+                        "subject": e.continued_from.subject,
+                    }
+                    if e.continued_from
+                    else None
+                ),
+                "start": sample_dict(e.start),
+                "end": sample_dict(e.end),
+                "members": [m.short for m in e.members],
+                "witnesses_start": e.witnesses_start,
+                "witnesses_end": e.witnesses_end,
+                "raw": e.raw.value if e.raw else None,
+            }
+            for e in report.eras
+        ],
+        "hint": report.hint,
+        "hints": report.hints,
+        "warnings": report.warnings,
+    }
+
+
+def lattice_table(op: str) -> list[list[str]]:
+    order = [
+        Status.TRUE,
+        Status.EMPTY,
+        Status.UNKNOWN,
+        Status.SHALLOW,
+        Status.FALSE,
+    ]
+    fn = join if op == "any" else meet
+    header = [op] + [s.value for s in order]
+    rows = [header]
+    for a in order:
+        row = [a.value]
+        for b in order:
+            row.append(fn(a, b).value)
+        rows.append(row)
+    return rows
+
+
+def format_lattice(*, op: str, as_json: bool) -> str:
+    if as_json:
+        tables = {}
+        for name in ("all", "any"):
+            tab = lattice_table(name)
+            tables[name] = {
+                "symbol": lattice_symbol(name),
+                "order": [s.value for s in RANK],
+                "rank": {s.value: r for s, r in RANK.items()},
+                "table": tab,
+            }
+        tables["note"] = (
+            "FALSE ⊑ SHALLOW ⊑ UNKNOWN ⊑ EMPTY ⊑ TRUE. "
+            "meet (--all, preserve) is inf; join (--any, introduce) is sup. "
+            "A missing parent is SHALLOW, a timeout is UNKNOWN; neither is FALSE."
+        )
+        return json.dumps(tables, indent=2)
+    lines = [
+        "ford lattice  FALSE ⊑ SHALLOW ⊑ UNKNOWN ⊑ EMPTY ⊑ TRUE",
+        "meet ⊓  (--all, default): TRUE iff every parent TRUE (preserve)",
+        "join ⊔  (--any):          TRUE if any parent TRUE (introduce via a side)",
+        "",
+    ]
+    names = [op] if op in ("all", "any") else ["all", "any"]
+    for name in names:
+        tab = lattice_table(name)
+        sym = lattice_symbol(name)
+        lines.append(f"# {name}  {sym}")
+        widths = [max(len(tab[r][c]) for r in range(len(tab))) for c in range(len(tab[0]))]
+        for row in tab:
+            lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ford",
+        description=(
+            "Occupancy of a merge is a join of parent statuses, not a boolean "
+            "sample on the merge SHA. Statuses TRUE / FALSE / UNKNOWN / SHALLOW / EMPTY. "
+            "A failed probe is not FALSE."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  ford exists src/app.py                 # merge: meet of parents (preserve)
+  ford --any exists src/app.py           # merge: join of parents (introduce)
+  ford --tree exists src/app.py          # sample the merge SHA (held/stead)
+  ford --boolean exists src/app.py       # lossy held recovery
+  ford lattice                           # print the 5×5 tables
+  ford --now -C empty-dirty exists README.md
+""",
+    )
+    parser.add_argument("-C", "--repo", default=None, help="repository (default: cwd)")
+    parser.add_argument("--rev", default="HEAD", help="end revision (default: HEAD)")
+    parser.add_argument("--range", dest="rev_range", default=None, help="limit to A..B")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="walk every reachable commit; compress along the DAG, not log order",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_order",
+        action="store_true",
+        help="compress git log --reverse order (held's lie) instead of the lattice",
+    )
+    parser.add_argument(
+        "--now",
+        action="store_true",
+        help="append the working tree as a final sample (works with no commits)",
+    )
+    parser.add_argument(
+        "--index",
+        action="store_true",
+        help="append the index as a sample",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="keep only the last N commits (creates a horizon, reported as SHALLOW)",
+    )
+    parser.add_argument(
+        "--any",
+        action="store_true",
+        help="join: TRUE if any parent TRUE (the merge introduces via a side)",
+    )
+    parser.add_argument(
+        "--all",
+        dest="join_all",
+        action="store_true",
+        help="meet: TRUE iff all parents TRUE (default; the merge preserves)",
+    )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="sample the merge SHA like held/stead; disable the parent join",
+    )
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument(
+        "--tsv",
+        action="store_true",
+        help="TSV eras (default when stdout is not a tty)",
+    )
+    parser.add_argument("--human", action="store_true", help="human report")
+    parser.add_argument("--oneline", action="store_true", help="status count span dates")
+    parser.add_argument("--revs", action="store_true", help="print SHAs where status is TRUE")
+    parser.add_argument(
+        "--bounds",
+        action="store_true",
+        help="print start_sha end_sha status count",
+    )
+    parser.add_argument(
+        "--true-bounds",
+        action="store_true",
+        help="like --bounds but only TRUE eras",
+    )
+    parser.add_argument(
+        "--boolean",
+        action="store_true",
+        help="lossy downcast to held: tree TRUE stays, everything else is FALSE",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="exit code only")
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds per exec probe (default: 30). must be > 0",
+    )
+    parser.add_argument(
+        "--no-witnesses",
+        action="store_true",
+        help="do not print witness paths",
+    )
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="omit the TSV header row",
+    )
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser(
+        "lattice",
+        help="print the 5-status meet/join tables (no repository needed)",
+    )
+
+    p_exists = sub.add_parser(
+        "exists",
+        help="TRUE when PATH exists (exact; one cat-file batch). globs: use glob",
+    )
+    p_exists.add_argument("path", help="exact path relative to repo root")
+
+    p_glob = sub.add_parser(
+        "glob",
+        help="TRUE when any path matches PATTERN (per unique tree, not exists)",
+    )
+    p_glob.add_argument("pattern", help="fnmatch pattern relative to repo root")
+
+    p_grep = sub.add_parser(
+        "grep",
+        help="TRUE on text match; EMPTY on binary/NUL-only match; UNKNOWN on bad regex",
+    )
+    p_grep.add_argument("-i", "--ignore-case", action="store_true")
+    p_grep.add_argument("-F", "--fixed-strings", action="store_true")
+    p_grep.add_argument("-w", "--word-regexp", action="store_true")
+    p_grep.add_argument("-v", "--invert-match", action="store_true")
+    p_grep.add_argument("pattern")
+    p_grep.add_argument("paths", nargs="*", help="optional path limiters")
+
+    p_exec = sub.add_parser(
+        "exec",
+        help="TRUE when COMMAND exits 0; timeout/checkout fail is UNKNOWN",
+    )
+    p_exec.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command to run; prefix with -- to avoid flag eating",
+    )
+
+    args = parser.parse_args(list(argv))
+    if args.cmd == "exec":
+        command = list(args.command)
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            parser.error("exec requires a command")
+        args.command = command
+    if args.timeout is None or args.timeout <= 0:
+        parser.error("--timeout must be > 0 (a timeout is UNKNOWN; 0 is not a probe)")
+    if args.cmd == "exists" and is_glob(args.path):
+        parser.error(
+            "exists is exact path occupancy (one cat-file batch). "
+            f"glob is a different cost class: ford glob {args.path}"
+        )
+    if args.any and args.join_all:
+        parser.error("use either --any (join) or --all (meet), not both")
+    if args.any and args.tree:
+        parser.error("--tree samples the merge SHA; --any has no join to apply")
+    args.join_op = "any" if args.any else "all"
+    return args
+
+
+def predicate_label(args: argparse.Namespace) -> str:
+    if args.cmd == "exists":
+        return f"exists {args.path}"
+    if args.cmd == "glob":
+        return f"glob {args.pattern}"
+    if args.cmd == "grep":
+        extra = []
+        if args.ignore_case:
+            extra.append("-i")
+        if args.fixed_strings:
+            extra.append("-F")
+        if args.word_regexp:
+            extra.append("-w")
+        if args.invert_match:
+            extra.append("-v")
+        flags = (" " + " ".join(extra)) if extra else ""
+        paths = (" -- " + " ".join(args.paths)) if args.paths else ""
+        return f"grep{flags} {args.pattern}{paths}"
+    if args.cmd == "lattice":
+        return "lattice"
+    return "exec " + " ".join(args.command)
+
+
+def probe_cost(cmd: str) -> str:
+    return {
+        "exists": "batch",
+        "glob": "per-tree",
+        "grep": "per-tree",
+        "exec": "per-commit",
+        "lattice": "none",
+    }.get(cmd, "unknown")
+
+
+def exit_for(status: Status, boolean: bool) -> int:
+    if boolean:
+        return 0 if status == Status.TRUE else 1
+    if status == Status.TRUE:
+        return 0
+    if status == Status.FALSE:
+        return 1
+    if status in NON_TF:
+        return 3
+    return 2
+
+
+def default_human(args: argparse.Namespace) -> bool:
+    if args.json or args.oneline or args.revs or args.bounds or args.true_bounds:
+        return False
+    if args.human:
+        return True
+    if args.tsv:
+        return False
+    return sys.stdout.isatty() and not args.quiet
+
+
+def run_probes(
+    args: argparse.Namespace,
+    repo: str,
+    targets: Sequence[Sample],
+) -> tuple[list[Probe], int, Optional[str]]:
+    bad_regex = None
+    if args.cmd == "exists":
+        probes, nprobe = probe_exists(repo, targets, args.path)
+    elif args.cmd == "glob":
+        probes, nprobe = probe_glob(repo, targets, args.pattern)
+    elif args.cmd == "grep":
+        probes, nprobe, bad_regex = probe_grep(
+            repo,
+            targets,
+            args.pattern,
+            args.paths,
+            ignore_case=args.ignore_case,
+            fixed=args.fixed_strings,
+            word=args.word_regexp,
+            invert=args.invert_match,
+        )
+    else:
+        probes, nprobe = probe_exec(
+            repo, targets, args.command, timeout=args.timeout
+        )
+    return probes, nprobe, bad_regex
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.cmd == "lattice":
+            text = format_lattice(op=args.join_op, as_json=bool(args.json))
+            print(text)
+            return 0
+
+        repo, bare = resolve_repo(args.repo)
+        if bare and args.now:
+            raise FordError("bare repository has no work tree for --now")
+
+        head = git(repo, "rev-parse", "--verify", f"{args.rev}^{{commit}}")
+        has_head = head.returncode == 0
+        samples: list[Sample] = []
+        if has_head:
+            samples = list_samples(
+                repo,
+                end_rev=args.rev,
+                rev_range=args.rev_range,
+                first_parent=not args.full,
+                limit=args.limit,
+            )
+        elif args.rev_range is not None:
+            raise FordError(f"no commits at {args.rev} (empty repository?)")
+
+        if args.index:
+            if bare:
+                raise FordError("bare repository has no index sample")
+            samples.append(index_sample())
+        if args.now:
+            samples.append(worktree_sample())
+        if not samples:
+            samples = [empty_sample()]
+
+        extras_needed = extra_parent_shas(samples)
+        extra_meta = load_commits(repo, extras_needed)
+        extra_samples = [m for m in extra_meta.values() if m is not None]
+
+        # Probe walked samples plus off-walk merge parents (the join inputs).
+        targets: list[Sample] = list(extra_samples)
+        seen = {s.sha for s in extra_samples}
+        for s in samples:
+            if s.kind == "commit" and s.sha in seen:
+                continue
+            targets.append(s)
+            if s.kind == "commit":
+                seen.add(s.sha)
+
+        probes_t, nprobe, bad_regex = run_probes(args, repo, targets)
+        by_sha: dict[str, Probe] = {}
+        target_index = {id(s): i for i, s in enumerate(targets)}
+        _ = target_index
+        for s, p in zip(targets, probes_t):
+            if s.kind == "commit":
+                by_sha[s.sha] = p
+
+        for psha in extras_needed:
+            if psha not in by_sha:
+                by_sha[psha] = Probe(
+                    Status.SHALLOW, Status.SHALLOW, ["(missing parent)"]
+                )
+
+        shallow = (
+            read_shallow_shas(repo) if any(s.kind == "commit" for s in samples) else set()
+        )
+        probed = set(by_sha)
+        tree_walk: list[Probe] = []
+        for s in samples:
+            if s.kind == "commit":
+                p = by_sha.get(s.sha)
+                if p is None:
+                    tree_walk.append(Probe(Status.UNKNOWN, Status.UNKNOWN, ["(probe)"]))
+                else:
+                    tree_walk.append(_copy_probe(p))
+            else:
+                # worktree/index/empty live on the target list
+                found = None
+                for t, p in zip(targets, probes_t):
+                    if t is s or (t.kind == s.kind and t.sha == s.sha):
+                        found = p
+                        break
+                tree_walk.append(
+                    _copy_probe(found) if found is not None else Probe(Status.EMPTY, Status.EMPTY)
+                )
+
+        horizon: set[str] = set()
+        if not args.boolean:
+            horizon = apply_horizon_trees(
+                samples, by_sha, shallow=shallow, probed=probed
+            )
+            # refresh walk trees after horizon rewrite
+            for i, s in enumerate(samples):
+                if s.kind == "commit" and s.sha in by_sha:
+                    tree_walk[i] = _copy_probe(by_sha[s.sha])
+                    tree_walk[i].tree = by_sha[s.sha].status
+
+        probes = apply_join(
+            samples,
+            by_sha,
+            tree_walk,
+            op=args.join_op,
+            tree_mode=bool(args.tree),
+            boolean=bool(args.boolean),
+            extra_meta=extra_meta,
+        )
+        if args.boolean:
+            probes = booleanize(probes)
+
+        # A TRUE/EMPTY join sitting on a shallow graft is still not birth.
+        if not args.boolean and horizon:
+            for i, s in enumerate(samples):
+                if s.kind == "commit" and s.sha in horizon:
+                    if probes[i].status in (Status.TRUE, Status.EMPTY):
+                        probes[i].status = Status.SHALLOW
+
+        if args.list_order:
+            eras = compress_list(samples, probes)
+            walk = "list"
+        else:
+            if args.full:
+                eras = compress_lattice(samples, probes)
+                walk = "lattice"
+            else:
+                eras = compress_list(samples, probes)
+                walk = "first-parent"
+        annotate_continuations(eras)
+        if not any(s.kind == "commit" for s in samples):
+            if any(s.kind in ("worktree", "index") for s in samples):
+                walk = "filesystem"
+            else:
+                walk = "unborn"
+        if args.boolean:
+            walk = walk + "+boolean"
+        if args.tree and "boolean" not in walk:
+            walk = walk + "+tree"
+
+        commit_pairs = [(s, p) for s, p in zip(samples, probes) if s.kind == "commit"]
+        true_n = sum(1 for _, p in commit_pairs if p.status == Status.TRUE)
+        shallow_n = sum(1 for _, p in commit_pairs if p.status == Status.SHALLOW)
+        unknown_n = sum(1 for _, p in commit_pairs if p.status == Status.UNKNOWN)
+        empty_n = sum(1 for _, p in commit_pairs if p.status == Status.EMPTY)
+        ford_n = sum(1 for _, p in commit_pairs if p.is_ford)
+        holds_now = probes[-1].status if probes else Status.EMPTY
+        tree_now = probes[-1].tree if probes else None
+        if tree_now is None and probes:
+            tree_now = probes[-1].raw
+        never_held = (
+            bool(commit_pairs)
+            and true_n == 0
+            and shallow_n == 0
+            and unknown_n == 0
+            and empty_n == 0
+        )
+        always_held = bool(commit_pairs) and true_n == len(commit_pairs)
+        spec = args.rev_range or args.rev
+        reachable = count_reachable(repo, spec) if has_head else 0
+
+        warnings: list[str] = []
+        hints: list[str] = []
+        extra_probes = 0
+        if bad_regex:
+            warnings.append("invalid regex: " + bad_regex.splitlines()[0])
+        if args.boolean and any(
+            (p.tree or p.raw) not in (Status.TRUE, Status.FALSE) for p in probes
+        ):
+            warnings.append(
+                "--boolean collapsed UNKNOWN/SHALLOW/EMPTY into FALSE (held recovery)"
+            )
+        if not args.boolean:
+            warnings, hints, extra_probes = diagnose(
+                args=args,
+                repo=repo,
+                samples=samples,
+                probes=probes,
+                end_rev=args.rev,
+                horizon=horizon,
+            )
+            if bad_regex:
+                warnings = [
+                    "invalid regex: " + bad_regex.splitlines()[0],
+                    *warnings,
+                ]
+        nprobe += extra_probes
+
+        report = Report(
+            repo=repo,
+            predicate=predicate_label(args),
+            end_rev=spec,
+            first_parent=not args.full,
+            include_now=bool(args.now),
+            holds_now=holds_now,
+            tree_now=tree_now,
+            never_held=never_held,
+            always_held=always_held,
+            commits_scanned=len(commit_pairs),
+            reachable=reachable,
+            probes=nprobe,
+            true_commits=true_n,
+            shallow_commits=shallow_n,
+            unknown_commits=unknown_n,
+            empty_commits=empty_n,
+            fords=ford_n,
+            eras=eras,
+            walk=walk,
+            probe_kind=args.cmd,
+            cost=probe_cost(args.cmd),
+            horizon=bool(horizon),
+            bare=bare,
+            boolean=bool(args.boolean),
+            join_op=args.join_op,
+            tree_mode=bool(args.tree),
+            hint=hints[0] if hints else None,
+            hints=hints,
+            warnings=warnings,
+        )
+
+        if not args.quiet:
+            if args.json:
+                print(json.dumps(report_to_json(report), indent=2, ensure_ascii=False))
+            elif args.revs:
+                print(
+                    "\n".join(
+                        s.sha
+                        for s, p in zip(samples, probes)
+                        if p.status == Status.TRUE and s.kind == "commit"
+                    )
+                )
+            elif args.bounds or args.true_bounds:
+                text = format_bounds(report, only_true=args.true_bounds)
+                if text:
+                    print(text)
+            elif args.oneline:
+                text = format_oneline(report)
+                if text:
+                    print(text)
+            elif default_human(args):
+                print(
+                    format_human(
+                        report,
+                        color=color_enabled(args),
+                        show_witnesses=not args.no_witnesses,
+                    )
+                )
+            else:
+                text = format_tsv(report, header=not args.no_header)
+                if text:
+                    print(text)
+                if sys.stderr.isatty() and not args.tsv:
+                    eprint(
+                        f"now={report.holds_now.value}  "
+                        f"true={report.true_commits}/{report.commits_scanned}  "
+                        f"fords={report.fords}  walk={report.walk}  join={report.join_op}"
+                    )
+
+        return exit_for(holds_now, boolean=bool(args.boolean))
+    except FordError as exc:
+        eprint(f"{TOOL}: {exc}")
+        return exc.code
+    except KeyboardInterrupt:
+        eprint(f"{TOOL}: interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

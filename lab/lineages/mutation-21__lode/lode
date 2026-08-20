@@ -1,0 +1,2487 @@
+#!/usr/bin/env python3
+"""lode — the environment a *load image set* is owed.
+
+ldd for env vars, of the binary *and* the dylibs it loads. A 52k
+python3 stub does not contain PYTHONHOME; libpython does. Harvest
+the names the process image set consults; join them against environments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".next",
+    ".turbo",
+    "coverage",
+    "vendor",
+    "Pods",
+    ".build",
+    ".idea",
+    ".vscode",
+    "Carthage",
+}
+
+SOURCE_SUFFIX = {
+    ".py",
+    ".pyi",
+    ".rs",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".go",
+    ".rb",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ksh",
+    ".java",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".hpp",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+}
+
+SHELL_SUFFIX = {".sh", ".bash", ".zsh", ".ksh"}
+
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+UPPER_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+SECRET_NAME_RE = re.compile(
+    r"(SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|CREDENTIAL|PRIVATE[_-]?KEY|AUTH)",
+    re.I,
+)
+
+# libc / POSIX / shell runtime — real, but they drown application ABI.
+LIBC_ENV = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TERMINFO",
+    "TERMCAP",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_COLLATE",
+    "LC_TIME",
+    "LC_NUMERIC",
+    "LC_MONETARY",
+    "TZ",
+    "TZDIR",
+    "PWD",
+    "OLDPWD",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "HOSTNAME",
+    "HOST",
+    "SHLVL",
+    "PS1",
+    "PS2",
+    "PS3",
+    "PS4",
+    "IFS",
+    "MAIL",
+    "MAILCHECK",
+    "MAILPATH",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "MANPATH",
+    "INFOPATH",
+    "CDPATH",
+    "COLUMNS",
+    "LINES",
+    "PPID",
+    "UID",
+    "EUID",
+    "RANDOM",
+    "SECONDS",
+    "REPLY",
+    "PIPESTATUS",
+    "BASH",
+    "BASH_VERSION",
+    "BASH_ENV",
+    "ZSH_VERSION",
+    "FPATH",
+    "HISTFILE",
+    "HISTSIZE",
+    "HISTFILESIZE",
+    "PROMPT",
+    "RPROMPT",
+    "COLORTERM",
+    "CLICOLOR",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "ITERM_SESSION_ID",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "GPG_TTY",
+    "GPG_AGENT_INFO",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XPC_SERVICE_NAME",
+    "XPC_FLAGS",
+    "COMMAND_MODE",
+    "__CF_USER_TEXT_ENCODING",
+    "__CFBundleIdentifier",
+    "SECURITYSESSIONID",
+    "LaunchInstanceID",
+    "MallocNanoZone",
+    "OSLogRateLimit",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_PRINT_LIBRARIES",
+    "LD_LIBRARY_PATH_64",
+}
+
+# Bare names that are real env vars but have no underscore.
+BARE_APP = {
+    "TMUX",
+    "ZELLIJ",
+    "STY",
+    "WINDOWID",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "DISPLAY",
+    "SHELL",
+    "HOME",
+    "PATH",
+    "USER",
+    "TERM",
+}
+
+# First segments used to unstick packed Rust/C rodata
+# (`KIZU_CONFIGXDG_CONFIG_HOME` → two names).
+PREFIX_SEEDS = {
+    "XDG_",
+    "GIT_",
+    "AWS_",
+    "HTTP_",
+    "HTTPS_",
+    "NODE_",
+    "NPM_",
+    "CARGO_",
+    "RUST_",
+    "RUSTC_",
+    "RUSTUP_",
+    "PYTHON_",
+    "PY_",
+    "JAVA_",
+    "GO_",
+    "GOPROXY_",
+    "SSL_",
+    "CURL_",
+    "REQUESTS_",
+    "DENO_",
+    "BUN_",
+    "VITE_",
+    "NEXT_",
+    "LC_",
+    "LD_",
+    "DYLD_",
+    "SSH_",
+    "GPG_",
+    "DBUS_",
+    "XPC_",
+    "TERM_",
+    "COLOR_",
+    "NO_",
+    "FORCE_",
+    "KIZU_",
+    "DUE_",
+    "LODE_",
+    "API_",
+    "APP_",
+    "DB_",
+    "DATABASE_",
+    "REDIS_",
+    "PG_",
+    "MYSQL_",
+    "S3_",
+    "OCI_",
+    "DOCKER_",
+    "KUBE_",
+    "KUBERNETES_",
+    "CI_",
+    "GITHUB_",
+    "GH_",
+    "HOMEBREW_",
+    "KITTY_",
+    "ZELLIJ_",
+    "TMUX_",
+}
+
+ENV_SUFFIXES = {
+    "HOME",
+    "DIR",
+    "PATH",
+    "FILE",
+    "KEY",
+    "TOKEN",
+    "URL",
+    "URI",
+    "HOST",
+    "PORT",
+    "USER",
+    "PASS",
+    "PASSWORD",
+    "SECRET",
+    "ID",
+    "NAME",
+    "LEVEL",
+    "MODE",
+    "ENV",
+    "ROOT",
+    "BIN",
+    "CONFIG",
+    "STATE",
+    "DATA",
+    "CACHE",
+    "TEMP",
+    "TMP",
+    "TIMEOUT",
+    "TTL",
+    "SECS",
+    "SESSION",
+    "ADDR",
+    "SOCK",
+    "PID",
+    "SIZE",
+    "LIMIT",
+    "LOG",
+    "FORMAT",
+    "COLOR",
+    "LANG",
+    "TZ",
+    "PROGRAM",
+    "VERSION",
+}
+
+PACKED_TOKEN_RE = re.compile(r"[A-Z]{2,}(?:_[A-Z0-9]+)+")
+PRINTABLE_RUN_RE = re.compile(rb"[\x20-\x7e]{3,512}")
+# CPython embeds `PYTHONHOME      : alternate <prefix>` and `  PYTHONHOME = \x00`.
+HELP_ENV_RE = re.compile(rb"(?:^|[\n\0])[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]{2,}:")
+ASSIGN_ENV_RE = re.compile(rb"(?:^|[\n\0])[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]*=[ \t]*(?:\x00|$)")
+DOLLAR_ENV_RE = re.compile(rb"\$([A-Z][A-Z0-9_]{2,})\b")
+CSTRING_ASSIGN_RE = re.compile(r"^[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]*=[ \t]*$")
+
+# Bare interpreter names: PYTHONHOME, PERL5LIB, RUBYOPT — no underscore.
+RUNTIME_FAMILY_PREFIXES = (
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "PHP",
+    "NODE",
+    "JAVA",
+    "GOROOT",
+    "GOPATH",
+    "CARGO",
+    "RUSTC",
+    "RUSTUP",
+    "BUN",
+    "DENO",
+    "GEM",
+    "PIP",
+    "IRB",
+    "BUNDLE",
+)
+# Printable-run split_packed on a 200MB dylib is a minute. Prefix peel is O(prefixes · n).
+LARGE_IMAGE_BYTES = 8 * 1024 * 1024
+
+SYSTEM_IMAGE_PREFIXES = (
+    "/usr/lib/",
+    "/usr/libexec/",
+    "/System/",
+    "/Library/Apple/",
+    "/lib/",
+    "/lib64/",
+    "/lib/x86_64-linux-gnu/",
+    "/lib/aarch64-linux-gnu/",
+    "/usr/lib64/",
+    "/usr/lib/system/",
+)
+
+# Strings that look like env names but are compiler / protocol / log junk.
+REJECT_STRINGS = {
+    "DEBUG",
+    "TRACE",
+    "INFO",
+    "ERROR",
+    "WARNING",
+    "WARN",
+    "FATAL",
+    "VERBOSE",
+    "NDEBUG",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+    "HTTP",
+    "HTTPS",
+    "HTTP2",
+    "HTTP3",
+    "JSON",
+    "YAML",
+    "TOML",
+    "XML",
+    "HTML",
+    "UTF8",
+    "UTF16",
+    "ASCII",
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "NONE",
+    "BOOL",
+    "TEXT",
+    "DATA",
+    "CODE",
+    "TYPE",
+    "NAME",
+    "FILE",
+    "LINE",
+    "FUNC",
+    "ARGS",
+    "ARGV",
+    "ARGC",
+    "SELF",
+    "THIS",
+    "TODO",
+    "FIXME",
+    "NOTE",
+    "HACK",
+    "XXX",
+    "OK",
+    "YES",
+    "NO",
+    "ON",
+    "OFF",
+    "ID",
+    "URL",
+    "URI",
+    "UUID",
+    "SHA",
+    "SHA1",
+    "SHA256",
+    "MD5",
+    "CRC32",
+    "LLVM",
+    "CLANG",
+    "GNUC",
+    "MSVC",
+    "POSIX",
+    "UNIX",
+    "LINUX",
+    "DARWIN",
+    "WIN32",
+    "WIN64",
+    "APPLE",
+    "ANDROID",
+    "RUSTC",
+    "RUSTFLAGS",
+    "CARGO",
+    "CMAKE",
+    "NINJA",
+    "MAKE",
+    "MAKEFLAGS",
+}
+
+MACH_O_MAGICS = {
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+}
+
+EVIDENCE_RANK = {"call": 3, "shell": 2, "string": 1}
+
+STATUS_ORDER = [
+    "MISSING",
+    "UNSET_LEFT",
+    "UNSET_RIGHT",
+    "DIFF",
+    "UNDOCUMENTED",
+    "STALE_EXAMPLE",
+    "LEFT_ONLY",
+    "RIGHT_ONLY",
+    "BOTH",
+    "DUE",
+    "SPARE",
+]
+
+FAIL_STATUSES = {"MISSING", "UNSET_LEFT", "UNSET_RIGHT", "DIFF", "UNDOCUMENTED"}
+ABI_FAIL_STATUSES = {"LEFT_ONLY"}
+
+
+@dataclass(order=True)
+class Need:
+    name: str
+    evidence: str
+    source: str
+    detail: str = ""
+
+    def as_tuple(self) -> tuple[str, str, str, str]:
+        return (self.name, self.evidence, self.source, self.detail)
+
+
+@dataclass
+class EnvMap:
+    values: dict[str, str]
+    origin: str
+
+
+@dataclass
+class Row:
+    status: str
+    name: str
+    left: str | None
+    right: str | None
+    example: str | None
+    evidence: str
+    source: str
+    detail: str = ""
+
+
+# ---------------------------------------------------------------------------
+# env snapshots
+# ---------------------------------------------------------------------------
+
+
+def parse_env_text(text: str, origin: str) -> EnvMap:
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        obj = json.loads(text)
+        if not isinstance(obj, dict):
+            raise ValueError(f"{origin}: JSON env must be an object")
+        values = {}
+        for key, val in obj.items():
+            if not isinstance(key, str) or not ENV_NAME_RE.match(key):
+                continue
+            if val is None:
+                values[key] = ""
+            elif isinstance(val, (str, int, float, bool)):
+                values[key] = str(val)
+        return EnvMap(values, origin)
+
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not ENV_NAME_RE.match(key):
+            continue
+        values[key] = _unquote_env_value(rest)
+    return EnvMap(values, origin)
+
+
+def _unquote_env_value(rest: str) -> str:
+    s = rest.strip()
+    if not s:
+        return ""
+    if s[0] in {'"', "'"}:
+        quote = s[0]
+        out: list[str] = []
+        i = 1
+        while i < len(s):
+            ch = s[i]
+            if ch == "\\" and i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    if " #" in s:
+        s = s.split(" #", 1)[0].rstrip()
+    return s
+
+
+def load_env_file(path: Path) -> EnvMap:
+    return parse_env_text(path.read_text(encoding="utf-8", errors="replace"), str(path))
+
+
+def current_env() -> EnvMap:
+    return EnvMap(dict(os.environ), "process")
+
+
+def env_from_pid(pid: int) -> EnvMap:
+    proc = Path(f"/proc/{pid}/environ")
+    if proc.is_file():
+        blob = proc.read_bytes()
+        values: dict[str, str] = {}
+        for part in blob.split(b"\0"):
+            if not part or b"=" not in part:
+                continue
+            key, _, val = part.partition(b"=")
+            try:
+                k = key.decode("utf-8")
+                v = val.decode("utf-8", "replace")
+            except UnicodeDecodeError:
+                continue
+            if ENV_NAME_RE.match(k):
+                values[k] = v
+        return EnvMap(values, f"pid:{pid}")
+
+    # macOS: ps may echo KEY=val after the argument vector.
+    try:
+        out = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot read environ of pid {pid}: {exc}") from exc
+    values = {}
+    for token in out.split():
+        if "=" not in token:
+            continue
+        key, _, val = token.partition("=")
+        if ENV_NAME_RE.match(key) and UPPER_NAME_RE.match(key):
+            values[key] = val
+    if not values:
+        raise RuntimeError(
+            f"cannot read environ of pid {pid} (no /proc, ps eww empty)"
+        )
+    return EnvMap(values, f"pid:{pid}")
+
+
+# ---------------------------------------------------------------------------
+# extractors
+# ---------------------------------------------------------------------------
+
+
+def _need(name: str, evidence: str, source: str, detail: str) -> Need | None:
+    if not ENV_NAME_RE.match(name):
+        return None
+    if evidence == "string" and name in REJECT_STRINGS:
+        return None
+    return Need(name, evidence, source, detail)
+
+
+def _loc(path: Path, lineno: int) -> str:
+    return f"{path}:{lineno}"
+
+
+class _PyEnvVisitor(ast.NodeVisitor):
+    """Collect getenv-like reads; ignore stores."""
+
+    def __init__(self, path: Path, constants: dict[str, str]) -> None:
+        self.path = path
+        self.constants = constants
+        self.needs: list[Need] = []
+        self.mod_alias: dict[str, str] = {}
+        self.from_alias: dict[str, str] = {}
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "os" or alias.name.startswith("os."):
+                self.mod_alias[alias.asname or alias.name.split(".", 1)[0]] = "os"
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "os":
+            for alias in node.names:
+                if alias.name in {"getenv", "environ"}:
+                    self.from_alias[alias.asname or alias.name] = alias.name
+        self.generic_visit(node)
+
+    def _str(self, node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in self.constants:
+            return self.constants[node.id]
+        return None
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # Keep constants up to date as we walk.
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self.constants[tgt.id] = node.value.value
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.generic_visit(node)
+            return
+        name = self._str(node.slice)
+        if name and self._is_environ(node.value):
+            n = _need(name, "call", _loc(self.path, node.lineno), "os.environ[]")
+            if n:
+                self.needs.append(n)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        kind = self._call_kind(func)
+        if kind and node.args:
+            name = self._str(node.args[0])
+            if name:
+                n = _need(name, "call", _loc(self.path, node.lineno), kind)
+                if n:
+                    self.needs.append(n)
+        self.generic_visit(node)
+
+    def _is_environ(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr == "environ":
+            return self._is_os(node.value)
+        if isinstance(node, ast.Name) and self.from_alias.get(node.id) == "environ":
+            return True
+        return False
+
+    def _is_os(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and self.mod_alias.get(node.id) == "os"
+
+    def _call_kind(self, func: ast.AST) -> str | None:
+        if isinstance(func, ast.Attribute):
+            if func.attr == "getenv" and self._is_os(func.value):
+                return "os.getenv"
+            if func.attr == "get" and self._is_environ(func.value):
+                return "os.environ.get"
+            if func.attr == "setdefault" and self._is_environ(func.value):
+                return "os.environ.setdefault"
+        if isinstance(func, ast.Name):
+            bound = self.from_alias.get(func.id)
+            if bound == "getenv":
+                return "os.getenv"
+        return None
+
+
+def extract_python(path: Path, text: str) -> list[Need]:
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return extract_by_regex(path, text, "python-fallback")
+    constants: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                constants[tgt.id] = node.value.value
+    vis = _PyEnvVisitor(path, dict(constants))
+    vis.visit(tree)
+    return vis.needs
+
+
+_CALL_SPECS: list[tuple[str, re.Pattern[str], str]] = [
+    (
+        "rust",
+        re.compile(
+            r"""(?:std::)?env::(?:var|var_os)\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""
+        ),
+        "env::var",
+    ),
+    (
+        "rust-option",
+        re.compile(r"""option_env!\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "option_env!",
+    ),
+    (
+        "js-dot",
+        re.compile(r"""process\.env\.([A-Za-z_][A-Za-z0-9_]*)"""),
+        "process.env",
+    ),
+    (
+        "js-sub",
+        re.compile(r"""process\.env\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "process.env[]",
+    ),
+    (
+        "deno",
+        re.compile(r"""Deno\.env\.get\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "Deno.env.get",
+    ),
+    (
+        "bun",
+        re.compile(r"""Bun\.env\.([A-Za-z_][A-Za-z0-9_]*)"""),
+        "Bun.env",
+    ),
+    (
+        "go",
+        re.compile(
+            r"""os\.(?:Getenv|LookupEnv)\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""
+        ),
+        "os.Getenv",
+    ),
+    (
+        "c",
+        re.compile(r"""(?:secure_)?getenv\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "getenv",
+    ),
+    (
+        "java",
+        re.compile(r"""System\.getenv\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "System.getenv",
+    ),
+    (
+        "ruby",
+        re.compile(r"""ENV(?:\.fetch)?\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "ENV[]",
+    ),
+    (
+        "ruby-fetch",
+        re.compile(r"""ENV\.fetch\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "ENV.fetch",
+    ),
+    (
+        "swift-env",
+        re.compile(r"""environment\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "environment[]",
+    ),
+]
+
+
+_SHELL_BRACE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[-+=?][^}]*)?\}")
+_SHELL_DOLLAR = re.compile(r"\$([A-Z_][A-Z0-9_]{1,})")
+
+
+def extract_by_regex(path: Path, text: str, _why: str) -> list[Need]:
+    found: list[Need] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for _label, cre, detail in _CALL_SPECS:
+            for m in cre.finditer(line):
+                n = _need(m.group(1), "call", _loc(path, i), detail)
+                if n:
+                    found.append(n)
+    return found
+
+
+def extract_shell(path: Path, text: str) -> list[Need]:
+    found: list[Need] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for m in _SHELL_BRACE.finditer(line):
+            n = _need(m.group(1), "shell", _loc(path, i), "${}")
+            if n:
+                found.append(n)
+        for m in _SHELL_DOLLAR.finditer(line):
+            n = _need(m.group(1), "shell", _loc(path, i), "$VAR")
+            if n:
+                found.append(n)
+    return found
+
+
+def is_macho_or_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return False
+    if magic == b"\x7fELF":
+        return True
+    if magic in MACH_O_MAGICS:
+        return True
+    if magic[:2] == b"MZ":
+        return True
+    return False
+
+
+def env_prefixes(extra: Iterable[str] | None = None) -> list[str]:
+    prefixes = set(PREFIX_SEEDS)
+    names = list(LIBC_ENV)
+    if extra:
+        names.extend(extra)
+    for name in names:
+        if "_" not in name or not UPPER_NAME_RE.match(name):
+            continue
+        head = name.split("_", 1)[0]
+        if len(head) >= 2:
+            prefixes.add(head + "_")
+    return sorted(prefixes, key=len, reverse=True)
+
+
+def is_runtime_family(name: str) -> bool:
+    """PYTHONHOME, PERL5LIB, RUBYOPT — interpreter ABI, often no underscore."""
+    if not UPPER_NAME_RE.match(name):
+        return False
+    if len(name) < 4 or len(name) > 40:
+        return False
+    if name in REJECT_STRINGS:
+        return False
+    for pfx in RUNTIME_FAMILY_PREFIXES:
+        if name == pfx or name.startswith(pfx):
+            rest = name[len(pfx) :]
+            if rest == "" or re.fullmatch(r"[A-Z0-9_]+", rest):
+                return True
+    return False
+
+
+def is_valid_env_token(name: str) -> bool:
+    if name in REJECT_STRINGS:
+        return False
+    if name in LIBC_ENV or name in BARE_APP:
+        return True
+    if is_runtime_family(name):
+        return True
+    if not UPPER_NAME_RE.match(name):
+        return False
+    if name.startswith("_") or name.endswith("_"):
+        return False
+    if "_" not in name:
+        return False
+    if re.search(r"\d$", name):
+        return False
+    if len(name) > 40:
+        return False
+    parts = name.split("_")
+    head, rest = parts[0], parts[1:]
+    if len(head) < 2 or not head.isalpha():
+        return False
+    if not rest:
+        return False
+    if any(len(p) > 16 for p in parts):
+        return False
+    long_alpha = [p for p in parts if len(p) >= 3 and p.isalpha()]
+    short_letter = [p for p in parts if len(p) == 1 and p.isalpha()]
+    if short_letter and len(long_alpha) < 2:
+        return False
+    if re.fullmatch(r"U+", name.replace("_", "")):
+        return False
+    return True
+
+
+def is_likely_env_name(name: str) -> bool:
+    """String-evidence filter: real-looking env, not compiler tables."""
+    if name in LIBC_ENV or name in BARE_APP:
+        return True
+    if is_runtime_family(name):
+        return True
+    if not is_valid_env_token(name):
+        return False
+    parts = name.split("_")
+    if parts[0] + "_" in PREFIX_SEEDS:
+        return True
+    if parts[-1] in ENV_SUFFIXES:
+        return True
+    if len(parts) >= 3 and sum(1 for p in parts if len(p) >= 3) >= 2:
+        return True
+    return False
+
+
+def split_packed(blob: str, prefixes: list[str]) -> list[str]:
+    cuts = {0, len(blob)}
+    for i in range(1, len(blob)):
+        for pfx in prefixes:
+            if blob.startswith(pfx, i):
+                cuts.add(i)
+                break
+        else:
+            # CONFIG|XDG_… — suffix word glued to a new PREFIX_
+            if re.match(r"[A-Z]{2,}_", blob[i:]):
+                before = blob[:i]
+                word = before.rsplit("_", 1)[-1]
+                if word in ENV_SUFFIXES:
+                    cuts.add(i)
+    ordered = sorted(cuts)
+    out: list[str] = []
+    for a, b in zip(ordered, ordered[1:]):
+        piece = blob[a:b]
+        if is_valid_env_token(piece) or piece in BARE_APP or piece in LIBC_ENV:
+            out.append(piece)
+            continue
+        for m in PACKED_TOKEN_RE.finditer(piece):
+            tok = m.group()
+            following = piece[m.end() :]
+            if tok and tok[-1].isupper() and following[:1].islower():
+                shorter = tok[:-1]
+                short_last = shorter.rsplit("_", 1)[-1]
+                long_last = tok.rsplit("_", 1)[-1]
+                if (
+                    is_valid_env_token(shorter)
+                    and short_last in ENV_SUFFIXES
+                    and long_last not in ENV_SUFFIXES
+                ):
+                    tok = shorter
+            if is_valid_env_token(tok):
+                out.append(tok)
+        for bare in BARE_APP | (LIBC_ENV & {"HOME", "PATH", "USER", "TERM", "SHELL", "EDITOR"}):
+            idx = 0
+            while True:
+                j = piece.find(bare, idx)
+                if j < 0:
+                    break
+                end = j + len(bare)
+                left_ok = j == 0 or not (piece[j - 1].isalnum() or piece[j - 1] == "_")
+                right_ok = end == len(piece) or not (piece[end].isalnum() or piece[end] == "_")
+                if left_ok and right_ok:
+                    out.append(bare)
+                idx = j + 1
+    return out
+
+
+def _after_boundary_ok(data: bytes, i: int, n: int) -> bool:
+    rest = data[i + n :]
+    if not rest:
+        return True
+    c = rest[0]
+    if not (chr(c).isalnum() or c == ord("_")):
+        return True
+    if 97 <= c <= 122:  # lowercase: end of ALLCAPS token
+        return True
+    if 65 <= c <= 90:  # uppercase
+        if re.match(rb"[A-Z]{2,}_", rest):
+            return True
+        if len(rest) > 1 and 97 <= rest[1] <= 122:
+            return True  # Titlecase word (Library, Application)
+        return False
+    return False
+
+
+def name_in_blob(data: bytes, name: str) -> bool:
+    try:
+        needle = name.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    start = 0
+    n = len(needle)
+    while True:
+        i = data.find(needle, start)
+        if i < 0:
+            return False
+        if _after_boundary_ok(data, i, n):
+            return True
+        start = i + 1
+
+
+def _is_env_byte(b: int) -> bool:
+    return (48 <= b <= 57) or (65 <= b <= 90) or b == 95
+
+
+def extract_doc_env_tokens(data: bytes) -> list[str]:
+    """Help tables, `NAME =`, and `$NAME` — how CPython spells PYTHONHOME."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def keep(raw: bytes) -> None:
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return
+        if text in seen:
+            return
+        if not (
+            is_valid_env_token(text)
+            or is_runtime_family(text)
+            or text in LIBC_ENV
+            or text in BARE_APP
+        ):
+            return
+        seen.add(text)
+        found.append(text)
+
+    for cre in (HELP_ENV_RE, ASSIGN_ENV_RE, DOLLAR_ENV_RE):
+        for m in cre.finditer(data):
+            keep(m.group(1))
+    return found
+
+
+def peel_prefix_tokens(data: bytes, prefixes: list[str]) -> list[str]:
+    """Find PREFIX_ seeds as bytes and take the ALLCAPS token at that offset.
+
+    Survives packed Rust rodata without walking every printable run of a
+    200MB librustc_driver.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for pfx in prefixes:
+        try:
+            needle = pfx.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        start = 0
+        n = len(needle)
+        while True:
+            i = data.find(needle, start)
+            if i < 0:
+                break
+            j = i
+            m = len(data)
+            while j < m and _is_env_byte(data[j]):
+                j += 1
+            tok = data[i:j].decode("ascii")
+            pieces = split_packed(tok, prefixes)
+            if not pieces and (
+                is_valid_env_token(tok) or tok in LIBC_ENV or tok in BARE_APP
+            ):
+                pieces = [tok]
+            for piece in pieces:
+                if piece not in seen and (
+                    is_valid_env_token(piece) or piece in LIBC_ENV or piece in BARE_APP
+                ):
+                    seen.add(piece)
+                    out.append(piece)
+            start = i + n
+    return out
+
+
+def extract_binary(path: Path, needles: Iterable[str] | None = None) -> list[Need]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    found: list[Need] = []
+    seen: set[str] = set()
+    prefixes = env_prefixes(needles)
+
+    def add(text: str, detail: str) -> None:
+        if text in seen:
+            return
+        n = _need(text, "string", str(path), detail)
+        if n:
+            seen.add(text)
+            found.append(n)
+
+    for chunk in data.split(b"\0"):
+        if not (3 <= len(chunk) <= 80):
+            continue
+        if not all(32 <= b < 127 for b in chunk):
+            continue
+        text = chunk.decode("ascii")
+        assign = CSTRING_ASSIGN_RE.match(text.strip())
+        if assign:
+            add(assign.group(1), "cstring-assign")
+        if is_valid_env_token(text) or text in LIBC_ENV or text in BARE_APP:
+            add(text, "cstring")
+        else:
+            for tok in split_packed(text, prefixes):
+                add(tok, "cstring-packed")
+
+    large = len(data) >= LARGE_IMAGE_BYTES
+    if not large:
+        for run in PRINTABLE_RUN_RE.finditer(data):
+            text = run.group().decode("ascii")
+            if is_valid_env_token(text) or text in LIBC_ENV or text in BARE_APP:
+                add(text, "rodata")
+                continue
+            for tok in split_packed(text, prefixes):
+                add(tok, "packed")
+
+    for tok in peel_prefix_tokens(data, prefixes):
+        add(tok, "prefix")
+
+    for tok in extract_doc_env_tokens(data):
+        add(tok, "doc")
+
+    if needles:
+        for name in needles:
+            if name in seen:
+                continue
+            if name_in_blob(data, name):
+                add(name, "needle")
+    return found
+
+
+def looks_like_binary_file(path: Path) -> bool:
+    if is_macho_or_elf(path):
+        return True
+    if path.suffix.lower() in {".bin", ".so", ".dylib", ".exe", ".o", ".a", ".dll"}:
+        return True
+    try:
+        chunk = path.read_bytes()[:4096]
+    except OSError:
+        return False
+    return b"\0" in chunk
+
+
+def extract_file(path: Path, needles: Iterable[str] | None = None) -> list[Need]:
+    suffix = path.suffix.lower()
+    if looks_like_binary_file(path):
+        return extract_binary(path, needles)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if suffix == ".py" or suffix == ".pyi":
+        return extract_python(path, text)
+    if suffix in SHELL_SUFFIX or _looks_like_shell(path, text):
+        return extract_shell(path, text) + extract_by_regex(path, text, "shell-calls")
+    if suffix in SOURCE_SUFFIX:
+        return extract_by_regex(path, text, suffix)
+    # Shebang scripts without a known suffix.
+    if _looks_like_shell(path, text):
+        return extract_shell(path, text)
+    if text.startswith("#!") and "python" in text.splitlines()[0].lower():
+        return extract_python(path, text)
+    if is_probably_binary_blob(path):
+        return extract_binary(path, needles)
+    return extract_by_regex(path, text, "unknown")
+
+
+def _looks_like_shell(path: Path, text: str) -> bool:
+    if path.suffix.lower() in SHELL_SUFFIX:
+        return True
+    if text.startswith("#!"):
+        head = text.splitlines()[0].lower()
+        return any(s in head for s in ("bash", "zsh", "ksh", "sh"))
+    return False
+
+
+def is_probably_binary_blob(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        try:
+            chunk = path.read_bytes()[:4096]
+        except OSError:
+            return False
+        return b"\0" in chunk
+    return False
+
+
+def should_skip_dir(name: str) -> bool:
+    return name in SKIP_DIRS or name.startswith(".")
+
+
+def iter_walk(root: Path) -> Iterator[Path]:
+    if root.is_file():
+        yield root
+        return
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        for fn in filenames:
+            if fn.startswith("."):
+                # Still allow .env* as env files, not as programs.
+                continue
+            yield Path(dirpath) / fn
+
+
+# ---------------------------------------------------------------------------
+# loaded images (otool -L / ldd)
+# ---------------------------------------------------------------------------
+
+
+def is_system_install_name(name: str) -> bool:
+    text = name.replace("\\", "/")
+    for pfx in SYSTEM_IMAGE_PREFIXES:
+        if text.startswith(pfx) or text.startswith("/private" + pfx):
+            return True
+    base = text.rsplit("/", 1)[-1]
+    if base in {"libSystem.B.dylib", "libobjc.A.dylib", "libc++.1.dylib", "linux-vdso.so.1"}:
+        return True
+    return False
+
+
+def is_system_image(path: Path) -> bool:
+    try:
+        text = str(path.resolve())
+    except OSError:
+        text = str(path)
+    return is_system_install_name(text)
+
+
+def parse_otool_L(text: str) -> list[str]:
+    names: list[str] = []
+    for i, raw in enumerate(text.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        if i == 0 and line.endswith(":"):
+            continue
+        m = re.match(r"^(.+?) \((?:compatibility version|architecture)\b", line)
+        if m:
+            names.append(m.group(1).strip())
+            continue
+        if line.startswith(("@", "/")) or ".dylib" in line or ".so" in line:
+            names.append(line.split(" (", 1)[0].strip())
+    return names
+
+
+def parse_otool_rpaths(text: str) -> list[str]:
+    rpaths: list[str] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "LC_RPATH" not in line:
+            continue
+        for j in range(i + 1, min(i + 8, len(lines))):
+            m = re.search(r"\bpath\s+(\S+)", lines[j])
+            if m:
+                rpaths.append(m.group(1))
+                break
+    return rpaths
+
+
+def parse_ldd(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if " => " in line:
+            right = line.split(" => ", 1)[1].strip()
+            path = right.split(" (", 1)[0].strip()
+            if path and path != "not found":
+                out.append(path)
+        elif line.startswith("/") and ".so" in line:
+            out.append(line.split()[0])
+    return out
+
+
+def parse_objdump_dynamic(text: str) -> tuple[list[str], list[str]]:
+    needed: list[str] = []
+    rpaths: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("NEEDED"):
+            needed.append(line.split()[-1])
+        elif line.startswith("RPATH") or line.startswith("RUNPATH"):
+            val = line.split()[-1]
+            rpaths.extend(p for p in val.split(":") if p)
+    return needed, rpaths
+
+
+def _run_tool(argv: list[str], timeout: float = 8.0) -> str:
+    try:
+        return subprocess.check_output(
+            argv, text=True, stderr=subprocess.DEVNULL, timeout=timeout
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
+def macho_install_names(path: Path) -> list[str]:
+    return parse_otool_L(_run_tool(["otool", "-L", str(path)]))
+
+
+def macho_rpaths(path: Path) -> list[str]:
+    return parse_otool_rpaths(_run_tool(["otool", "-l", str(path)]))
+
+
+def expand_load_special(spec: str, *, loader: Path, executable: Path) -> str:
+    loader_dir = str(loader.parent)
+    exec_dir = str(executable.parent)
+    return spec.replace("@loader_path", loader_dir).replace(
+        "@executable_path", exec_dir
+    )
+
+
+def resolve_load_name(
+    name: str,
+    *,
+    loader: Path,
+    executable: Path,
+    rpaths: list[str],
+) -> Path | None:
+    name = name.strip()
+    if not name:
+        return None
+    if name.startswith("@rpath/"):
+        rest = name[len("@rpath/") :]
+        expanded = [expand_load_special(r, loader=loader, executable=executable) for r in rpaths]
+        extra = [
+            str(loader.parent),
+            str(loader.parent / "lib"),
+            str(loader.parent.parent / "lib"),
+            str(executable.parent),
+            str(executable.parent / "lib"),
+            str(executable.parent.parent / "lib"),
+        ]
+        seen_dir: set[str] = set()
+        for rp in expanded + extra:
+            if not rp or rp in seen_dir:
+                continue
+            seen_dir.add(rp)
+            cand = Path(rp) / rest
+            if cand.is_file():
+                return cand.resolve()
+        return None
+
+    expanded = expand_load_special(name, loader=loader, executable=executable)
+    if expanded.startswith("@rpath/"):
+        return resolve_load_name(
+            expanded, loader=loader, executable=executable, rpaths=rpaths
+        )
+    path = Path(expanded)
+    if path.is_file():
+        return path.resolve()
+    rel = loader.parent / name
+    if rel.is_file():
+        return rel.resolve()
+    return None
+
+
+def elf_needed_and_rpaths(path: Path) -> tuple[list[str], list[str]]:
+    ldd = shutil.which("ldd")
+    if ldd:
+        resolved = parse_ldd(_run_tool([ldd, str(path)]))
+        if resolved:
+            return resolved, []
+    dump = shutil.which("objdump") or shutil.which("llvm-objdump")
+    if dump:
+        return parse_objdump_dynamic(_run_tool([dump, "-p", str(path)]))
+    return [], []
+
+
+@dataclass
+class ImageRow:
+    role: str  # main | load | skip | missing
+    path: Path | None
+    raw: str
+    bytes: int = 0
+
+
+def iter_loaded_images(
+    root: Path,
+    *,
+    system: bool = False,
+    closure: bool = False,
+    depth: int = 1,
+) -> list[ImageRow]:
+    """Direct dependents of root (otool -L / ldd). closure=BFS of non-system."""
+    root = root.resolve()
+    rows: list[ImageRow] = []
+    try:
+        size = root.stat().st_size
+    except OSError:
+        size = 0
+    rows.append(ImageRow("main", root, str(root), size))
+    if not is_macho_or_elf(root):
+        return rows
+
+    max_depth = 64 if closure else max(0, depth)
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    seen: set[Path] = {root}
+    listed_raw: set[str] = set()
+
+    while pending:
+        current, d = pending.pop(0)
+        if d >= max_depth:
+            continue
+        rpaths = macho_rpaths(current) if is_macho_or_elf(current) else []
+        names: list[str] = []
+        magic_ok = False
+        try:
+            with current.open("rb") as fh:
+                magic = fh.read(4)
+        except OSError:
+            magic = b""
+        if magic in MACH_O_MAGICS:
+            magic_ok = True
+            names = macho_install_names(current)
+        elif magic == b"\x7fELF":
+            magic_ok = True
+            needed, elf_rpaths = elf_needed_and_rpaths(current)
+            rpaths = list(elf_rpaths) + rpaths
+            names = needed
+        if not magic_ok:
+            continue
+
+        for raw in names:
+            if raw in listed_raw:
+                continue
+            listed_raw.add(raw)
+            resolved = resolve_load_name(
+                raw, loader=current, executable=root, rpaths=rpaths
+            )
+            if resolved is None:
+                role = "skip" if (not system) and is_system_install_name(raw) else "missing"
+                rows.append(ImageRow(role, None, raw, 0))
+                continue
+            if resolved == root or resolved == current:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                sz = resolved.stat().st_size
+            except OSError:
+                sz = 0
+            skip = (not system) and is_system_image(resolved)
+            role = "skip" if skip else "load"
+            rows.append(ImageRow(role, resolved, raw, sz))
+            if not skip:
+                pending.append((resolved, d + 1))
+    return rows
+
+
+def harvest(
+    paths: Iterable[Path],
+    needles: Iterable[str] | None = None,
+    *,
+    walk_images: bool = True,
+    system: bool = False,
+    closure: bool = False,
+    depth: int = 1,
+) -> list[Need]:
+    acc: list[Need] = []
+    needle_list = list(needles) if needles else None
+    seen_images: set[Path] = set()
+
+    def add_image_tree(binary: Path) -> None:
+        if not walk_images or not is_macho_or_elf(binary):
+            return
+        for row in iter_loaded_images(
+            binary, system=system, closure=closure, depth=depth
+        ):
+            if row.role != "load" or row.path is None:
+                continue
+            rp = row.path.resolve()
+            if rp in seen_images:
+                continue
+            seen_images.add(rp)
+            acc.extend(extract_file(rp, needle_list))
+
+    for path in paths:
+        path = path.resolve()
+        seen_images.add(path)
+        if path.is_dir():
+            for child in iter_walk(path):
+                if child.suffix.lower() in SOURCE_SUFFIX or is_macho_or_elf(child):
+                    acc.extend(extract_file(child, needle_list))
+                    add_image_tree(child)
+                elif child.is_file() and os.access(child, os.X_OK):
+                    acc.extend(extract_file(child, needle_list))
+                    add_image_tree(child)
+            continue
+        if path.is_file():
+            acc.extend(extract_file(path, needle_list))
+            add_image_tree(path)
+    return merge_needs(acc)
+
+
+def merge_needs(needs: Iterable[Need]) -> list[Need]:
+    best: dict[str, Need] = {}
+    extras: dict[str, list[Need]] = defaultdict(list)
+    for need in needs:
+        cur = best.get(need.name)
+        if cur is None:
+            best[need.name] = need
+            continue
+        if EVIDENCE_RANK.get(need.evidence, 0) > EVIDENCE_RANK.get(cur.evidence, 0):
+            extras[need.name].append(cur)
+            best[need.name] = need
+        elif need.source != cur.source:
+            extras[need.name].append(need)
+    # Keep the winning row per name; source notes extra loci in detail if few.
+    out = []
+    for name in sorted(best):
+        win = best[name]
+        others = extras.get(name, [])
+        extra_srcs = sorted({o.source for o in others if o.source != win.source})
+        if extra_srcs:
+            more = extra_srcs[:3]
+            suffix = f" (+{len(extra_srcs)} more)" if extra_srcs[3:] else ""
+            detail = win.detail
+            extra = ",".join(more) + suffix
+            if detail:
+                detail = f"{detail}; also {extra}"
+            else:
+                detail = f"also {extra}"
+            win = Need(win.name, win.evidence, win.source, detail)
+        out.append(win)
+    return out
+
+
+def resolve_program(spec: str) -> Path:
+    path = Path(spec)
+    if path.exists():
+        return path
+    found = shutil.which(spec)
+    if found:
+        return Path(found)
+    raise FileNotFoundError(f"not a file, directory, or PATH command: {spec}")
+
+
+def parse_abi_text(text: str, origin: str) -> list[Need]:
+    needs: list[Need] = []
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("name\t"):
+            continue
+        parts = line.split("\t")
+        name = parts[0].strip()
+        evidence = parts[1].strip() if len(parts) > 1 else "call"
+        source = parts[2].strip() if len(parts) > 2 else origin
+        detail = parts[3].strip() if len(parts) > 3 else "abi"
+        n = _need(name, evidence or "call", source, detail)
+        if n:
+            needs.append(n)
+        elif ENV_NAME_RE.match(name):
+            needs.append(Need(name, evidence or "call", source, detail))
+        else:
+            raise ValueError(f"{origin}:{i}: bad ABI name {name!r}")
+    return merge_needs(needs)
+
+
+# ---------------------------------------------------------------------------
+# join
+# ---------------------------------------------------------------------------
+
+
+def classify(
+    needs: list[Need],
+    left: EnvMap | None,
+    right: EnvMap | None,
+    example: EnvMap | None,
+    *,
+    spare: bool,
+) -> list[Row]:
+    by_name = {n.name: n for n in needs}
+    owed = set(by_name)
+    rows: list[Row] = []
+
+    names = set(owed)
+    if left:
+        names.update(left.values)
+    if right:
+        names.update(right.values)
+    if example:
+        names.update(example.values)
+
+    for name in sorted(names):
+        need = by_name.get(name)
+        lv = left.values.get(name) if left else None
+        rv = right.values.get(name) if right else None
+        ev = example.values.get(name) if example else None
+        in_left = left is not None and name in left.values
+        in_right = right is not None and name in right.values
+        in_ex = example is not None and name in example.values
+
+        if name not in owed:
+            if example is not None and in_ex:
+                rows.append(
+                    Row(
+                        "STALE_EXAMPLE",
+                        name,
+                        lv if in_left else None,
+                        rv if in_right else None,
+                        ev,
+                        "example",
+                        example.origin,
+                        "documented but unread",
+                    )
+                )
+            elif spare and (in_left or in_right):
+                rows.append(
+                    Row(
+                        "SPARE",
+                        name,
+                        lv if in_left else None,
+                        rv if in_right else None,
+                        ev if in_ex else None,
+                        "-",
+                        "-",
+                        "set but unread",
+                    )
+                )
+            continue
+
+        assert need is not None
+        if example is not None and not in_ex:
+            # Still also emit the env-join status; UNDOCUMENTED is extra signal.
+            rows.append(
+                Row(
+                    "UNDOCUMENTED",
+                    name,
+                    lv if in_left else None,
+                    rv if in_right else None,
+                    None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+
+        if left is None and right is None:
+            rows.append(
+                Row(
+                    "DUE",
+                    name,
+                    None,
+                    None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if right is None:
+            status = "DUE" if in_left else "MISSING"
+            rows.append(
+                Row(
+                    status,
+                    name,
+                    lv if in_left else None,
+                    None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if left is None:
+            status = "DUE" if in_right else "MISSING"
+            rows.append(
+                Row(
+                    status,
+                    name,
+                    None,
+                    rv if in_right else None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if in_left and in_right:
+            status = "DUE" if lv == rv else "DIFF"
+        elif in_left:
+            status = "UNSET_RIGHT"
+        elif in_right:
+            status = "UNSET_LEFT"
+        else:
+            status = "MISSING"
+        rows.append(
+            Row(
+                status,
+                name,
+                lv if in_left else None,
+                rv if in_right else None,
+                ev if in_ex else None,
+                need.evidence,
+                need.source,
+                need.detail,
+            )
+        )
+
+    # Prefer the env-join row over a duplicate UNDOCUMENTED-only listing
+    # when we already emitted both; keep both — they answer different questions.
+    rows.sort(key=lambda r: (STATUS_ORDER.index(r.status) if r.status in STATUS_ORDER else 99, r.name))
+    return rows
+
+
+def classify_abi(left: list[Need], right: list[Need]) -> list[Row]:
+    lmap = {n.name: n for n in left}
+    rmap = {n.name: n for n in right}
+    rows: list[Row] = []
+    for name in sorted(set(lmap) | set(rmap)):
+        ln = lmap.get(name)
+        rn = rmap.get(name)
+        if ln and rn:
+            status = "BOTH"
+        elif ln:
+            status = "LEFT_ONLY"
+        else:
+            status = "RIGHT_ONLY"
+        rows.append(
+            Row(
+                status,
+                name,
+                ln.source if ln else None,
+                rn.source if rn else None,
+                None,
+                (ln.evidence if ln else rn.evidence) if (ln or rn) else "-",
+                (ln.source if ln else rn.source) if (ln or rn) else "-",
+                f"{ln.detail if ln else '-'} | {rn.detail if rn else '-'}",
+            )
+        )
+    rows.sort(key=lambda r: (STATUS_ORDER.index(r.status) if r.status in STATUS_ORDER else 99, r.name))
+    return rows
+
+
+def is_libc_name(name: str) -> bool:
+    if name in LIBC_ENV:
+        return True
+    if name.startswith("LC_"):
+        return True
+    if name.startswith("LD_") or name.startswith("DYLD_"):
+        return True
+    if name.startswith("XPC_") or name.startswith("SSH_"):
+        return True
+    return False
+
+
+def looks_secret(name: str, value: str | None) -> bool:
+    if SECRET_NAME_RE.search(name):
+        return True
+    if value is None:
+        return False
+    if value.startswith(("sk-", "ghp_", "github_pat_", "xoxb-", "AKIA")):
+        return True
+    return False
+
+
+def display_value(name: str, value: str | None, *, show: bool) -> str:
+    if value is None:
+        return "-"
+    if not show and looks_secret(name, value):
+        return "«redacted»"
+    if len(value) > 72:
+        return value[:69] + "..."
+    return value
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def format_human(rows: list[Row], *, show: bool, have_right: bool, have_example: bool) -> str:
+    if not rows:
+        return "(no owed names)\n"
+    cols = ["STATUS", "NAME", "LEFT"]
+    if have_right:
+        cols.append("RIGHT")
+    if have_example:
+        cols.append("EXAMPLE")
+    cols.extend(["EVIDENCE", "SOURCE"])
+    table: list[list[str]] = [cols]
+    for row in rows:
+        line = [
+            row.status,
+            row.name,
+            display_value(row.name, row.left, show=show),
+        ]
+        if have_right:
+            line.append(display_value(row.name, row.right, show=show))
+        if have_example:
+            line.append(display_value(row.name, row.example, show=show))
+        line.extend([row.evidence, row.source])
+        table.append(line)
+    widths = [max(len(r[i]) for r in table) for i in range(len(cols))]
+    out = []
+    for i, rec in enumerate(table):
+        out.append("  ".join(cell.ljust(widths[j]) for j, cell in enumerate(rec)))
+        if i == 0:
+            out.append("  ".join("-" * widths[j] for j in range(len(cols))))
+    return "\n".join(out) + "\n"
+
+
+def format_tsv(rows: list[Row], *, show: bool) -> str:
+    lines = ["status\tname\tleft\tright\texample\tevidence\tsource\tdetail"]
+    for row in rows:
+        fields = [
+            row.status,
+            row.name,
+            display_value(row.name, row.left, show=show),
+            display_value(row.name, row.right, show=show),
+            display_value(row.name, row.example, show=show),
+            row.evidence,
+            row.source,
+            row.detail,
+        ]
+        lines.append("\t".join(fields))
+    return "\n".join(lines) + "\n"
+
+
+def format_json(rows: list[Row], *, show: bool) -> str:
+    payload = []
+    for row in rows:
+        payload.append(
+            {
+                "status": row.status,
+                "name": row.name,
+                "left": None
+                if row.left is None
+                else display_value(row.name, row.left, show=show),
+                "right": None
+                if row.right is None
+                else display_value(row.name, row.right, show=show),
+                "example": None
+                if row.example is None
+                else display_value(row.name, row.example, show=show),
+                "evidence": row.evidence,
+                "source": row.source,
+                "detail": row.detail,
+            }
+        )
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def format_abi(needs: list[Need]) -> str:
+    lines = ["name\tevidence\tsource\tdetail"]
+    for n in needs:
+        lines.append("\t".join([n.name, n.evidence, n.source, n.detail]))
+    return "\n".join(lines) + "\n"
+
+
+def format_emit(needs: list[Need], env: EnvMap, *, show: bool) -> str:
+    lines = []
+    for n in needs:
+        if n.name not in env.values:
+            continue
+        val = env.values[n.name]
+        if not show and looks_secret(n.name, val):
+            continue
+        lines.append(f"{n.name}={_emit_quote(val)}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _emit_quote(val: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_./:@+-]*", val):
+        return val
+    return json.dumps(val, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="lode",
+        description="The environment a load image set is owed (ldd for env vars).",
+    )
+    p.add_argument("programs", nargs="*", help="binary, script, source file, or tree")
+    p.add_argument("-C", dest="chdir", metavar="DIR", help="change directory first")
+    p.add_argument("--vs", dest="vs", metavar="FILE", help="right-hand env file")
+    p.add_argument("--left", dest="left", metavar="FILE", help="left-hand env file")
+    p.add_argument("--right", dest="right", metavar="FILE", help="alias for --vs")
+    p.add_argument("--example", dest="example", metavar="FILE", help=".env.example join")
+    p.add_argument("--vs-pid", dest="vs_pid", type=int, metavar="PID")
+    p.add_argument(
+        "--vs-program",
+        dest="vs_program",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="compare owed names against another program/tree (source vs image)",
+    )
+    p.add_argument(
+        "--abi",
+        dest="abi",
+        metavar="FILE",
+        help="load owed names from a lode --dump-abi table (or -)",
+    )
+    p.add_argument("--dump-abi", action="store_true", help="emit the owed-name table")
+    p.add_argument("--names", action="store_true", help="print owed names only")
+    p.add_argument(
+        "--emit",
+        action="store_true",
+        help="print KEY=VAL for owed names set on the left",
+    )
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true", help="alias for --tsv")
+    p.add_argument("--spare", action="store_true", help="include unread set variables")
+    p.add_argument("--app", action="store_true", help="hide well-known libc/runtime names")
+    p.add_argument(
+        "--loose",
+        action="store_true",
+        help="keep low-quality string tokens from binaries (compiler junk)",
+    )
+    p.add_argument(
+        "--min-evidence",
+        choices=("call", "shell", "string"),
+        default=None,
+        help="drop weaker evidence (call > shell > string)",
+    )
+    p.add_argument("--show-values", action="store_true", help="do not redact secrets")
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if MISSING/DIFF/UNSET/UNDOCUMENTED",
+    )
+    p.add_argument("--report-only", action="store_true", help="always exit 0")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument(
+        "--solo",
+        action="store_true",
+        help="do not walk loaded dylibs/so (ancestor: main executable only)",
+    )
+    p.add_argument(
+        "--images",
+        action="store_true",
+        help="print the load image set (main + otool/ldd dependents) and exit",
+    )
+    p.add_argument(
+        "--system",
+        action="store_true",
+        help="include /usr/lib /System images when walking the load list",
+    )
+    p.add_argument(
+        "--closure",
+        action="store_true",
+        help="BFS the non-system load graph instead of direct dependents",
+    )
+    p.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        metavar="N",
+        help="max load-list hops (default 1 = otool -L / ldd of the binary)",
+    )
+    return p
+
+
+def filter_needs(
+    needs: list[Need],
+    *,
+    app: bool,
+    min_evidence: str | None,
+    loose: bool = False,
+) -> list[Need]:
+    out = []
+    min_rank = EVIDENCE_RANK[min_evidence] if min_evidence else 0
+    for n in needs:
+        if app and is_libc_name(n.name):
+            continue
+        if EVIDENCE_RANK.get(n.evidence, 0) < min_rank:
+            continue
+        if n.evidence == "string" and not loose and not is_likely_env_name(n.name):
+            continue
+        out.append(n)
+    return out
+
+
+def run(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.selftest:
+        return run_selftest()
+
+    if args.chdir:
+        os.chdir(args.chdir)
+
+    if args.images:
+        if not args.programs:
+            print("lode: --images needs a program", file=sys.stderr)
+            return 2
+        try:
+            return emit_images(args)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"lode: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        needs = collect_needs(args)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"lode: {exc}", file=sys.stderr)
+        return 2
+
+    needs = filter_needs(
+        needs, app=args.app, min_evidence=args.min_evidence, loose=args.loose
+    )
+
+    if args.vs_program:
+        if args.vs or args.right or args.vs_pid is not None:
+            print("lode: --vs-program cannot mix with --vs/--right/--vs-pid", file=sys.stderr)
+            return 2
+        try:
+            right_paths = [resolve_program(p) for p in args.vs_program]
+            right_needs = harvest(
+                right_paths,
+                needles=[n.name for n in needs],
+                walk_images=not args.solo,
+                system=args.system,
+                closure=args.closure,
+                depth=args.depth,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            print(f"lode: {exc}", file=sys.stderr)
+            return 2
+        right_needs = filter_needs(
+            right_needs, app=args.app, min_evidence=None, loose=args.loose
+        )
+        if args.names:
+            sys.stdout.write("".join(n.name + "\n" for n in needs))
+            return 0
+        if args.dump_abi:
+            sys.stdout.write(format_abi(needs))
+            return 0
+        rows = classify_abi(needs, right_needs)
+        show = True
+        if args.json:
+            sys.stdout.write(format_json(rows, show=show))
+        elif args.tsv or args.porcelain:
+            sys.stdout.write(format_tsv(rows, show=show))
+        else:
+            sys.stdout.write(
+                format_human(rows, show=show, have_right=True, have_example=False)
+            )
+        if args.report_only:
+            return 0
+        fail = ABI_FAIL_STATUSES if args.check else set()
+        if any(r.status in fail for r in rows):
+            return 1
+        return 0
+
+    if args.names:
+        sys.stdout.write("".join(n.name + "\n" for n in needs))
+        return 0
+    if args.dump_abi:
+        sys.stdout.write(format_abi(needs))
+        return 0
+
+    try:
+        left, right, example = load_envs(args)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"lode: {exc}", file=sys.stderr)
+        return 2
+
+    if args.emit:
+        env = left or current_env()
+        sys.stdout.write(format_emit(needs, env, show=args.show_values))
+        return 0
+
+    rows = classify(
+        needs,
+        left,
+        right,
+        example,
+        spare=args.spare,
+    )
+    show = args.show_values
+    if args.json:
+        sys.stdout.write(format_json(rows, show=show))
+    elif args.tsv or args.porcelain:
+        sys.stdout.write(format_tsv(rows, show=show))
+    else:
+        sys.stdout.write(
+            format_human(
+                rows,
+                show=show,
+                have_right=right is not None,
+                have_example=example is not None,
+            )
+        )
+
+    if args.report_only:
+        return 0
+    if args.check and any(r.status in FAIL_STATUSES for r in rows):
+        return 1
+    if not args.check and any(r.status in FAIL_STATUSES for r in rows):
+        return 1
+    return 0
+
+
+def collect_needs(args: argparse.Namespace) -> list[Need]:
+    needs: list[Need] = []
+    if args.abi:
+        if args.abi == "-":
+            needs.extend(parse_abi_text(sys.stdin.read(), "stdin"))
+        else:
+            path = Path(args.abi)
+            needs.extend(parse_abi_text(path.read_text(encoding="utf-8"), str(path)))
+    programs = list(args.programs)
+    if not programs and not args.abi:
+        raise ValueError("need a program/tree or --abi")
+    paths = [resolve_program(p) for p in programs]
+    if paths:
+        needs.extend(
+            harvest(
+                paths,
+                walk_images=not args.solo,
+                system=args.system,
+                closure=args.closure,
+                depth=args.depth,
+            )
+        )
+    return merge_needs(needs)
+
+
+def format_images(rows: list[ImageRow], *, tsv: bool = False) -> str:
+    lines = []
+    if tsv:
+        lines.append("role\tbytes\tpath\traw")
+        for row in rows:
+            path = str(row.path) if row.path is not None else "-"
+            lines.append(f"{row.role}\t{row.bytes}\t{path}\t{row.raw}")
+        return "\n".join(lines) + "\n"
+    for row in rows:
+        path = str(row.path) if row.path is not None else row.raw
+        extra = f"  ({row.bytes})" if row.bytes else ""
+        if row.role == "skip":
+            lines.append(f"skip  {path}")
+        elif row.role == "missing":
+            lines.append(f"miss  {row.raw}")
+        elif row.role == "main":
+            lines.append(f"main  {path}{extra}")
+        else:
+            lines.append(f"load  {path}{extra}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def emit_images(args: argparse.Namespace) -> int:
+    chunks: list[str] = []
+    for spec in args.programs:
+        path = resolve_program(spec)
+        rows = iter_loaded_images(
+            path.resolve(),
+            system=args.system,
+            closure=args.closure,
+            depth=args.depth,
+        )
+        chunks.append(format_images(rows, tsv=args.tsv or args.porcelain))
+    sys.stdout.write("".join(chunks))
+    return 0
+
+
+def load_envs(args: argparse.Namespace) -> tuple[EnvMap | None, EnvMap | None, EnvMap | None]:
+    left = load_env_file(Path(args.left)) if args.left else current_env()
+    right_path = args.right or args.vs
+    right = load_env_file(Path(right_path)) if right_path else None
+    if args.vs_pid is not None:
+        pid_env = env_from_pid(args.vs_pid)
+        if right is None:
+            right = pid_env
+        else:
+            raise ValueError("use only one of --vs/--right and --vs-pid")
+    example = load_env_file(Path(args.example)) if args.example else None
+    return left, right, example
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def run_selftest() -> int:
+    import tempfile
+    import traceback
+
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            failures += 1
+            extra = f" — {detail}" if detail else ""
+            print(f"  FAIL  {name}{extra}", file=sys.stderr)
+
+    tmp = Path(tempfile.mkdtemp(prefix="lode-selftest-"))
+    try:
+        py = tmp / "app.py"
+        py.write_text(
+            "import os\n"
+            "from os import getenv as g\n"
+            'KEY = "DUE_CONST"\n'
+            'os.environ["DUE_PORT"]\n'
+            'os.getenv("DUE_API_KEY", "")\n'
+            "g(KEY)\n"
+            'os.environ["DUE_PORT"] = "nope"\n',
+            encoding="utf-8",
+        )
+        got = {n.name: n for n in extract_python(py, py.read_text(encoding="utf-8"))}
+        check("py environ load", "DUE_PORT" in got)
+        check("py getenv", "DUE_API_KEY" in got)
+        check("py const alias", "DUE_CONST" in got)
+        check("py ignores store", got["DUE_PORT"].detail == "os.environ[]")
+
+        rs = tmp / "file with spaces.rs"
+        rs.write_text(
+            'fn main() { let _ = std::env::var("DUE_TOKEN"); }\n',
+            encoding="utf-8",
+        )
+        rsn = extract_file(rs)
+        check("rust env::var + spaces", [n.name for n in rsn] == ["DUE_TOKEN"])
+
+        sh = tmp / "計画.sh"
+        sh.write_text(
+            "#!/bin/sh\n"
+            'echo "${DUE_HOME}/x"\n'
+            "echo $DUE_PORT\n"
+            "# $DUE_COMMENTED\n",
+            encoding="utf-8",
+        )
+        shn = {n.name for n in extract_file(sh)}
+        check("shell brace", "DUE_HOME" in shn)
+        check("shell dollar", "DUE_PORT" in shn)
+        check("shell comment ignored", "DUE_COMMENTED" not in shn)
+
+        js = tmp / "x.ts"
+        js.write_text('const x = process.env.DUE_BIN ?? process.env["DUE_PORT"];\n')
+        jsn = {n.name for n in extract_file(js)}
+        check("process.env", jsn == {"DUE_BIN", "DUE_PORT"})
+
+        go = tmp / "x.go"
+        go.write_text('package m\nimport "os"\nfunc f() { os.Getenv("DUE_TOKEN") }\n')
+        check("go Getenv", {n.name for n in extract_file(go)} == {"DUE_TOKEN"})
+
+        env_a = parse_env_text(
+            "DUE_PORT=3000\nDUE_API_KEY=secret\nSPARE_VAR=1\nexport DUE_HOME=/tmp\n",
+            "a",
+        )
+        env_b = parse_env_text(
+            'DUE_PORT="8080"\nDUE_API_KEY=secret\n# only\n',
+            "b",
+        )
+        ex = parse_env_text("DUE_PORT=3000\nDUE_UNUSED=x\n", "ex")
+        needs = [
+            Need("DUE_PORT", "call", "app.py:1", "os.environ[]"),
+            Need("DUE_API_KEY", "call", "app.py:2", "os.getenv"),
+            Need("DUE_HOME", "shell", "x.sh:1", "${}"),
+            Need("DUE_TOKEN", "call", "x.rs:1", "env::var"),
+        ]
+        rows = classify(needs, env_a, env_b, ex, spare=True)
+        by = defaultdict(list)
+        for r in rows:
+            by[r.name].append(r.status)
+        check("DIFF port", "DIFF" in by["DUE_PORT"])
+        check("DUE secret", "DUE" in by["DUE_API_KEY"])
+        check("UNSET_RIGHT home", "UNSET_RIGHT" in by["DUE_HOME"])
+        check("MISSING token", "MISSING" in by["DUE_TOKEN"])
+        check("SPARE unread", "SPARE" in by["SPARE_VAR"])
+        check("STALE_EXAMPLE", "STALE_EXAMPLE" in by["DUE_UNUSED"])
+        check("UNDOCUMENTED key", "UNDOCUMENTED" in by["DUE_API_KEY"])
+
+        check(
+            "redact",
+            display_value("DUE_API_KEY", "secret", show=False) == "«redacted»",
+        )
+        check("show", display_value("DUE_PORT", "3000", show=False) == "3000")
+
+        dumped = format_abi(needs)
+        reparsed = parse_abi_text(dumped, "roundtrip")
+        check("abi roundtrip", {n.name for n in reparsed} == {n.name for n in needs})
+
+        skip = tmp / "node_modules" / "x.js"
+        skip.parent.mkdir()
+        skip.write_text("process.env.SHOULD_NOT\n")
+        keep = tmp / "src" / "ok.py"
+        keep.parent.mkdir()
+        keep.write_text('import os\nos.getenv("DUE_KEEP")\n')
+        walked = harvest([tmp])
+        names = {n.name for n in walked}
+        check("walk skips node_modules", "SHOULD_NOT" not in names)
+        check("walk finds src", "DUE_KEEP" in names)
+
+        json_env = parse_env_text('{"DUE_PORT": 9, "X": null}', "j")
+        check("json env", json_env.values["DUE_PORT"] == "9" and json_env.values["X"] == "")
+
+        packed = "junkKIZU_CONFIGXDG_CONFIG_HOMEtailKITTY_LISTEN_ONTERM_PROGRAM"
+        toks = split_packed(packed, env_prefixes(["KIZU_CONFIG"]))
+        check("split KIZU_CONFIG", "KIZU_CONFIG" in toks)
+        check("split XDG_CONFIG_HOME", "XDG_CONFIG_HOME" in toks)
+        check("split KITTY_LISTEN_ON", "KITTY_LISTEN_ON" in toks)
+        check("split TERM_PROGRAM", "TERM_PROGRAM" in toks)
+        check("reject D_0", not is_valid_env_token("D_0"))
+        check("reject T4_", not is_valid_env_token("T4_"))
+
+        blob = tmp / "packed.bin"
+        blob.write_bytes(b"\x10\x02\xd6DUE_FIXTURE_C\x00HOME\x00" + packed.encode("ascii") + b"\x00")
+        bnames = {n.name for n in extract_binary(blob)}
+        check("packed DUE_FIXTURE_C", "DUE_FIXTURE_C" in bnames)
+        check("packed HOME cstring", "HOME" in bnames)
+        check("packed KIZU_CONFIG", "KIZU_CONFIG" in bnames)
+        check("name_in_blob TMUX", name_in_blob(b"<!--TMUX.git", "TMUX"))
+        check(
+            "name_in_blob ZELLIJ packed",
+            name_in_blob(b"kizuZELLIJKITTY_LISTEN_ON", "ZELLIJ"),
+        )
+        check(
+            "name_in_blob packed boundary",
+            name_in_blob(b"KIZU_CONFIGXDG_CONFIG_HOME", "KIZU_CONFIG"),
+        )
+        check(
+            "name_in_blob rejects longer word",
+            not name_in_blob(b"KIZU_CONFIGURATION\x00", "KIZU_CONFIG"),
+        )
+        check(
+            "name_in_blob titlecase path",
+            name_in_blob(b"KIZU_STATE_DIRLibrary/Application", "KIZU_STATE_DIR"),
+        )
+        check("likely env KIZU_CONFIG", is_likely_env_name("KIZU_CONFIG"))
+        check("unlikely BITSET_CANONICAL", not is_likely_env_name("BITSET_CANONICAL"))
+        glued = split_packed("KIZU_STATE_DIRLibrary/Application", env_prefixes())
+        check("trim titlecase glue", "KIZU_STATE_DIR" in glued and "KIZU_STATE_DIRL" not in glued)
+        home_tail = split_packed("XDG_CONFIG_HOMEtailKITTY_LISTEN_ON", env_prefixes())
+        check(
+            "do not trim HOME+tail",
+            "XDG_CONFIG_HOME" in home_tail and "XDG_CONFIG_HOM" not in home_tail,
+        )
+        # explicit needle on a fresh blob
+        zblob = tmp / "mux.bin"
+        zblob.write_bytes(b"detectkizuZELLIJKITTY_LISTEN_ON\x00")
+        znames = {n.name for n in extract_binary(zblob, ["ZELLIJ", "TMUX"])}
+        check("needle ZELLIJ in packed rust", "ZELLIJ" in znames)
+
+        left_abi = [Need("KIZU_CONFIG", "call", "paths.rs:10", "env::var")]
+        right_abi = [Need("KIZU_CONFIG", "string", "kizu", "packed"), Need("RUST_LOG", "string", "kizu", "rodata")]
+        arows = {r.name: r.status for r in classify_abi(left_abi, right_abi)}
+        check("abi BOTH", arows["KIZU_CONFIG"] == "BOTH")
+        check("abi RIGHT_ONLY", arows["RUST_LOG"] == "RIGHT_ONLY")
+
+        otool_l = (
+            "/opt/host:\n"
+            "\t@rpath/libplugin.dylib (compatibility version 0.0.0, current version 0.0.0)\n"
+            "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)\n"
+        )
+        parsed = parse_otool_L(otool_l)
+        check("otool -L rpath", parsed[0] == "@rpath/libplugin.dylib")
+        check("otool -L system", parsed[1].endswith("libSystem.B.dylib"))
+        otool_r = (
+            "          cmd LC_RPATH\n"
+            "      cmdsize 32\n"
+            "         path @loader_path/../lib (offset 12)\n"
+        )
+        check("otool rpath", parse_otool_rpaths(otool_r) == ["@loader_path/../lib"])
+        ldd_txt = (
+            "\tlinux-vdso.so.1 (0x0000)\n"
+            "\tlibpython3.14.so.1.0 => /usr/lib/libpython3.14.so.1.0 (0x1234)\n"
+            "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x5678)\n"
+        )
+        ldd_parsed = parse_ldd(ldd_txt)
+        check("ldd python", "/usr/lib/libpython3.14.so.1.0" in ldd_parsed)
+
+        plug_dir = tmp / "lib"
+        plug_dir.mkdir()
+        plug = plug_dir / "libplugin.dylib"
+        plug.write_bytes(b"\xcf\xfa\xed\xfeLODE_PLUGIN_HOME\x00HOME\x00")
+        host = tmp / "bin"
+        host.mkdir()
+        exe = host / "host"
+        resolved = resolve_load_name(
+            "@rpath/libplugin.dylib",
+            loader=exe,
+            executable=exe,
+            rpaths=["@loader_path/../lib"],
+        )
+        check("resolve @rpath", resolved == plug.resolve())
+        check("system image", is_system_image(Path("/usr/lib/libSystem.B.dylib")))
+        check(
+            "homebrew python not system",
+            not is_system_image(
+                Path("/opt/homebrew/Cellar/python@3.14/Python.framework/Versions/3.14/Python")
+            ),
+        )
+
+        pref = peel_prefix_tokens(
+            b"junkRUSTC_LOG\x00moreLODE_PLUGIN_HOMEXDG_CACHE_HOME",
+            env_prefixes(["RUSTC_LOG", "LODE_PLUGIN_HOME"]),
+        )
+        check("prefix peel RUSTC_LOG", "RUSTC_LOG" in pref)
+        check("prefix peel LODE_PLUGIN_HOME", "LODE_PLUGIN_HOME" in pref)
+
+        helpb = tmp / "help.bin"
+        helpb.write_bytes(
+            b"header\nPYTHONHOME      : alternate <prefix>\n"
+            b"\x00  PYTHONPATH = \x00Consider setting $PYTHONSTARTUP to x\x00"
+        )
+        hnames = {n.name for n in extract_binary(helpb)}
+        check("doc PYTHONHOME", "PYTHONHOME" in hnames)
+        check("assign PYTHONPATH", "PYTHONPATH" in hnames)
+        check("dollar PYTHONSTARTUP", "PYTHONSTARTUP" in hnames)
+        check("likely PYTHONHOME", is_likely_env_name("PYTHONHOME"))
+        check("runtime family PYTHONHOME", is_runtime_family("PYTHONHOME"))
+        check("unlikely JAVASCRIPT", not is_runtime_family("ERROR"))
+    except Exception:
+        traceback.print_exc()
+        failures += 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if failures:
+        print(f"selftest: {failures} failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

@@ -49,4 +49,4 @@ Repos or fixtures used.
 
 ## Parent workspace rule
 
-The parent tree is coordinator-only. Candidate implementation happens in isolated worktrees. The parent may copy reports into `lab/lineages/` after a worker finishes.
+During the night the parent tree is coordinator-only. Candidate implementation happens in isolated worktrees. After the window, implementations are archived next to reports under `lab/lineages/<id>/` (CLI, fixtures, tests). Product code is still not merged onto `main` as a promoted tool — it is stored as lineage evidence.

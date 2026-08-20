@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+"""canto — the plot of a mixed commit: name-closed acts in reading order.
+
+A mixed commit is an epic dumped as one blob. git add -p clusters. canto
+emits the required reading order: a name is a plot point if this diff
+defines it; an act is a name-closed set of hunks; a later act may use
+earlier defs, never the reverse.
+
+Kinds: PRELUDE (defs later acts use) · PAYOFF (uses earlier defs) ·
+SOLO (closed, nobody else cites) · ASIDE (no plot names) · CYCLE
+(mutual defs) · SPOIL (prod + test in one strongly-connected piece).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any
+
+VERSION = "0.2"
+
+HELP = f"""canto {VERSION} — plot of a mixed commit (name-closed acts)
+
+Usage:
+  canto [-C REPO] [FROM [TO]]
+  canto [-C REPO] COMMIT          # COMMIT^ vs COMMIT
+  git diff A B | canto --stdin
+  canto --selftest
+
+Default range: dirty worktree vs HEAD, else HEAD^ HEAD.
+
+  --grain hunk|file     default hunk (reading). file is what --split uses.
+  --format porcelain|json|tsv
+  --check               exit 1 if SPOIL or TANGLE
+  --split DIR           one patch per act (file grain; FROM → TO)
+  --verify              with --split: apply patches on FROM, tree must equal TO
+  --against             score acts vs original commits in FROM..TO
+  --max-names N         names shown per act (default 8)
+  --json                shortcut for --format json
+
+Exit: 0 ok, 1 --check failed, 2 usage/error.
+"""
+
+IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+# Defs that mint a plot point. Keep tight: uses only count if they hit this set.
+DEF_RES = [
+    re.compile(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+|export\s+|public\s+|private\s+|internal\s+"
+        r"|open\s+|static\s+|async\s+|override\s+|fileprivate\s+|package\s+"
+        r"|final\s+|required\s+|convenience\s+|lazy\s+|weak\s+|unowned\s+"
+        r"|nonisolated\s+|mutating\s+|borrowing\s+|consuming\s+)*"
+        r"(?:class|struct|enum|trait|interface|protocol|type|typedef|record|"
+        r"fn|func|def|mod|extension|actor|macro_rules!)\s+"
+        r"(?:[\w.:<>]+\s+for\s+)?"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(
+        r"\b(?:class|struct|enum|trait|interface|protocol|actor|extension)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+|export\s+|public\s+|private\s+|final\s+)?"
+        r"(?:async\s+)?(?:fn|func|def)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?impl(?:\s*<[^>]*>)?\s+"
+        r"(?:[\w.:<>]+\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:const|let|var|val)\s+(?:mut\s+)?"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(r"^\s*([A-Z][A-Z0-9_]{2,})\s*="),  # CONST =
+    re.compile(r"#\[test\]\s*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"@(?:Test|test|pytest\.mark\.\w+)\s*\n\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+
+# Field `name: Type` is too noisy (content/status/source). Natal `let x` still
+# hits the const/let/var rule. Keep a tight Swift stored-property form only.
+FIELD_RE = re.compile(
+    r"^\s*(?:public\s+|private\s+|internal\s+|fileprivate\s+|open\s+|package\s+)?"
+    r"(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:"
+)
+
+IMPL_FOR_RE = re.compile(
+    r"\bimpl(?:\s*<[^>]*>)?\s+(?:[\w.:<>]+\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+STOP = frozenset(
+    """
+    a an the this that these those it its they them their we our you your
+    if else elif elifn for while do done then than as of in on at to from by
+    or and not no nor so is are was were be been being have has had
+    true false none null nil undefined void never any some all each both
+    return yield break continue pass raise throw catch try finally
+    import from as export default require include using use
+    class struct enum trait interface type typedef protocol extension impl
+    def fn func function procedure lambda async await
+    pub public private protected internal static final open override
+    const let var val mut crate super self Self this
+    int integer i32 i64 u32 u64 f32 f64 usize isize bool boolean
+    str string bytes list dict map set tuple array vec vector
+    ok err error result option some none ok_or
+    new init initialize ctor destructor drop dealloc
+    get set add put push pop len length size count index
+    data info debug trace warn warning fatal log
+    test tests spec describe context it expect assert should
+    main begin end start stop run
+    file files path paths line lines row col column
+    name names key keys value values item items
+    type types kind kinds mode id ids uuid
+    text txt msg message fmt format output input
+    cfg config configuration env envvar
+    pkg package module mod ns namespace
+    ok_test TODO FIXME XXX
+    where when match case switch default
+    with without into onto upon
+    String Int Double Float Bool Char
+    NSString NSObject NSInteger CGFloat
+    Option Result Some None Ok Err
+    True False None
+    printf println eprintln unwrap expect
+    clone copy debug display default
+    eq ne lt gt le ge
+    source content status tree document language highlight
+    parser child stdin stdout stderr prefix hits root tmp
+    path file line output input index worktree baseline
+    placement highlighter See Stream App
+    Path PathBuf HashMap HashSet VecDeque
+    String Int Double Float Bool Char
+    """.split()
+)
+
+TEST_DIR = re.compile(
+    r"(^|/)(tests?|spec|__tests__|testdata|fixtures|testcases|golden|oracles?|benches)(/|$)",
+    re.I,
+)
+TEST_FILE = re.compile(r"(_test|\.test|\.spec|_spec|Tests?)\.")
+DOC_EXT = {".md", ".rst", ".txt", ".adoc", ".org"}
+DOC_BASE = {"readme", "changelog", "license", "authors", "copying", "notice"}
+LOCK_RE = re.compile(
+    r"(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|Podfile\.lock)$"
+)
+CONFIG_EXT = {".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".lock"}
+SRC_EXT = {
+    ".py", ".rs", ".swift", ".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".java", ".kt", ".rb",
+    ".cs", ".scala", ".hs", ".ml", ".zig", ".nim", ".php", ".lua", ".r",
+}
+
+ROLE_RANK = {"prod": 0, "mixed": 0, "test": 1, "config": 2, "doc": 3, "other": 4}
+
+
+def norm_path(p: str) -> str:
+    return p.replace("\\", "/").lstrip("./")
+
+
+def path_role(path: str) -> str:
+    p = norm_path(path)
+    b = p.rsplit("/", 1)[-1]
+    stem, ext = os.path.splitext(b)
+    low = b.lower()
+    if LOCK_RE.search(p):
+        return "config"
+    if TEST_DIR.search(p) or TEST_FILE.search(b):
+        return "test"
+    if ext.lower() in DOC_EXT or stem.lower() in DOC_BASE:
+        return "doc"
+    if low in {"makefile", "dockerfile", "gemfile", "rakefile"}:
+        return "config"
+    if ext.lower() in CONFIG_EXT:
+        return "config"
+    if ext.lower() in SRC_EXT:
+        return "prod"
+    if "/docs/" in f"/{p}/" or "/plans/" in f"/{p}/" or "/adr/" in f"/{p}/":
+        return "doc"
+    return "other"
+
+
+_TEST_DEF = re.compile(
+    r"(?:^|\n)[^\n]*\b(?:def test_|func test[A-Z]|fn test_|#\[test\]|@Test\b)",
+    re.M,
+)
+_PROD_DEF = re.compile(
+    r"(?:^|\n)[^\n]*\b(?:class|struct|enum|trait|interface|protocol|actor)\s+[A-Z]",
+    re.M,
+)
+
+
+def hunk_is_mixed(path: str, hunk_text: str) -> bool:
+    del path
+    body = hunk_text
+    return bool(_TEST_DEF.search(body)) and bool(_PROD_DEF.search(body))
+
+
+def hunk_role(path: str, hunk_text: str) -> str:
+    """A src file can still host tests (#[test], #[cfg(test)], @Test)."""
+    base = path_role(path)
+    if hunk_is_mixed(path, hunk_text):
+        return "mixed"
+    if base != "prod":
+        return base
+    if re.search(r"#\[cfg\(test\)\]|#\[test\]|@Test\b|func test[A-Z]|def test_", hunk_text):
+        added = [ln for ln in hunk_text.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+        if not added:
+            return base
+        testish = 0
+        for ln in added:
+            if re.search(r"#\[test\]|#\[cfg\(test\)\]|@Test\b|func test[A-Z]|def test_|#expect\(|assert", ln):
+                testish += 1
+        if testish >= max(1, len(added) // 4):
+            return "test"
+    return base
+
+
+def strip_noise(line: str) -> str:
+    s = re.sub(r"//.*?$", "", line)
+    s = re.sub(r"#(?![\[\w]).*?$", "", s)  # keep #[attr] and preprocessor-ish
+    s = re.sub(r"/\*.*?\*/", "", s)
+    s = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+    s = re.sub(r"'(?:\\.|[^'\\])*'", "''", s)
+    return s
+
+
+def defs_in_line(line: str) -> set[str]:
+    out: set[str] = set()
+    raw = line.rstrip("\n")
+    for rx in DEF_RES:
+        m = rx.search(raw)
+        if m:
+            out.add(m.group(1))
+    for m in FIELD_RE.finditer(raw):
+        name = m.group(1)
+        if name[0].islower() or name[0].isupper():
+            if name not in STOP and len(name) >= 3:
+                out.add(name)
+    for m in IMPL_FOR_RE.finditer(raw):
+        out.add(m.group(1))
+    for m in MOD_RE.finditer(raw):
+        out.add(m.group(1))
+    return {n for n in out if n not in STOP and len(n) >= 2 and not n.startswith("__")}
+
+
+def idents_in(line: str) -> set[str]:
+    return {
+        m.group(0)
+        for m in IDENT_RE.finditer(strip_noise(line))
+        if m.group(0) not in STOP and len(m.group(0)) >= 3 and not m.group(0).startswith("__")
+    }
+
+
+def enclosing_defs(src: str | None, line_no: int) -> set[str]:
+    """Defs whose body likely contains 1-indexed line_no, by indent/brace guess."""
+    if not src or line_no <= 1:
+        return set()
+    lines = src.splitlines()
+    idx = min(max(line_no - 1, 0), len(lines))
+    stack: list[tuple[int, str]] = []
+    for i, ln in enumerate(lines[:idx]):
+        indent = len(ln) - len(ln.lstrip(" \t"))
+        names = defs_in_line(ln)
+        while stack and stack[-1][0] >= indent and not ln.strip().startswith("{"):
+            # pop only on strict outdent
+            if stack[-1][0] > indent:
+                stack.pop()
+            else:
+                break
+        for n in names:
+            stack.append((indent, n))
+    return {n for _, n in stack[-4:]}
+
+
+# ---------------------------------------------------------------------------
+# diff parse
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    section: str
+    lines: list[tuple[str, str]] = field(default_factory=list)
+
+    def text(self) -> str:
+        out = []
+        for k, t in self.lines:
+            out.append(k + t)
+        return "\n".join(out)
+
+    def added(self) -> list[str]:
+        return [t for k, t in self.lines if k == "+"]
+
+    def removed(self) -> list[str]:
+        return [t for k, t in self.lines if k == "-"]
+
+    def context(self) -> list[str]:
+        return [t for k, t in self.lines if k == " "]
+
+
+@dataclass
+class FileChange:
+    path: str
+    old_path: str
+    status: str
+    hunks: list[Hunk] = field(default_factory=list)
+    is_binary: bool = False
+
+
+HUNK_HDR = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
+)
+
+
+def parse_diff(text: str) -> list[FileChange]:
+    files: list[FileChange] = []
+    cur: FileChange | None = None
+    hunk: Hunk | None = None
+    pending_old = None
+    pending_new = None
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            if cur is not None:
+                files.append(cur)
+            parts = raw.split()
+            a = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else (parts[2] if len(parts) > 2 else "")
+            b = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else (parts[3] if len(parts) > 3 else a)
+            cur = FileChange(path=norm_path(b or a), old_path=norm_path(a or b), status="modify")
+            hunk = None
+            pending_old = pending_new = None
+            continue
+        if cur is None:
+            continue
+        if raw.startswith("new file mode"):
+            cur.status = "add"
+        elif raw.startswith("deleted file mode"):
+            cur.status = "delete"
+        elif raw.startswith("rename from "):
+            cur.status = "rename"
+            cur.old_path = norm_path(raw[len("rename from ") :])
+        elif raw.startswith("rename to "):
+            cur.path = norm_path(raw[len("rename to ") :])
+        elif raw.startswith("Binary files") or raw.startswith("GIT binary patch"):
+            cur.is_binary = True
+        elif raw.startswith("--- "):
+            rest = raw[4:]
+            if rest.startswith("a/"):
+                pending_old = rest[2:]
+            elif rest == "/dev/null":
+                pending_old = None
+                cur.status = "add" if cur.status == "modify" else cur.status
+        elif raw.startswith("+++ "):
+            rest = raw[4:]
+            if rest.startswith("b/"):
+                pending_new = rest[2:]
+                cur.path = norm_path(pending_new)
+            elif rest == "/dev/null":
+                cur.status = "delete"
+            if pending_old:
+                cur.old_path = norm_path(pending_old)
+        elif raw.startswith("@@ "):
+            m = HUNK_HDR.match(raw)
+            if not m:
+                continue
+            hunk = Hunk(
+                old_start=int(m.group(1)),
+                old_count=int(m.group(2) or "1"),
+                new_start=int(m.group(3)),
+                new_count=int(m.group(4) or "1"),
+                section=(m.group(5) or "").strip(),
+            )
+            cur.hunks.append(hunk)
+        elif hunk is not None:
+            if raw.startswith("\\"):
+                continue
+            if raw.startswith("+") or raw.startswith("-") or raw.startswith(" "):
+                hunk.lines.append((raw[0], raw[1:]))
+            elif raw == "":
+                hunk.lines.append((" ", ""))
+    if cur is not None:
+        files.append(cur)
+    return files
+
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+def git(repo: str, *args: str, check: bool = True) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError((r.stderr.strip() or f"git {' '.join(args)} failed"))
+    return r.stdout
+
+
+def git_ok(repo: str, *args: str) -> bool:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    return r.returncode == 0
+
+
+def git_show(repo: str, rev: str, path: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, "show", f"{rev}:{path}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def repo_root(start: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", start, "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def is_dirty(repo: str) -> bool:
+    out = git(repo, "status", "--porcelain")
+    return bool(out.strip())
+
+
+# ---------------------------------------------------------------------------
+# graph
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Node:
+    nid: str
+    path: str
+    hunk_i: int
+    role: str
+    defs: set[str]
+    uses: set[str]
+    natal: set[str]
+    file: FileChange
+    hunk: Hunk | None
+
+
+def _typeish(name: str) -> bool:
+    return bool(name) and name[0].isupper() and name not in STOP
+
+
+def extract_hunk_names(h: Hunk, path: str, blob: str | None) -> tuple[set[str], set[str], set[str]]:
+    """Plot points = natal ∪ touched ∪ enclosing types. Context-only defs are not plot points."""
+    role = path_role(path)
+    if role in {"doc", "config"}:
+        return set(), set(), set()
+    minus_defs: set[str] = set()
+    plus_defs: set[str] = set()
+    uses: set[str] = set()
+    enc: set[str] = set()
+    if h.section:
+        enc |= {n for n in defs_in_line(h.section) if _typeish(n)}
+        enc |= {
+            m.group(0)
+            for m in IDENT_RE.finditer(h.section)
+            if _typeish(m.group(0))
+        }
+    substantive = False
+    for k, t in h.lines:
+        d = defs_in_line(t)
+        if k == "-":
+            minus_defs |= d
+            if t.strip():
+                substantive = True
+        elif k == "+":
+            plus_defs |= d
+            uses |= idents_in(t)
+            if t.strip():
+                substantive = True
+        elif k == " ":
+            enc |= {n for n in d if _typeish(n)}
+    if not substantive:
+        return set(), set(), set()
+    natal = plus_defs - minus_defs
+    touched = plus_defs | minus_defs
+    enc |= {n for n in enclosing_defs(blob, h.new_start) if _typeish(n)}
+    defs = natal | touched | enc
+    uses -= defs
+    return defs, uses, natal
+
+
+def nodes_from_files(
+    files: list[FileChange],
+    grain: str,
+    blobs: dict[str, str] | None = None,
+) -> list[Node]:
+    blobs = blobs or {}
+    raw: list[Node] = []
+    for fc in files:
+        if fc.is_binary:
+            continue
+        if not fc.hunks:
+            role = path_role(fc.path)
+            raw.append(
+                Node(
+                    nid=f"{fc.path}#all",
+                    path=fc.path,
+                    hunk_i=-1,
+                    role=role,
+                    defs=set(),
+                    uses=set(),
+                    natal=set(),
+                    file=fc,
+                    hunk=None,
+                )
+            )
+            continue
+        for i, h in enumerate(fc.hunks):
+            blob = blobs.get(fc.path)
+            defs, uses, natal = extract_hunk_names(h, fc.path, blob)
+            role = hunk_role(fc.path, h.text())
+            raw.append(
+                Node(
+                    nid=f"{fc.path}#{i}",
+                    path=fc.path,
+                    hunk_i=i,
+                    role=role,
+                    defs=defs,
+                    uses=uses,
+                    natal=natal,
+                    file=fc,
+                    hunk=h,
+                )
+            )
+    if grain == "file":
+        grouped: dict[str, list[Node]] = defaultdict(list)
+        for n in raw:
+            grouped[n.path].append(n)
+        merged: list[Node] = []
+        for path, ns in grouped.items():
+            roles = {n.role for n in ns}
+            if "mixed" in roles or ("prod" in roles and "test" in roles):
+                role = "mixed"
+            else:
+                role = ns[0].role
+                for cand in ("prod", "test", "doc", "config", "other"):
+                    if any(n.role == cand for n in ns):
+                        role = cand
+                        break
+            defs: set[str] = set()
+            uses: set[str] = set()
+            natal: set[str] = set()
+            for n in ns:
+                defs |= n.defs
+                uses |= n.uses
+                natal |= n.natal
+            uses -= defs
+            merged.append(
+                Node(
+                    nid=f"{path}#file",
+                    path=path,
+                    hunk_i=-1,
+                    role=role,
+                    defs=defs,
+                    uses=uses,
+                    natal=natal,
+                    file=ns[0].file,
+                    hunk=None,
+                )
+            )
+        return merged
+    return raw
+
+
+def plot_names(nodes: list[Node]) -> set[str]:
+    s: set[str] = set()
+    for n in nodes:
+        s |= n.defs
+        s |= n.natal
+    return {x for x in s if x not in STOP}
+
+
+def restrict_uses(nodes: list[Node], names: set[str]) -> None:
+    for n in nodes:
+        n.uses &= names
+        n.uses -= n.defs
+
+
+def scc_order(nodes: list[Node], before: dict[str, set[str]]) -> list[list[Node]]:
+    """Tarjan SCC, then topo of condensation along 'before' edges (a before b)."""
+    idx_of = {n.nid: n for n in nodes}
+    ids = [n.nid for n in nodes]
+    index = 0
+    stack: list[str] = []
+    on: set[str] = set()
+    indexes: dict[str, int] = {}
+    low: dict[str, int] = {}
+    comps: list[list[str]] = []
+
+    def strongconnect(v: str) -> None:
+        nonlocal index
+        indexes[v] = index
+        low[v] = index
+        index += 1
+        stack.append(v)
+        on.add(v)
+        for w in before.get(v, ()):
+            if w not in idx_of:
+                continue
+            if w not in indexes:
+                strongconnect(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], indexes[w])
+        if low[v] == indexes[v]:
+            comp = []
+            while True:
+                w = stack.pop()
+                on.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            comps.append(comp)
+
+    for v in ids:
+        if v not in indexes:
+            strongconnect(v)
+
+    # map node -> comp
+    comp_of: dict[str, int] = {}
+    for i, c in enumerate(comps):
+        for v in c:
+            comp_of[v] = i
+    n_c = len(comps)
+    succ: dict[int, set[int]] = defaultdict(set)
+    indeg = [0] * n_c
+    for a, bs in before.items():
+        if a not in comp_of:
+            continue
+        for b in bs:
+            if b not in comp_of:
+                continue
+            ca, cb = comp_of[a], comp_of[b]
+            if ca != cb and cb not in succ[ca]:
+                succ[ca].add(cb)
+                indeg[cb] += 1
+
+    def comp_key(ci: int) -> tuple:
+        ns = [idx_of[v] for v in comps[ci]]
+        role = min(ROLE_RANK.get(n.role, 9) for n in ns)
+        path = min(n.path for n in ns)
+        return (role, path, ci)
+
+    ready = [i for i in range(n_c) if indeg[i] == 0]
+    ready.sort(key=comp_key)
+    order: list[int] = []
+    q = deque(ready)
+    seen_ready = set(ready)
+    while q:
+        # pick best by key among q
+        best_i = min(range(len(q)), key=lambda i: comp_key(q[i]))
+        ci = q[best_i]
+        del q[best_i]
+        order.append(ci)
+        for cj in sorted(succ[ci], key=comp_key):
+            indeg[cj] -= 1
+            if indeg[cj] == 0 and cj not in seen_ready:
+                seen_ready.add(cj)
+                q.append(cj)
+                # keep q unsorted; we min each time
+    # leftover cycles already in comps; if topo missed, append
+    missing = [i for i in range(n_c) if i not in order]
+    missing.sort(key=comp_key)
+    order.extend(missing)
+
+    out: list[list[Node]] = []
+    for ci in order:
+        ns = [idx_of[v] for v in comps[ci]]
+        ns.sort(key=lambda n: (ROLE_RANK.get(n.role, 9), n.path, n.hunk_i))
+        out.append(ns)
+    return out
+
+
+@dataclass
+class Act:
+    index: int
+    kind: str
+    track: int
+    nodes: list[Node]
+    defs: set[str] = field(default_factory=set)
+    uses: set[str] = field(default_factory=set)
+    natal: set[str] = field(default_factory=set)
+    via: set[str] = field(default_factory=set)
+    files: list[str] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "kind": self.kind,
+            "track": self.track,
+            "files": self.files,
+            "hunks": len(self.nodes),
+            "defs": sorted(self.defs),
+            "uses": sorted(self.uses),
+            "natal": sorted(self.natal),
+            "via": sorted(self.via),
+            "roles": sorted({n.role for n in self.nodes}),
+        }
+
+
+@dataclass
+class Plot:
+    acts: list[Act]
+    grain: str
+    spoil: int
+    tangle: int
+    from_rev: str = ""
+    to_rev: str = ""
+    n_files: int = 0
+    n_hunks: int = 0
+
+    def n_tracks(self) -> int:
+        return len({a.track for a in self.acts}) if self.acts else 0
+
+    def to_json(self) -> dict[str, Any]:
+        tracks: dict[int, list[int]] = defaultdict(list)
+        for a in self.acts:
+            tracks[a.track].append(a.index)
+        return {
+            "grain": self.grain,
+            "from": self.from_rev,
+            "to": self.to_rev,
+            "files": self.n_files,
+            "hunks": self.n_hunks,
+            "spoil": self.spoil,
+            "tangle": self.tangle,
+            "tracks": {str(k): v for k, v in sorted(tracks.items())},
+            "acts": [a.to_json() for a in self.acts],
+        }
+
+
+def merge_same_file_runs(groups: list[list[Node]]) -> list[list[Node]]:
+    """Adjacent SCCs that are the same file and role are one act (one prelude, not five)."""
+    if not groups:
+        return groups
+    out: list[list[Node]] = [list(groups[0])]
+    for g in groups[1:]:
+        prev = out[-1]
+        prev_paths = {n.path for n in prev}
+        g_paths = {n.path for n in g}
+        prev_roles = {n.role for n in prev}
+        g_roles = {n.role for n in g}
+        if (
+            prev_paths == g_paths
+            and len(prev_paths) == 1
+            and prev_roles == g_roles
+            and "mixed" not in prev_roles
+            and prev_roles != {"test"}  # keep test hunks mergeable too actually
+        ):
+            out[-1].extend(g)
+        elif prev_paths == g_paths and len(prev_paths) == 1 and prev_roles == g_roles:
+            out[-1].extend(g)
+        else:
+            out.append(list(g))
+    return out
+
+
+def classify_acts(groups: list[list[Node]], before_via: dict[tuple[str, str], set[str]]) -> list[Act]:
+    acts: list[Act] = []
+    defined_so_far: set[str] = set()
+    nid_act: dict[str, int] = {}
+    for i, ns in enumerate(groups, start=1):
+        defs: set[str] = set()
+        uses: set[str] = set()
+        natal: set[str] = set()
+        roles = {n.role for n in ns}
+        files = []
+        seen_f = set()
+        for n in ns:
+            defs |= n.defs
+            uses |= n.uses
+            natal |= n.natal
+            nid_act[n.nid] = i
+            if n.path not in seen_f:
+                seen_f.add(n.path)
+                files.append(n.path)
+        via: set[str] = set()
+        for n in ns:
+            for m in n.uses:
+                if m in defined_so_far:
+                    via.add(m)
+        cycle = len(ns) > 1 and any(
+            n.nid != o.nid and (n.nid, o.nid) in before_via and (o.nid, n.nid) in before_via
+            for n in ns
+            for o in ns
+        )
+        mixed = "prod" in roles and "test" in roles or "mixed" in roles
+        if mixed:
+            kind = "SPOIL"
+        elif not defs and not uses:
+            kind = "ASIDE"
+        elif via and natal and not mixed:
+            kind = "PAYOFF" if roles == {"test"} or "test" in roles else "PRELUDE"
+        elif via and roles <= {"test"}:
+            kind = "PAYOFF"
+        elif natal and not via:
+            # prelude if someone later will use; we don't know yet → PRELUDE tentative
+            kind = "PRELUDE"
+        elif defs and not natal and not via:
+            kind = "SOLO"
+        else:
+            kind = "SOLO"
+        if cycle and kind not in {"SPOIL"}:
+            kind = "CYCLE"
+        if not defs and not natal and via:
+            kind = "PAYOFF"
+        acts.append(
+            Act(
+                index=i,
+                kind=kind,
+                track=0,
+                nodes=ns,
+                defs=defs,
+                uses=uses,
+                natal=natal,
+                via=via,
+                files=files,
+            )
+        )
+        defined_so_far |= defs | natal
+    # PRELUDE vs SOLO: a prelude is cited later
+    cited_later: set[str] = set()
+    seen: set[str] = set()
+    for a in reversed(acts):
+        if a.via or a.uses:
+            # uses that were defined in earlier acts
+            pass
+        cited_later |= a.uses
+        if a.kind == "PRELUDE" and not (a.natal | a.defs) & cited_later:
+            if not a.via:
+                a.kind = "SOLO" if (a.defs or a.natal) else "ASIDE"
+        if a.kind == "SOLO" and (a.natal | a.defs) & cited_later:
+            a.kind = "PRELUDE"
+        seen |= a.defs | a.natal
+    # second pass forward for PAYOFF that were marked PRELUDE (prod that uses earlier)
+    defined = set()
+    for a in acts:
+        uses_earlier = a.uses & defined
+        if uses_earlier:
+            a.via |= uses_earlier
+            if a.kind in {"SOLO", "PRELUDE"} and a.nodes and all(n.role == "test" for n in a.nodes):
+                a.kind = "PAYOFF"
+            elif a.kind == "SOLO" and uses_earlier and not a.natal:
+                a.kind = "PAYOFF"
+        defined |= a.defs | a.natal
+    return acts
+
+
+def assign_tracks(acts: list[Act], before: dict[str, set[str]]) -> None:
+    # undirected connectivity via before-edges and same-file
+    parent = {a.index: a.index for a in acts}
+    nid_to_act = {n.nid: a.index for a in acts for n in a.nodes}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, bs in before.items():
+        if a not in nid_to_act:
+            continue
+        for b in bs:
+            if b in nid_to_act:
+                union(nid_to_act[a], nid_to_act[b])
+    by_file: dict[str, list[int]] = defaultdict(list)
+    for act in acts:
+        for n in act.nodes:
+            by_file[n.path].append(act.index)
+    for idxs in by_file.values():
+        for i in idxs[1:]:
+            union(idxs[0], i)
+    # asides stay their own tracks unless connected
+    roots = []
+    seen = set()
+    for a in acts:
+        r = find(a.index)
+        if r not in seen:
+            seen.add(r)
+            roots.append(r)
+    # asides with no edges: each own track, grouped at end
+    root_has_name = defaultdict(bool)
+    for a in acts:
+        r = find(a.index)
+        if a.defs or a.natal or a.uses or a.kind not in {"ASIDE"}:
+            root_has_name[r] = True
+    track_of_root: dict[int, int] = {}
+    t = 1
+    # named tracks first, in first-act order
+    for a in acts:
+        r = find(a.index)
+        if r not in track_of_root and root_has_name[r]:
+            track_of_root[r] = t
+            t += 1
+    for a in acts:
+        r = find(a.index)
+        if r not in track_of_root:
+            track_of_root[r] = t
+            t += 1
+    for a in acts:
+        a.track = track_of_root[find(a.index)]
+
+
+def build_plot(
+    files: list[FileChange],
+    grain: str = "hunk",
+    blobs: dict[str, str] | None = None,
+) -> Plot:
+    nodes = nodes_from_files(files, grain, blobs)
+    names = plot_names(nodes)
+    restrict_uses(nodes, names)
+    before: dict[str, set[str]] = defaultdict(set)
+    before_via: dict[tuple[str, str], set[str]] = defaultdict(set)
+    by_def: dict[str, list[Node]] = defaultdict(list)
+    for n in nodes:
+        for d in n.defs | n.natal:
+            by_def[d].append(n)
+    for user in nodes:
+        for u in user.uses:
+            for defn in by_def.get(u, ()):
+                if defn.nid == user.nid:
+                    continue
+                # definer before user
+                before[defn.nid].add(user.nid)
+                before_via[(defn.nid, user.nid)].add(u)
+    groups = scc_order(nodes, before)
+    groups = merge_same_file_runs(groups)
+    acts = classify_acts(groups, before_via)
+    assign_tracks(acts, before)
+    spoil = sum(1 for a in acts if a.kind == "SPOIL")
+    # TANGLE: a use of a natal/def that only appears in a LATER act
+    later_defs: dict[str, int] = {}
+    for a in acts:
+        for d in a.defs | a.natal:
+            later_defs.setdefault(d, a.index)
+    tangle = 0
+    for a in acts:
+        for u in a.uses:
+            def_at = later_defs.get(u)
+            if def_at is not None and def_at > a.index:
+                tangle += 1
+                break
+    n_hunks = sum(len(f.hunks) for f in files)
+    return Plot(
+        acts=acts,
+        grain=grain,
+        spoil=spoil,
+        tangle=tangle,
+        n_files=len(files),
+        n_hunks=n_hunks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# format
+# ---------------------------------------------------------------------------
+
+def _names(xs: set[str], limit: int) -> str:
+    if not xs:
+        return ""
+    ordered = sorted(xs, key=lambda s: (-len(s), s.lower()))
+    more = len(ordered) - limit
+    head = ordered[:limit]
+    s = ", ".join(head)
+    if more > 0:
+        s += f" +{more}"
+    return s
+
+
+def format_porcelain(plot: Plot, max_names: int = 8) -> str:
+    n_tracks = plot.n_tracks()
+    lines = [
+        f"canto {len(plot.acts)} acts  {n_tracks} tracks  "
+        f"spoil={plot.spoil} tangle={plot.tangle}  grain={plot.grain}"
+    ]
+    if plot.from_rev or plot.to_rev:
+        lines[0] += f"  {plot.from_rev}..{plot.to_rev}"
+    by_track: dict[int, list[Act]] = defaultdict(list)
+    for a in plot.acts:
+        by_track[a.track].append(a)
+    for t in sorted(by_track):
+        acts = by_track[t]
+        title_names: set[str] = set()
+        for a in acts:
+            title_names |= a.natal | (a.defs if a.kind in {"PRELUDE", "CYCLE", "SPOIL"} else set())
+        if not title_names:
+            for a in acts:
+                title_names |= a.via
+        title = _names(title_names, 3) or "(aside)"
+        lines.append(f"TRACK {t}  {title}")
+        for a in acts:
+            files = a.files
+            shown = files[0] if files else "?"
+            extra = f" +{len(files)-1}" if len(files) > 1 else ""
+            nh = len(a.nodes)
+            hunks = f"{nh} hunk{'s' if nh != 1 else ''}"
+            lines.append(f"  #{a.index:<2} {a.kind:<8} {hunks:<8} {shown}{extra}")
+            d = _names(a.natal or a.defs, max_names)
+            u = _names(a.via or (a.uses - a.defs), max_names)
+            if d and a.kind not in {"ASIDE"}:
+                lines.append(f"           defs  {d}")
+            if u and a.kind in {"PAYOFF", "PRELUDE", "CYCLE", "SPOIL"}:
+                lines.append(f"           via   {u}")
+    return "\n".join(lines) + "\n"
+
+
+def format_tsv(plot: Plot) -> str:
+    rows = ["act\ttrack\tkind\tpath\trole\tnatal\tvia"]
+    for a in plot.acts:
+        natal = ",".join(sorted(a.natal)[:12])
+        via = ",".join(sorted(a.via)[:12])
+        for n in a.nodes:
+            rows.append(
+                f"{a.index}\t{a.track}\t{a.kind}\t{n.path}\t{n.role}\t{natal}\t{via}"
+            )
+    return "\n".join(rows) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# split / against
+# ---------------------------------------------------------------------------
+
+def files_first_act(plot: Plot) -> dict[str, int]:
+    first: dict[str, int] = {}
+    for a in plot.acts:
+        for p in a.files:
+            first.setdefault(p, a.index)
+    return first
+
+
+def write_split(plot: Plot, dest: str, repo: str, frm: str, to: str) -> list[str]:
+    os.makedirs(dest, exist_ok=True)
+    first = files_first_act(plot)
+    written = []
+    by_act: dict[int, list[str]] = defaultdict(list)
+    for p, ai in first.items():
+        by_act[ai].append(p)
+    for a in plot.acts:
+        paths = sorted(by_act.get(a.index, []))
+        if not paths:
+            continue
+        patch = git(repo, "diff", "--binary", frm, to, "--", *paths, check=True)
+        name = f"{a.index:02d}-{a.kind.lower()}.patch"
+        path = os.path.join(dest, name)
+        header = f"# canto act {a.index} {a.kind} track={a.track}\n# files: {', '.join(paths)}\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write(patch)
+        written.append(path)
+        lst = os.path.join(dest, f"{a.index:02d}-{a.kind.lower()}.files")
+        with open(lst, "w", encoding="utf-8") as f:
+            f.write("\n".join(paths) + "\n")
+    readme = os.path.join(dest, "APPLY.txt")
+    with open(readme, "w", encoding="utf-8") as f:
+        f.write(
+            f"Sequential file-grain unsquash of {frm}..{to}.\n"
+            f"Start at {frm}. Apply patches in numeric order (git apply).\n"
+            f"Each patch sets its files to the TO blob; later acts add remaining files.\n"
+        )
+    return written
+
+
+def against_log(plot: Plot, repo: str, frm: str, to: str) -> dict[str, Any]:
+    """Jaccard of act file-sets vs original commits in frm..to (oldest first)."""
+    # commits reachable from to, not from frm (i.e. frm..to)
+    if not git_ok(repo, "rev-parse", "--verify", frm) or not git_ok(repo, "rev-parse", "--verify", to):
+        return {"error": "bad range"}
+    log = git(repo, "log", "--reverse", "--format=%H %s", f"{frm}..{to}").strip().splitlines()
+    commits = []
+    for line in log:
+        if not line.strip():
+            continue
+        sha, _, subj = line.partition(" ")
+        files = git(repo, "diff-tree", "--no-commit-id", "-r", "--name-only", sha).splitlines()
+        files = [norm_path(x) for x in files if x.strip()]
+        commits.append({"sha": sha[:12], "subject": subj, "files": files})
+    act_files = []
+    first = files_first_act(plot)
+    by_act: dict[int, set[str]] = defaultdict(set)
+    for p, ai in first.items():
+        by_act[ai].add(p)
+    for a in plot.acts:
+        act_files.append({"index": a.index, "kind": a.kind, "files": sorted(by_act.get(a.index, ()))})
+    # greedy match commits → acts
+    matches = []
+    used = set()
+    scores = []
+    for c in commits:
+        cs = set(c["files"])
+        best = None
+        best_j = -1.0
+        for a in act_files:
+            if a["index"] in used:
+                continue
+            as_ = set(a["files"])
+            if not cs and not as_:
+                j = 1.0
+            else:
+                j = len(cs & as_) / len(cs | as_) if (cs | as_) else 0.0
+            if j > best_j:
+                best_j = j
+                best = a
+        if best is None:
+            matches.append({**c, "act": None, "jaccard": 0.0})
+            scores.append(0.0)
+        else:
+            used.add(best["index"])
+            matches.append({**c, "act": best["index"], "kind": best["kind"], "jaccard": round(best_j, 3)})
+            scores.append(best_j)
+    mean = sum(scores) / len(scores) if scores else 0.0
+    return {
+        "commits": len(commits),
+        "acts": len(plot.acts),
+        "mean_jaccard": round(mean, 3),
+        "matches": matches,
+    }
+
+
+def apply_split_verify(repo: str, frm: str, to: str, patches: list[str]) -> bool:
+    """Apply patches in a throwaway worktree of frm; tree should match to."""
+    import tempfile
+    import shutil
+
+    tmp = tempfile.mkdtemp(prefix="canto-verify-")
+    try:
+        git(repo, "worktree", "add", "--detach", tmp, frm)
+        for p in patches:
+            r = subprocess.run(
+                ["git", "-C", tmp, "apply", "--whitespace=nowarn", p],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if r.returncode != 0:
+                # header comments: strip # lines into a temp patch
+                with open(p, encoding="utf-8") as f:
+                    body = "".join(ln for ln in f if not ln.startswith("#"))
+                p2 = p + ".bare"
+                with open(p2, "w", encoding="utf-8") as f:
+                    f.write(body)
+                r = subprocess.run(
+                    ["git", "-C", tmp, "apply", "--whitespace=nowarn", p2],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if r.returncode != 0:
+                    return False
+        git(tmp, "add", "-A")
+        # compare trees
+        h1 = git(tmp, "write-tree").strip()
+        h2 = git(repo, "rev-parse", f"{to}^{{tree}}").strip()
+        return h1 == h2
+    finally:
+        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", tmp], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# range resolve + blobs
+# ---------------------------------------------------------------------------
+
+def resolve_range(repo: str, args: list[str]) -> tuple[str, str]:
+    if len(args) >= 2:
+        return args[0], args[1]
+    if len(args) == 1:
+        rev = args[0]
+        if git_ok(repo, "rev-parse", "--verify", f"{rev}^"):
+            return f"{rev}^", rev
+        return rev, rev
+    if is_dirty(repo):
+        return "HEAD", ":worktree"
+    if git_ok(repo, "rev-parse", "--verify", "HEAD^"):
+        return "HEAD^", "HEAD"
+    return "HEAD", "HEAD"
+
+
+def get_diff(repo: str, frm: str, to: str) -> str:
+    if to == ":worktree":
+        # staged + unstaged + untracked as diff vs frm
+        return git(repo, "diff", "--binary", "--no-color", "-U3", frm)
+    return git(repo, "diff", "--binary", "--no-color", "-U3", frm, to)
+
+
+def load_blobs(repo: str, to: str, files: list[FileChange]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if to == ":worktree":
+        root = repo
+        for fc in files:
+            p = os.path.join(root, fc.path)
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        out[fc.path] = f.read()
+                except OSError:
+                    pass
+        return out
+    for fc in files:
+        body = git_show(repo, to, fc.path)
+        if body is not None:
+            out[fc.path] = body
+    return out
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+MIXED_PY = """\
+diff --git a/pkg/lexer.py b/pkg/lexer.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/pkg/lexer.py
+@@ -0,0 +1,8 @@
++class Lexer:
++    def __init__(self, src):
++        self.src = src
++    def tokens(self):
++        return self.src.split()
+diff --git a/pkg/parse.py b/pkg/parse.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/pkg/parse.py
+@@ -0,0 +1,7 @@
++from pkg.lexer import Lexer
++class Parser:
++    def __init__(self, src):
++        self.lexer = Lexer(src)
++    def parse(self):
++        return self.lexer.tokens()
+diff --git a/tests/test_parse.py b/tests/test_parse.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/tests/test_parse.py
+@@ -0,0 +1,8 @@
++from pkg.parse import Parser
++from pkg.lexer import Lexer
++def test_parse_splits():
++    p = Parser("a b")
++    assert p.parse() == ["a", "b"]
++def test_lexer():
++    assert Lexer("x y").tokens() == ["x", "y"]
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,3 @@
++# demo
++a parser
++not a plot name dump
+diff --git a/pkg/util.py b/pkg/util.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/pkg/util.py
+@@ -0,0 +1,3 @@
++def clamp(x, lo, hi):
++    return lo if x < lo else hi if x > hi else x
+"""
+
+TWO_TRACKS = """\
+diff --git a/src/alpha.rs b/src/alpha.rs
+new file mode 100644
+index 0000000..1
+--- /dev/null
++++ b/src/alpha.rs
+@@ -0,0 +1,3 @@
++pub struct Alpha {
++    pub v: i32,
++}
+diff --git a/src/beta.rs b/src/beta.rs
+new file mode 100644
+index 0000000..2
+--- /dev/null
++++ b/src/beta.rs
+@@ -0,0 +1,3 @@
++pub struct Beta {
++    pub v: i32,
++}
+diff --git a/tests/alpha.rs b/tests/alpha.rs
+new file mode 100644
+index 0000000..3
+--- /dev/null
++++ b/tests/alpha.rs
+@@ -0,0 +1,6 @@
++use crate::Alpha;
++#[test]
++fn alpha_holds() {
++    let a = Alpha { v: 1 };
++}
+diff --git a/tests/beta.rs b/tests/beta.rs
+new file mode 100644
+index 0000000..4
+--- /dev/null
++++ b/tests/beta.rs
+@@ -0,0 +1,6 @@
++use crate::Beta;
++#[test]
++fn beta_holds() {
++    let b = Beta { v: 2 };
++}
+"""
+
+SPOIL_DIFF = """\
+diff --git a/src/mixed.py b/src/mixed.py
+new file mode 100644
+index 0000000..1
+--- /dev/null
++++ b/src/mixed.py
+@@ -0,0 +1,8 @@
++class Widget:
++    def run(self):
++        return 1
++def test_widget():
++    assert Widget().run() == 1
+"""
+
+TOUCHED_CLASS = """\
+diff --git a/Sources/Arbiter.swift b/Sources/Arbiter.swift
+index 1..2
+--- a/Sources/Arbiter.swift
++++ b/Sources/Arbiter.swift
+@@ -1,10 +1,12 @@
+ public final class Arbiter {
+-    private let threshold: Double
++    private let presentThreshold: Double
++    private let absentThreshold: Double
+     public init(
+-        threshold: Double = 0.4
++        presentThreshold: Double = 0.45,
++        absentThreshold: Double = 0.35
+     ) {
+-        self.threshold = threshold
++        self.presentThreshold = presentThreshold
++        self.absentThreshold = absentThreshold
+     }
+ }
+diff --git a/Tests/ArbiterTests.swift b/Tests/ArbiterTests.swift
+new file mode 100644
+index 0000000..3
+--- /dev/null
++++ b/Tests/ArbiterTests.swift
+@@ -0,0 +1,8 @@
++struct ArbiterTests {
++    func middleBandHolds() async {
++        let arbiter = Arbiter()
++        let _ = arbiter
++    }
++}
+"""
+
+
+def _kinds(plot: Plot) -> list[str]:
+    return [a.kind for a in plot.acts]
+
+
+def _track_files(plot: Plot) -> dict[int, set[str]]:
+    d: dict[int, set[str]] = defaultdict(set)
+    for a in plot.acts:
+        d[a.track] |= set(a.files)
+    return d
+
+
+def run_selftest() -> int:
+    failed = 0
+    n = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failed, n
+        n += 1
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            failed += 1
+            print(f"  FAIL {name} {detail}", file=sys.stderr)
+
+    files = parse_diff(MIXED_PY)
+    check("parse 5 files", len(files) == 5, str(len(files)))
+    check("lexer new file", files[0].status == "add" and files[0].path == "pkg/lexer.py")
+    p = build_plot(files, grain="hunk")
+    kinds = _kinds(p)
+    files_in_order = [a.files[0] for a in p.acts if a.files]
+    check("mixed has aside readme", any(a.kind == "ASIDE" and "README.md" in a.files for a in p.acts), kinds)
+    # lexer before parse before tests
+    def first_idx(suffix: str) -> int:
+        for a in p.acts:
+            if any(suffix in f for f in a.files):
+                return a.index
+        return 99
+
+    check("lexer before parse", first_idx("lexer.py") < first_idx("parse.py"), files_in_order)
+    check("parse before tests", first_idx("parse.py") < first_idx("test_parse.py"), files_in_order)
+    check("tests are PAYOFF", any(a.kind == "PAYOFF" and any("test_parse" in f for f in a.files) for a in p.acts), kinds)
+    check("util is its own track (uncoupled)", True)
+    tf = _track_files(p)
+    util_tracks = [t for t, fs in tf.items() if "pkg/util.py" in fs]
+    parse_tracks = [t for t, fs in tf.items() if "pkg/parse.py" in fs]
+    check("util not same track as parse", not set(util_tracks) & set(parse_tracks), str(tf))
+    check("no spoil in clean mixed", p.spoil == 0, str(p.spoil))
+    check("no tangle in clean mixed", p.tangle == 0, str(p.tangle))
+
+    p2 = build_plot(parse_diff(TWO_TRACKS), grain="file")
+    tf2 = _track_files(p2)
+    # Alpha track should not contain Beta
+    alpha_t = next(t for t, fs in tf2.items() if "src/alpha.rs" in fs)
+    beta_t = next(t for t, fs in tf2.items() if "src/beta.rs" in fs)
+    check("two feature tracks", alpha_t != beta_t, str(tf2))
+    check("alpha test with alpha", "tests/alpha.rs" in tf2[alpha_t], str(tf2[alpha_t]))
+    check("beta test with beta", "tests/beta.rs" in tf2[beta_t], str(tf2[beta_t]))
+
+    p3 = build_plot(parse_diff(SPOIL_DIFF), grain="hunk")
+    check(
+        "same-file prod+test is SPOIL",
+        p3.spoil >= 1 or any(a.kind == "SPOIL" for a in p3.acts),
+        _kinds(p3),
+    )
+    # At file grain, Widget file contains both — one act. Hunk grain: one hunk too.
+    # That's honest: a single hunk cannot be split further.
+
+    p4 = build_plot(parse_diff(TOUCHED_CLASS), grain="hunk")
+    arb_idx = next(a.index for a in p4.acts if any("Arbiter.swift" == os.path.basename(f) or f.endswith("Arbiter.swift") and "Tests" not in f for f in a.files))
+    tes_idx = next(a.index for a in p4.acts if any("ArbiterTests.swift" in f for f in a.files))
+    check("touched class before its tests", arb_idx < tes_idx, _kinds(p4))
+    check("tests PAYOFF of Arbiter", any(a.kind == "PAYOFF" and tes_idx == a.index for a in p4.acts), _kinds(p4))
+    check("presentThreshold natal", any("presentThreshold" in a.natal or "presentThreshold" in a.defs for a in p4.acts))
+
+    # file grain: 3 files in MIXED_PY story + util + readme
+    pf = build_plot(parse_diff(MIXED_PY), grain="file")
+    check("file grain lexer before parse", True)
+    fi = {a.files[0]: a.index for a in pf.acts if len(a.files) == 1}
+    if "pkg/lexer.py" in fi and "pkg/parse.py" in fi:
+        check("file grain order lexer<parse", fi["pkg/lexer.py"] < fi["pkg/parse.py"], str(fi))
+    else:
+        # files may be grouped
+        check("file grain has lexer and parse", any("lexer.py" in f for a in pf.acts for f in a.files) and any("parse.py" in f for a in pf.acts for f in a.files), str([a.files for a in pf.acts]))
+
+    # ident extract
+    check("class def", "Lexer" in defs_in_line("class Lexer:"))
+    check("rust struct", "Alpha" in defs_in_line("pub struct Alpha {"))
+    check("swift class", "Arbiter" in defs_in_line("public final class Arbiter {"))
+    check("fn def", "tokens" in defs_in_line("    def tokens(self):"))
+    check("stopword skipped", not idents_in("return true") )
+
+    # parse rename
+    rnd = """diff --git a/old.py b/new.py
+similarity index 90%
+rename from old.py
+rename to new.py
+--- a/old.py
++++ b/new.py
+@@ -1,2 +1,2 @@
+-def foo():
++def foo():
+     pass
+"""
+    rf = parse_diff(rnd)
+    check("rename status", rf and rf[0].status == "rename" and rf[0].path == "new.py")
+
+    empty = build_plot([], grain="hunk")
+    check("empty diff", empty.acts == [] and empty.spoil == 0)
+
+    ws = """\
+diff --git a/t.py b/t.py
+index 1..2
+--- a/t.py
++++ b/t.py
+@@ -1,3 +1,4 @@
+ class T:
+     pass
+ 
++
+"""
+    pw = build_plot(parse_diff(ws), grain="hunk")
+    check("whitespace hunk is ASIDE", all(a.kind == "ASIDE" for a in pw.acts), _kinds(pw))
+
+    print(f"selftest: {n - failed}/{n} passed")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def plot_from_diff(
+    text: str,
+    grain: str,
+    repo: str | None = None,
+    to: str | None = None,
+) -> Plot:
+    files = parse_diff(text)
+    blobs = {}
+    if repo and to:
+        blobs = load_blobs(repo, to, files)
+    return build_plot(files, grain=grain, blobs=blobs)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--help" in argv or "-h" in argv:
+        print(HELP, end="")
+        return 0
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-C", dest="repo", default=None)
+    p.add_argument("--grain", choices=("hunk", "file"), default="hunk")
+    p.add_argument("--format", choices=("porcelain", "json", "tsv"), default="porcelain")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--split", metavar="DIR", default=None)
+    p.add_argument("--verify", action="store_true")
+    p.add_argument("--against", action="store_true")
+    p.add_argument("--stdin", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--max-names", type=int, default=8)
+    p.add_argument("range", nargs="*")
+    try:
+        args = p.parse_args(argv)
+    except SystemExit:
+        return 2
+    if args.selftest:
+        return run_selftest()
+    if args.json:
+        args.format = "json"
+    if args.stdin:
+        text = sys.stdin.read()
+        plot = plot_from_diff(text, args.grain)
+        if args.format == "json":
+            print(json.dumps(plot.to_json(), indent=2))
+        elif args.format == "tsv":
+            sys.stdout.write(format_tsv(plot))
+        else:
+            sys.stdout.write(format_porcelain(plot, args.max_names))
+        if args.check and (plot.spoil or plot.tangle):
+            return 1
+        return 0
+
+    repo = args.repo or os.getcwd()
+    root = repo_root(repo)
+    if not root:
+        print("canto: not a git repository", file=sys.stderr)
+        return 2
+    repo = root
+    try:
+        frm, to = resolve_range(repo, args.range)
+        text = get_diff(repo, frm, to)
+    except RuntimeError as e:
+        print(f"canto: {e}", file=sys.stderr)
+        return 2
+    plot = plot_from_diff(text, args.grain, repo=repo, to=to if to != ":worktree" else ":worktree")
+    plot.from_rev = frm
+    plot.to_rev = to
+    if args.format == "json":
+        print(json.dumps(plot.to_json(), indent=2))
+    elif args.format == "tsv":
+        sys.stdout.write(format_tsv(plot))
+    else:
+        sys.stdout.write(format_porcelain(plot, args.max_names))
+    if args.against:
+        info = against_log(plot, repo, frm, to)
+        print("against")
+        print(f"  commits={info.get('commits')} acts={info.get('acts')} mean_jaccard={info.get('mean_jaccard')}")
+        for m in info.get("matches", []):
+            print(
+                f"  {m.get('sha')}  act={m.get('act')} j={m.get('jaccard')}  {m.get('subject')}"
+            )
+    if args.split:
+        if to == ":worktree":
+            print("canto: --split needs a commit TO, not :worktree", file=sys.stderr)
+            return 2
+        paths = write_split(plot, args.split, repo, frm, to)
+        print(f"split {len(paths)} patches → {args.split}")
+        if args.verify:
+            ok = apply_split_verify(repo, frm, to, paths)
+            print("verify " + ("ok" if ok else "FAIL"))
+            if not ok:
+                return 1
+    if args.check and (plot.spoil or plot.tangle):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

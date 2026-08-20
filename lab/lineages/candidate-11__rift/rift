@@ -1,0 +1,1331 @@
+#!/usr/bin/env python3
+"""rift — silent identifier conflicts a clean git merge would hide."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from typing import Iterable, Sequence
+
+__version__ = "0.2.0"
+
+IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
+)
+
+# Keywords that introduce a definition of the following identifier.
+INTRO_RE = re.compile(
+    r"""
+    \b(
+        fn | func | function | def | class | struct | enum | trait |
+        interface | protocol | type | typedef | record | actor |
+        extension | module | namespace | object | union | newtype |
+        macro_rules!?
+    )\b
+    (?:\s*<[^>]*>)?
+    \s+
+    ([A-Za-z_][A-Za-z0-9_]*)
+    """,
+    re.VERBOSE,
+)
+IMPL_RE = re.compile(
+    r"""
+    \bimpl\b
+    (?:\s*<[^>]*>)?
+    \s+
+    (?:([A-Za-z_][A-Za-z0-9_]*)\s+for\s+)?
+    ([A-Za-z_][A-Za-z0-9_]*)
+    """,
+    re.VERBOSE,
+)
+BINDING_RE = re.compile(
+    r"""
+    \b(?:export\s+)?(?:declare\s+)?(?:pub\s+)?(?:static\s+)?
+    (?:const | let | var | val)\s+
+    ([A-Za-z_][A-Za-z0-9_]*)
+    """,
+    re.VERBOSE,
+)
+
+COMMENT_LINE_RE = re.compile(
+    r"""^\s*(//|/\*|\* |#|-- |<!--|\{/\*)"""
+)
+# Git funcname headers often name the enclosing type (class/struct). Those
+# are not signature changes. Only treat callable intros as touched defs.
+HEADER_CALLABLE_KWS = {"fn", "func", "function", "def", "macro_rules", "macro_rules!"}
+
+KEYWORDS = {
+    "abstract", "alignof", "as", "asm", "assert", "async", "await", "become",
+    "bool", "break", "byte", "case", "catch", "char", "class", "const",
+    "continue", "crate", "debugger", "declare", "default", "defer", "def",
+    "del", "delete", "do", "double", "dyn", "elif", "else", "enum", "except",
+    "export", "extends", "extern", "false", "final", "finally", "float", "fn",
+    "for", "from", "func", "function", "go", "goto", "guard", "if", "impl",
+    "import", "in", "int", "interface", "internal", "is", "lambda", "let",
+    "long", "loop", "match", "mod", "module", "move", "mut", "namespace",
+    "never", "new", "nil", "none", "null", "object", "of", "offline", "on",
+    "operator", "or", "override", "package", "pass", "priv", "private",
+    "proc", "protocol", "pub", "public", "raise", "record", "ref", "repeat",
+    "require", "return", "self", "sizeof", "static", "struct", "super",
+    "switch", "this", "throw", "throws", "trait", "true", "try", "type",
+    "typealias", "typedef", "typeof", "undefined", "union", "unless",
+    "unsafe", "until", "use", "using", "var", "virtual", "void", "volatile",
+    "where", "while", "with", "yield", "and", "not", "NaN", "Infinity",
+}
+
+# Identifiers too generic to be useful as a silent-conflict key.
+COMMON = {
+    "add", "append", "apply", "args", "array", "body", "build", "call",
+    "clone", "close", "cmp", "code", "config", "copy", "count", "create",
+    "current", "data", "debug", "decode", "default", "delete", "deref",
+    "dict", "draw", "dump", "encode", "eq", "err", "error", "execute",
+    "expect", "fetch", "file", "filter", "fmt", "fold", "format", "from",
+    "get", "handle", "hash", "hide", "id", "index", "info", "init", "insert",
+    "into", "item", "items", "iter", "key", "keys", "len", "length", "list",
+    "load", "log", "main", "make", "map", "message", "move", "msg", "name",
+    "next", "ok", "open", "option", "params", "parse", "path", "pop", "prev",
+    "print", "process", "push", "read", "remove", "render", "reset", "result",
+    "run", "save", "send", "set", "setup", "show", "size", "some", "start",
+    "stop", "str", "string", "teardown", "temp", "test", "tests", "text",
+    "tmp", "to", "type", "unwrap", "update", "val", "value", "values", "vec",
+    "warn", "with", "write", "ok", "from_str", "to_string", "to_owned",
+    "as_str", "as_ref", "into_iter", "into_inner", "unwrap_or",
+}
+
+STDLIB = {
+    "Any", "Array", "Bool", "Boolean", "Data", "Dict", "Error", "Exception",
+    "False", "HashMap", "Int", "Iterator", "JSONDecoder", "JSONEncoder",
+    "List", "Logger", "None", "Nothing", "Number", "Object", "Ok", "Option",
+    "Path", "PathBuf", "Promise", "Result", "Self", "Some", "String", "True",
+    "URL", "Vec", "bytes", "dict", "false", "float", "int", "list", "null",
+    "str", "string", "true", "undefined", "usize", "u8", "u16", "u32", "u64",
+    "i8", "i16", "i32", "i64", "f32", "f64", "char", "bool",
+}
+
+IGNORE_DIRS = {
+    ".git", "__pycache__", "node_modules", "dist", "build", "target",
+    "vendor", ".next", ".venv", "venv", "coverage",
+}
+
+IGNORE_GLOBS = [
+    "*.lock", "*.min.js", "*.min.css", "*.map", "*.png", "*.jpg", "*.jpeg",
+    "*.gif", "*.webp", "*.svg", "*.woff", "*.woff2", "*.pdf", "*.bin",
+    "*.sum", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "Cargo.lock", "go.sum", "composer.lock", "poetry.lock", "*.generated.*",
+    "*.md", "*.markdown", "*.rst",
+]
+
+KINDS_DEFAULT = ("delete-use", "dup-def", "def-use")
+KIND_ORDER = {
+    "delete-use": 0,
+    "dup-def": 1,
+    "def-use": 2,
+    "use-use": 3,
+}
+
+
+class GitError(Exception):
+    def __init__(self, args: Sequence[str], stderr: str, code: int) -> None:
+        super().__init__(f"git {' '.join(args)} failed ({code}): {stderr.strip()}")
+        self.args_ = args
+        self.stderr = stderr
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class Hit:
+    path: str
+    line: int
+    sign: str
+    role: str
+    ident: str
+    text: str
+
+
+@dataclass
+class FileHunks:
+    path: str
+    lines: list[tuple[str, int, str]] = field(default_factory=list)
+    headers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SideIdent:
+    defs_added: list[Hit] = field(default_factory=list)
+    defs_removed: list[Hit] = field(default_factory=list)
+    defs_touched: list[Hit] = field(default_factory=list)
+    uses_added: list[Hit] = field(default_factory=list)
+    uses_removed: list[Hit] = field(default_factory=list)
+
+    def all_hits(self) -> list[Hit]:
+        return (
+            self.defs_added
+            + self.defs_removed
+            + self.defs_touched
+            + self.uses_added
+            + self.uses_removed
+        )
+
+    def changed_def(self) -> bool:
+        return bool(self.defs_added or self.defs_removed or self.defs_touched)
+
+    def deleted_def(self) -> bool:
+        return bool(self.defs_removed) and not self.defs_added
+
+    def added_def(self) -> bool:
+        return bool(self.defs_added) and not self.defs_removed
+
+    def changed_use(self) -> bool:
+        return bool(self.uses_added or self.uses_removed)
+
+
+@dataclass
+class Rift:
+    kind: str
+    ident: str
+    hidden: bool
+    a: list[Hit]
+    b: list[Hit]
+    files: list[str]
+
+
+@dataclass
+class Report:
+    a: str
+    b: str
+    base: str | None
+    textual_conflicts: list[str]
+    merge_clean: bool | None
+    one_sided: bool
+    rifts: list[Rift]
+    a_name: str | None = None
+    b_name: str | None = None
+
+
+def unquote_git_path(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        inner = raw[1:-1]
+        out = bytearray()
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt == "n":
+                    out.append(0x0A)
+                    i += 2
+                elif nxt == "t":
+                    out.append(0x09)
+                    i += 2
+                elif nxt == "r":
+                    out.append(0x0D)
+                    i += 2
+                elif nxt == "\\":
+                    out.append(0x5C)
+                    i += 2
+                elif nxt == '"':
+                    out.append(0x22)
+                    i += 2
+                elif nxt in "01234567":
+                    j = i + 1
+                    digits = []
+                    while j < len(inner) and len(digits) < 3 and inner[j] in "01234567":
+                        digits.append(inner[j])
+                        j += 1
+                    out.append(int("".join(digits), 8))
+                    i = j
+                else:
+                    out.extend(nxt.encode("utf-8"))
+                    i += 2
+            else:
+                out.extend(inner[i].encode("utf-8"))
+                i += 1
+        return out.decode("utf-8", errors="surrogateescape")
+    return raw
+
+
+def strip_ab_prefix(path: str) -> str:
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def parse_diff_paths(line: str) -> tuple[str | None, str | None]:
+    if not line.startswith("diff --git "):
+        return None, None
+    rest = line[len("diff --git ") :].rstrip("\n")
+    # Quoted pair.
+    if rest.startswith('"'):
+        parts: list[str] = []
+        buf = []
+        in_q = False
+        i = 0
+        while i < len(rest):
+            ch = rest[i]
+            if ch == '"' and not in_q:
+                in_q = True
+                buf = ['"']
+            elif ch == '"' and in_q:
+                buf.append('"')
+                parts.append(unquote_git_path("".join(buf)))
+                in_q = False
+                buf = []
+            elif in_q:
+                buf.append(ch)
+            i += 1
+        if len(parts) >= 2:
+            return strip_ab_prefix(parts[0]), strip_ab_prefix(parts[1])
+        return None, None
+    # Unquoted: split on " b/" last occurrence after "a/".
+    marker = " b/"
+    idx = rest.find(marker)
+    if idx == -1:
+        bits = rest.split()
+        if len(bits) >= 2:
+            return strip_ab_prefix(unquote_git_path(bits[0])), strip_ab_prefix(
+                unquote_git_path(bits[1])
+            )
+        return None, None
+    a = strip_ab_prefix(unquote_git_path(rest[:idx]))
+    b = strip_ab_prefix(unquote_git_path(rest[idx + 1 :]))
+    return a, b
+
+
+def parse_unified_diff(text: str) -> list[FileHunks]:
+    files: list[FileHunks] = []
+    current: FileHunks | None = None
+    old_ln = 0
+    new_ln = 0
+    skip_binary = False
+
+    def ensure(path: str) -> FileHunks:
+        nonlocal current
+        if current is None or current.path != path:
+            current = FileHunks(path=path)
+            files.append(current)
+        return current
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            skip_binary = False
+            a_path, b_path = parse_diff_paths(line)
+            path = b_path or a_path or ""
+            current = FileHunks(path=path)
+            files.append(current)
+            i += 1
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            skip_binary = True
+            i += 1
+            continue
+        if skip_binary:
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            rhs = unquote_git_path(line[4:])
+            if rhs != "/dev/null" and current is not None:
+                current.path = strip_ab_prefix(rhs)
+            i += 1
+            continue
+        if line.startswith("--- "):
+            lhs = unquote_git_path(line[4:])
+            if current is not None and current.path in ("", "/dev/null"):
+                if lhs != "/dev/null":
+                    current.path = strip_ab_prefix(lhs)
+            i += 1
+            continue
+        m = HUNK_RE.match(line)
+        if m and current is not None:
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(3))
+            trailer = m.group(5) or ""
+            current.headers.append(trailer.lstrip())
+            i += 1
+            continue
+        if current is None:
+            i += 1
+            continue
+        if line.startswith("+"):
+            current.lines.append(("+", new_ln, line[1:]))
+            new_ln += 1
+        elif line.startswith("-"):
+            current.lines.append(("-", old_ln, line[1:]))
+            old_ln += 1
+        elif line.startswith("\\"):
+            pass
+        elif line.startswith(" "):
+            current.lines.append((" ", new_ln, line[1:]))
+            old_ln += 1
+            new_ln += 1
+        i += 1
+
+    return [f for f in files if f.path]
+
+
+def is_comment_line(text: str) -> bool:
+    return bool(COMMENT_LINE_RE.match(text))
+
+
+def defs_on_line(text: str) -> set[str]:
+    if is_comment_line(text):
+        return set()
+    found: set[str] = set()
+    for m in INTRO_RE.finditer(text):
+        found.add(m.group(2))
+    for m in IMPL_RE.finditer(text):
+        if m.group(1):
+            found.add(m.group(1))
+        found.add(m.group(2))
+    for m in BINDING_RE.finditer(text):
+        found.add(m.group(1))
+    return found
+
+
+def header_defs_on_line(text: str) -> set[str]:
+    """Definitions implied by a git hunk-header funcname trailer."""
+    found: set[str] = set()
+    for m in INTRO_RE.finditer(text):
+        if m.group(1) in HEADER_CALLABLE_KWS:
+            found.add(m.group(2))
+    return found
+
+
+def idents_on_line(text: str) -> list[str]:
+    return IDENT_RE.findall(text)
+
+
+def interesting(ident: str, *, allow_common: bool) -> bool:
+    if len(ident) < 3:
+        return False
+    if ident in KEYWORDS or ident.lower() in KEYWORDS:
+        return False
+    if ident in STDLIB:
+        return False
+    if not allow_common and (ident in COMMON or ident.lower() in COMMON):
+        return False
+    return True
+
+
+def ignored_path(path: str, extra_ignore: Sequence[str], no_ignore: bool) -> bool:
+    if no_ignore:
+        return False
+    posix = path.replace("\\", "/")
+    parts = [p for p in posix.split("/") if p]
+    if any(p in IGNORE_DIRS for p in parts):
+        return True
+    base = parts[-1] if parts else posix
+    for g in (*IGNORE_GLOBS, *extra_ignore):
+        if fnmatch.fnmatch(posix, g) or fnmatch.fnmatch(base, g):
+            return True
+        if g.endswith("/") and posix.startswith(g.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def extract_hits(
+    files: Iterable[FileHunks],
+    *,
+    allow_common: bool,
+    extra_ignore: Sequence[str],
+    no_ignore: bool,
+    strict: bool,
+) -> list[Hit]:
+    hits: list[Hit] = []
+    for fh in files:
+        if ignored_path(fh.path, extra_ignore, no_ignore):
+            continue
+        changed = [ln for ln in fh.lines if ln[0] in "+-"]
+        if not changed:
+            continue
+        header_defs: set[str] = set()
+        for hdr in fh.headers:
+            header_defs |= header_defs_on_line(hdr)
+
+        if not strict:
+            for ident in header_defs:
+                if interesting(ident, allow_common=allow_common):
+                    hits.append(
+                        Hit(
+                            path=fh.path,
+                            line=changed[0][1],
+                            sign="~",
+                            role="def",
+                            ident=ident,
+                            text=fh.headers[0] if fh.headers else "",
+                        )
+                    )
+
+        for sign, ln, text in changed:
+            defs = defs_on_line(text)
+            seen: set[str] = set()
+            for ident in idents_on_line(text):
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                if not interesting(ident, allow_common=allow_common):
+                    continue
+                role = "def" if ident in defs else "use"
+                hits.append(
+                    Hit(
+                        path=fh.path,
+                        line=ln,
+                        sign=sign,
+                        role=role,
+                        ident=ident,
+                        text=text.strip(),
+                    )
+                )
+    return hits
+
+
+def index_side(hits: Iterable[Hit]) -> dict[str, SideIdent]:
+    out: dict[str, SideIdent] = defaultdict(SideIdent)
+    for h in hits:
+        s = out[h.ident]
+        if h.role == "def":
+            if h.sign == "+":
+                s.defs_added.append(h)
+            elif h.sign == "-":
+                s.defs_removed.append(h)
+            else:
+                s.defs_touched.append(h)
+        else:
+            if h.sign == "+":
+                s.uses_added.append(h)
+            elif h.sign == "-":
+                s.uses_removed.append(h)
+    return out
+
+
+def classify_kind(a: SideIdent, b: SideIdent) -> str | None:
+    a_del = a.deleted_def()
+    b_del = b.deleted_def()
+    if a_del and b.uses_added:
+        return "delete-use"
+    if b_del and a.uses_added:
+        return "delete-use"
+    a_def = a.changed_def()
+    b_def = b.changed_def()
+    if a_def and b_def:
+        return "dup-def"
+    if a_def and b.changed_use():
+        return "def-use"
+    if b_def and a.changed_use():
+        return "def-use"
+    if a.changed_use() and b.changed_use():
+        return "use-use"
+    return None
+
+
+def find_rifts(
+    hits_a: Sequence[Hit],
+    hits_b: Sequence[Hit],
+    textual: Sequence[str],
+    *,
+    kinds: Sequence[str],
+) -> list[Rift]:
+    ia = index_side(hits_a)
+    ib = index_side(hits_b)
+    textual_set = set(textual)
+    rifts: list[Rift] = []
+    for ident in sorted(set(ia) | set(ib)):
+        a = ia.get(ident, SideIdent())
+        b = ib.get(ident, SideIdent())
+        kind = classify_kind(a, b)
+        if kind is None or kind not in kinds:
+            continue
+        files = sorted(
+            {h.path for h in a.all_hits()} | {h.path for h in b.all_hits()}
+        )
+        # Hidden iff git did not already flag every involved file.
+        if not files:
+            hidden = True
+        elif textual_set:
+            hidden = any(f not in textual_set for f in files)
+        else:
+            hidden = True
+        rifts.append(
+            Rift(
+                kind=kind,
+                ident=ident,
+                hidden=hidden,
+                a=a.all_hits(),
+                b=b.all_hits(),
+                files=files,
+            )
+        )
+    rifts.sort(key=lambda r: (KIND_ORDER.get(r.kind, 9), r.ident))
+    return rifts
+
+
+def git(
+    args: Sequence[str],
+    cwd: str | None = None,
+    *,
+    check: bool = True,
+    nul: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace")
+        raise GitError(args, err, proc.returncode)
+    return proc
+
+
+def git_text(args: Sequence[str], cwd: str | None = None, check: bool = True) -> str:
+    proc = git(args, cwd=cwd, check=check)
+    return proc.stdout.decode("utf-8", errors="surrogateescape")
+
+
+def resolve_revs(a: str, b: str, cwd: str | None) -> tuple[str, str, str | None, bool]:
+    """Return (a, b, base, one_sided)."""
+    a_full = git_text(["rev-parse", "--verify", a], cwd=cwd).strip()
+    b_full = git_text(["rev-parse", "--verify", b], cwd=cwd).strip()
+    try:
+        base = git_text(["merge-base", a_full, b_full], cwd=cwd).strip()
+    except GitError:
+        return a_full, b_full, None, False
+    one_sided = base == a_full or base == b_full
+    return a_full, b_full, base, one_sided
+
+
+def collect_diff(left: str, right: str, cwd: str | None) -> str:
+    return git_text(
+        ["diff", "--no-color", "--no-ext-diff", "-U0", "-M", left, right, "--"],
+        cwd=cwd,
+    )
+
+
+def merge_tree_conflicts(a: str, b: str, cwd: str | None) -> tuple[bool | None, list[str]]:
+    proc = git(
+        [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            a,
+            b,
+        ],
+        cwd=cwd,
+        check=False,
+    )
+    if proc.returncode not in (0, 1):
+        err = proc.stderr.decode("utf-8", errors="replace")
+        # Older or unusual repo; treat as unknown.
+        if err.strip():
+            return None, []
+        return None, []
+    raw = proc.stdout.split(b"\0")
+    parts = [p.decode("utf-8", errors="surrogateescape") for p in raw if p]
+    files = [p for p in parts[1:] if p]
+    clean = proc.returncode == 0
+    return clean, files
+
+
+def short(rev: str) -> str:
+    return rev[:8] if re.fullmatch(r"[0-9a-f]{40}", rev) else rev
+
+
+def rev_label(name: str | None, rev: str) -> str:
+    s = short(rev)
+    if name and name not in (rev, s) and not re.fullmatch(r"[0-9a-f]{40}", name):
+        return f"{name} ({s})"
+    return s
+
+
+def parse_merge_log_line(line: str) -> tuple[str, list[str], str] | None:
+    """Parse `git log --merges --format=%H%x09%P%x09%s` (tab) or space-delimited."""
+    line = line.rstrip("\n")
+    if not line:
+        return None
+    if "\t" in line:
+        parts = line.split("\t", 2)
+        commit = parts[0].strip()
+        parents = parts[1].split() if len(parts) > 1 else []
+        subject = parts[2] if len(parts) > 2 else ""
+        return commit, parents, subject
+    tokens = line.split()
+    commit = tokens[0]
+    parents: list[str] = []
+    i = 1
+    while i < len(tokens) and re.fullmatch(r"[0-9a-f]{40}", tokens[i]):
+        parents.append(tokens[i])
+        i += 1
+    subject = " ".join(tokens[i:])
+    return commit, parents, subject
+
+
+def color_enabled(args_color: str) -> bool:
+    if args_color == "always":
+        return True
+    if args_color == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(text: str, code: str, on: bool) -> str:
+    if not on:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def format_text(report: Report, *, color: bool, snippets: bool) -> str:
+    a = rev_label(report.a_name, report.a)
+    b = rev_label(report.b_name, report.b)
+    if report.one_sided:
+        return (
+            f"rift: one-sided history between {a} and {b}; "
+            "no parallel changeset to compare\n"
+        )
+    if report.base is None and report.a_name != "--diffs" and report.a != "--diffs":
+        header = f"rift: {a} vs {b} (no merge-base)\n"
+    else:
+        base = short(report.base) if report.base else "-"
+        header = f"rift: {a} vs {b}  base {base}\n"
+    if report.merge_clean is True:
+        header += "git merge-tree: clean\n"
+    elif report.merge_clean is False:
+        n = len(report.textual_conflicts)
+        header += f"git merge-tree: {n} textual conflict(s)\n"
+    shown = report.rifts
+    if not shown:
+        header += "no silent identifier conflicts\n"
+        return header
+
+    header += f"{len(shown)} rift(s)\n\n"
+    blocks = [header]
+    kind_color = {
+        "delete-use": "31",
+        "dup-def": "33",
+        "def-use": "35",
+        "use-use": "34",
+    }
+    for r in shown:
+        tag = paint(r.kind, kind_color.get(r.kind, "36"), color)
+        vis = "hidden" if r.hidden else "also-text"
+        blocks.append(f"{tag}  {paint(r.ident, '1', color)}  {vis}\n")
+        for side, hits in (("A", r.a), ("B", r.b)):
+            # Compact: unique path:line role sign
+            seen: set[tuple] = set()
+            for h in hits:
+                key = (h.path, h.line, h.role, h.sign)
+                if key in seen:
+                    continue
+                seen.add(key)
+                loc = f"{h.path}:{h.line}"
+                line = f"  {side}  {h.role:<3} {h.sign} {loc}"
+                if snippets and h.text:
+                    clip = h.text.replace("\t", " ")
+                    if len(clip) > 100:
+                        clip = clip[:97] + "..."
+                    line += f"  {clip}"
+                blocks.append(line + "\n")
+        blocks.append("\n")
+    return "".join(blocks)
+
+
+def format_tsv(report: Report) -> str:
+    rows = [
+        "kind\tident\thidden\tside\trole\tsign\tpath\tline\ttext"
+    ]
+    for r in report.rifts:
+        for side, hits in (("A", r.a), ("B", r.b)):
+            for h in hits:
+                text = h.text.replace("\t", " ").replace("\n", " ")
+                rows.append(
+                    f"{r.kind}\t{r.ident}\t{int(r.hidden)}\t{side}\t"
+                    f"{h.role}\t{h.sign}\t{h.path}\t{h.line}\t{text}"
+                )
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def format_json(report: Report) -> str:
+    payload = {
+        "a": report.a,
+        "b": report.b,
+        "a_name": report.a_name,
+        "b_name": report.b_name,
+        "base": report.base,
+        "textual_conflicts": report.textual_conflicts,
+        "merge_clean": report.merge_clean,
+        "one_sided": report.one_sided,
+        "rifts": [
+            {
+                "kind": r.kind,
+                "ident": r.ident,
+                "hidden": r.hidden,
+                "files": r.files,
+                "a": [asdict(h) for h in r.a],
+                "b": [asdict(h) for h in r.b],
+            }
+            for r in report.rifts
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def analyze_diffs(
+    diff_a: str,
+    diff_b: str,
+    *,
+    allow_common: bool,
+    extra_ignore: Sequence[str],
+    no_ignore: bool,
+    strict: bool,
+    kinds: Sequence[str],
+    textual: Sequence[str],
+    merge_clean: bool | None,
+    a_label: str,
+    b_label: str,
+    base: str | None,
+    one_sided: bool,
+    hidden_only: bool,
+    a_name: str | None = None,
+    b_name: str | None = None,
+) -> Report:
+    files_a = parse_unified_diff(diff_a)
+    files_b = parse_unified_diff(diff_b)
+    hits_a = extract_hits(
+        files_a,
+        allow_common=allow_common,
+        extra_ignore=extra_ignore,
+        no_ignore=no_ignore,
+        strict=strict,
+    )
+    hits_b = extract_hits(
+        files_b,
+        allow_common=allow_common,
+        extra_ignore=extra_ignore,
+        no_ignore=no_ignore,
+        strict=strict,
+    )
+    rifts = find_rifts(hits_a, hits_b, textual, kinds=kinds)
+    if hidden_only:
+        rifts = [r for r in rifts if r.hidden]
+    return Report(
+        a=a_label,
+        b=b_label,
+        base=base,
+        textual_conflicts=list(textual),
+        merge_clean=merge_clean,
+        one_sided=one_sided,
+        rifts=rifts,
+        a_name=a_name,
+        b_name=b_name,
+    )
+
+
+def parse_range_token(token: str) -> tuple[str, str] | None:
+    if "..." in token:
+        a, b = token.split("...", 1)
+        return a or "HEAD", b or "HEAD"
+    return None
+
+
+def run_audit(
+    cwd: str | None,
+    n: int,
+    analyze_kwargs: dict,
+    *,
+    fmt: str,
+    color: bool,
+    snippets: bool,
+    quiet: bool,
+) -> int:
+    log = git_text(
+        ["log", "--merges", f"-n{n}", "--format=%H%x09%P%x09%s"],
+        cwd=cwd,
+        check=True,
+    ).strip()
+    if not log:
+        if not quiet:
+            sys.stderr.write("rift: no merge commits in range\n")
+        return 0
+    found = 0
+    n_total = 0
+    n_one = 0
+    n_two = 0
+    n_skip = 0
+    rc = 0
+    for line in log.splitlines():
+        parsed = parse_merge_log_line(line)
+        if parsed is None:
+            continue
+        commit, ps, subject = parsed
+        n_total += 1
+        if len(ps) < 2:
+            n_skip += 1
+            continue
+        p1, p2 = ps[0], ps[1]
+        try:
+            a, b, base, one_sided = resolve_revs(p1, p2, cwd)
+        except GitError as e:
+            n_skip += 1
+            if not quiet:
+                sys.stderr.write(f"rift: skip {commit[:8]}: {e}\n")
+            continue
+        if one_sided:
+            n_one += 1
+            continue
+        n_two += 1
+        diff_a = collect_diff(base or a, a, cwd)
+        diff_b = collect_diff(base or b, b, cwd)
+        clean, textual = merge_tree_conflicts(a, b, cwd)
+        report = analyze_diffs(
+            diff_a,
+            diff_b,
+            textual=textual,
+            merge_clean=clean,
+            a_label=a,
+            b_label=b,
+            base=base,
+            one_sided=False,
+            a_name=f"{commit[:8]}^1",
+            b_name=f"{commit[:8]}^2",
+            **analyze_kwargs,
+        )
+        if report.rifts:
+            rc = 1
+            found += len(report.rifts)
+            if fmt == "text":
+                sys.stdout.write(f"# merge {commit[:8]}  {subject}\n")
+                sys.stdout.write(format_text(report, color=color, snippets=snippets))
+            elif fmt == "json":
+                sys.stdout.write(json.dumps({"merge": commit, "subject": subject}) + "\n")
+                sys.stdout.write(format_json(report))
+            else:
+                sys.stdout.write(f"# merge {commit[:8]}\n")
+                sys.stdout.write(format_tsv(report))
+    if not quiet:
+        sys.stderr.write(
+            f"rift: audited {n_total} merge(s): "
+            f"{n_two} two-sided, {n_one} one-sided, {n_skip} skipped, "
+            f"{found} rift(s)\n"
+        )
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# self-test (no git required)
+# ---------------------------------------------------------------------------
+
+DIFF_DEF_A = """diff --git a/src/parse.rs b/src/parse.rs
+index 1111111..2222222 100644
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -10 +10 @@
+-pub fn parse_config(s: &str) -> Config {
++pub fn parse_config(s: &str, timeout: u64) -> Config {
+"""
+
+DIFF_USE_B = """diff --git a/src/cli.rs b/src/cli.rs
+index 1111111..2222222 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -40 +40 @@
+-    let cfg = parse_config(raw);
++    let cfg = parse_config(raw, None);
+"""
+
+DIFF_DELETE_A = """diff --git a/src/parse.rs b/src/parse.rs
+index 1111111..2222222 100644
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -10,3 +9,0 @@
+-pub fn parse_config(s: &str) -> Config {
+-    Config::from(s)
+-}
+"""
+
+DIFF_NEW_USE_B = """diff --git a/src/extra.rs b/src/extra.rs
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/src/extra.rs
+@@ -0,0 +1,3 @@
++pub fn extra() {
++    parse_config("hi");
++}
+"""
+
+DIFF_UNRELATED_A = """diff --git a/src/a.rs b/src/a.rs
+index 1111111..2222222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-pub fn alpha_unique(x: u32) -> u32 { x }
++pub fn alpha_unique(x: u32) -> u32 { x + 1 }
+"""
+
+DIFF_UNRELATED_B = """diff --git a/src/b.rs b/src/b.rs
+index 1111111..2222222 100644
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-pub fn beta_unique(x: u32) -> u32 { x }
++pub fn beta_unique(x: u32) -> u32 { x + 2 }
+"""
+
+DIFF_PARAM_A = """diff --git a/src/parse.rs b/src/parse.rs
+index 1111111..2222222 100644
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -2,0 +3 @@ pub fn parse_config(
++    timeout: u64,
+"""
+
+DIFF_WEIRD_A = r"""diff --git "a/src/weird file-\346\226\207.rs" "b/src/weird file-\346\226\207.rs"
+index 1111111..2222222 100644
+--- "a/src/weird file-\346\226\207.rs"
++++ "b/src/weird file-\346\226\207.rs"
+@@ -4 +4 @@
+-pub fn weird_ident_zzz(x: u32) -> u32 { x }
++pub fn weird_ident_zzz(x: u32, y: u32) -> u32 { x + y }
+"""
+
+DIFF_WEIRD_B = """diff --git a/src/call.rs b/src/call.rs
+index 1111111..2222222 100644
+--- a/src/call.rs
++++ b/src/call.rs
+@@ -1 +1 @@
+-weird_ident_zzz(1);
++weird_ident_zzz(1, 2);
+"""
+
+DIFF_DUP_A = """diff --git a/src/left.rs b/src/left.rs
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/left.rs
+@@ -0,0 +1 @@
++pub fn shared_helper_zzz() {}
+"""
+
+DIFF_DUP_B = """diff --git a/src/right.rs b/src/right.rs
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/right.rs
+@@ -0,0 +1 @@
++pub fn shared_helper_zzz() {}
+"""
+
+DIFF_LOCK_A = """diff --git a/Cargo.lock b/Cargo.lock
+index 1111111..2222222 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1 +1 @@
+-pub fn lock_only_ident() {}
++pub fn lock_only_ident(x: u32) {}
+"""
+
+DIFF_LOCK_B = """diff --git a/src/x.rs b/src/x.rs
+index 1111111..2222222 100644
+--- a/src/x.rs
++++ b/src/x.rs
+@@ -1 +1 @@
+-lock_only_ident();
++lock_only_ident(1);
+"""
+
+DIFF_CLASS_A = """diff --git a/JSONSessionStore.swift b/JSONSessionStore.swift
+index 1111111..2222222 100644
+--- a/JSONSessionStore.swift
++++ b/JSONSessionStore.swift
+@@ -40 +40 @@ public final class JSONSessionStore: SessionStoreProtocol {
+-    public func saveCumulative(_ record: CumulativeRecord) async throws {
++    public func saveCumulative(_ record: CumulativeRecord, flush: Bool) async throws {
+"""
+
+DIFF_CLASS_B = """diff --git a/RiftProbe.swift b/RiftProbe.swift
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/RiftProbe.swift
+@@ -0,0 +1,3 @@
++enum RiftProbe {
++    static func ping(_ store: JSONSessionStore) async throws {
++        try await store.saveCumulative(CumulativeRecord())
+"""
+
+
+def _self_check(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def self_test() -> None:
+    files = parse_unified_diff(DIFF_DEF_A)
+    _self_check(len(files) == 1, "parse one file")
+    _self_check(files[0].path == "src/parse.rs", files[0].path)
+    _self_check(files[0].lines[0][0] == "-", "minus line")
+    _self_check("parse_config" in files[0].lines[0][2], "old ident")
+
+    weird = parse_unified_diff(DIFF_WEIRD_A)
+    _self_check(len(weird) == 1, "weird file parsed")
+    _self_check("weird file-" in weird[0].path, weird[0].path)
+    _self_check("文" in weird[0].path, f"unicode in path: {weird[0].path!r}")
+
+    kwargs = dict(
+        allow_common=False,
+        extra_ignore=(),
+        no_ignore=False,
+        strict=False,
+        kinds=KINDS_DEFAULT,
+        hidden_only=False,
+    )
+
+    r = analyze_diffs(
+        DIFF_DEF_A, DIFF_USE_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(len(r.rifts) == 1, f"def-use count {r.rifts}")
+    _self_check(r.rifts[0].ident == "parse_config", r.rifts[0].ident)
+    _self_check(r.rifts[0].kind == "def-use", r.rifts[0].kind)
+    _self_check(r.rifts[0].hidden is True, "hidden when merge clean")
+
+    r = analyze_diffs(
+        DIFF_DELETE_A, DIFF_NEW_USE_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(any(x.kind == "delete-use" and x.ident == "parse_config" for x in r.rifts),
+                f"delete-use: {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_UNRELATED_A, DIFF_UNRELATED_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(r.rifts == [], f"unrelated produced {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_PARAM_A, DIFF_USE_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(any(x.ident == "parse_config" for x in r.rifts),
+                f"hunk-header def missed: {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_WEIRD_A, DIFF_WEIRD_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(any(x.ident == "weird_ident_zzz" for x in r.rifts),
+                f"weird name: {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_DUP_A, DIFF_DUP_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(any(x.kind == "dup-def" and x.ident == "shared_helper_zzz" for x in r.rifts),
+                f"dup-def: {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_LOCK_A, DIFF_LOCK_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    _self_check(r.rifts == [], f"lockfile should be ignored: {r.rifts}")
+
+    r = analyze_diffs(
+        DIFF_DEF_A, DIFF_USE_B, textual=("src/parse.rs", "src/cli.rs"),
+        merge_clean=False, a_label="A", b_label="B", base="base",
+        one_sided=False, **kwargs,
+    )
+    _self_check(r.rifts and r.rifts[0].hidden is False, "also-text when all files conflict")
+
+    hidden_kwargs = dict(kwargs)
+    hidden_kwargs["hidden_only"] = True
+    r = analyze_diffs(
+        DIFF_DEF_A, DIFF_USE_B, textual=("src/parse.rs", "src/cli.rs"),
+        merge_clean=False, a_label="A", b_label="B", base="base",
+        one_sided=False, **hidden_kwargs,
+    )
+    _self_check(r.rifts == [], "hidden-only filters also-text")
+
+    r = analyze_diffs(
+        DIFF_CLASS_A, DIFF_CLASS_B, textual=(), merge_clean=True,
+        a_label="A", b_label="B", base="base", one_sided=False, **kwargs,
+    )
+    idents = {x.ident for x in r.rifts}
+    _self_check("saveCumulative" in idents, f"swift method missed: {r.rifts}")
+    _self_check(
+        "JSONSessionStore" not in idents,
+        f"enclosing class false positive: {idents}",
+    )
+
+    parsed = parse_merge_log_line(
+        "347089529764c6e44a98c15024e286e118514b1c\t"
+        "88362116eea2e722d395ee6f1196617a6cd047f0 "
+        "04adde1f11f21fea0bee1c48ea544e21df5e5668\t"
+        "Merge pull request #18"
+    )
+    _self_check(parsed is not None, "parse merge log")
+    assert parsed is not None
+    _self_check(len(parsed[1]) == 2, f"two parents, got {parsed[1]}")
+    spacey = parse_merge_log_line(
+        "347089529764c6e44a98c15024e286e118514b1c "
+        "88362116eea2e722d395ee6f1196617a6cd047f0 "
+        "04adde1f11f21fea0bee1c48ea544e21df5e5668 "
+        "Merge pull request #18 from annenpolka/x"
+    )
+    _self_check(spacey is not None and len(spacey[1]) == 2, "space-delimited parents")
+
+    sys.stdout.write("rift --self-test: ok\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="rift",
+        description=(
+            "Detect identifier-level conflicts that a clean git merge would hide. "
+            "Compares two changesets (two revs vs their merge-base, a merge commit, "
+            "or two unified diffs) and reports crossed definition/use edits."
+        ),
+        epilog="Exit 0 if no rifts, 1 if rifts exist, 2 on usage/git error.",
+    )
+    p.add_argument("revs", nargs="*", help="A, B, or A...B  (B defaults to HEAD)")
+    p.add_argument("-C", "--repo", default=None, help="git -C directory")
+    p.add_argument("--merge", metavar="COMMIT", help="audit a merge commit's two parents")
+    p.add_argument("--diffs", nargs=2, metavar=("A.diff", "B.diff"),
+                   help="compare two unified-diff files (no git required)")
+    p.add_argument("--audit", nargs="?", const="20", metavar="N",
+                   help="scan the last N merge commits (default 20)")
+    p.add_argument("-o", "--format", choices=("text", "json", "tsv"), default="text")
+    p.add_argument("-q", "--quiet", action="store_true", help="no stdout; exit status only")
+    p.add_argument("--all", action="store_true", help="include use-use rifts")
+    p.add_argument("--common", action="store_true", help="do not filter generic identifiers")
+    p.add_argument("--strict", action="store_true",
+                   help="only count definition lines in +/- hunks, not hunk headers")
+    p.add_argument("--also-text", action="store_true",
+                   help="include rifts that git merge-tree already flags as textual conflicts")
+    p.add_argument("--ignore", action="append", default=[], metavar="GLOB",
+                   help="extra path ignore glob (repeatable)")
+    p.add_argument("--no-ignore", action="store_true", help="do not ignore lock/docs/vendor paths")
+    p.add_argument("--no-snippets", action="store_true")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--version", action="version", version=f"rift {__version__}")
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.self_test:
+        try:
+            self_test()
+        except AssertionError as e:
+            sys.stderr.write(f"rift --self-test FAILED: {e}\n")
+            return 2
+        return 0
+
+    kinds = KINDS_DEFAULT + (("use-use",) if args.all else ())
+    analyze_kwargs = dict(
+        allow_common=args.common,
+        extra_ignore=tuple(args.ignore),
+        no_ignore=args.no_ignore,
+        strict=args.strict,
+        kinds=kinds,
+        hidden_only=not args.also_text,
+    )
+    color = color_enabled(args.color)
+    snippets = not args.no_snippets
+    cwd = args.repo
+
+    try:
+        if args.diffs:
+            with open(args.diffs[0], encoding="utf-8", errors="surrogateescape") as f:
+                diff_a = f.read()
+            with open(args.diffs[1], encoding="utf-8", errors="surrogateescape") as f:
+                diff_b = f.read()
+            report = analyze_diffs(
+                diff_a, diff_b, textual=(), merge_clean=None,
+                a_label=args.diffs[0], b_label=args.diffs[1],
+                base=None, one_sided=False,
+                a_name=args.diffs[0], b_name=args.diffs[1],
+                **analyze_kwargs,
+            )
+        elif args.audit is not None:
+            n = int(args.audit)
+            return run_audit(
+                cwd, n, analyze_kwargs,
+                fmt=args.format, color=color, snippets=snippets, quiet=args.quiet,
+            )
+        else:
+            if args.merge:
+                body = git_text(["rev-parse", args.merge], cwd=cwd).strip()
+                parents = git_text(["rev-parse", f"{body}^1", f"{body}^2"], cwd=cwd).split()
+                if len(parents) < 2:
+                    sys.stderr.write("rift: --merge commit is not a merge\n")
+                    return 2
+                rev_a, rev_b = parents[0], parents[1]
+            else:
+                revs = list(args.revs)
+                if len(revs) == 1 and parse_range_token(revs[0]):
+                    rev_a, rev_b = parse_range_token(revs[0])  # type: ignore[misc]
+                elif len(revs) == 1:
+                    rev_a, rev_b = revs[0], "HEAD"
+                elif len(revs) == 2:
+                    rev_a, rev_b = revs[0], revs[1]
+                elif len(revs) == 0:
+                    sys.stderr.write("rift: need A [B], A...B, --merge, --diffs, or --audit\n")
+                    return 2
+                else:
+                    sys.stderr.write("rift: too many revision arguments\n")
+                    return 2
+            a, b, base, one_sided = resolve_revs(rev_a, rev_b, cwd)
+            if one_sided:
+                report = Report(
+                    a=a, b=b, base=base, textual_conflicts=[],
+                    merge_clean=True, one_sided=True, rifts=[],
+                    a_name=rev_a, b_name=rev_b,
+                )
+            else:
+                left = base or a
+                diff_a = collect_diff(left, a, cwd)
+                diff_b = collect_diff(left, b, cwd)
+                clean, textual = merge_tree_conflicts(a, b, cwd)
+                report = analyze_diffs(
+                    diff_a, diff_b, textual=textual, merge_clean=clean,
+                    a_label=a, b_label=b, base=base, one_sided=False,
+                    a_name=rev_a, b_name=rev_b,
+                    **analyze_kwargs,
+                )
+    except GitError as e:
+        sys.stderr.write(f"rift: {e}\n")
+        return 2
+    except OSError as e:
+        sys.stderr.write(f"rift: {e}\n")
+        return 2
+
+    if not args.quiet:
+        if args.format == "json":
+            sys.stdout.write(format_json(report))
+        elif args.format == "tsv":
+            sys.stdout.write(format_tsv(report))
+        else:
+            sys.stdout.write(format_text(report, color=color, snippets=snippets))
+
+    if report.one_sided:
+        return 0
+    return 1 if report.rifts else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

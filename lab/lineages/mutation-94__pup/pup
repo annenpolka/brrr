@@ -1,0 +1,1922 @@
+#!/usr/bin/env python3
+"""pup — covering predicates in, occupancy eras out.
+
+ditto emits COPY vs FOLLOW then pastes `held exists DEST` / `--follow exists OLD`.
+`ditto A B | sh` runs those walks. held does not parse --follow; dest existence
+is also TRUE for a unique birth. pup occupies the covering predicates:
+git mv is FOLLOW (identity eras); cp is COPY (dest is the extra holder).
+
+Not git diff -C. Not a third ambit. Not leftover-name search.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+
+TOOL = "pup"
+COPY_SIM_MIN = 0.5
+RENAME_SIM_MIN = 0.5
+MAX_BLOB = 1_000_000
+HOLDER_PRINT_LIMIT = 8
+GLOB_CHARS = set("*?[")
+
+SKIP_TOKEN_SUFFIXES = (
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bin",
+)
+SKIP_TOKEN_NAMES = {
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+    "gemfile.lock",
+}
+SKIP_TOKEN_PARTS = ("/docs/generated/", "/generated/", ".generated.")
+
+
+class GitError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{TOOL}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_git(
+    repo: str,
+    args: list[str],
+    check: bool = True,
+    input_text: Optional[str] = None,
+    input_bytes: Optional[bytes] = None,
+) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", repo, *args]
+    if input_bytes is not None:
+        r = subprocess.run(cmd, input=input_bytes, capture_output=True)
+    else:
+        r = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
+    if check and r.returncode != 0:
+        raw = r.stderr or r.stdout or b""
+        err = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        raise GitError(err.strip() or f"git {' '.join(args)} failed")
+    return r
+
+
+def resolve_repo(path: str) -> str:
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        die(f"not a git repository: {path}")
+    r = run_git(path, ["rev-parse", "--show-toplevel"], check=False)
+    if r.returncode != 0:
+        die(f"not a git repository: {path}")
+    top = r.stdout.strip() if isinstance(r.stdout, str) else ""
+    if not top:
+        die(f"not a git repository: {path}")
+    return top
+
+
+def quote(s: str) -> str:
+    if not s:
+        return "''"
+    if all(ch.isalnum() or ch in "._-/@+," for ch in s):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def unquote_token(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        inner = s[1:-1]
+        if s[0] == "'":
+            return inner.replace("'\\''", "'")
+        out = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                out.append(inner[i + 1])
+                i += 2
+                continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
+    return s
+
+
+def is_glob(path: str) -> bool:
+    return any(ch in path for ch in GLOB_CHARS)
+
+
+# --- samples / eras --------------------------------------------------------
+
+
+@dataclass
+class Sample:
+    sha: str
+    short: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str
+    parents: list[str] = field(default_factory=list)
+    value: bool = False
+    witnesses: list[str] = field(default_factory=list)
+
+    def as_json(self) -> dict:
+        return {
+            "sha": self.sha,
+            "short": self.short,
+            "timestamp": self.timestamp,
+            "iso": self.iso,
+            "subject": self.subject,
+            "kind": self.kind,
+        }
+
+
+@dataclass
+class Era:
+    value: bool
+    samples: list[Sample]
+    split: str = "start"
+    kind_name: str = "absent"
+    added: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    origin: Optional[Sample] = None
+    origin_count: int = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.samples)
+
+    @property
+    def start(self) -> Sample:
+        return self.samples[0]
+
+    @property
+    def end(self) -> Sample:
+        return self.samples[-1]
+
+    @property
+    def holders(self) -> list[str]:
+        if not self.value:
+            return []
+        return list(self.start.witnesses)
+
+
+@dataclass
+class Identity:
+    kind: str  # copied | renamed | died | born | changed
+    a_path: Optional[str] = None
+    b_path: Optional[str] = None
+    sha_a: Optional[str] = None
+    sha_b: Optional[str] = None
+    similarity: float = 1.0
+
+
+@dataclass
+class Covering:
+    kind: str  # copy | follow
+    source: str
+    dest: str
+    repo: Optional[str] = None
+    event_rev: Optional[str] = None
+    raw: str = ""
+
+
+def day(iso: str) -> str:
+    return iso[:10]
+
+
+def fmt_dates(start: Sample, end: Sample, always_arrow: bool = False) -> str:
+    a, b = day(start.iso), day(end.iso)
+    if a == b and not always_arrow:
+        return a
+    return f"{a} → {b}"
+
+
+def fmt_span(start: Sample, end: Sample) -> str:
+    if start.short == end.short:
+        return start.short
+    return f"{start.short}..{end.short}"
+
+
+def load_commits(
+    repo: str, spec: str, first_parent: bool, limit: Optional[int]
+) -> list[Sample]:
+    args = ["log", "--reverse", "--pretty=format:%H\t%P\t%ct\t%ci\t%s"]
+    if first_parent:
+        args.append("--first-parent")
+    args.append(spec)
+    r = run_git(repo, args, check=False)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if not r.stdout.strip():
+            return []
+        raise GitError(err)
+    samples: list[Sample] = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        sha, parents, ts, iso, subject = parts
+        samples.append(
+            Sample(
+                sha=sha,
+                short=sha[:7],
+                timestamp=int(ts),
+                iso=iso,
+                subject=subject,
+                kind="commit",
+                parents=parents.split() if parents.strip() else [],
+            )
+        )
+    if limit is not None and limit >= 0:
+        samples = samples[-limit:]
+    return samples
+
+
+def reachable_count(repo: str, spec: str) -> int:
+    r = run_git(repo, ["rev-list", "--count", spec], check=False)
+    if r.returncode != 0:
+        return 0
+    try:
+        return int(r.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def now_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        short="WORKTREE",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def index_sample() -> Sample:
+    stamp = datetime.now().astimezone()
+    return Sample(
+        sha="INDEX",
+        short="INDEX",
+        timestamp=int(stamp.timestamp()),
+        iso=stamp.isoformat(timespec="seconds"),
+        subject="staged index",
+        kind="index",
+    )
+
+
+def compress(samples: list[Sample], split_holders: bool) -> list[Era]:
+    eras: list[Era] = []
+    for s in samples:
+        if not eras:
+            eras.append(Era(value=s.value, samples=[s], split="start"))
+            continue
+        prev = eras[-1]
+        if prev.value != s.value:
+            eras.append(Era(value=s.value, samples=[s], split="boolean"))
+            continue
+        if split_holders and s.value and list(prev.end.witnesses) != list(s.witnesses):
+            eras.append(Era(value=s.value, samples=[s], split="holders"))
+            continue
+        prev.samples.append(s)
+    return eras
+
+
+def classify_eras(eras: list[Era]) -> None:
+    for i, era in enumerate(eras):
+        prev = eras[i - 1] if i else None
+        prev_h = list(prev.holders) if prev and prev.value else []
+        cur_h = list(era.holders) if era.value else []
+        if era.value:
+            era.added = sorted(set(cur_h) - set(prev_h))
+            era.dropped = sorted(set(prev_h) - set(cur_h))
+        else:
+            era.added = []
+            era.dropped = []
+        if not era.value:
+            era.kind_name = "absent" if prev is None else "death"
+            continue
+        if prev is None or not prev.value:
+            era.kind_name = "birth"
+            continue
+        if era.added and era.dropped:
+            era.kind_name = "move"
+        elif era.added:
+            era.kind_name = "spread"
+        elif era.dropped:
+            era.kind_name = "shrink"
+        else:
+            era.kind_name = "birth"
+
+
+# --- two-tree covering (ditto kernel, no history walk) ---------------------
+
+
+def git_blob_sha(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+class TreeCache:
+    def __init__(self, repo: str) -> None:
+        self.repo = repo
+        self.trees: dict[str, dict[str, str]] = {}
+        self.blobs: dict[str, Optional[bytes]] = {}
+        self.probes = 0
+
+    def tree(self, spec: str) -> dict[str, str]:
+        if spec in self.trees:
+            return self.trees[spec]
+        if spec in ("WORKTREE", ":worktree"):
+            paths = self._load_worktree()
+        elif spec in ("INDEX", ":index"):
+            paths = self._load_index()
+        else:
+            paths = self._load_commit(spec)
+        self.trees[spec] = paths
+        return paths
+
+    def _load_commit(self, sha: str) -> dict[str, str]:
+        rb = run_git(self.repo, ["ls-tree", "-r", "-z", sha], check=False, input_bytes=b"")
+        self.probes += 1
+        if rb.returncode != 0:
+            return {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        paths: dict[str, str] = {}
+        for entry in data.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                meta, path_b = entry.split(b"\t", 1)
+            except ValueError:
+                continue
+            parts = meta.split()
+            if len(parts) < 3:
+                continue
+            obj_type = parts[1].decode("ascii", "replace")
+            sha = parts[2].decode("ascii", "replace")
+            path = path_b.decode("utf-8", "surrogateescape")
+            if obj_type != "blob":
+                continue
+            paths[path] = sha
+        return paths
+
+    def _load_worktree(self) -> dict[str, str]:
+        rb = run_git(
+            self.repo,
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            check=False,
+            input_bytes=b"",
+        )
+        self.probes += 1
+        paths: dict[str, str] = {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        for raw in data.split(b"\0"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", "surrogateescape")
+            abs_path = os.path.join(self.repo, rel)
+            if not os.path.isfile(abs_path):
+                continue
+            try:
+                with open(abs_path, "rb") as fh:
+                    blob = fh.read(MAX_BLOB + 1)
+            except OSError:
+                continue
+            if len(blob) > MAX_BLOB:
+                paths[rel] = "LARGE"
+                continue
+            paths[rel] = git_blob_sha(blob)
+            self.blobs[paths[rel]] = blob
+        return paths
+
+    def _load_index(self) -> dict[str, str]:
+        rb = run_git(
+            self.repo, ["ls-files", "-z", "--cached", "-s"], check=False, input_bytes=b""
+        )
+        self.probes += 1
+        paths: dict[str, str] = {}
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        for entry in data.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                meta, path_b = entry.split(b"\t", 1)
+            except ValueError:
+                continue
+            parts = meta.split()
+            if len(parts) < 2:
+                continue
+            sha = parts[1].decode("ascii", "replace")
+            path = path_b.decode("utf-8", "surrogateescape")
+            paths[path] = sha
+        return paths
+
+    def blob(self, tree: dict[str, str], path: str) -> Optional[bytes]:
+        sha = tree.get(path)
+        if not sha or sha == "LARGE":
+            return None
+        if sha in self.blobs:
+            return self.blobs[sha]
+        if len(sha) != 40:
+            return None
+        rb = run_git(
+            self.repo, ["cat-file", "--batch"], check=False, input_bytes=f"{sha}\n".encode()
+        )
+        self.probes += 1
+        data = rb.stdout if isinstance(rb.stdout, bytes) else b""
+        nl = data.find(b"\n")
+        if nl < 0:
+            self.blobs[sha] = None
+            return None
+        header = data[:nl].decode("ascii", "replace")
+        if header.endswith(" missing"):
+            self.blobs[sha] = None
+            return None
+        parts = header.split()
+        if len(parts) < 3:
+            self.blobs[sha] = None
+            return None
+        try:
+            size = int(parts[2])
+        except ValueError:
+            self.blobs[sha] = None
+            return None
+        blob = data[nl + 1 : nl + 1 + size]
+        if size > MAX_BLOB or b"\0" in blob[:8000]:
+            self.blobs[sha] = None
+            return None
+        self.blobs[sha] = blob
+        return blob
+
+
+def skip_token_path(path: str) -> bool:
+    lower = path.lower().replace("\\", "/")
+    base = lower.rsplit("/", 1)[-1]
+    if base in SKIP_TOKEN_NAMES:
+        return True
+    if lower.endswith(SKIP_TOKEN_SUFFIXES):
+        return True
+    return any(part in lower for part in SKIP_TOKEN_PARTS)
+
+
+def line_jaccard(a: bytes, b: bytes) -> float:
+    if a == b:
+        return 1.0
+    la = set(a.splitlines())
+    lb = set(b.splitlines())
+    if not la and not lb:
+        return 1.0
+    if not la or not lb:
+        return 0.0
+    return len(la & lb) / len(la | lb)
+
+
+def path_pair_score(a_path: str, b_path: str) -> tuple:
+    a_base = a_path.rsplit("/", 1)[-1]
+    b_base = b_path.rsplit("/", 1)[-1]
+    a_stem = a_base.rsplit(".", 1)[0] if "." in a_base else a_base
+    b_stem = b_base.rsplit(".", 1)[0] if "." in b_base else b_base
+    same_base = 0 if a_base == b_base else 1
+    same_stem = 0 if a_stem == b_stem else 1
+    return (same_base, same_stem, abs(len(a_path) - len(b_path)), a_path, b_path)
+
+
+def pick_source(sources: list[str], dest: str) -> str:
+    scored = sorted(
+        sources,
+        key=lambda src: (
+            0 if src.rsplit("/", 1)[-1] == dest.rsplit("/", 1)[-1] else 1,
+            -len(os.path.commonprefix([src, dest])),
+            abs(len(src) - len(dest)),
+            src,
+        ),
+    )
+    return scored[0]
+
+
+def ext_of(path: str) -> str:
+    base = path.rsplit("/", 1)[-1]
+    if "." not in base:
+        return ""
+    return base.rsplit(".", 1)[-1].lower()
+
+
+def related_paths(src: str, dest: str) -> bool:
+    se, de = ext_of(src), ext_of(dest)
+    if se and se == de:
+        return True
+    sa = src.split("/")[:-1]
+    sb = dest.split("/")[:-1]
+    return bool(sa and sb and sa[0] == sb[0])
+
+
+def detect_identities(
+    cache: TreeCache,
+    tree_a: dict[str, str],
+    tree_b: dict[str, str],
+) -> list[Identity]:
+    """Same blob still on A and born on B is COPY, not FOLLOW."""
+    only_a = sorted(p for p in tree_a if p not in tree_b)
+    only_b = sorted(p for p in tree_b if p not in tree_a)
+    changed = sorted(p for p in tree_a if p in tree_b and tree_a[p] != tree_b[p])
+    shared = sorted(p for p in tree_a if p in tree_b)
+
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    identities: list[Identity] = []
+
+    def remaining_holders(sha: str) -> list[str]:
+        return [
+            p
+            for p in shared
+            if tree_a.get(p) == sha or tree_b.get(p) == sha
+        ]
+
+    def take_rename(ap: str, bp: str, sim: float) -> None:
+        used_a.add(ap)
+        used_b.add(bp)
+        identities.append(
+            Identity(kind="renamed", a_path=ap, b_path=bp, sha_a=tree_a.get(ap), sha_b=tree_b.get(bp), similarity=sim)
+        )
+
+    def take_copy(ap: str, bp: str, sim: float) -> None:
+        used_b.add(bp)
+        identities.append(
+            Identity(kind="copied", a_path=ap, b_path=bp, sha_a=tree_a.get(ap), sha_b=tree_b.get(bp), similarity=sim)
+        )
+
+    def blob_a(path: str) -> Optional[bytes]:
+        return cache.blob(tree_a, path)
+
+    def blob_b(path: str) -> Optional[bytes]:
+        return cache.blob(tree_b, path)
+
+    for bp in only_b:
+        sha = tree_b[bp]
+        holders = remaining_holders(sha)
+        if holders:
+            take_copy(pick_source(holders, bp), bp, 1.0)
+
+    a_by_sha: dict[str, list[str]] = {}
+    for p in only_a:
+        a_by_sha.setdefault(tree_a[p], []).append(p)
+    b_by_sha: dict[str, list[str]] = {}
+    for p in only_b:
+        b_by_sha.setdefault(tree_b[p], []).append(p)
+    for sha, a_paths in a_by_sha.items():
+        b_paths = b_by_sha.get(sha) or []
+        if not b_paths:
+            continue
+        remaining_a = [p for p in a_paths if p not in used_a]
+        remaining_b = [p for p in b_paths if p not in used_b]
+        pairs = sorted(
+            ((ap, bp) for ap in remaining_a for bp in remaining_b),
+            key=lambda pair: path_pair_score(pair[0], pair[1]),
+        )
+        for ap, bp in pairs:
+            if ap in used_a or bp in used_b:
+                continue
+            holders = remaining_holders(sha)
+            if holders:
+                take_copy(pick_source(holders, bp), bp, 1.0)
+                continue
+            take_rename(ap, bp, 1.0)
+
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    a_base: dict[str, list[str]] = {}
+    b_base: dict[str, list[str]] = {}
+    for p in leftover_a:
+        a_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for p in leftover_b:
+        b_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    for base, a_paths in a_base.items():
+        b_paths = b_base.get(base) or []
+        if len(a_paths) == 1 and len(b_paths) == 1:
+            ap, bp = a_paths[0], b_paths[0]
+            if ap in used_a or bp in used_b:
+                continue
+            ba, bb = blob_a(ap), blob_b(bp)
+            sim = line_jaccard(ba or b"", bb or b"") if ba is not None and bb is not None else 0.0
+            take_rename(ap, bp, sim)
+
+    leftover_a = [p for p in only_a if p not in used_a]
+    leftover_b = [p for p in only_b if p not in used_b]
+    scored: list[tuple[float, str, str]] = []
+    for ap in leftover_a:
+        ba = blob_a(ap)
+        if ba is None:
+            continue
+        for bp in leftover_b:
+            bb = blob_b(bp)
+            if bb is None:
+                continue
+            sim = line_jaccard(ba, bb)
+            if sim >= RENAME_SIM_MIN:
+                scored.append((sim, ap, bp))
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    for sim, ap, bp in scored:
+        if ap in used_a or bp in used_b:
+            continue
+        take_rename(ap, bp, sim)
+
+    leftover_b = [p for p in only_b if p not in used_b]
+    changed_set = set(changed)
+    copy_scored: list[tuple[tuple, str, str, float]] = []
+    for bp in leftover_b:
+        bb = blob_b(bp)
+        if bb is None:
+            continue
+        best_ap: Optional[str] = None
+        best_key: Optional[tuple] = None
+        best_sim = 0.0
+        for ap in shared:
+            if skip_token_path(ap) or not related_paths(ap, bp):
+                continue
+            ba = blob_a(ap)
+            if ba is None:
+                continue
+            sim = line_jaccard(ba, bb)
+            if sim < COPY_SIM_MIN:
+                continue
+            key = (
+                sim,
+                1 if ap in changed_set else 0,
+                1 if ext_of(ap) == ext_of(bp) else 0,
+                len(os.path.commonprefix([ap, bp])),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_ap = ap
+                best_sim = sim
+        if best_ap is not None and best_key is not None:
+            copy_scored.append((best_key, best_ap, bp, best_sim))
+    copy_scored.sort(key=lambda t: t[0], reverse=True)
+    for _key, ap, bp, sim in copy_scored:
+        if bp in used_b:
+            continue
+        take_copy(ap, bp, sim)
+
+    for p in only_a:
+        if p not in used_a:
+            identities.append(Identity(kind="died", a_path=p, sha_a=tree_a.get(p)))
+    for p in only_b:
+        if p not in used_b:
+            identities.append(Identity(kind="born", b_path=p, sha_b=tree_b.get(p)))
+    for p in changed:
+        identities.append(
+            Identity(kind="changed", a_path=p, b_path=p, sha_a=tree_a.get(p), sha_b=tree_b.get(p))
+        )
+    return identities
+
+
+def classify_pair(repo: str, a: str, b: str) -> tuple[list[Covering], int]:
+    cache = TreeCache(repo)
+    tree_a = cache.tree(a)
+    tree_b = cache.tree(b)
+    idents = detect_identities(cache, tree_a, tree_b)
+    out: list[Covering] = []
+    for ident in idents:
+        if ident.kind == "copied" and ident.a_path and ident.b_path:
+            out.append(
+                Covering(kind="copy", source=ident.a_path, dest=ident.b_path, repo=repo, event_rev=b)
+            )
+        elif ident.kind == "renamed" and ident.a_path and ident.b_path:
+            out.append(
+                Covering(kind="follow", source=ident.a_path, dest=ident.b_path, repo=repo, event_rev=b)
+            )
+    return out, cache.probes
+
+
+# --- covering ingest -------------------------------------------------------
+
+
+ARROW_RE = re.compile(r"\s*(?:→|->)\s*")
+COPY_LINE_RE = re.compile(
+    r"(?:^#\s*[C]\s+\d+\s+)?copy\s+(.+?)\s*(?:→|->)\s*(.+)$",
+    re.IGNORECASE,
+)
+FOLLOW_LINE_RE = re.compile(
+    r"(?:^#\s*[R]\s+\d+\s+)?follow\s+(.+?)\s*(?:→|->)\s*(.+)$",
+    re.IGNORECASE,
+)
+WALK_TOOLS = {"held", "berth", "crib", "perch", "roost", "ditto"}
+
+
+def _strip_sheaf_tail(dest: str) -> str:
+    dest = dest.rstrip()
+    dest = re.sub(r"\s{2,}\d+\s+paths?\s*$", "", dest)
+    dest = re.sub(r"\s{2,}.*$", "", dest)
+    return dest.strip()
+
+
+def add_covering(out: list[Covering], cov: Covering) -> None:
+    key = (cov.kind, cov.source, cov.dest)
+    for existing in out:
+        if (existing.kind, existing.source, existing.dest) == key:
+            if cov.repo and not existing.repo:
+                existing.repo = cov.repo
+            if cov.event_rev and not existing.event_rev:
+                existing.event_rev = cov.event_rev
+            return
+    out.append(cov)
+
+
+def parse_copy_follow_text(line: str) -> Optional[Covering]:
+    raw = line.strip()
+    if not raw:
+        return None
+    body = raw[1:].strip() if raw.startswith("#") else raw
+    # drop leading C/R rank columns: "C   26  copy ..."
+    body = re.sub(r"^[CR]\s+\d+\s+", "", body)
+    m = COPY_LINE_RE.search(body)
+    if m:
+        src = unquote_token(m.group(1))
+        dst = unquote_token(_strip_sheaf_tail(m.group(2)))
+        if src and dst:
+            return Covering(kind="copy", source=src, dest=dst, raw=raw)
+    m = FOLLOW_LINE_RE.search(body)
+    if m:
+        src = unquote_token(m.group(1))
+        dst = unquote_token(_strip_sheaf_tail(m.group(2)))
+        if src and dst:
+            return Covering(kind="follow", source=src, dest=dst, raw=raw)
+    return None
+
+
+def parse_walk_argv(line: str) -> Optional[dict]:
+    try:
+        parts = shlex.split(line, posix=True)
+    except ValueError:
+        return None
+    if not parts or parts[0] not in WALK_TOOLS:
+        return None
+    info: dict = {
+        "tool": parts[0],
+        "repo": None,
+        "rev": None,
+        "follow": False,
+        "full": False,
+        "now": False,
+        "observer": None,
+        "path": None,
+        "paths": [],
+    }
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        if tok in ("-C", "--repo") and i + 1 < len(parts):
+            info["repo"] = parts[i + 1]
+            i += 2
+            continue
+        if tok in ("--rev",) and i + 1 < len(parts):
+            info["rev"] = parts[i + 1]
+            i += 2
+            continue
+        if tok == "--limit" and i + 1 < len(parts):
+            i += 2
+            continue
+        if tok == "--follow":
+            info["follow"] = True
+            i += 1
+            continue
+        if tok == "--full":
+            info["full"] = True
+            i += 1
+            continue
+        if tok == "--now":
+            info["now"] = True
+            i += 1
+            continue
+        if tok in ("--no-follow", "--boolean", "--json", "--oneline", "-q", "--quiet"):
+            i += 1
+            continue
+        if tok in ("exists", "copy", "grep"):
+            info["observer"] = tok
+            rest = parts[i + 1 :]
+            # grep flags
+            j = 0
+            while j < len(rest) and rest[j].startswith("-") and rest[j] != "--":
+                j += 1
+            if tok == "grep":
+                # not a covering occupancy we walk
+                info["path"] = rest[j] if j < len(rest) else None
+            else:
+                info["path"] = rest[j] if j < len(rest) else None
+                info["paths"] = rest[j:]
+            break
+        i += 1
+    return info
+
+
+def coverings_from_json(data: object) -> list[Covering]:
+    out: list[Covering] = []
+    if not isinstance(data, dict):
+        return out
+    repo = data.get("repo") if isinstance(data.get("repo"), str) else None
+    event_rev = None
+    b = data.get("b")
+    if isinstance(b, dict) and isinstance(b.get("sha"), str):
+        event_rev = b["sha"]
+    elif isinstance(b, str):
+        event_rev = b
+
+    def from_pred(pred: dict, *, walk_copy: Optional[bool] = None, walk_follow: Optional[bool] = None) -> None:
+        kind = pred.get("kind")
+        src = pred.get("from") or pred.get("from_path")
+        dst = pred.get("to") or pred.get("to_path") or pred.get("path")
+        if kind == "copy" or walk_copy:
+            if not src or not dst:
+                note = pred.get("note") or ""
+                parsed = parse_copy_follow_text(str(note))
+                if parsed:
+                    src, dst = parsed.source, parsed.dest
+            if src and dst:
+                add_covering(
+                    out,
+                    Covering(kind="copy", source=str(src), dest=str(dst), repo=repo, event_rev=event_rev),
+                )
+        elif kind == "follow" or walk_follow:
+            if not src or not dst:
+                note = pred.get("note") or ""
+                parsed = parse_copy_follow_text(str(note))
+                if parsed:
+                    src, dst = parsed.source, parsed.dest
+            if src and dst:
+                add_covering(
+                    out,
+                    Covering(kind="follow", source=str(src), dest=str(dst), repo=repo, event_rev=event_rev),
+                )
+
+    for key in ("sheaf", "cover", "predicates"):
+        items = data.get(key)
+        if isinstance(items, list):
+            for pred in items:
+                if isinstance(pred, dict):
+                    from_pred(pred)
+    walks = data.get("walks")
+    if isinstance(walks, list):
+        for walk in walks:
+            if not isinstance(walk, dict):
+                continue
+            if walk.get("copy"):
+                src = walk.get("from")
+                dst = walk.get("to")
+                if src and dst:
+                    add_covering(
+                        out,
+                        Covering(
+                            kind="copy",
+                            source=str(src),
+                            dest=str(dst),
+                            repo=repo,
+                            event_rev=walk.get("rev") or event_rev,
+                        ),
+                    )
+            elif walk.get("follow"):
+                src = walk.get("from")
+                dst = walk.get("to")
+                if src and dst:
+                    add_covering(
+                        out,
+                        Covering(
+                            kind="follow",
+                            source=str(src),
+                            dest=str(dst),
+                            repo=repo,
+                            event_rev=walk.get("rev") or event_rev,
+                        ),
+                    )
+            elif isinstance(walk.get("line"), str):
+                # recovered below via walk line + classify
+                pass
+    return out
+
+
+def parse_stdin_text(text: str) -> tuple[list[Covering], list[dict], list[str]]:
+    """Return (coverings, walk infos, skipped notes)."""
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            if isinstance(data, list):
+                covs: list[Covering] = []
+                for item in data:
+                    if isinstance(item, dict):
+                        covs.extend(coverings_from_json(item))
+                return covs, [], []
+            return coverings_from_json(data), [], []
+
+    coverings: list[Covering] = []
+    walks: list[dict] = []
+    skipped: list[str] = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        cov = parse_copy_follow_text(line)
+        if cov:
+            add_covering(coverings, cov)
+            continue
+        info = parse_walk_argv(line.strip())
+        if info:
+            walks.append(info)
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if line.lstrip().startswith("held ") or line.lstrip().startswith("berth "):
+            skipped.append(line.strip())
+    return coverings, walks, skipped
+
+
+def recover_from_walks(
+    walks: list[dict],
+    coverings: list[Covering],
+    default_repo: Optional[str],
+) -> list[str]:
+    """Turn dest-exists / --follow exists walks into coverings via two-tree classify."""
+    notes: list[str] = []
+    for info in walks:
+        repo = info.get("repo") or default_repo
+        rev = info.get("rev")
+        path = info.get("path")
+        observer = info.get("observer")
+        if observer == "grep":
+            if path:
+                notes.append(f"skip grep {quote(path)} (not copy/follow)")
+            else:
+                notes.append("skip grep covering (not copy/follow)")
+            continue
+        if observer not in ("exists", "copy") or not path:
+            continue
+        if not repo:
+            notes.append(f"walk {observer} {quote(path)} has no -C repo")
+            continue
+        repo = resolve_repo(repo)
+        # dest-exists / --follow exists paste: recover covering at rev^..rev
+        if not rev:
+            if info.get("follow"):
+                add_covering(
+                    coverings,
+                    Covering(kind="follow", source=path, dest=path, repo=repo, event_rev=rev),
+                )
+            else:
+                notes.append(f"exists {quote(path)} has no --rev to recover covering")
+            continue
+        parent = f"{rev}^"
+        r = run_git(repo, ["rev-parse", "--verify", parent], check=False)
+        if r.returncode != 0:
+            notes.append(f"cannot resolve {parent} to recover covering of {quote(path)}")
+            continue
+        found, _probes = classify_pair(repo, parent, rev)
+        want = "follow" if info.get("follow") else None
+        matched = [
+            c
+            for c in found
+            if path in (c.source, c.dest) and (want is None or c.kind == want)
+        ]
+        if not matched and want == "follow":
+            matched = [c for c in found if c.kind == "follow"]
+        if not matched:
+            notes.append(
+                f"{quote(path)} at {rev[:7] if len(rev) >= 7 else rev} is not copy/follow "
+                f"(unique birth?). held exists {quote(path)}"
+            )
+            continue
+        for c in matched:
+            c.repo = repo
+            c.event_rev = rev
+            add_covering(coverings, c)
+    return notes
+
+
+# --- occupancy -------------------------------------------------------------
+
+
+def is_missing_line(line: str) -> bool:
+    return line.endswith(" missing") or line == "missing"
+
+
+def exists_at_commits(repo: str, shas: list[str], path: str) -> list[tuple[bool, list[str]]]:
+    if not shas:
+        return []
+    if is_glob(path):
+        out: list[tuple[bool, list[str]]] = []
+        for sha in shas:
+            r = run_git(
+                repo,
+                ["ls-files", "-z", "--with-tree", sha, "--", path],
+                check=False,
+            )
+            names = [n for n in r.stdout.split("\0") if n]
+            if not names:
+                r2 = run_git(repo, ["ls-tree", "-r", "-z", "--name-only", sha], check=False)
+                names = [n for n in r2.stdout.split("\0") if n]
+                rx = fnmatch_to_re(path)
+                names = [n for n in names if rx.match(n)]
+            names.sort()
+            out.append((bool(names), names))
+        return out
+    payload = "".join(f"{sha}:{path}\n" for sha in shas)
+    r = run_git(repo, ["cat-file", "--batch-check"], input_text=payload)
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    if len(lines) != len(shas):
+        out = []
+        for sha in shas:
+            rr = run_git(repo, ["cat-file", "--batch-check"], input_text=f"{sha}:{path}\n")
+            miss = is_missing_line(rr.stdout.strip())
+            out.append((not miss, [] if miss else [path]))
+        return out
+    out = []
+    for line in lines:
+        miss = is_missing_line(line)
+        out.append((not miss, [] if miss else [path]))
+    return out
+
+
+def fnmatch_to_re(spec: str) -> re.Pattern:
+    rx = []
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if ch == "*":
+            rx.append(".*")
+        elif ch == "?":
+            rx.append(".")
+        elif ch == "[":
+            j = spec.find("]", i + 1)
+            if j < 0:
+                rx.append(re.escape(ch))
+            else:
+                rx.append(spec[i : j + 1])
+                i = j
+        else:
+            rx.append(re.escape(ch))
+        i += 1
+    return re.compile("^" + "".join(rx) + "$")
+
+
+def unquote_git_path(path: str) -> str:
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        raw = path[1:-1]
+        out = bytearray()
+        i = 0
+        while i < len(raw):
+            if raw[i] == "\\" and i + 3 < len(raw) and raw[i + 1 : i + 4].isdigit():
+                out.append(int(raw[i + 1 : i + 4], 8))
+                i += 4
+                continue
+            if raw[i] == "\\" and i + 1 < len(raw):
+                esc = {"n": 10, "t": 9, "r": 13, '"': 34, "\\": 92}.get(raw[i + 1])
+                if esc is not None:
+                    out.append(esc)
+                    i += 2
+                    continue
+            out.extend(raw[i].encode("utf-8", "surrogateescape"))
+            i += 1
+        return out.decode("utf-8", "surrogateescape")
+    return path
+
+
+def collect_tree_changes(
+    repo: str, spec: str, first_parent: bool
+) -> dict[str, tuple[list[tuple[str, str]], set[str], set[str]]]:
+    """sha → (renames old→new, added, deleted). Copies are not identity moves.
+
+    Uses git log --find-renames (R), never --find-copies / -C.
+    """
+    args = [
+        "-c",
+        "core.quotepath=false",
+        "log",
+        "--reverse",
+        "--find-renames",
+        "--name-status",
+        "--pretty=format:COMMIT %H",
+    ]
+    if first_parent:
+        args.append("--first-parent")
+    args.append(spec)
+    r = run_git(repo, args, check=False)
+    out: dict[str, tuple[list[tuple[str, str]], set[str], set[str]]] = {}
+    sha: Optional[str] = None
+    renames: list[tuple[str, str]] = []
+    added: set[str] = set()
+    deleted: set[str] = set()
+
+    def flush() -> None:
+        nonlocal sha, renames, added, deleted
+        if sha:
+            out[sha] = (renames, added, deleted)
+        sha = None
+        renames, added, deleted = [], set(), set()
+
+    for line in r.stdout.splitlines():
+        if line.startswith("COMMIT "):
+            flush()
+            sha = line.split(" ", 1)[1].strip()
+            continue
+        if not line.strip() or sha is None:
+            continue
+        parts = line.split("\t")
+        code = parts[0] if parts else ""
+        if code.startswith("R") and len(parts) >= 3:
+            renames.append((unquote_git_path(parts[1]), unquote_git_path(parts[2])))
+        elif code.startswith("A") and len(parts) >= 2:
+            added.add(unquote_git_path(parts[1]))
+        elif code.startswith("D") and len(parts) >= 2:
+            deleted.add(unquote_git_path(parts[1]))
+    flush()
+    return out
+
+
+def follow_names(
+    shas: list[str],
+    path: str,
+    changes: dict[str, tuple[list[tuple[str, str]], set[str], set[str]]],
+    existed: list[bool],
+) -> list[Optional[str]]:
+    n = len(shas)
+    names: list[Optional[str]] = [None] * n
+    if n == 0:
+        return names
+
+    def rec(i: int) -> tuple[list[tuple[str, str]], set[str], set[str]]:
+        return changes.get(shas[i], ([], set(), set()))
+
+    seed = next((i for i, ok in enumerate(existed) if ok), None)
+    if seed is None:
+        for i in range(n):
+            renames, _, _ = rec(i)
+            for old, new in renames:
+                if path == new:
+                    seed = i
+                    names[i] = new
+                    break
+                if path == old:
+                    if i > 0:
+                        seed = i - 1
+                        names[seed] = old
+                    else:
+                        seed = i
+                        names[i] = new
+                    break
+            if seed is not None:
+                break
+        if seed is None:
+            return names
+    else:
+        names[seed] = path
+
+    cur = names[seed]
+    for i in range(seed, 0, -1):
+        if cur is None:
+            break
+        renames, added, _deleted = rec(i)
+        moved = False
+        for old, new in renames:
+            if new == cur:
+                cur = old
+                names[i - 1] = cur
+                moved = True
+                break
+        if moved:
+            continue
+        if cur in added:
+            break
+        names[i - 1] = cur
+
+    cur = names[seed]
+    for i in range(seed, n - 1):
+        if cur is None:
+            break
+        renames, _added, deleted = rec(i + 1)
+        moved = False
+        for old, new in renames:
+            if old == cur:
+                cur = new
+                names[i + 1] = cur
+                moved = True
+                break
+        if moved:
+            continue
+        if cur in deleted:
+            break
+        names[i + 1] = cur
+    return names
+
+
+def identity_chain(names: list[Optional[str]]) -> list[str]:
+    out: list[str] = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def occupy_copy_dest(
+    repo: str,
+    commits: list[Sample],
+    dest: str,
+) -> int:
+    """COPY occupancy is dest existence. Source still holds; dest is the extra holder."""
+    shas = [s.sha for s in commits]
+    hits = exists_at_commits(repo, shas, dest)
+    for sample, (ok, wits) in zip(commits, hits):
+        sample.value = ok
+        sample.witnesses = wits if ok else []
+    return 1
+
+
+def occupy_follow_identity(
+    repo: str,
+    commits: list[Sample],
+    spec: str,
+    first_parent: bool,
+    query: str,
+) -> tuple[list[Optional[str]], int]:
+    shas = [s.sha for s in commits]
+    changes = collect_tree_changes(repo, spec, first_parent)
+    probes = 1
+    seed_hits = exists_at_commits(repo, shas, query)
+    probes += 1
+    existed = [ok for ok, _ in seed_hits]
+    names = follow_names(shas, query, changes, existed)
+    payload: list[str] = []
+    query_idx: list[int] = []
+    for i, sha in enumerate(shas):
+        n = names[i]
+        if n:
+            payload.append(f"{sha}:{n}\n")
+            query_idx.append(i)
+    if payload:
+        r = run_git(repo, ["cat-file", "--batch-check"], input_text="".join(payload))
+        probes += 1
+        lines = [ln for ln in r.stdout.splitlines() if ln]
+        for i, line in zip(query_idx, lines):
+            n = names[i]
+            if n and not is_missing_line(line):
+                commits[i].value = True
+                commits[i].witnesses = [n]
+            else:
+                names[i] = None
+                commits[i].value = False
+                commits[i].witnesses = []
+    return names, probes
+
+
+def exists_worktree(repo: str, path: str) -> tuple[bool, list[str]]:
+    p = os.path.join(repo, path)
+    ok = os.path.lexists(p)
+    return ok, ([path] if ok else [])
+
+
+def follow_dirty_name(repo: str, head_name: Optional[str], *, cached: bool) -> Optional[str]:
+    if not head_name:
+        return None
+    args = ["-c", "core.quotepath=false", "diff", "-M", "--name-status"]
+    if cached:
+        args.append("--cached")
+    args.append("HEAD")
+    r = run_git(repo, args, check=False)
+    cur = head_name
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if not parts:
+            continue
+        code = parts[0]
+        if code.startswith("R") and len(parts) >= 3:
+            old, new = unquote_git_path(parts[1]), unquote_git_path(parts[2])
+            if old == cur:
+                cur = new
+        elif code.startswith("D") and len(parts) >= 2:
+            if unquote_git_path(parts[1]) == cur:
+                return None
+    return cur
+
+
+def dest_birth_sha(repo: str, dest: str, tip: str) -> Optional[str]:
+    r = run_git(
+        repo,
+        ["log", "--reverse", "--diff-filter=A", "--pretty=format:%H", tip, "--", dest],
+        check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout.splitlines()[0].strip()
+
+
+def merge_parents(repo: str, sha: str) -> list[str]:
+    r = run_git(repo, ["rev-list", "--parents", "-n", "1", sha], check=False)
+    if r.returncode != 0:
+        return []
+    parts = r.stdout.strip().split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+def load_commit_meta(repo: str, sha: str) -> Optional[Sample]:
+    r = run_git(
+        repo,
+        ["log", "-1", "--pretty=format:%H\t%ct\t%ci\t%s", sha],
+        check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    parts = r.stdout.strip().split("\t", 3)
+    if len(parts) < 4:
+        return None
+    h, ts, iso, subject = parts
+    return Sample(
+        sha=h,
+        short=h[:7],
+        timestamp=int(ts),
+        iso=iso,
+        subject=subject,
+        kind="commit",
+    )
+
+
+def annotate_origin(
+    repo: str,
+    eras: list[Era],
+    first_parent: bool,
+    dest: str,
+    event_rev: Optional[str],
+    enabled: bool,
+) -> int:
+    """Name dest-add behind a first-parent merge (kizu C056 = 5671a72)."""
+    if not enabled or not first_parent:
+        return 0
+    extra = 0
+    for era in eras:
+        if not era.value or era.start.kind != "commit":
+            continue
+        parents = merge_parents(repo, era.start.sha)
+        if len(parents) < 2:
+            continue
+        extra += 1
+        born = dest_birth_sha(repo, dest, era.start.sha)
+        if not born or born == era.start.sha:
+            if event_rev:
+                r = run_git(repo, ["rev-parse", event_rev], check=False)
+                born = r.stdout.strip() if r.returncode == 0 else event_rev
+            else:
+                continue
+        if not born or born == era.start.sha:
+            continue
+        origin = load_commit_meta(repo, born)
+        if origin is None:
+            continue
+        origin.witnesses = [dest]
+        era.origin = origin
+        behind = run_git(
+            repo,
+            ["rev-list", "--count", era.start.sha, f"^{parents[0]}"],
+            check=False,
+        )
+        try:
+            era.origin_count = int(behind.stdout.strip() or "0")
+        except ValueError:
+            era.origin_count = 0
+    return extra
+
+
+# --- print -----------------------------------------------------------------
+
+
+def use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(value: bool, enabled: bool) -> str:
+    raw = "TRUE" if value else "FALSE"
+    if not enabled:
+        return f"{raw:<5}"
+    if value:
+        return f"\033[32;1m{raw:<5}\033[0m"
+    return f"\033[31m{raw}\033[0m"
+
+
+def fmt_witnesses(wits: list[str], limit: int = HOLDER_PRINT_LIMIT) -> Optional[str]:
+    if not wits:
+        return None
+    shown = wits[:limit]
+    extra = len(wits) - limit
+    text = ", ".join(shown)
+    if extra > 0:
+        text += f" (+{extra})"
+    return text
+
+
+def print_human(report: dict, eras: list[Era], color: bool, show_wits: bool) -> None:
+    name = os.path.basename(report["repo"])
+    scanned = report["commits_scanned"]
+    reachable = report["reachable"]
+    walk = "first-parent" if report["first_parent"] else "full"
+    if scanned != reachable:
+        count = f"{scanned} of {reachable} commits"
+    else:
+        count = f"{scanned} commits"
+    extra = []
+    if report["include_now"]:
+        extra.append("now")
+    extra.append(report["kind"])
+    bits = ", ".join([count, walk, *extra])
+    print(f"# {report['predicate']}  ({name}, {bits})")
+    ident = report.get("identity") or []
+    if len(ident) >= 2:
+        label = "copy" if report["kind"] == "copy" else "follow"
+        print(f"       {label}: " + " → ".join(ident))
+    elif ident:
+        print("       names: " + " → ".join(ident))
+    for era in eras:
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        unit = "commit" if era.count == 1 else "commits"
+        label = paint(era.value, color)
+        print(f"{label} {era.count:>3} {unit:<8} {span}  {dates}".rstrip())
+        if era.count == 1:
+            print(f"       {era.start.subject}")
+        else:
+            print(f"       {era.start.short}  {era.start.subject}")
+            print(f"       {era.end.short}  {era.end.subject}")
+        if era.origin is not None:
+            n = era.origin_count
+            as_name = ""
+            if era.origin.witnesses:
+                as_name = f"  as {era.origin.witnesses[0]}"
+            print(
+                f"       origin: {era.origin.short}  {era.origin.subject}"
+                f"  ({n} commit{'s' if n != 1 else ''} before this merge)"
+                f"{as_name}"
+            )
+        if show_wits and era.value:
+            wtxt = fmt_witnesses(era.holders)
+            if wtxt:
+                print(f"       holders: {wtxt}")
+            if era.split == "holders":
+                for h in era.added:
+                    print(f"       + {h}")
+                for h in era.dropped:
+                    print(f"       - {h}")
+    holds = "TRUE" if report["holds_now"] else "FALSE"
+    holder_splits = sum(1 for e in eras if e.split == "holders")
+    bits_out = [
+        f"now={holds}",
+        f"true={report['true_commits']}/{report['commits_scanned']}",
+        f"eras={len(eras)}",
+    ]
+    if report["split_holders"] and holder_splits:
+        bits_out.append(f"boolean={report['boolean_eras']}")
+        bits_out.append(f"holder_splits={holder_splits}")
+    bits_out.append(f"probes={report['probes']}")
+    if report.get("identity"):
+        bits_out.append("aka=" + ",".join(report["identity"]))
+    print("  ".join(bits_out))
+    for w in report.get("warnings") or []:
+        print(f"warning: {w}")
+    for h in report.get("hints") or []:
+        print(f"hint: {h}")
+
+
+def print_oneline(eras: list[Era]) -> None:
+    for era in eras:
+        flag = "T" if era.value else "F"
+        span = fmt_span(era.start, era.end)
+        dates = fmt_dates(era.start, era.end)
+        holders = ",".join(era.holders)
+        split = "" if era.split == "start" else era.split
+        print(
+            f"{flag}\t{era.count}\t{span}\t{dates}\t{holders}\t{split}\t{era.kind_name}"
+        )
+
+
+def era_records(eras: list[Era]) -> list[dict]:
+    recs = []
+    for era in eras:
+        rec = {
+            "value": era.value,
+            "count": era.count,
+            "split": era.split,
+            "kind": era.kind_name,
+            "start": era.start.as_json(),
+            "end": era.end.as_json(),
+            "holders": list(era.holders),
+            "added": list(era.added),
+            "dropped": list(era.dropped),
+            "witnesses_start": list(era.start.witnesses) if era.value else [],
+            "witnesses_end": list(era.end.witnesses) if era.value else [],
+        }
+        if era.origin is not None:
+            rec["origin"] = era.origin.as_json()
+            rec["origin_true_commits"] = era.origin_count
+        recs.append(rec)
+    return recs
+
+
+# --- occupy one covering ---------------------------------------------------
+
+
+def occupy_one(
+    cov: Covering,
+    repo: str,
+    commits: list[Sample],
+    spec: str,
+    first_parent: bool,
+    *,
+    want_now: bool,
+    want_index: bool,
+    split_holders: bool,
+    name_origin: bool,
+) -> dict:
+    # clone sample shells so predicates do not share value flags
+    local = [
+        Sample(
+            sha=s.sha,
+            short=s.short,
+            timestamp=s.timestamp,
+            iso=s.iso,
+            subject=s.subject,
+            kind=s.kind,
+            parents=list(s.parents),
+        )
+        for s in commits
+    ]
+    probes = 0
+    names: list[str] = []
+    if cov.kind == "copy":
+        probes += occupy_copy_dest(repo, local, cov.dest)
+        names = [cov.source, cov.dest]
+        extra: list[Sample] = []
+        if want_index:
+            s = index_sample()
+            ok, wits = exists_worktree(repo, cov.dest)
+            # index: dest staged?
+            r = run_git(repo, ["ls-files", "-c", "--error-unmatch", "--", cov.dest], check=False)
+            s.value = r.returncode == 0
+            s.witnesses = [cov.dest] if s.value else []
+            extra.append(s)
+            probes += 1
+        if want_now:
+            s = now_sample()
+            ok, wits = exists_worktree(repo, cov.dest)
+            s.value = ok
+            s.witnesses = wits
+            extra.append(s)
+        samples = local + extra
+    else:
+        query = cov.dest if cov.dest else cov.source
+        # Prefer dest so a first-parent dest-only merge still seeds.
+        seed = cov.source if cov.source else query
+        # Seed from dest if dest exists more recently (first-parent dest birth).
+        dest_hits = exists_at_commits(repo, [local[-1].sha], cov.dest) if cov.dest else [(False, [])]
+        src_hits = exists_at_commits(repo, [local[-1].sha], cov.source) if cov.source else [(False, [])]
+        probes += 2
+        if dest_hits and dest_hits[0][0]:
+            seed = cov.dest
+        elif src_hits and src_hits[0][0]:
+            seed = cov.source
+        else:
+            seed = cov.dest or cov.source
+        followed, more = occupy_follow_identity(repo, local, spec, first_parent, seed)
+        probes += more
+        names = identity_chain(followed)
+        if cov.source and cov.source not in names:
+            names = [cov.source] + [n for n in names if n != cov.source]
+        if cov.dest and cov.dest not in names:
+            names.append(cov.dest)
+        extra = []
+        if want_index:
+            s = index_sample()
+            head_name = followed[-1] if followed else seed
+            cur = follow_dirty_name(repo, head_name, cached=True)
+            if cur:
+                r = run_git(repo, ["ls-files", "-c", "--error-unmatch", "--", cur], check=False)
+                s.value = r.returncode == 0
+                s.witnesses = [cur] if s.value else []
+            extra.append(s)
+            probes += 1
+        if want_now:
+            s = now_sample()
+            head_name = followed[-1] if followed else seed
+            cur = follow_dirty_name(repo, head_name, cached=False)
+            if cur:
+                ok, wits = exists_worktree(repo, cur)
+                s.value = ok
+                s.witnesses = wits
+            extra.append(s)
+            probes += 1
+        samples = local + extra
+
+    true_commit_n = sum(1 for s in local if s.value)
+    holds_now = bool(samples[-1].value) if samples else False
+    boolean_eras = compress(samples, split_holders=False)
+    eras = compress(samples, split_holders=split_holders)
+    classify_eras(eras)
+    dest_for_origin = cov.dest if cov.kind == "copy" else (names[-1] if names else cov.dest)
+    probes += annotate_origin(
+        repo, eras, first_parent, dest_for_origin, cov.event_rev, enabled=name_origin
+    )
+
+    pred = f"{cov.kind} {cov.source} → {cov.dest}"
+    report = {
+        "repo": repo,
+        "predicate": pred,
+        "kind": cov.kind,
+        "from": cov.source,
+        "to": cov.dest,
+        "end_rev": spec,
+        "first_parent": first_parent,
+        "include_now": want_now,
+        "holds_now": holds_now,
+        "never_held": true_commit_n == 0,
+        "always_held": true_commit_n == len(local) and len(local) > 0,
+        "commits_scanned": len(local),
+        "true_commits": true_commit_n,
+        "boolean_eras": len(boolean_eras),
+        "split_holders": split_holders,
+        "copy": cov.kind == "copy",
+        "follow": cov.kind == "follow",
+        "identity": names,
+        "probes": probes,
+        "eras": era_records(eras),
+        "hints": [],
+        "warnings": [],
+        "_eras": eras,
+        "_samples": samples,
+    }
+    return report
+
+
+# --- cli -------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=TOOL,
+        description=(
+            "Occupy covering copy/follow predicates as eras. stdin is ditto / "
+            "held / berth covering lines (or pup A B classifies two trees). "
+            "stdout is occupancy, without sh. git mv is FOLLOW; cp is COPY."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  ditto A B | pup
+  ditto -C repo 5671a72^ 5671a72 | pup --full
+  ditto --walks -C repo A B | pup
+  pup -C repo A B
+  pup -C repo --json < covering.json
+""",
+    )
+    p.add_argument("-C", "--repo", default=None, help="repository (default: from stdin -C, else cwd)")
+    p.add_argument("--rev", default="HEAD", help="occupancy tip (default: HEAD)")
+    p.add_argument("--range", dest="rev_range", metavar="REV_RANGE")
+    p.add_argument("--full", action="store_true", help="every reachable commit, not first-parent")
+    p.add_argument("--now", action="store_true")
+    p.add_argument("--index", action="store_true")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--oneline", action="store_true")
+    p.add_argument("--revs", action="store_true")
+    p.add_argument("--bounds", action="store_true")
+    p.add_argument("--true-bounds", action="store_true")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    p.add_argument("--no-witnesses", action="store_true")
+    p.add_argument("--boolean", action="store_true")
+    p.add_argument("--copy-only", action="store_true")
+    p.add_argument("--follow-only", action="store_true")
+    p.add_argument(
+        "--origin",
+        dest="origin",
+        action="store_true",
+        default=True,
+        help="name dest-add behind a first-parent merge (default; kizu C056 = 5671a72)",
+    )
+    p.add_argument(
+        "--no-origin",
+        dest="origin",
+        action="store_false",
+        help="do not name off-mainline dest-add (v1 dest-existence boolean only)",
+    )
+    p.add_argument("trees", nargs="*", help="optional A B: classify those two trees as covering")
+    return p
+
+
+def stdin_has_data() -> bool:
+    return not sys.stdin.isatty()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    name_origin = bool(args.origin)
+
+    coverings: list[Covering] = []
+    notes: list[str] = []
+    stdin_repo: Optional[str] = None
+
+    if stdin_has_data():
+        text = sys.stdin.read()
+        covs, walks, skipped = parse_stdin_text(text)
+        coverings.extend(covs)
+        for w in walks:
+            if w.get("repo") and not stdin_repo:
+                stdin_repo = w["repo"]
+        repo_guess = args.repo or stdin_repo or "."
+        notes.extend(recover_from_walks(walks, coverings, repo_guess))
+        notes.extend(skipped)
+
+    if args.trees:
+        if len(args.trees) == 1:
+            die("need two trees A B (or pipe ditto covering on stdin)")
+        if len(args.trees) > 2:
+            die("too many tree arguments; expected A B")
+        a, b = args.trees
+        repo_for_pair = resolve_repo(args.repo or stdin_repo or ".")
+        found, _ = classify_pair(repo_for_pair, a, b)
+        if not found:
+            notes.append(f"{a}..{b} has no copy/follow covering")
+        for c in found:
+            c.repo = repo_for_pair
+            add_covering(coverings, c)
+
+    if args.copy_only:
+        coverings = [c for c in coverings if c.kind == "copy"]
+    if args.follow_only:
+        coverings = [c for c in coverings if c.kind == "follow"]
+
+    repo_arg = args.repo or stdin_repo
+    if coverings:
+        repo_arg = repo_arg or next((c.repo for c in coverings if c.repo), None)
+    if not repo_arg:
+        repo_arg = "."
+    try:
+        repo = resolve_repo(repo_arg)
+    except GitError as e:
+        die(e.message)
+
+    spec = args.rev_range if args.rev_range else args.rev
+    first_parent = not args.full
+    split_holders = not args.boolean
+
+    try:
+        commits = load_commits(repo, spec, first_parent=first_parent, limit=args.limit)
+    except GitError as e:
+        die(e.message)
+    if not commits:
+        die(f"no commits at {spec} (empty repository?)")
+
+    reachable = reachable_count(repo, spec)
+    color = use_color(args.color)
+    reports: list[dict] = []
+
+    if not coverings:
+        hint = "no copy/follow covering on stdin (grep/exists-only is held, not pup)"
+        if notes:
+            hint = notes[0]
+        empty = {
+            "repo": repo,
+            "predicate": "copy/follow",
+            "kind": "none",
+            "holds_now": False,
+            "never_held": True,
+            "commits_scanned": len(commits),
+            "reachable": reachable,
+            "true_commits": 0,
+            "first_parent": first_parent,
+            "include_now": bool(args.now),
+            "probes": 0,
+            "identity": [],
+            "eras": [],
+            "hints": [hint, *notes[1:]],
+            "warnings": [],
+            "predicates": [],
+        }
+        if not args.quiet:
+            if args.json:
+                print(json.dumps(empty, indent=2, ensure_ascii=False))
+            else:
+                print(f"# (no copy/follow covering)  ({os.path.basename(repo)}, {len(commits)} commits)")
+                for h in empty["hints"]:
+                    print(f"hint: {h}")
+        return 1
+
+    any_now = False
+    for cov in coverings:
+        report = occupy_one(
+            cov,
+            repo,
+            commits,
+            spec,
+            first_parent,
+            want_now=bool(args.now),
+            want_index=bool(args.index),
+            split_holders=split_holders,
+            name_origin=name_origin,
+        )
+        report["reachable"] = reachable
+        # Mixed sheaves (copy + leftover grep) are occupied as copy/follow;
+        # skip-grep notes are noise on a successful occupy.
+        report["hints"] = []
+        reports.append(report)
+        any_now = any_now or bool(report["holds_now"])
+
+    if not args.quiet:
+        if args.json:
+            payload = {
+                "repo": repo,
+                "end_rev": spec,
+                "first_parent": first_parent,
+                "holds_now": any_now,
+                "commits_scanned": len(commits),
+                "reachable": reachable,
+                "predicates": [],
+            }
+            for report in reports:
+                rec = {k: v for k, v in report.items() if not k.startswith("_")}
+                payload["predicates"].append(rec)
+            if len(reports) == 1:
+                payload.update({k: v for k, v in reports[0].items() if not k.startswith("_")})
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        elif args.revs:
+            seen: set[str] = set()
+            for report in reports:
+                for s in report["_samples"]:
+                    if s.value and s.kind == "commit" and s.sha not in seen:
+                        seen.add(s.sha)
+                        print(s.sha)
+        elif args.true_bounds or args.bounds:
+            for report in reports:
+                for era in report["_eras"]:
+                    if args.true_bounds and not era.value:
+                        continue
+                    print(f"{era.start.sha} {era.end.sha} {int(era.value)} {era.count}")
+        elif args.oneline:
+            for report in reports:
+                print_oneline(report["_eras"])
+        else:
+            for i, report in enumerate(reports):
+                if i:
+                    print()
+                print_human(report, report["_eras"], color, show_wits=not args.no_witnesses)
+
+    return 0 if any_now else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except GitError as e:
+        die(e.message)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

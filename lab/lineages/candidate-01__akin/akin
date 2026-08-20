@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""akin — files that once were the same git blob, and the merge-base that implies."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
+from itertools import combinations
+from typing import NoReturn
+
+NUL = b"\0"
+VERSION = "0.2.0"
+SIMILAR_MAX_BYTES = 200_000
+STATUS_COPY = re.compile(r"^C(\d+)$")
+STATUS_RENAME = re.compile(r"^R(\d+)$")
+
+# --- git -------------------------------------------------------------------
+
+
+class GitError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def git(repo: str, args: list[str], *, check: bool = True, input: bytes | None = None) -> bytes:
+    cmd = ["git", "-C", repo, *args]
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, input=input
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip() or f"git {' '.join(args)} failed"
+        raise GitError(err, proc.returncode)
+    return proc.stdout
+
+
+def git_text(repo: str, args: list[str], check: bool = True) -> str:
+    return git(repo, args, check=check).decode("utf-8", "replace")
+
+
+def toplevel(repo: str) -> str:
+    return git_text(repo, ["rev-parse", "--show-toplevel"]).strip()
+
+
+def resolve_repo_path(repo: str, user: str) -> str:
+    top = toplevel(repo)
+    abs_user = os.path.abspath(user)
+    rel = os.path.relpath(abs_user, top)
+    if rel.startswith(".."):
+        cand = user.replace("\\", "/").lstrip("./")
+        return cand
+    return rel.replace("\\", "/")
+
+
+def cat_batch(repo: str, blobs: list[str]) -> dict[str, bytes]:
+    uniq = [b for b in dict.fromkeys(blobs) if b and b != "-"]
+    if not uniq:
+        return {}
+    raw = git(repo, ["cat-file", "--batch"], input="".join(x + "\n" for x in uniq).encode())
+    out: dict[str, bytes] = {}
+    i = 0
+    n = len(raw)
+    while i < n:
+        nl = raw.find(b"\n", i)
+        if nl < 0:
+            break
+        header = raw[i:nl].decode("ascii", "replace")
+        i = nl + 1
+        parts = header.split()
+        if len(parts) == 2 and parts[1] == "missing":
+            continue
+        if len(parts) < 3:
+            continue
+        sha, _typ, size_s = parts[0], parts[1], parts[2]
+        try:
+            size = int(size_s)
+        except ValueError:
+            continue
+        out[sha] = raw[i : i + size]
+        i += size
+        if i < n and raw[i : i + 1] == b"\n":
+            i += 1
+    return out
+
+
+# --- scan ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Pair:
+    kind: str  # simultaneous | copy | similar | echo
+    a: str
+    b: str
+    base_blob: str
+    base_commit: str
+    base_time: int
+    blob_a: str
+    blob_b: str
+    insertions: int | None
+    deletions: int | None
+    frozen: str  # a | b | both | -
+    score: int  # 0-100
+
+    @property
+    def drifted(self) -> bool:
+        return self.blob_a != self.blob_b
+
+
+@dataclass
+class Event:
+    kind: str
+    a: str
+    b: str
+    base_blob: str
+    commit: str
+    time: int
+    score: int
+
+
+@dataclass
+class Scan:
+    current: dict[str, str]
+    events: list[Event]
+    ever_blobs: dict[str, set[str]]
+    blob_paths: dict[str, set[str]]
+    blob_last: dict[tuple[str, str], tuple[str, int]]
+    commits: int
+    ref: str
+
+
+def list_commits(repo: str, ref: str, all_refs: bool) -> list[tuple[str, int, list[str]]]:
+    args = ["rev-list", "--timestamp", "--parents"]
+    args.append("--all" if all_refs else ref)
+    out = git_text(repo, args)
+    rows: list[tuple[str, int, list[str]]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        bits = line.split()
+        ts = int(bits[0])
+        sha = bits[1]
+        parents = bits[2:]
+        rows.append((sha, ts, parents))
+    rows.reverse()
+    return rows
+
+
+def ls_tree(repo: str, sha: str) -> dict[str, str]:
+    raw = git(repo, ["ls-tree", "-r", "--full-tree", "-z", sha])
+    tree: dict[str, str] = {}
+    if not raw:
+        return tree
+    for entry in raw.split(NUL):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split(b" ", 2)
+        if len(parts) != 3 or parts[1] != b"blob":
+            continue
+        path = path_b.decode("utf-8", "surrogateescape")
+        tree[path] = parts[2].decode("ascii")
+    return tree
+
+
+def diff_tree_copies(repo: str, parent: str, sha: str) -> list[tuple[str, str, str, str, int]]:
+    """Return (src, dst, base_blob, kind, score) for copies and renames."""
+    raw = git(
+        repo,
+        [
+            "diff-tree",
+            "-r",
+            "-C50",
+            "--find-copies-harder",
+            "--no-abbrev",
+            "-z",
+            parent,
+            sha,
+        ],
+        check=False,
+    )
+    found: list[tuple[str, str, str, str, int]] = []
+    if not raw:
+        return found
+    parts = raw.split(NUL)
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if not rec or not rec.startswith(b":"):
+            continue
+        try:
+            meta = rec.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        bits = meta[1:].split()
+        if len(bits) < 5:
+            continue
+        old_blob, _new_blob, status = bits[2], bits[3], bits[4]
+        m_c = STATUS_COPY.match(status)
+        m_r = STATUS_RENAME.match(status)
+        if m_c or m_r:
+            if i + 1 >= len(parts):
+                break
+            src = parts[i].decode("utf-8", "surrogateescape")
+            dst = parts[i + 1].decode("utf-8", "surrogateescape")
+            i += 2
+            score = int((m_c or m_r).group(1))
+            kind = "copy" if m_c else "rename"
+            found.append((src, dst, old_blob, kind, score))
+        else:
+            if i < len(parts):
+                i += 1
+    return found
+
+
+def path_wanted(path: str, globs: list[str], excludes: list[str]) -> bool:
+    base = os.path.basename(path)
+    if excludes and any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g) for g in excludes):
+        return False
+    if not globs:
+        return True
+    return any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g) for g in globs)
+
+
+def text_ratio(a: bytes, b: bytes) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    if b"\0" in a[:4096] or b"\0" in b[:4096]:
+        return 1.0 if a == b else 0.0
+    if abs(len(a) - len(b)) > max(len(a), len(b), 1) * 3:
+        return 0.0
+    sa = a.decode("utf-8", "surrogateescape")
+    sb = b.decode("utf-8", "surrogateescape")
+    sm = SequenceMatcher(None, sa, sb)
+    if sm.quick_ratio() < 0.35:
+        return sm.quick_ratio()
+    return sm.ratio()
+
+
+def resolve_rename(path: str, fwd: dict[str, str]) -> str:
+    seen: set[str] = set()
+    while path in fwd and path not in seen:
+        seen.add(path)
+        path = fwd[path]
+    return path
+
+
+def scan(
+    repo: str,
+    ref: str,
+    all_refs: bool,
+    globs: list[str],
+    excludes: list[str],
+    *,
+    want_copies: bool,
+    want_similar: bool,
+    min_score: int,
+) -> Scan:
+    current = {p: b for p, b in ls_tree(repo, ref).items() if path_wanted(p, globs, excludes)}
+    wanted = set(current)
+    commits = list_commits(repo, ref, all_refs)
+    last_together: dict[tuple[str, str], tuple[str, int, str]] = {}
+    ever_blobs: dict[str, set[str]] = defaultdict(set)
+    blob_paths: dict[str, set[str]] = defaultdict(set)
+    blob_last: dict[tuple[str, str], tuple[str, int]] = {}
+    events: list[Event] = []
+    rename_fwd: dict[str, str] = {}
+    seen_paths: set[str] = set()
+
+    for sha, ts, parents in commits:
+        tree = ls_tree(repo, sha)
+        by_blob: dict[str, list[str]] = defaultdict(list)
+        for path in wanted:
+            blob = tree.get(path)
+            if not blob:
+                continue
+            ever_blobs[path].add(blob)
+            blob_paths[blob].add(path)
+            blob_last[(path, blob)] = (sha, ts)
+            by_blob[blob].append(path)
+        for blob, paths in by_blob.items():
+            if len(paths) < 2:
+                continue
+            paths.sort()
+            for a, b in combinations(paths, 2):
+                last_together[(a, b)] = (sha, ts, blob)
+
+        if want_copies and parents:
+            for src, dst, base_blob, kind, score in diff_tree_copies(repo, parents[0], sha):
+                if kind == "rename":
+                    rename_fwd[src] = dst
+                    continue
+                if score < min_score:
+                    continue
+                src_now = resolve_rename(src, rename_fwd)
+                dst_now = resolve_rename(dst, rename_fwd)
+                if src_now not in wanted or dst_now not in wanted:
+                    continue
+                if src_now == dst_now:
+                    continue
+                aa, bb = sorted((src_now, dst_now))
+                events.append(
+                    Event("copy", aa, bb, base_blob, sha, ts, score)
+                )
+
+        if want_similar:
+            new_paths = sorted(p for p in wanted if p in tree and p not in seen_paths)
+            if new_paths:
+                by_base: dict[str, list[str]] = defaultdict(list)
+                for p in sorted(wanted):
+                    if p in tree:
+                        by_base[os.path.basename(p)].append(p)
+                need_blobs: list[str] = []
+                for p in new_paths:
+                    need_blobs.append(tree[p])
+                    for q in by_base.get(os.path.basename(p), []):
+                        if q != p and q in tree:
+                            need_blobs.append(tree[q])
+                contents = cat_batch(repo, need_blobs)
+                seen_pair: set[tuple[str, str]] = set()
+                new_set = set(new_paths)
+                for p in new_paths:
+                    pb = contents.get(tree[p], b"")
+                    if len(pb) > SIMILAR_MAX_BYTES:
+                        continue
+                    for q in by_base.get(os.path.basename(p), []):
+                        if q == p or q not in tree:
+                            continue
+                        aa, bb = sorted((p, q))
+                        if (aa, bb) in seen_pair:
+                            continue
+                        seen_pair.add((aa, bb))
+                        qb = contents.get(tree[q], b"")
+                        if len(qb) > SIMILAR_MAX_BYTES:
+                            continue
+                        ratio = text_ratio(pb, qb)
+                        score = int(round(ratio * 100))
+                        if score < min_score:
+                            continue
+                        # Prefer the already-existing file as merge-base when one side is old.
+                        if q not in new_set:
+                            base_blob = tree[q]
+                        elif p not in new_set:
+                            base_blob = tree[p]
+                        else:
+                            base_blob = tree[aa]
+                        events.append(Event("similar", aa, bb, base_blob, sha, ts, score))
+
+        seen_paths.update(p for p in wanted if p in tree)
+
+    for (a, b), (sha, ts, blob) in last_together.items():
+        events.append(Event("simultaneous", a, b, blob, sha, ts, 100))
+
+    return Scan(
+        current=current,
+        events=events,
+        ever_blobs=dict(ever_blobs),
+        blob_paths=dict(blob_paths),
+        blob_last=dict(blob_last),
+        commits=len(commits),
+        ref=ref,
+    )
+
+
+def numstat(repo: str, blob_a: str, blob_b: str) -> tuple[int | None, int | None]:
+    if blob_a == blob_b:
+        return 0, 0
+    out = git_text(repo, ["diff", "--numstat", blob_a, blob_b], check=False)
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    if not line:
+        return None, None
+    ins, dele, *_rest = line.split("\t", 2)
+    if ins == "-" or dele == "-":
+        return None, None
+    try:
+        return int(ins), int(dele)
+    except ValueError:
+        return None, None
+
+
+def frozen_side(blob_a: str, blob_b: str, base: str) -> str:
+    a_f = blob_a == base
+    b_f = blob_b == base
+    if a_f and b_f:
+        return "both"
+    if a_f:
+        return "a"
+    if b_f:
+        return "b"
+    return "-"
+
+
+KIND_RANK = {"simultaneous": 0, "copy": 1, "similar": 2, "echo": 3}
+
+
+def pairs_from_scan(
+    repo: str,
+    sc: Scan,
+    *,
+    include_identical: bool,
+    include_echo: bool,
+) -> list[Pair]:
+    best: dict[tuple[str, str], Event] = {}
+    for ev in sc.events:
+        key = (ev.a, ev.b)
+        prev = best.get(key)
+        if prev is None:
+            best[key] = ev
+            continue
+        # Prefer a real shared blob over a copy/similar guess.
+        if KIND_RANK[ev.kind] < KIND_RANK[prev.kind]:
+            best[key] = ev
+            continue
+        if KIND_RANK[ev.kind] > KIND_RANK[prev.kind]:
+            continue
+        # Same kind: last simultaneous share is the better base; earliest
+        # copy/similar is the split point.
+        if ev.kind == "simultaneous":
+            if (ev.time, ev.score) >= (prev.time, prev.score):
+                best[key] = ev
+        elif (ev.time, -ev.score) < (prev.time, -prev.score):
+            best[key] = ev
+
+    if include_echo:
+        for blob, paths in sc.blob_paths.items():
+            if len(paths) < 2:
+                continue
+            for a, b in combinations(sorted(paths), 2):
+                if (a, b) in best:
+                    continue
+                last_a = sc.blob_last.get((a, blob))
+                last_b = sc.blob_last.get((b, blob))
+                ts = 0
+                sha = "-"
+                if last_a and last_b:
+                    sha, ts = max(last_a, last_b, key=lambda x: x[1])
+                elif last_a:
+                    sha, ts = last_a
+                elif last_b:
+                    sha, ts = last_b
+                best[(a, b)] = Event("echo", a, b, blob, sha, ts, 100)
+
+    found: list[Pair] = []
+    for (a, b), ev in best.items():
+        ba = sc.current.get(a)
+        bb = sc.current.get(b)
+        if not ba or not bb:
+            continue
+        if ba == bb and not include_identical:
+            continue
+        ins, dele = numstat(repo, ba, bb)
+        found.append(
+            Pair(
+                kind=ev.kind,
+                a=a,
+                b=b,
+                base_blob=ev.base_blob,
+                base_commit=ev.commit,
+                base_time=ev.time,
+                blob_a=ba,
+                blob_b=bb,
+                insertions=ins,
+                deletions=dele,
+                frozen=frozen_side(ba, bb, ev.base_blob),
+                score=ev.score,
+            )
+        )
+    found.sort(key=lambda p: (KIND_RANK.get(p.kind, 9), -p.score, -p.base_time, p.a, p.b))
+    return found
+
+
+def filter_paths(ps: list[Pair], paths: list[str]) -> list[Pair]:
+    if not paths:
+        return ps
+    if len(paths) == 1:
+        want = paths[0]
+        return [p for p in ps if p.a == want or p.b == want]
+    x, y = sorted(paths[:2])
+    return [p for p in ps if p.a == x and p.b == y]
+
+
+# --- format ----------------------------------------------------------------
+
+
+TSV_COLS = (
+    "kind",
+    "score",
+    "a",
+    "b",
+    "base_blob",
+    "base_commit",
+    "base_time",
+    "insertions",
+    "deletions",
+    "frozen",
+)
+
+
+def fmt_num(n: int | None) -> str:
+    return "-" if n is None else str(n)
+
+
+def format_tsv(ps: list[Pair], header: bool) -> str:
+    lines: list[str] = []
+    if header:
+        lines.append("\t".join(TSV_COLS))
+    for p in ps:
+        lines.append(
+            "\t".join(
+                [
+                    p.kind,
+                    str(p.score),
+                    p.a,
+                    p.b,
+                    p.base_blob[:12],
+                    p.base_commit[:12] if p.base_commit != "-" else "-",
+                    str(p.base_time) if p.base_time else "-",
+                    fmt_num(p.insertions),
+                    fmt_num(p.deletions),
+                    p.frozen,
+                ]
+            )
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def short_time(ts: int) -> str:
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def format_pretty(ps: list[Pair]) -> str:
+    if not ps:
+        return "no kin\n"
+    chunks: list[str] = []
+    for p in ps:
+        drift = f"+{p.insertions} -{p.deletions}" if p.insertions is not None else "binary/unknown"
+        frozen = ""
+        if p.frozen == "a":
+            frozen = "  frozen: a (still at base)"
+        elif p.frozen == "b":
+            frozen = "  frozen: b (still at base)"
+        elif p.frozen == "both":
+            frozen = "  identical"
+        chunks.append(
+            f"{p.a}\n"
+            f"  ↔ {p.b}\n"
+            f"  {p.kind} {p.score}%  base {p.base_blob[:12]}  {short_time(p.base_time)}  {p.base_commit[:12]}\n"
+            f"  {drift}{frozen}"
+        )
+    return "\n".join(chunks) + "\n"
+
+
+def format_json(ps: list[Pair]) -> str:
+    payload = []
+    for p in ps:
+        payload.append(
+            {
+                "kind": p.kind,
+                "score": p.score,
+                "a": p.a,
+                "b": p.b,
+                "base_blob": p.base_blob,
+                "base_commit": p.base_commit,
+                "base_time": p.base_time,
+                "blob_a": p.blob_a,
+                "blob_b": p.blob_b,
+                "insertions": p.insertions,
+                "deletions": p.deletions,
+                "frozen": p.frozen,
+                "drifted": p.drifted,
+            }
+        )
+    return json.dumps(payload, indent=2) + "\n"
+
+
+# --- port / diff -----------------------------------------------------------
+
+
+def materialize_blob(repo: str, blob: str, path: str) -> None:
+    data = git(repo, ["cat-file", "-p", blob])
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def cmd_port(repo: str, pair: Pair, write: bool, dest_abs: str | None) -> int:
+    """Apply a's post-base changes onto b. Prints the merge unless --write."""
+    with tempfile.TemporaryDirectory(prefix="akin-port-") as td:
+        src_f = os.path.join(td, "src")
+        dst_f = os.path.join(td, "dst")
+        base_f = os.path.join(td, "base")
+        materialize_blob(repo, pair.blob_a, src_f)
+        materialize_blob(repo, pair.blob_b, dst_f)
+        materialize_blob(repo, pair.base_blob, base_f)
+        proc = subprocess.run(
+            [
+                "git",
+                "merge-file",
+                "-p",
+                "-L",
+                pair.b,
+                "-L",
+                f"base {pair.base_blob[:12]}",
+                "-L",
+                pair.a,
+                dst_f,
+                base_f,
+                src_f,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = proc.stdout
+        if write:
+            target = dest_abs or pair.b
+            with open(target, "wb") as f:
+                f.write(out)
+        else:
+            sys.stdout.buffer.write(out)
+        if proc.returncode not in (0, 1):
+            err = proc.stderr.decode("utf-8", "replace")
+            print(err, file=sys.stderr)
+            return 2
+        return proc.returncode
+
+
+def cmd_diff(repo: str, pair: Pair) -> int:
+    print(f"# a vs b  ({pair.a} vs {pair.b})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", "--stat", pair.blob_a, pair.blob_b])
+    print(f"\n# base -> a  ({pair.a})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", pair.base_blob, pair.blob_a])
+    print(f"\n# base -> b  ({pair.b})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", pair.base_blob, pair.blob_b])
+    return 0
+
+
+# --- main ------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="akin",
+        description="Find files that once shared content — a copy, not a branch — "
+        "and treat the source blob as the merge-base git never recorded.",
+    )
+    p.add_argument("-C", dest="repo", default=".", help="git repository (like git -C)")
+    p.add_argument("--ref", default="HEAD", help="ref to treat as current tree (default HEAD)")
+    p.add_argument("--all", action="store_true", help="walk all refs, not only --ref")
+    p.add_argument("--identical", action="store_true", help="include currently-identical copies")
+    p.add_argument("--echo", action="store_true", help="also report non-simultaneous shared-blob kinship")
+    p.add_argument("--no-copies", action="store_true", help="disable git copy detection")
+    p.add_argument("--no-similar", action="store_true", help="disable same-basename similarity at add-time")
+    p.add_argument("--min-score", type=int, default=50, metavar="N", help="minimum copy/similar score 0-100 (default 50)")
+    p.add_argument("--check", action="store_true", help="exit 1 if any drifted kin exists")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--pretty", action="store_true", help="human output (default is TSV)")
+    p.add_argument("--no-header", action="store_true", help="omit TSV header")
+    p.add_argument("--glob", action="append", default=[], metavar="GLOB", help="only paths matching (repeatable)")
+    p.add_argument("--exclude", action="append", default=[], metavar="GLOB", help="skip paths matching")
+    p.add_argument("--port", nargs=2, metavar=("FROM", "TO"), help="3-way-merge FROM's unique changes onto TO")
+    p.add_argument("--diff", nargs=2, metavar=("A", "B"), dest="diff_paths", help="show base→A, base→B, A vs B")
+    p.add_argument("--write", action="store_true", help="with --port, overwrite TO instead of printing")
+    p.add_argument("--version", action="version", version=f"akin {VERSION}")
+    p.add_argument("paths", nargs="*", help="restrict to kin of PATH, or inspect PATH PATH")
+    return p.parse_args(argv)
+
+
+def die(msg: str, code: int = 2) -> NoReturn:
+    print(f"akin: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_pair(repo: str, sc: Scan, a: str, b: str, include_echo: bool) -> Pair:
+    a_r = resolve_repo_path(repo, a)
+    b_r = resolve_repo_path(repo, b)
+    ps = pairs_from_scan(repo, sc, include_identical=True, include_echo=include_echo)
+    x, y = sorted((a_r, b_r))
+    for p in ps:
+        if p.a == x and p.b == y:
+            return reorient(p, from_path=a_r, to_path=b_r)
+    die(f"not kin: {a_r}  {b_r}")
+
+
+def reorient(p: Pair, from_path: str, to_path: str) -> Pair:
+    """Make pair.a = FROM, pair.b = TO for porting. base_blob stays the ancestor."""
+    if p.a == from_path and p.b == to_path:
+        return p
+    if p.b == from_path and p.a == to_path:
+        frozen = {"a": "b", "b": "a", "both": "both", "-": "-"}[p.frozen]
+        return replace(
+            p,
+            a=p.b,
+            b=p.a,
+            blob_a=p.blob_b,
+            blob_b=p.blob_a,
+            insertions=p.deletions if p.insertions is not None else None,
+            deletions=p.insertions if p.deletions is not None else None,
+            frozen=frozen,
+        )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    repo = args.repo
+    try:
+        git_text(repo, ["rev-parse", "--is-inside-work-tree"])
+    except GitError as e:
+        die(e.args[0], 2)
+
+    try:
+        sc = scan(
+            repo,
+            args.ref,
+            args.all,
+            args.glob,
+            args.exclude,
+            want_copies=not args.no_copies,
+            want_similar=not args.no_similar,
+            min_score=args.min_score,
+        )
+    except GitError as e:
+        die(str(e), 2)
+
+    if args.port:
+        pair = load_pair(repo, sc, args.port[0], args.port[1], include_echo=True)
+        dest_abs = os.path.abspath(args.port[1]) if args.write else None
+        return cmd_port(repo, pair, write=args.write, dest_abs=dest_abs)
+
+    if args.diff_paths:
+        pair = load_pair(repo, sc, args.diff_paths[0], args.diff_paths[1], include_echo=True)
+        return cmd_diff(repo, pair)
+
+    resolved = [resolve_repo_path(repo, pth) for pth in args.paths]
+    ps = pairs_from_scan(
+        repo,
+        sc,
+        include_identical=args.identical,
+        include_echo=args.echo,
+    )
+    ps = filter_paths(ps, resolved)
+
+    if args.json:
+        sys.stdout.write(format_json(ps))
+    elif args.pretty:
+        sys.stdout.write(format_pretty(ps))
+    else:
+        sys.stdout.write(format_tsv(ps, header=not args.no_header))
+
+    if args.check and any(p.drifted for p in ps):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GitError as e:
+        print(f"akin: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

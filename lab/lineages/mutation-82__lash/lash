@@ -1,0 +1,4371 @@
+#!/usr/bin/env python3
+"""lash — DUE vs LATENT env of a load image set, by getenv-shaped *use*.
+
+Ancestor xref made DUE a getenv/env::var *call-site* proof. Its hole was
+one-hop wrappers: CPython `_config_get_env_dup` moves x3→x0 and `bl getenv`,
+`_env_to_dict` does `add x0, x1, #4`, `_Py_get_env_flag` moves x2→x0.
+Direct xref left PYTHONHOME / PYTHONPATH LATENT even though the image
+really getenv's them.
+
+lash keeps xref's two columns and adds **one-hop wrapper follow**. If a
+function moves an argument register into x0 (optionally plus a small
+constant) and branches to getenv, that function is getenv-shaped at that
+argv index. Call sites that pass a cstring there become DUE. A second hop
+is not followed. Orphan env-shaped bytes stay not-DUE. rustc's LLVM
+opcodes stay out. `--min-evidence call` stays a real filter.
+
+  DUE     names a getenv-shaped call site *uses* (direct or one wrapper)
+  LATENT  names the image *did* document
+  BOTH    intersection
+
+DYLD/`LD_PRELOAD` `--trace` is not the second column (malloc reentry + SIP).
+This is not strings(1).
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".next",
+    ".turbo",
+    "coverage",
+    "vendor",
+    "Pods",
+    ".build",
+    ".idea",
+    ".vscode",
+    "Carthage",
+}
+
+SOURCE_SUFFIX = {
+    ".py",
+    ".pyi",
+    ".rs",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".go",
+    ".rb",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ksh",
+    ".java",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".hpp",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+}
+
+SHELL_SUFFIX = {".sh", ".bash", ".zsh", ".ksh"}
+
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+UPPER_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+SECRET_NAME_RE = re.compile(
+    r"(SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|CREDENTIAL|PRIVATE[_-]?KEY|AUTH)",
+    re.I,
+)
+
+# libc / POSIX / shell runtime — real, but they drown application ABI.
+LIBC_ENV = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TERMINFO",
+    "TERMCAP",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_COLLATE",
+    "LC_TIME",
+    "LC_NUMERIC",
+    "LC_MONETARY",
+    "TZ",
+    "TZDIR",
+    "PWD",
+    "OLDPWD",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "HOSTNAME",
+    "HOST",
+    "SHLVL",
+    "PS1",
+    "PS2",
+    "PS3",
+    "PS4",
+    "IFS",
+    "MAIL",
+    "MAILCHECK",
+    "MAILPATH",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "MANPATH",
+    "INFOPATH",
+    "CDPATH",
+    "COLUMNS",
+    "LINES",
+    "PPID",
+    "UID",
+    "EUID",
+    "RANDOM",
+    "SECONDS",
+    "REPLY",
+    "PIPESTATUS",
+    "BASH",
+    "BASH_VERSION",
+    "BASH_ENV",
+    "ZSH_VERSION",
+    "FPATH",
+    "HISTFILE",
+    "HISTSIZE",
+    "HISTFILESIZE",
+    "PROMPT",
+    "RPROMPT",
+    "COLORTERM",
+    "CLICOLOR",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "ITERM_SESSION_ID",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "GPG_TTY",
+    "GPG_AGENT_INFO",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XPC_SERVICE_NAME",
+    "XPC_FLAGS",
+    "COMMAND_MODE",
+    "__CF_USER_TEXT_ENCODING",
+    "__CFBundleIdentifier",
+    "SECURITYSESSIONID",
+    "LaunchInstanceID",
+    "MallocNanoZone",
+    "OSLogRateLimit",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_PRINT_LIBRARIES",
+    "LD_LIBRARY_PATH_64",
+}
+
+# Bare names that are real env vars but have no underscore.
+BARE_APP = {
+    "TMUX",
+    "ZELLIJ",
+    "STY",
+    "WINDOWID",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "DISPLAY",
+    "SHELL",
+    "HOME",
+    "PATH",
+    "USER",
+    "TERM",
+}
+
+# First segments used to unstick packed Rust/C rodata
+# (`KIZU_CONFIGXDG_CONFIG_HOME` → two names).
+PREFIX_SEEDS = {
+    "XDG_",
+    "GIT_",
+    "AWS_",
+    "HTTP_",
+    "HTTPS_",
+    "NODE_",
+    "NPM_",
+    "CARGO_",
+    "RUST_",
+    "RUSTC_",
+    "RUSTUP_",
+    "PYTHON_",
+    "PY_",
+    "JAVA_",
+    "GO_",
+    "GOPROXY_",
+    "SSL_",
+    "CURL_",
+    "REQUESTS_",
+    "DENO_",
+    "BUN_",
+    "VITE_",
+    "NEXT_",
+    "LC_",
+    "LD_",
+    "DYLD_",
+    "SSH_",
+    "GPG_",
+    "DBUS_",
+    "XPC_",
+    "TERM_",
+    "COLOR_",
+    "NO_",
+    "FORCE_",
+    "KIZU_",
+    "DUE_",
+    "LODE_",
+    "ASSAY_",
+    "XREF_",
+    "LASH_",
+    "API_",
+    "APP_",
+    "DB_",
+    "DATABASE_",
+    "REDIS_",
+    "PG_",
+    "MYSQL_",
+    "S3_",
+    "OCI_",
+    "DOCKER_",
+    "KUBE_",
+    "KUBERNETES_",
+    "CI_",
+    "GITHUB_",
+    "GH_",
+    "HOMEBREW_",
+    "KITTY_",
+    "ZELLIJ_",
+    "TMUX_",
+}
+
+ENV_SUFFIXES = {
+    "HOME",
+    "DIR",
+    "PATH",
+    "FILE",
+    "KEY",
+    "TOKEN",
+    "URL",
+    "URI",
+    "HOST",
+    "PORT",
+    "USER",
+    "PASS",
+    "PASSWORD",
+    "SECRET",
+    "ID",
+    "NAME",
+    "LEVEL",
+    "MODE",
+    "ENV",
+    "ROOT",
+    "BIN",
+    "CONFIG",
+    "STATE",
+    "DATA",
+    "CACHE",
+    "TEMP",
+    "TMP",
+    "TIMEOUT",
+    "TTL",
+    "SECS",
+    "SESSION",
+    "ADDR",
+    "SOCK",
+    "PID",
+    "SIZE",
+    "LIMIT",
+    "LOG",
+    "FORMAT",
+    "COLOR",
+    "LANG",
+    "TZ",
+    "PROGRAM",
+    "VERSION",
+}
+
+PACKED_TOKEN_RE = re.compile(r"[A-Z]{2,}(?:_[A-Z0-9]+)+")
+PRINTABLE_RUN_RE = re.compile(rb"[\x20-\x7e]{3,512}")
+# CPython embeds `PYTHONHOME      : alternate <prefix>` and `  PYTHONHOME = \x00`.
+# Help lines are often packed against a code byte (same shape as getenv cstrings).
+HELP_ENV_RE = re.compile(
+    rb"(?:^|[\n\0]|[^A-Za-z0-9_])[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]{2,}:"
+)
+ASSIGN_ENV_RE = re.compile(
+    rb"(?:^|[\n\0]|[^A-Za-z0-9_])[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]*=[ \t]*(?:\x00|$)"
+)
+DOLLAR_ENV_RE = re.compile(rb"\$([A-Z][A-Z0-9_]{2,})\b")
+# rustc: "setting environment variable `RUSTC_GRAPHVIZ_FONT`" / "CARGO_INCREMENTAL=0"
+ENV_PROSE_RE = re.compile(rb"environment variables?[ \t]+`?([A-Z][A-Z0-9_]{2,})`?")
+CSTRING_ASSIGN_RE = re.compile(r"^[ \t]*([A-Z][A-Z0-9_]{2,})[ \t]*=[ \t]*$")
+
+# Bare interpreter names: PYTHONHOME, PERL5LIB, RUBYOPT — no underscore.
+RUNTIME_FAMILY_PREFIXES = (
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "PHP",
+    "NODE",
+    "JAVA",
+    "GOROOT",
+    "GOPATH",
+    "CARGO",
+    "RUSTC",
+    "RUSTUP",
+    "BUN",
+    "DENO",
+    "GEM",
+    "PIP",
+    "IRB",
+    "BUNDLE",
+)
+# Printable-run split_packed on a 200MB dylib is a minute. Prefix peel is O(prefixes · n).
+LARGE_IMAGE_BYTES = 8 * 1024 * 1024
+
+SYSTEM_IMAGE_PREFIXES = (
+    "/usr/lib/",
+    "/usr/libexec/",
+    "/System/",
+    "/Library/Apple/",
+    "/lib/",
+    "/lib64/",
+    "/lib/x86_64-linux-gnu/",
+    "/lib/aarch64-linux-gnu/",
+    "/usr/lib64/",
+    "/usr/lib/system/",
+)
+
+# Strings that look like env names but are compiler / protocol / log junk.
+REJECT_STRINGS = {
+    "DEBUG",
+    "TRACE",
+    "INFO",
+    "ERROR",
+    "WARNING",
+    "WARN",
+    "FATAL",
+    "VERBOSE",
+    "NDEBUG",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+    "HTTP",
+    "HTTPS",
+    "HTTP2",
+    "HTTP3",
+    "JSON",
+    "YAML",
+    "TOML",
+    "XML",
+    "HTML",
+    "UTF8",
+    "UTF16",
+    "ASCII",
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "NONE",
+    "BOOL",
+    "TEXT",
+    "DATA",
+    "CODE",
+    "TYPE",
+    "NAME",
+    "FILE",
+    "LINE",
+    "FUNC",
+    "ARGS",
+    "ARGV",
+    "ARGC",
+    "SELF",
+    "THIS",
+    "TODO",
+    "FIXME",
+    "NOTE",
+    "HACK",
+    "XXX",
+    "OK",
+    "YES",
+    "NO",
+    "ON",
+    "OFF",
+    "ID",
+    "URL",
+    "URI",
+    "UUID",
+    "SHA",
+    "SHA1",
+    "SHA256",
+    "MD5",
+    "CRC32",
+    "LLVM",
+    "CLANG",
+    "GNUC",
+    "MSVC",
+    "POSIX",
+    "UNIX",
+    "LINUX",
+    "DARWIN",
+    "WIN32",
+    "WIN64",
+    "APPLE",
+    "ANDROID",
+    "RUSTC",
+    "RUSTFLAGS",
+    "CARGO",
+    "CMAKE",
+    "NINJA",
+    "MAKE",
+    "MAKEFLAGS",
+}
+
+MACH_O_MAGICS = {
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+}
+
+EVIDENCE_RANK = {"call": 3, "shell": 2, "string": 1}
+
+# Help-table / `$VAR` / `NAME =` — the binary *did* document these.
+DOC_HOWS = frozenset({"doc", "cstring-assign", "help", "dollar", "assign", "prose"})
+# Getenv-shaped *use* — source call or a binary xref to getenv/env::var.
+# Isolated cstring / packed / prefix is NOT enough (assay's flood).
+STRONG_READ_HOWS = frozenset(
+    {
+        "call",
+        "shell",
+        "xref",
+        "getenv",
+        "secure_getenv",
+        "std::getenv",
+        "wrapper",
+        "Py_GETENV",
+        "os.getenv",
+        "os.environ[]",
+        "os.environ.get",
+        "os.environ.setdefault",
+        "env::var",
+        "env::var_os",
+        "option_env!",
+        "process.env",
+        "process.env[]",
+        "os.Getenv",
+        "System.getenv",
+        "ENV[]",
+        "ENV.fetch",
+        "Deno.env.get",
+        "Bun.env",
+        "environment[]",
+        "${}",
+        "$VAR",
+    }
+)
+# Packed/prefix/rodata: search aid for LATENT (help glued to a code byte)
+# and for --loose. Never a KIND promotion to DUE.
+WEAK_READ_HOWS = frozenset(
+    {
+        "prefix",
+        "packed",
+        "cstring",
+        "cstring-packed",
+        "needle",
+        "rodata",
+        "string",
+    }
+)
+
+KIND_ORDER = ["DUE", "LATENT", "BOTH"]
+
+STATUS_ORDER = [
+    "MISSING",
+    "UNSET_LEFT",
+    "UNSET_RIGHT",
+    "DIFF",
+    "UNDOCUMENTED",
+    "STALE_EXAMPLE",
+    "LEFT_ONLY",
+    "RIGHT_ONLY",
+    "BOTH",
+    "DUE",
+    "LATENT",
+    "SPARE",
+]
+
+FAIL_STATUSES = {"MISSING", "UNSET_LEFT", "UNSET_RIGHT", "DIFF", "UNDOCUMENTED"}
+ABI_FAIL_STATUSES = {"LEFT_ONLY"}
+
+
+@dataclass(order=True)
+class Need:
+    name: str
+    evidence: str
+    source: str
+    detail: str = ""
+    hows: frozenset[str] = field(default_factory=frozenset)
+
+    def as_tuple(self) -> tuple[str, str, str, str]:
+        return (self.name, self.evidence, self.source, self.detail)
+
+
+@dataclass
+class EnvMap:
+    values: dict[str, str]
+    origin: str
+
+
+@dataclass
+class Row:
+    status: str
+    name: str
+    left: str | None
+    right: str | None
+    example: str | None
+    evidence: str
+    source: str
+    detail: str = ""
+    kind: str = "DUE"
+
+
+# ---------------------------------------------------------------------------
+# env snapshots
+# ---------------------------------------------------------------------------
+
+
+def parse_env_text(text: str, origin: str) -> EnvMap:
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        obj = json.loads(text)
+        if not isinstance(obj, dict):
+            raise ValueError(f"{origin}: JSON env must be an object")
+        values = {}
+        for key, val in obj.items():
+            if not isinstance(key, str) or not ENV_NAME_RE.match(key):
+                continue
+            if val is None:
+                values[key] = ""
+            elif isinstance(val, (str, int, float, bool)):
+                values[key] = str(val)
+        return EnvMap(values, origin)
+
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not ENV_NAME_RE.match(key):
+            continue
+        values[key] = _unquote_env_value(rest)
+    return EnvMap(values, origin)
+
+
+def _unquote_env_value(rest: str) -> str:
+    s = rest.strip()
+    if not s:
+        return ""
+    if s[0] in {'"', "'"}:
+        quote = s[0]
+        out: list[str] = []
+        i = 1
+        while i < len(s):
+            ch = s[i]
+            if ch == "\\" and i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    if " #" in s:
+        s = s.split(" #", 1)[0].rstrip()
+    return s
+
+
+def load_env_file(path: Path) -> EnvMap:
+    return parse_env_text(path.read_text(encoding="utf-8", errors="replace"), str(path))
+
+
+def current_env() -> EnvMap:
+    return EnvMap(dict(os.environ), "process")
+
+
+def env_from_pid(pid: int) -> EnvMap:
+    proc = Path(f"/proc/{pid}/environ")
+    if proc.is_file():
+        blob = proc.read_bytes()
+        values: dict[str, str] = {}
+        for part in blob.split(b"\0"):
+            if not part or b"=" not in part:
+                continue
+            key, _, val = part.partition(b"=")
+            try:
+                k = key.decode("utf-8")
+                v = val.decode("utf-8", "replace")
+            except UnicodeDecodeError:
+                continue
+            if ENV_NAME_RE.match(k):
+                values[k] = v
+        return EnvMap(values, f"pid:{pid}")
+
+    # macOS: ps may echo KEY=val after the argument vector.
+    try:
+        out = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot read environ of pid {pid}: {exc}") from exc
+    values = {}
+    for token in out.split():
+        if "=" not in token:
+            continue
+        key, _, val = token.partition("=")
+        if ENV_NAME_RE.match(key) and UPPER_NAME_RE.match(key):
+            values[key] = val
+    if not values:
+        raise RuntimeError(
+            f"cannot read environ of pid {pid} (no /proc, ps eww empty)"
+        )
+    return EnvMap(values, f"pid:{pid}")
+
+
+# ---------------------------------------------------------------------------
+# extractors
+# ---------------------------------------------------------------------------
+
+
+def _need(name: str, evidence: str, source: str, detail: str) -> Need | None:
+    if not ENV_NAME_RE.match(name):
+        return None
+    if evidence == "string" and name in REJECT_STRINGS:
+        return None
+    hows = frozenset(h for h in (detail, evidence) if h)
+    return Need(name, evidence, source, detail, hows)
+
+
+def _hows_of(need: Need) -> set[str]:
+    hows = set(need.hows)
+    if need.detail:
+        for part in re.split(r"[+,;|]", need.detail):
+            tok = part.strip()
+            if tok:
+                hows.add(tok)
+    hows.add(need.evidence)
+    return hows
+
+
+def is_documented(need: Need) -> bool:
+    return bool(_hows_of(need) & DOC_HOWS)
+
+
+def uses_getenv(need: Need) -> bool:
+    """True iff this name is a getenv-shaped *use* (call/xref), not a token."""
+    if need.evidence in {"call", "shell"}:
+        return True
+    return bool(_hows_of(need) & STRONG_READ_HOWS)
+
+
+def kind_of(need: Need) -> str:
+    """DUE = getenv-shaped use. LATENT = documented. BOTH = both.
+
+    Isolated cstring / prefix / packed is not DUE. Assay promoted those;
+    that is the 12k LLVM flood and `COLOR_FORCE`.
+    """
+    due = uses_getenv(need)
+    latent = is_documented(need)
+    if due and latent:
+        return "BOTH"
+    if latent:
+        return "LATENT"
+    return "DUE"
+
+
+def _loc(path: Path, lineno: int) -> str:
+    return f"{path}:{lineno}"
+
+
+class _PyEnvVisitor(ast.NodeVisitor):
+    """Collect getenv-like reads; ignore stores."""
+
+    def __init__(self, path: Path, constants: dict[str, str]) -> None:
+        self.path = path
+        self.constants = constants
+        self.needs: list[Need] = []
+        self.mod_alias: dict[str, str] = {}
+        self.from_alias: dict[str, str] = {}
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "os" or alias.name.startswith("os."):
+                self.mod_alias[alias.asname or alias.name.split(".", 1)[0]] = "os"
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "os":
+            for alias in node.names:
+                if alias.name in {"getenv", "environ"}:
+                    self.from_alias[alias.asname or alias.name] = alias.name
+        self.generic_visit(node)
+
+    def _str(self, node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in self.constants:
+            return self.constants[node.id]
+        return None
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # Keep constants up to date as we walk.
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self.constants[tgt.id] = node.value.value
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.generic_visit(node)
+            return
+        name = self._str(node.slice)
+        if name and self._is_environ(node.value):
+            n = _need(name, "call", _loc(self.path, node.lineno), "os.environ[]")
+            if n:
+                self.needs.append(n)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        kind = self._call_kind(func)
+        if kind and node.args:
+            name = self._str(node.args[0])
+            if name:
+                n = _need(name, "call", _loc(self.path, node.lineno), kind)
+                if n:
+                    self.needs.append(n)
+        self.generic_visit(node)
+
+    def _is_environ(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr == "environ":
+            return self._is_os(node.value)
+        if isinstance(node, ast.Name) and self.from_alias.get(node.id) == "environ":
+            return True
+        return False
+
+    def _is_os(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and self.mod_alias.get(node.id) == "os"
+
+    def _call_kind(self, func: ast.AST) -> str | None:
+        if isinstance(func, ast.Attribute):
+            if func.attr == "getenv" and self._is_os(func.value):
+                return "os.getenv"
+            if func.attr == "get" and self._is_environ(func.value):
+                return "os.environ.get"
+            if func.attr == "setdefault" and self._is_environ(func.value):
+                return "os.environ.setdefault"
+        if isinstance(func, ast.Name):
+            bound = self.from_alias.get(func.id)
+            if bound == "getenv":
+                return "os.getenv"
+        return None
+
+
+def extract_python(path: Path, text: str) -> list[Need]:
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return extract_by_regex(path, text, "python-fallback")
+    constants: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                constants[tgt.id] = node.value.value
+    vis = _PyEnvVisitor(path, dict(constants))
+    vis.visit(tree)
+    return vis.needs
+
+
+_CALL_SPECS: list[tuple[str, re.Pattern[str], str]] = [
+    (
+        "rust",
+        re.compile(
+            r"""(?:std::)?env::(?:var|var_os)\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""
+        ),
+        "env::var",
+    ),
+    (
+        "rust-option",
+        re.compile(r"""option_env!\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "option_env!",
+    ),
+    (
+        "js-dot",
+        re.compile(r"""process\.env\.([A-Za-z_][A-Za-z0-9_]*)"""),
+        "process.env",
+    ),
+    (
+        "js-sub",
+        re.compile(r"""process\.env\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "process.env[]",
+    ),
+    (
+        "deno",
+        re.compile(r"""Deno\.env\.get\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "Deno.env.get",
+    ),
+    (
+        "bun",
+        re.compile(r"""Bun\.env\.([A-Za-z_][A-Za-z0-9_]*)"""),
+        "Bun.env",
+    ),
+    (
+        "go",
+        re.compile(
+            r"""os\.(?:Getenv|LookupEnv)\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""
+        ),
+        "os.Getenv",
+    ),
+    (
+        "c",
+        re.compile(r"""(?:secure_)?getenv\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "getenv",
+    ),
+    (
+        "java",
+        re.compile(r"""System\.getenv\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "System.getenv",
+    ),
+    (
+        "ruby",
+        re.compile(r"""ENV(?:\.fetch)?\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "ENV[]",
+    ),
+    (
+        "ruby-fetch",
+        re.compile(r"""ENV\.fetch\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""),
+        "ENV.fetch",
+    ),
+    (
+        "swift-env",
+        re.compile(r"""environment\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""),
+        "environment[]",
+    ),
+]
+
+
+_SHELL_BRACE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[-+=?][^}]*)?\}")
+_SHELL_DOLLAR = re.compile(r"\$([A-Z_][A-Z0-9_]{1,})")
+
+
+def extract_by_regex(path: Path, text: str, _why: str) -> list[Need]:
+    found: list[Need] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for _label, cre, detail in _CALL_SPECS:
+            for m in cre.finditer(line):
+                n = _need(m.group(1), "call", _loc(path, i), detail)
+                if n:
+                    found.append(n)
+    return found
+
+
+def extract_shell(path: Path, text: str) -> list[Need]:
+    found: list[Need] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for m in _SHELL_BRACE.finditer(line):
+            n = _need(m.group(1), "shell", _loc(path, i), "${}")
+            if n:
+                found.append(n)
+        for m in _SHELL_DOLLAR.finditer(line):
+            n = _need(m.group(1), "shell", _loc(path, i), "$VAR")
+            if n:
+                found.append(n)
+    return found
+
+
+def is_macho_or_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return False
+    if magic == b"\x7fELF":
+        return True
+    if magic in MACH_O_MAGICS:
+        return True
+    if magic[:2] == b"MZ":
+        return True
+    return False
+
+
+def env_prefixes(extra: Iterable[str] | None = None) -> list[str]:
+    prefixes = set(PREFIX_SEEDS)
+    names = list(LIBC_ENV)
+    if extra:
+        names.extend(extra)
+    for name in names:
+        if "_" not in name or not UPPER_NAME_RE.match(name):
+            continue
+        head = name.split("_", 1)[0]
+        if len(head) >= 2:
+            prefixes.add(head + "_")
+    return sorted(prefixes, key=len, reverse=True)
+
+
+def is_runtime_family(name: str) -> bool:
+    """PYTHONHOME, PERL5LIB, RUBYOPT — interpreter ABI, often no underscore."""
+    if not UPPER_NAME_RE.match(name):
+        return False
+    if len(name) < 4 or len(name) > 40:
+        return False
+    if name in REJECT_STRINGS:
+        return False
+    for pfx in RUNTIME_FAMILY_PREFIXES:
+        if name == pfx or name.startswith(pfx):
+            rest = name[len(pfx) :]
+            if rest == "" or re.fullmatch(r"[A-Z0-9_]+", rest):
+                return True
+    return False
+
+
+def is_valid_env_token(name: str) -> bool:
+    if name in REJECT_STRINGS:
+        return False
+    if name in LIBC_ENV or name in BARE_APP:
+        return True
+    if is_runtime_family(name):
+        return True
+    if not UPPER_NAME_RE.match(name):
+        return False
+    if name.startswith("_") or name.endswith("_"):
+        return False
+    if "_" not in name:
+        return False
+    if re.search(r"\d$", name):
+        return False
+    if len(name) > 40:
+        return False
+    parts = name.split("_")
+    head, rest = parts[0], parts[1:]
+    if len(head) < 2 or not head.isalpha():
+        return False
+    if not rest:
+        return False
+    if any(len(p) > 16 for p in parts):
+        return False
+    long_alpha = [p for p in parts if len(p) >= 3 and p.isalpha()]
+    short_letter = [p for p in parts if len(p) == 1 and p.isalpha()]
+    if short_letter and len(long_alpha) < 2:
+        return False
+    if re.fullmatch(r"U+", name.replace("_", "")):
+        return False
+    return True
+
+
+def is_likely_env_name(name: str) -> bool:
+    """String-evidence filter: real-looking env, not compiler tables."""
+    if name in LIBC_ENV or name in BARE_APP:
+        return True
+    if is_runtime_family(name):
+        return True
+    if not is_valid_env_token(name):
+        return False
+    parts = name.split("_")
+    if parts[0] + "_" in PREFIX_SEEDS:
+        return True
+    if parts[-1] in ENV_SUFFIXES:
+        return True
+    if len(parts) >= 3 and sum(1 for p in parts if len(p) >= 3) >= 2:
+        return True
+    return False
+
+
+def split_packed(blob: str, prefixes: list[str]) -> list[str]:
+    cuts = {0, len(blob)}
+    for i in range(1, len(blob)):
+        for pfx in prefixes:
+            if blob.startswith(pfx, i):
+                cuts.add(i)
+                break
+        else:
+            # CONFIG|XDG_… — suffix word glued to a new PREFIX_
+            if re.match(r"[A-Z]{2,}_", blob[i:]):
+                before = blob[:i]
+                word = before.rsplit("_", 1)[-1]
+                if word in ENV_SUFFIXES:
+                    cuts.add(i)
+    ordered = sorted(cuts)
+    out: list[str] = []
+    for a, b in zip(ordered, ordered[1:]):
+        piece = blob[a:b]
+        if is_valid_env_token(piece) or piece in BARE_APP or piece in LIBC_ENV:
+            out.append(piece)
+            continue
+        for m in PACKED_TOKEN_RE.finditer(piece):
+            tok = m.group()
+            following = piece[m.end() :]
+            if tok and tok[-1].isupper() and following[:1].islower():
+                shorter = tok[:-1]
+                short_last = shorter.rsplit("_", 1)[-1]
+                long_last = tok.rsplit("_", 1)[-1]
+                if (
+                    is_valid_env_token(shorter)
+                    and short_last in ENV_SUFFIXES
+                    and long_last not in ENV_SUFFIXES
+                ):
+                    tok = shorter
+            if is_valid_env_token(tok):
+                out.append(tok)
+        for bare in BARE_APP | (LIBC_ENV & {"HOME", "PATH", "USER", "TERM", "SHELL", "EDITOR"}):
+            idx = 0
+            while True:
+                j = piece.find(bare, idx)
+                if j < 0:
+                    break
+                end = j + len(bare)
+                left_ok = j == 0 or not (piece[j - 1].isalnum() or piece[j - 1] == "_")
+                right_ok = end == len(piece) or not (piece[end].isalnum() or piece[end] == "_")
+                if left_ok and right_ok:
+                    out.append(bare)
+                idx = j + 1
+    return out
+
+
+def _after_boundary_ok(data: bytes, i: int, n: int) -> bool:
+    rest = data[i + n :]
+    if not rest:
+        return True
+    c = rest[0]
+    if not (chr(c).isalnum() or c == ord("_")):
+        return True
+    if 97 <= c <= 122:  # lowercase: end of ALLCAPS token
+        return True
+    if 65 <= c <= 90:  # uppercase
+        if re.match(rb"[A-Z]{2,}_", rest):
+            return True
+        if len(rest) > 1 and 97 <= rest[1] <= 122:
+            return True  # Titlecase word (Library, Application)
+        return False
+    return False
+
+
+def name_in_blob(data: bytes, name: str) -> bool:
+    try:
+        needle = name.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    start = 0
+    n = len(needle)
+    while True:
+        i = data.find(needle, start)
+        if i < 0:
+            return False
+        if _after_boundary_ok(data, i, n):
+            return True
+        start = i + 1
+
+
+def _is_env_byte(b: int) -> bool:
+    return (48 <= b <= 57) or (65 <= b <= 90) or b == 95
+
+
+def extract_doc_env_tokens(data: bytes) -> list[tuple[str, str]]:
+    """Help tables, `NAME =`, and `$NAME` — how CPython spells PYTHONHOME.
+
+    Returns (name, how) with how in {help, assign, dollar}.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def keep(raw: bytes, how: str) -> None:
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return
+        key = (text, how)
+        if key in seen:
+            return
+        if not (
+            is_valid_env_token(text)
+            or is_runtime_family(text)
+            or text in LIBC_ENV
+            or text in BARE_APP
+        ):
+            return
+        seen.add(key)
+        found.append((text, how))
+
+    for cre, how in (
+        (HELP_ENV_RE, "help"),
+        (ASSIGN_ENV_RE, "assign"),
+        (DOLLAR_ENV_RE, "dollar"),
+        (ENV_PROSE_RE, "prose"),
+    ):
+        for m in cre.finditer(data):
+            keep(m.group(1), how)
+    return found
+
+
+def peel_prefix_tokens(data: bytes, prefixes: list[str]) -> list[str]:
+    """Find PREFIX_ seeds as bytes and take the ALLCAPS token at that offset.
+
+    Survives packed Rust rodata without walking every printable run of a
+    200MB librustc_driver.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for pfx in prefixes:
+        try:
+            needle = pfx.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        start = 0
+        n = len(needle)
+        while True:
+            i = data.find(needle, start)
+            if i < 0:
+                break
+            j = i
+            m = len(data)
+            while j < m and _is_env_byte(data[j]):
+                j += 1
+            tok = data[i:j].decode("ascii")
+            pieces = split_packed(tok, prefixes)
+            if not pieces and (
+                is_valid_env_token(tok) or tok in LIBC_ENV or tok in BARE_APP
+            ):
+                pieces = [tok]
+            for piece in pieces:
+                if piece not in seen and (
+                    is_valid_env_token(piece) or piece in LIBC_ENV or piece in BARE_APP
+                ):
+                    seen.add(piece)
+                    out.append(piece)
+            start = i + n
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Mach-O / ELF getenv xref
+# ---------------------------------------------------------------------------
+
+MH_MAGIC_64 = 0xFEEDFACF
+MH_CIGAM_64 = 0xCFFAEDFE
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
+CPU_TYPE_X86_64 = 0x01000007
+CPU_TYPE_ARM64 = 0x0100000C
+LC_SYMTAB = 0x02
+LC_DYSYMTAB = 0x0B
+LC_SEGMENT_64 = 0x19
+S_SYMBOL_STUBS = 0x08
+INDIRECT_SYMBOL_LOCAL = 0x80000000
+INDIRECT_SYMBOL_ABS = 0x40000000
+
+ELF_MAGIC = b"\x7fELF"
+
+
+def getenv_sym_kind(name: str) -> str | None:
+    """Classify a symbol as a getenv-shaped callee. None = ignore."""
+    if not name:
+        return None
+    raw = name
+    if name.startswith("_Z"):  # Itanium
+        if "getenvPKc" in name or name == "_ZSt6getenvPKc":
+            return "std::getenv"
+        if "getenv" in name.lower() and "Environ" not in name:
+            return "std::getenv"
+    n = name.lstrip("_")
+    if "NSGetEnviron" in name or n in {"NSGetEnviron", "_NSGetEnviron"}:
+        return None
+    if n in {"getenv", "secure_getenv"}:
+        return "getenv"
+    if n == "Py_GETENV" or name.endswith("Py_GETENV"):
+        return "getenv"
+    if n.endswith("getenv") or name.endswith("GETENV"):
+        # mimalloc _mi_prim_getenv, rust unix getenv, …
+        if "Environ" in name:
+            return None
+        return "getenv"
+    if "std3env7__var_os" in name or name.endswith("7__var_os"):
+        return "env::var_os"
+    if "std3env4__var" in name or name.endswith("4__var"):
+        return "env::var"
+    if "std3env3var_os" in name:
+        return "env::var_os"
+    if "std3env3var" in name:
+        return "env::var"
+    if "3env3var_os" in name:
+        return "env::var_os"
+    if "3env3var" in name and "current" not in name:
+        return "env::var"
+    return None
+
+
+def _host_prefers_arm64() -> bool:
+    mach = os.uname().machine.lower() if hasattr(os, "uname") else ""
+    return mach in {"arm64", "aarch64"}
+
+
+def macho_native_slice(data: bytes) -> bytes:
+    """Return the preferred thin Mach-O from a fat image, else data."""
+    if len(data) < 8:
+        return data
+    magic = data[:4]
+    if magic not in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+        return data
+    be = magic == b"\xca\xfe\xba\xbe"
+    endian = ">" if be else "<"
+    nfat = struct.unpack_from(endian + "I", data, 4)[0]
+    if nfat <= 0 or nfat > 16:
+        return data
+    prefer_arm = _host_prefers_arm64()
+    arm = x64 = first = None
+    for i in range(nfat):
+        off = 8 + i * 20
+        if off + 20 > len(data):
+            break
+        cputype, _cpusub, offset, size, _align = struct.unpack_from(
+            endian + "IIIII", data, off
+        )
+        if offset + size > len(data):
+            continue
+        slice_ = data[offset : offset + size]
+        if first is None:
+            first = slice_
+        if cputype == CPU_TYPE_ARM64:
+            arm = slice_
+        elif cputype == CPU_TYPE_X86_64:
+            x64 = slice_
+    if prefer_arm:
+        return arm or x64 or first or data
+    return x64 or arm or first or data
+
+
+@dataclass
+class _Sect:
+    sg: str
+    sn: str
+    addr: int
+    size: int
+    off: int
+    flags: int
+    res1: int
+    res2: int
+
+
+@dataclass
+class _MachO:
+    data: bytes
+    cputype: int
+    sects: list[_Sect]
+    symbols: list[tuple[str, int, int, int]]  # name, type, sect, value
+    indirect: bytes
+    nindirect: int
+
+
+@dataclass(frozen=True)
+class _Callee:
+    """A getenv-shaped callee: how, which argv register, extra byte offset."""
+
+    how: str
+    arg: int = 0
+    offset: int = 0
+    symbol: str = ""
+
+
+def parse_macho(data: bytes) -> _MachO | None:
+    if len(data) < 32:
+        return None
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic == MH_CIGAM_64:
+        return None  # swapped; ignore
+    if magic != MH_MAGIC_64:
+        return None
+    _magic, cputype, _cpusub, _ft, ncmds, sizeofcmds, _flags, _res = struct.unpack_from(
+        "<IIIIIIII", data, 0
+    )
+    if sizeofcmds > len(data):
+        return None
+    off = 32
+    sects: list[_Sect] = []
+    indirectoff = nindirect = 0
+    symoff = nsyms = stroff = strsize = 0
+    end_cmds = 32 + sizeofcmds
+    for _ in range(ncmds):
+        if off + 8 > end_cmds:
+            break
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmdsize < 8:
+            break
+        if cmd == LC_SEGMENT_64 and cmdsize >= 72:
+            nsects = struct.unpack_from("<I", data, off + 64)[0]
+            so = off + 72
+            for _i in range(nsects):
+                if so + 80 > len(data):
+                    break
+                sn = data[so : so + 16].split(b"\0", 1)[0].decode("ascii", "replace")
+                sg = data[so + 16 : so + 32].split(b"\0", 1)[0].decode("ascii", "replace")
+                addr, size = struct.unpack_from("<QQ", data, so + 32)
+                soff = struct.unpack_from("<I", data, so + 48)[0]
+                flags = struct.unpack_from("<I", data, so + 64)[0]
+                reserved1, reserved2 = struct.unpack_from("<II", data, so + 68)
+                sects.append(_Sect(sg, sn, addr, size, soff, flags, reserved1, reserved2))
+                so += 80
+        elif cmd == LC_SYMTAB and cmdsize >= 24:
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, off + 8)
+        elif cmd == LC_DYSYMTAB and cmdsize >= 80:
+            fields = struct.unpack_from("<" + "I" * 18, data, off + 8)
+            indirectoff, nindirect = fields[12], fields[13]
+        off += cmdsize
+    symbols: list[tuple[str, int, int, int]] = []
+    if nsyms and symoff and stroff + strsize <= len(data) and nsyms < 5_000_000:
+        for i in range(nsyms):
+            rec = symoff + i * 16
+            if rec + 16 > len(data):
+                break
+            n_strx, n_type, n_sect, _n_desc, n_value = struct.unpack_from(
+                "<IBBHQ", data, rec
+            )
+            name = ""
+            if 0 < n_strx < strsize:
+                start = stroff + n_strx
+                end = data.find(b"\0", start, min(start + 512, stroff + strsize))
+                if end > start:
+                    name = data[start:end].decode("ascii", "replace")
+            symbols.append((name, n_type, n_sect, n_value))
+    indirect = b""
+    if nindirect and indirectoff and nindirect < 2_000_000:
+        nbytes = nindirect * 4
+        if indirectoff + nbytes <= len(data):
+            indirect = data[indirectoff : indirectoff + nbytes]
+    return _MachO(data, cputype, sects, symbols, indirect, nindirect)
+
+
+def _macho_vm_to_file(mo: _MachO, vm: int) -> int | None:
+    for s in mo.sects:
+        if s.addr <= vm < s.addr + s.size:
+            return s.off + (vm - s.addr)
+    return None
+
+
+def _macho_getenv_targets(mo: _MachO) -> dict[int, str]:
+    """VA → kind for getenv-shaped stubs and defined symbols."""
+    targets: dict[int, str] = {}
+    for s in mo.sects:
+        stype = s.flags & 0xFF
+        if stype != S_SYMBOL_STUBS and "stub" not in s.sn:
+            continue
+        stubsize = s.res2 or (16 if "auth" in s.sn else 12)
+        if stubsize <= 0 or s.size <= 0:
+            continue
+        n = s.size // stubsize
+        if n > 100_000:
+            continue
+        for j in range(n):
+            idx_off = (s.res1 + j) * 4
+            if idx_off + 4 > len(mo.indirect):
+                break
+            idx = struct.unpack_from("<I", mo.indirect, idx_off)[0]
+            if idx & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS):
+                continue
+            if idx >= len(mo.symbols):
+                continue
+            kind = getenv_sym_kind(mo.symbols[idx][0])
+            if kind:
+                targets[s.addr + j * stubsize] = kind
+    for name, _t, sect, val in mo.symbols:
+        if sect == 0:
+            continue
+        kind = getenv_sym_kind(name)
+        if kind:
+            targets[val] = kind
+    return targets
+
+
+def _read_ascii(data: bytes, file_off: int, n: int) -> str | None:
+    if file_off < 0 or n <= 0 or n > 80:
+        return None
+    if file_off + n > len(data):
+        return None
+    chunk = data[file_off : file_off + n]
+    if all(32 <= b < 127 for b in chunk):
+        return chunk.decode("ascii")
+    return None
+
+
+def _read_cstr(data: bytes, file_off: int, limit: int = 80) -> str | None:
+    if file_off < 0 or file_off >= len(data):
+        return None
+    end = data.find(b"\0", file_off, min(file_off + limit, len(data)))
+    if end < 0:
+        return None
+    return _read_ascii(data, file_off, end - file_off)
+
+
+def _arm64_adrp(word: int, pc: int) -> tuple[int, int] | None:
+    if (word & 0x9F000000) != 0x90000000:
+        return None
+    rd = word & 31
+    immlo = (word >> 29) & 3
+    immhi = (word >> 5) & 0x7FFFF
+    imm = (immhi << 2) | immlo
+    if imm & (1 << 20):
+        imm -= 1 << 21
+    return rd, (pc & ~0xFFF) + (imm << 12)
+
+
+def _arm64_adr(word: int, pc: int) -> tuple[int, int] | None:
+    if (word & 0x9F000000) != 0x10000000:
+        return None
+    rd = word & 31
+    immlo = (word >> 29) & 3
+    immhi = (word >> 5) & 0x7FFFF
+    imm = (immhi << 2) | immlo
+    if imm & (1 << 20):
+        imm -= 1 << 21
+    return rd, pc + imm
+
+
+def _arm64_add_imm(word: int) -> tuple[int, int, int] | None:
+    if (word & 0xFF800000) != 0x91000000:
+        return None
+    sh = (word >> 22) & 1
+    imm12 = (word >> 10) & 0xFFF
+    rn = (word >> 5) & 31
+    rd = word & 31
+    return rd, rn, imm12 << (12 if sh else 0)
+
+
+def _arm64_movz(word: int) -> tuple[int, int] | None:
+    if (word & 0x7F800000) != 0x52800000:
+        return None
+    rd = word & 31
+    imm16 = (word >> 5) & 0xFFFF
+    hw = (word >> 21) & 3
+    return rd, imm16 << (hw * 16)
+
+
+def _arm64_movk(word: int) -> tuple[int, int, int] | None:
+    if (word & 0x7F800000) != 0x72800000:
+        return None
+    rd = word & 31
+    imm16 = (word >> 5) & 0xFFFF
+    hw = (word >> 21) & 3
+    return rd, imm16, hw
+
+
+def _arm64_mov_reg(word: int) -> tuple[int, int] | None:
+    # ORR Xd, XZR, Xm  / ORR Wd, WZR, Wm  (unshifted)
+    if (word & 0x7FE0FFE0) != 0x2A0003E0:
+        return None
+    if ((word >> 10) & 0x3F) != 0:
+        return None
+    if ((word >> 22) & 3) != 0:
+        return None
+    return word & 31, (word >> 16) & 31
+
+
+def _arm64_bl_target(word: int, pc: int) -> int | None:
+    op = word >> 26
+    if op not in (0b100101, 0b000101):  # BL, B (tail)
+        return None
+    imm26 = word & 0x3FFFFFF
+    if imm26 & (1 << 25):
+        imm26 -= 1 << 26
+    return pc + (imm26 << 2)
+
+
+def _arm64_ret(word: int) -> bool:
+    return (word & 0xFFFFFC1F) == 0xD65F0000
+
+
+def _arm64_is_b_cond(word: int) -> bool:
+    return (word & 0xFF000010) == 0x54000000
+
+
+def _arm64_is_cbz_family(word: int) -> bool:
+    op = word & 0x7E000000
+    return op in (0x34000000, 0x35000000, 0x36000000, 0x37000000)
+
+
+def _arm64_is_any_branch(word: int) -> bool:
+    op = word >> 26
+    if op in (0b000101, 0b100101):
+        return True
+    return _arm64_is_b_cond(word) or _arm64_is_cbz_family(word)
+
+
+def _arm64_ldr_rd(word: int) -> int | None:
+    """Register written by a common LDR form, else None."""
+    if (word & 0xFFC00000) in (0xF9400000, 0xB9400000, 0x39400000, 0x79400000):
+        return word & 31
+    if (word & 0xFF000000) in (0x58000000, 0x18000000, 0x98000000):
+        return word & 31
+    return None
+
+
+def _arm64_mem_uoff64(word: int, *, load: bool) -> tuple[int, int, int] | None:
+    """LDR/STR Xt, [Xn, #imm12*8] → (rt, rn, byte_off)."""
+    want = 0xF9400000 if load else 0xF9000000
+    if (word & 0xFFC00000) != want:
+        return None
+    rt = word & 31
+    rn = (word >> 5) & 31
+    imm12 = (word >> 10) & 0xFFF
+    return rt, rn, imm12 * 8
+
+
+def _arm64_mem_unscaled64(word: int, *, load: bool) -> tuple[int, int, int] | None:
+    """LDUR/STUR Xt, [Xn, #simm9] → (rt, rn, byte_off)."""
+    want = 0xF8400000 if load else 0xF8000000
+    if (word & 0xFFE00C00) != want:
+        return None
+    rt = word & 31
+    rn = (word >> 5) & 31
+    imm9 = (word >> 12) & 0x1FF
+    if imm9 & 0x100:
+        imm9 -= 0x200
+    return rt, rn, imm9
+
+
+def _arm64_is_stack_base(rn: int) -> bool:
+    return rn in (29, 31)  # fp / sp
+
+
+def _arm64_recover_regs(blob: bytes, taddr: int, call_off: int, window: int = 48) -> dict[int, int]:
+    regs: dict[int, int] = {}
+    start = max(0, call_off - window * 4)
+    for off in range(start, call_off, 4):
+        word = struct.unpack_from("<I", blob, off)[0]
+        pc = taddr + off
+        ad = _arm64_adrp(word, pc) or _arm64_adr(word, pc)
+        if ad:
+            regs[ad[0]] = ad[1]
+            continue
+        add = _arm64_add_imm(word)
+        if add:
+            rd, rn, imm = add
+            if rn in regs:
+                regs[rd] = regs[rn] + imm
+            continue
+        mv = _arm64_mov_reg(word)
+        if mv:
+            rd, rm = mv
+            if rm in regs:
+                regs[rd] = regs[rm]
+            continue
+        mz = _arm64_movz(word)
+        if mz:
+            regs[mz[0]] = mz[1]
+            continue
+        mk = _arm64_movk(word)
+        if mk:
+            rd, imm16, hw = mk
+            if rd in regs:
+                shift = hw * 16
+                mask = 0xFFFF << shift
+                regs[rd] = (regs[rd] & ~mask) | (imm16 << shift)
+    return regs
+
+
+def _macho_text_funcs(mo: _MachO, text: _Sect) -> list[tuple[int, str]]:
+    lo, hi = text.addr, text.addr + text.size
+    funcs = [(val, name) for name, _t, _sect, val in mo.symbols if name and lo <= val < hi]
+    funcs.sort()
+    return funcs
+
+
+def _containing_func(funcs: list[tuple[int, str]], va: int) -> tuple[int, str] | None:
+    lo, hi = 0, len(funcs)
+    best: tuple[int, str] | None = None
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if funcs[mid][0] <= va:
+            best = funcs[mid]
+            lo = mid + 1
+        else:
+            hi = mid
+    return best
+
+
+def _arm64_arg_to_x0(
+    blob: bytes, taddr: int, fn_off: int, call_off: int
+) -> tuple[int, int] | None:
+    """If x0 at call_off is ARG[k] plus a small constant, return (k, offset).
+
+    Walks backward from the getenv site. A `ret` / `b elsewhere` block is
+    skipped so `_Py_GETENV`'s early `mov x0, #0; ret` does not kill ARG0.
+    One hop only: we do not follow a wrapper of a wrapper.
+    """
+    if call_off <= fn_off or (call_off - fn_off) > 2048:
+        return None
+    need: int | None = 0  # register we are tracing, or None if tracing a slot
+    slot: tuple[int, int] | None = None  # (rn, imm) of a spilled arg
+    offset = 0
+    skipping = False
+    for off in range(call_off - 4, fn_off - 4, -4):
+        if off < 0:
+            break
+        word = struct.unpack_from("<I", blob, off)[0]
+        pc = taddr + off
+        if skipping:
+            if _arm64_is_any_branch(word):
+                skipping = False
+            continue
+        if _arm64_ret(word):
+            skipping = True
+            continue
+        b_tgt = _arm64_bl_target(word, pc)
+        op = word >> 26
+        if op == 0b000101 and b_tgt is not None:
+            # Unconditional B to somewhere that is not this getenv site.
+            if b_tgt != taddr + call_off:
+                skipping = True
+                continue
+        if need is not None:
+            mv = _arm64_mov_reg(word)
+            if mv:
+                rd, rm = mv
+                if rd == need:
+                    need = rm
+                continue
+            add = _arm64_add_imm(word)
+            if add:
+                rd, rn, imm = add
+                if rd == need:
+                    need = rn
+                    offset += imm
+                    if offset > 32:
+                        return None
+                continue
+            ad = _arm64_adrp(word, pc) or _arm64_adr(word, pc)
+            if ad and ad[0] == need:
+                return None
+            mz = _arm64_movz(word)
+            if mz and mz[0] == need:
+                return None
+            load = _arm64_mem_uoff64(word, load=True) or _arm64_mem_unscaled64(
+                word, load=True
+            )
+            if load:
+                rt, rn, imm = load
+                if rt == need:
+                    if _arm64_is_stack_base(rn):
+                        slot = (rn, imm)
+                        need = None
+                    else:
+                        return None
+                continue
+            if _arm64_ldr_rd(word) == need:
+                return None
+            continue
+        # Tracing a stack slot back to the store that filled it.
+        store = _arm64_mem_uoff64(word, load=False) or _arm64_mem_unscaled64(
+            word, load=False
+        )
+        if store and slot is not None:
+            rt, rn, imm = store
+            if (rn, imm) == slot:
+                need = rt
+                slot = None
+            continue
+    if need is not None and 0 <= need <= 7:
+        return need, offset
+    return None
+
+
+def xref_macho_arm64(mo: _MachO, targets: dict[int, str]) -> list[tuple[str, str, int]]:
+    text = next((s for s in mo.sects if s.sn == "__text"), None)
+    if text is None or text.size <= 0:
+        return []
+    if text.off + text.size > len(mo.data):
+        return []
+    blob = mo.data[text.off : text.off + text.size]
+    taddr = text.addr
+    funcs = _macho_text_funcs(mo, text)
+    bls: list[tuple[int, int]] = []
+    for i in range(0, len(blob) - 3, 4):
+        word = struct.unpack_from("<I", blob, i)[0]
+        tgt = _arm64_bl_target(word, taddr + i)
+        if tgt is not None:
+            bls.append((i, tgt))
+
+    callees: dict[int, _Callee] = {
+        va: _Callee(how=kind) for va, kind in targets.items()
+    }
+    hits: list[tuple[str, str, int]] = []
+
+    def recover(off: int, callee: _Callee) -> str | None:
+        fn = _containing_func(funcs, taddr + off)
+        window = 48
+        if fn is not None:
+            max_back = (off - (fn[0] - taddr)) // 4
+            window = max(1, min(48, max_back))
+        regs = _arm64_recover_regs(blob, taddr, off, window=window)
+        return _name_from_regs(
+            mo.data, mo, regs, callee.how, arg=callee.arg, offset=callee.offset
+        )
+
+    for off, tgt in bls:
+        callee = callees.get(tgt)
+        if callee is None or callee.how == "wrapper":
+            continue
+        name = recover(off, callee)
+        if name:
+            hits.append((name, callee.how, taddr + off))
+        fn = _containing_func(funcs, taddr + off)
+        if fn is None:
+            continue
+        fn_va, fn_name = fn
+        if fn_va in callees:
+            continue
+        fn_off = fn_va - taddr
+        if fn_off < 0 or fn_off >= off:
+            continue
+        got = _arm64_arg_to_x0(blob, taddr, fn_off, off)
+        if got is None:
+            continue
+        arg, offset = got
+        callees[fn_va] = _Callee("wrapper", arg, offset, fn_name)
+
+    for off, tgt in bls:
+        callee = callees.get(tgt)
+        if callee is None or callee.how != "wrapper":
+            continue
+        name = recover(off, callee)
+        if name:
+            how = callee.symbol or "wrapper"
+            hits.append((name, how, taddr + off))
+    return hits
+
+
+def macho_wrappers_arm64(
+    mo: _MachO, targets: dict[int, str]
+) -> list[tuple[int, int, int, str]]:
+    """Return (func_va, arg, offset, symbol) for one-hop getenv wrappers."""
+    text = next((s for s in mo.sects if s.sn == "__text"), None)
+    if text is None or text.size <= 0 or text.off + text.size > len(mo.data):
+        return []
+    blob = mo.data[text.off : text.off + text.size]
+    taddr = text.addr
+    funcs = _macho_text_funcs(mo, text)
+    found: dict[int, tuple[int, int, int, str]] = {}
+    for i in range(0, len(blob) - 3, 4):
+        word = struct.unpack_from("<I", blob, i)[0]
+        tgt = _arm64_bl_target(word, taddr + i)
+        if tgt is None or tgt not in targets:
+            continue
+        fn = _containing_func(funcs, taddr + i)
+        if fn is None or fn[0] in targets or fn[0] in found:
+            continue
+        fn_va, fn_name = fn
+        fn_off = fn_va - taddr
+        if fn_off < 0 or fn_off >= i:
+            continue
+        got = _arm64_arg_to_x0(blob, taddr, fn_off, i)
+        if got is None:
+            continue
+        arg, offset = got
+        found[fn_va] = (fn_va, arg, offset, fn_name)
+    return [found[k] for k in sorted(found)]
+
+
+def _name_from_regs(
+    data: bytes,
+    mo: _MachO,
+    regs: dict[int, int],
+    kind: str,
+    *,
+    arg: int = 0,
+    offset: int = 0,
+) -> str | None:
+    ptr = regs.get(arg)
+    if ptr is None:
+        return None
+    ptr += offset
+    foff = _macho_vm_to_file(mo, ptr)
+    if foff is None:
+        return None
+    if kind.startswith("env::var"):
+        ln = regs.get(1)
+        if ln is not None and 1 <= ln <= 80:
+            got = _read_ascii(data, foff, ln)
+            if got:
+                return got
+        # packed rust literals are not NUL-terminated; do not walk on
+        return None
+    return _read_cstr(data, foff)
+
+
+def _x64_arg_to_rdi(blob: bytes, fn_off: int, call_off: int) -> tuple[int, int] | None:
+    """If rdi at call is ARG[k]+offset, return (k, offset). Linear, few patterns."""
+    if call_off <= fn_off or (call_off - fn_off) > 2048:
+        return None
+    # rdi starts as ARG0. Track which arg register currently lives in rdi.
+    src = 0
+    offset = 0
+    killed = False
+    i = fn_off
+    while i < call_off:
+        # lea rdi, [rip+disp] — a literal, not an argument
+        if (
+            i + 7 <= call_off
+            and blob[i] == 0x48
+            and blob[i + 1] == 0x8D
+            and (blob[i + 2] & 0xC7) == 0x05
+            and ((blob[i + 2] >> 3) & 7) == 7
+        ):
+            killed = True
+            i += 7
+            continue
+        # lea rdi, [r64+disp8]  48 8d 7x disp8  (mod=01, reg=rdi=111)
+        if (
+            i + 4 <= call_off
+            and blob[i] == 0x48
+            and blob[i + 1] == 0x8D
+            and (blob[i + 2] & 0xF8) == 0x78
+        ):
+            rm = blob[i + 2] & 7
+            disp = struct.unpack_from("<b", blob, i + 3)[0]
+            rm_to_arg = {7: 0, 6: 1, 2: 2, 1: 3}  # rdi,rsi,rdx,rcx
+            if rm in rm_to_arg and 0 <= disp <= 32:
+                src = rm_to_arg[rm]
+                offset = disp
+                killed = False
+            else:
+                killed = True
+            i += 4
+            continue
+        # mov rdi, r64 : 48 89 /r  (mod=11, reg=src, rm=rdi=111)
+        if i + 3 <= call_off and blob[i] == 0x48 and blob[i + 1] == 0x89:
+            modrm = blob[i + 2]
+            if (modrm & 0xC7) == 0xC7:
+                src_reg = (modrm >> 3) & 7
+                reg_to_arg = {7: 0, 6: 1, 2: 2, 1: 3}
+                if src_reg in reg_to_arg:
+                    src = reg_to_arg[src_reg]
+                    offset = 0
+                    killed = False
+                else:
+                    killed = True
+                i += 3
+                continue
+        i += 1
+    if killed:
+        return None
+    return src, offset
+
+
+def xref_macho_x64(mo: _MachO, targets: dict[int, str]) -> list[tuple[str, str, int]]:
+    text = next((s for s in mo.sects if s.sn == "__text"), None)
+    if text is None or text.size <= 0 or text.off + text.size > len(mo.data):
+        return []
+    blob = mo.data[text.off : text.off + text.size]
+    taddr = text.addr
+    funcs = _macho_text_funcs(mo, text)
+    calls: list[tuple[int, int]] = []
+    n = len(blob)
+    i = 0
+    while i < n - 4:
+        if blob[i] != 0xE8:
+            i += 1
+            continue
+        rel = struct.unpack_from("<i", blob, i + 1)[0]
+        tgt = taddr + i + 5 + rel
+        calls.append((i, tgt))
+        i += 5
+
+    callees: dict[int, _Callee] = {va: _Callee(how=kind) for va, kind in targets.items()}
+    hits: list[tuple[str, str, int]] = []
+
+    def recover(off: int, callee: _Callee) -> str | None:
+        return _x64_recover_name(
+            mo, blob, taddr, off, callee.how, arg=callee.arg, offset=callee.offset
+        )
+
+    for off, tgt in calls:
+        callee = callees.get(tgt)
+        if callee is None or callee.how == "wrapper":
+            continue
+        name = recover(off, callee)
+        if name:
+            hits.append((name, callee.how, taddr + off))
+        fn = _containing_func(funcs, taddr + off)
+        if fn is None or fn[0] in callees:
+            continue
+        fn_va, fn_name = fn
+        fn_off = fn_va - taddr
+        if fn_off < 0 or fn_off >= off:
+            continue
+        got = _x64_arg_to_rdi(blob, fn_off, off)
+        if got is None:
+            continue
+        arg, offset = got
+        callees[fn_va] = _Callee("wrapper", arg, offset, fn_name)
+
+    for off, tgt in calls:
+        callee = callees.get(tgt)
+        if callee is None or callee.how != "wrapper":
+            continue
+        name = recover(off, callee)
+        if name:
+            how = callee.symbol or "wrapper"
+            hits.append((name, how, taddr + off))
+    return hits
+
+
+def macho_wrappers_x64(
+    mo: _MachO, targets: dict[int, str]
+) -> list[tuple[int, int, int, str]]:
+    text = next((s for s in mo.sects if s.sn == "__text"), None)
+    if text is None or text.size <= 0 or text.off + text.size > len(mo.data):
+        return []
+    blob = mo.data[text.off : text.off + text.size]
+    taddr = text.addr
+    funcs = _macho_text_funcs(mo, text)
+    found: dict[int, tuple[int, int, int, str]] = {}
+    n = len(blob)
+    i = 0
+    while i < n - 4:
+        if blob[i] != 0xE8:
+            i += 1
+            continue
+        rel = struct.unpack_from("<i", blob, i + 1)[0]
+        tgt = taddr + i + 5 + rel
+        if tgt in targets:
+            fn = _containing_func(funcs, taddr + i)
+            if fn is not None and fn[0] not in targets and fn[0] not in found:
+                fn_va, fn_name = fn
+                fn_off = fn_va - taddr
+                if 0 <= fn_off < i:
+                    got = _x64_arg_to_rdi(blob, fn_off, i)
+                    if got is not None:
+                        arg, offset = got
+                        found[fn_va] = (fn_va, arg, offset, fn_name)
+        i += 5
+    return [found[k] for k in sorted(found)]
+
+
+def _x64_recover_name(
+    mo: _MachO,
+    blob: bytes,
+    taddr: int,
+    call_off: int,
+    kind: str,
+    *,
+    arg: int = 0,
+    offset: int = 0,
+) -> str | None:
+    """Look back ~64 bytes for `lea r64, [rip+disp]` into the wrapper's arg reg."""
+    # arg 0=rdi, 1=rsi, 2=rdx, 3=rcx
+    want = {0: 7, 1: 6, 2: 2, 3: 1}.get(arg, 7)
+    start = max(0, call_off - 64)
+    ptr = None
+    rsi = None
+    window = blob[start:call_off]
+    j = 0
+    while j < len(window) - 6:
+        # REX.W lea r/m: 48 8d …
+        if window[j] == 0x48 and window[j + 1] == 0x8D:
+            modrm = window[j + 2]
+            # RIP-relative: mod=00, rm=101
+            if (modrm & 0xC7) == 0x05 and j + 7 <= len(window):
+                disp = struct.unpack_from("<i", window, j + 3)[0]
+                insn_va = taddr + start + j
+                val = insn_va + 7 + disp
+                reg = (modrm >> 3) & 7
+                if reg == want:
+                    ptr = val
+                elif reg == 6:
+                    rsi = val
+                j += 7
+                continue
+        # mov esi, imm32 :  be imm32
+        if window[j] == 0xBE and j + 5 <= len(window):
+            rsi = struct.unpack_from("<I", window, j + 1)[0]
+            j += 5
+            continue
+        j += 1
+    if ptr is None:
+        return None
+    ptr += offset
+    foff = _macho_vm_to_file(mo, ptr)
+    if foff is None:
+        return None
+    if kind.startswith("env::var"):
+        if isinstance(rsi, int) and 1 <= rsi <= 80:
+            return _read_ascii(mo.data, foff, rsi)
+        return None
+    return _read_cstr(mo.data, foff)
+
+
+def xref_macho(data: bytes) -> list[tuple[str, str, int]]:
+    mo = parse_macho(data)
+    if mo is None:
+        return []
+    targets = _macho_getenv_targets(mo)
+    if not targets:
+        return []
+    if mo.cputype == CPU_TYPE_ARM64:
+        return xref_macho_arm64(mo, targets)
+    if mo.cputype == CPU_TYPE_X86_64:
+        return xref_macho_x64(mo, targets)
+    return []
+
+
+def macho_wrappers(data: bytes) -> list[tuple[int, int, int, str]]:
+    mo = parse_macho(data)
+    if mo is None:
+        return []
+    targets = _macho_getenv_targets(mo)
+    if not targets:
+        return []
+    if mo.cputype == CPU_TYPE_ARM64:
+        return macho_wrappers_arm64(mo, targets)
+    if mo.cputype == CPU_TYPE_X86_64:
+        return macho_wrappers_x64(mo, targets)
+    return []
+
+
+# ELF (ET_DYN / ET_EXEC), little-endian 64-bit.
+
+SHT_SYMTAB = 2
+SHT_DYNSYM = 11
+SHT_STRTAB = 3
+SHT_RELA = 4
+STT_FUNC = 2
+R_X86_64_JUMP_SLOT = 7
+R_AARCH64_JUMP_SLOT = 1026
+
+
+def parse_elf64_le(data: bytes) -> tuple[int, list[tuple], list[tuple], int] | None:
+    """e_machine, sections[(name,type,addr,off,size,link,entsize)],
+    no full struct — returns (machine, shdrs, names via shstrndx)."""
+    if len(data) < 64 or data[:4] != ELF_MAGIC:
+        return None
+    if data[4] != 2 or data[5] != 1:  # 64-bit LE
+        return None
+    e_machine = struct.unpack_from("<H", data, 18)[0]
+    e_shoff = struct.unpack_from("<Q", data, 40)[0]
+    e_shentsize = struct.unpack_from("<H", data, 58)[0]
+    e_shnum = struct.unpack_from("<H", data, 60)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+    if e_shentsize < 64 or e_shnum == 0 or e_shnum > 10_000:
+        return None
+    if e_shoff + e_shnum * e_shentsize > len(data):
+        return None
+    shdrs = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        sh_name, sh_type = struct.unpack_from("<II", data, o)
+        sh_addr, sh_off, sh_size = struct.unpack_from("<QQQ", data, o + 16)
+        sh_link = struct.unpack_from("<I", data, o + 40)[0]
+        sh_entsize = struct.unpack_from("<Q", data, o + 56)[0]
+        shdrs.append((sh_name, sh_type, sh_addr, sh_off, sh_size, sh_link, sh_entsize))
+    if e_shstrndx >= len(shdrs):
+        return None
+    _, _, _, stroff, strsz, _, _ = shdrs[e_shstrndx]
+    return e_machine, shdrs, (stroff, strsz), e_shstrndx
+
+
+def _elf_sec_name(data: bytes, stroff: int, strsz: int, name_off: int) -> str:
+    start = stroff + name_off
+    end = data.find(b"\0", start, stroff + strsz)
+    if end < 0:
+        return ""
+    return data[start:end].decode("ascii", "replace")
+
+
+def xref_elf(data: bytes) -> list[tuple[str, str, int]]:
+    parsed = parse_elf64_le(data)
+    if parsed is None:
+        return []
+    e_machine, shdrs, (stroff, strsz), _ = parsed
+    named = []
+    for i, sh in enumerate(shdrs):
+        named.append((_elf_sec_name(data, stroff, strsz, sh[0]), i, sh))
+
+    def sec(name: str):
+        for n, i, sh in named:
+            if n == name:
+                return sh
+        return None
+
+    dynsym = next((sh for n, i, sh in named if sh[1] == SHT_DYNSYM), None)
+    if dynsym is None:
+        return []
+    _n, stype, saddr, soff, ssize, slink, entsize = dynsym
+    if slink >= len(shdrs) or entsize not in (0, 24):
+        return []
+    entsize = 24
+    strtab = shdrs[slink]
+    _, _, _, str_off, str_sz, _, _ = strtab
+    nsym = ssize // entsize
+    if nsym > 1_000_000:
+        return []
+    getenv_syms: dict[int, str] = {}  # dynsym index → kind
+    getenv_va: dict[int, str] = {}
+    for i in range(nsym):
+        o = soff + i * entsize
+        st_name, st_info, _st_other, _st_shndx, st_value, _st_size = struct.unpack_from(
+            "<IBBHQQ", data, o
+        )
+        start = str_off + st_name
+        if start >= str_off + str_sz:
+            continue
+        end = data.find(b"\0", start, min(start + 256, str_off + str_sz))
+        if end < 0:
+            continue
+        name = data[start:end].decode("ascii", "replace")
+        kind = getenv_sym_kind(name) or getenv_sym_kind("_" + name)
+        if kind:
+            getenv_syms[i] = kind
+            if st_value:
+                getenv_va[st_value] = kind
+
+    # PLT via RELA
+    plt_targets: dict[int, str] = {}
+    for n, i, sh in named:
+        if sh[1] != SHT_RELA:
+            continue
+        _n, _t, _a, roff, rsize, rlink, rentsz = sh
+        if rentsz not in (0, 24):
+            continue
+        rentsz = 24
+        nrel = rsize // rentsz
+        if nrel > 500_000:
+            continue
+        for j in range(nrel):
+            o = roff + j * rentsz
+            r_offset, r_info, _addend = struct.unpack_from("<QQq", data, o)
+            r_type = r_info & 0xFFFFFFFF
+            r_sym = r_info >> 32
+            if r_sym in getenv_syms and r_type in (
+                R_X86_64_JUMP_SLOT,
+                R_AARCH64_JUMP_SLOT,
+                0,
+            ):
+                plt_targets[r_offset] = getenv_syms[r_sym]
+            # Some linkers put JUMP_SLOT against .got.plt; call sites hit .plt
+    # Map .plt entries: each 16-byte slot after the header often corresponds
+    # to reloc order. Also accept direct calls to defined getenv_va.
+
+    plt = sec(".plt") or sec(".plt.got") or sec(".plt.sec")
+    text = sec(".text")
+    if text is None:
+        return []
+    _, _, taddr, toff, tsize, _, _ = text
+    if toff + tsize > len(data) or tsize <= 0:
+        return []
+    blob = data[toff : toff + tsize]
+    targets = dict(getenv_va)
+    # Heuristic: .rela.plt order matches .plt slots of 16 bytes, skip first.
+    rela_plt = sec(".rela.plt")
+    if plt is not None and rela_plt is not None:
+        _n, _t, plt_addr, plt_off, plt_size, _, _ = plt
+        _n, _t, _a, roff, rsize, _l, rentsz = rela_plt
+        rentsz = 24 if rentsz in (0, 24) else rentsz
+        nrel = rsize // rentsz if rentsz else 0
+        slot = 16
+        # skip PLT0 (16 or 32 bytes)
+        for hdr in (32, 16):
+            if plt_size >= hdr + nrel * slot:
+                for j in range(nrel):
+                    o = roff + j * rentsz
+                    _r_offset, r_info, _add = struct.unpack_from("<QQq", data, o)
+                    r_sym = r_info >> 32
+                    if r_sym in getenv_syms:
+                        targets[plt_addr + hdr + j * slot] = getenv_syms[r_sym]
+                break
+
+    hits: list[tuple[str, str, int]] = []
+    if e_machine == 183:  # EM_AARCH64
+
+        def elf_vm_to_file(vm: int) -> int | None:
+            for _n, i, sh in named:
+                _nm, _t, addr, off, size, _l, _e = sh
+                if addr and size and addr <= vm < addr + size:
+                    return off + (vm - addr)
+            return None
+
+        funcs: list[tuple[int, str]] = []
+        for _n, _i, sh in named:
+            if sh[1] not in (SHT_SYMTAB, SHT_DYNSYM):
+                continue
+            _nm, _t, _a, soff2, ssize2, slink2, entsz2 = sh
+            if slink2 >= len(shdrs):
+                continue
+            entsz2 = 24 if entsz2 in (0, 24) else entsz2
+            if entsz2 != 24 or ssize2 // entsz2 > 1_000_000:
+                continue
+            strtab2 = shdrs[slink2]
+            _, _, _, str_off2, str_sz2, _, _ = strtab2
+            for si in range(ssize2 // entsz2):
+                o = soff2 + si * entsz2
+                st_name, st_info, _o, _shndx, st_value, _sz = struct.unpack_from(
+                    "<IBBHQQ", data, o
+                )
+                if (st_info & 0xF) != STT_FUNC or not st_value:
+                    continue
+                if not (taddr <= st_value < taddr + tsize):
+                    continue
+                s0 = str_off2 + st_name
+                s1 = data.find(b"\0", s0, min(s0 + 256, str_off2 + str_sz2))
+                nm = data[s0:s1].decode("ascii", "replace") if s1 > s0 else ""
+                funcs.append((st_value, nm))
+        funcs.sort()
+
+        callees: dict[int, _Callee] = {
+            va: _Callee(how=kind) for va, kind in targets.items()
+        }
+        bls: list[tuple[int, int]] = []
+        for i in range(0, len(blob) - 3, 4):
+            word = struct.unpack_from("<I", blob, i)[0]
+            tgt = _arm64_bl_target(word, taddr + i)
+            if tgt is not None:
+                bls.append((i, tgt))
+
+        def recover_elf(off: int, callee: _Callee) -> str | None:
+            regs = _arm64_recover_regs(blob, taddr, off, window=48)
+            ptr = regs.get(callee.arg)
+            if ptr is None:
+                return None
+            ptr += callee.offset
+            foff = elf_vm_to_file(ptr)
+            if foff is None:
+                return None
+            if callee.how.startswith("env::var"):
+                ln = regs.get(1)
+                return _read_ascii(data, foff, ln) if ln else None
+            return _read_cstr(data, foff)
+
+        for off, tgt in bls:
+            callee = callees.get(tgt)
+            if callee is None or callee.how == "wrapper":
+                continue
+            name = recover_elf(off, callee)
+            if name:
+                hits.append((name, callee.how, taddr + off))
+            fn = _containing_func(funcs, taddr + off)
+            if fn is None or fn[0] in callees:
+                continue
+            fn_va, fn_name = fn
+            fn_off = fn_va - taddr
+            if fn_off < 0 or fn_off >= off:
+                continue
+            got = _arm64_arg_to_x0(blob, taddr, fn_off, off)
+            if got is None:
+                continue
+            arg, offset = got
+            callees[fn_va] = _Callee("wrapper", arg, offset, fn_name)
+
+        for off, tgt in bls:
+            callee = callees.get(tgt)
+            if callee is None or callee.how != "wrapper":
+                continue
+            name = recover_elf(off, callee)
+            if name:
+                how = callee.symbol or "wrapper"
+                hits.append((name, how, taddr + off))
+        return hits
+
+    if e_machine == 62:  # EM_X86_64
+        def elf_vm_to_file(vm: int) -> int | None:
+            for _n, i, sh in named:
+                _nm, _t, addr, off, size, _l, _e = sh
+                if addr and size and addr <= vm < addr + size:
+                    return off + (vm - addr)
+            return None
+
+        n = len(blob)
+        i = 0
+        while i < n - 4:
+            if blob[i] != 0xE8:
+                i += 1
+                continue
+            rel = struct.unpack_from("<i", blob, i + 1)[0]
+            pc = taddr + i
+            tgt = pc + 5 + rel
+            if tgt in targets:
+                kind = targets[tgt]
+                start = max(0, i - 48)
+                window = blob[start:i]
+                rdi = None
+                rsi = None
+                j = 0
+                while j < len(window) - 6:
+                    if window[j] == 0x48 and window[j + 1] == 0x8D:
+                        modrm = window[j + 2]
+                        if (modrm & 0xC7) == 0x05 and j + 7 <= len(window):
+                            disp = struct.unpack_from("<i", window, j + 3)[0]
+                            insn_va = taddr + start + j
+                            val = insn_va + 7 + disp
+                            reg = (modrm >> 3) & 7
+                            if reg == 7:
+                                rdi = val
+                            elif reg == 6:
+                                rsi = val
+                            j += 7
+                            continue
+                    if window[j] == 0xBE and j + 5 <= len(window):
+                        rsi = struct.unpack_from("<I", window, j + 1)[0]
+                        j += 5
+                        continue
+                    j += 1
+                if rdi is not None:
+                    foff = elf_vm_to_file(rdi)
+                    if foff is not None:
+                        if kind.startswith("env::var") and isinstance(rsi, int) and 1 <= rsi <= 80:
+                            name = _read_ascii(data, foff, rsi)
+                        else:
+                            name = _read_cstr(data, foff)
+                        if name:
+                            hits.append((name, kind, pc))
+                i += 5
+                continue
+            i += 1
+        return hits
+    return hits
+
+
+def extract_getenv_xrefs(path: Path, data: bytes) -> list[tuple[str, str, int]]:
+    """Return (name, how, call_va) for getenv-shaped uses in a load image."""
+    if data[:4] in MACH_O_MAGICS:
+        slice_ = macho_native_slice(data)
+        return xref_macho(slice_)
+    if data[:4] == ELF_MAGIC:
+        return xref_elf(data)
+    return []
+
+
+def extract_wrappers(path: Path, data: bytes) -> list[tuple[int, int, int, str]]:
+    """Return (func_va, arg, offset, symbol) for one-hop getenv wrappers."""
+    if data[:4] in MACH_O_MAGICS:
+        return macho_wrappers(macho_native_slice(data))
+    return []
+
+
+def extract_binary(
+    path: Path,
+    needles: Iterable[str] | None = None,
+    *,
+    loose: bool = False,
+) -> list[Need]:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    # Prefer the native slice so xref and the string harvest see one image.
+    data = macho_native_slice(raw) if raw[:4] in MACH_O_MAGICS else raw
+    found: dict[str, Need] = {}
+    prefixes = env_prefixes(needles)
+
+    def add(text: str, detail: str, evidence: str = "string") -> None:
+        n = _need(text, evidence, str(path), detail)
+        if not n:
+            return
+        cur = found.get(text)
+        if cur is None:
+            found[text] = n
+            return
+        hows = cur.hows | n.hows
+        if EVIDENCE_RANK.get(evidence, 0) > EVIDENCE_RANK.get(cur.evidence, 0):
+            ev = evidence
+            src = n.source
+        else:
+            ev = cur.evidence
+            src = cur.source
+        # Prefer a getenv-shaped how as the display detail when mixed.
+        if cur.detail in DOC_HOWS and detail not in DOC_HOWS:
+            show = detail
+        elif detail in DOC_HOWS and cur.detail not in DOC_HOWS:
+            show = cur.detail
+        elif evidence == "call" and cur.evidence != "call":
+            show = detail
+        else:
+            show = cur.detail
+        extra = "+".join(sorted(hows))
+        found[text] = Need(cur.name, ev, src, extra or show, hows)
+
+    for name, how, _va in extract_getenv_xrefs(path, raw):
+        if ENV_NAME_RE.match(name):
+            add(name, how, "call")
+            # One-hop wrapper: keep a generic how so KIND/filter stay stable
+            # even when --calls names the wrapper symbol.
+            if how not in {
+                "getenv",
+                "secure_getenv",
+                "std::getenv",
+                "env::var",
+                "env::var_os",
+                "wrapper",
+            } and "getenv" not in how.lower() and not how.startswith("env::"):
+                add(name, "wrapper", "call")
+
+    for tok, how in extract_doc_env_tokens(data):
+        add(tok, how)
+
+    # Packed / prefix / isolated cstring: --loose search aid, not KIND.
+    if loose:
+        for chunk in data.split(b"\0"):
+            if not (3 <= len(chunk) <= 80):
+                continue
+            if not all(32 <= b < 127 for b in chunk):
+                continue
+            text = chunk.decode("ascii")
+            assign = CSTRING_ASSIGN_RE.match(text.strip())
+            if assign:
+                add(assign.group(1), "cstring-assign")
+            if is_valid_env_token(text) or text in LIBC_ENV or text in BARE_APP:
+                add(text, "cstring")
+            else:
+                for tok in split_packed(text, prefixes):
+                    add(tok, "cstring-packed")
+
+        large = len(data) >= LARGE_IMAGE_BYTES
+        if not large:
+            for run in PRINTABLE_RUN_RE.finditer(data):
+                text = run.group().decode("ascii")
+                if is_valid_env_token(text) or text in LIBC_ENV or text in BARE_APP:
+                    add(text, "rodata")
+                    continue
+                for tok in split_packed(text, prefixes):
+                    add(tok, "packed")
+
+        for tok in peel_prefix_tokens(data, prefixes):
+            add(tok, "prefix")
+
+    if needles:
+        for name in needles:
+            if name_in_blob(data, name):
+                add(name, "needle")
+    return list(found.values())
+
+
+def looks_like_binary_file(path: Path) -> bool:
+    if is_macho_or_elf(path):
+        return True
+    if path.suffix.lower() in {".bin", ".so", ".dylib", ".exe", ".o", ".a", ".dll"}:
+        return True
+    try:
+        chunk = path.read_bytes()[:4096]
+    except OSError:
+        return False
+    return b"\0" in chunk
+
+
+def extract_file(
+    path: Path,
+    needles: Iterable[str] | None = None,
+    *,
+    loose: bool = False,
+) -> list[Need]:
+    suffix = path.suffix.lower()
+    if looks_like_binary_file(path):
+        return extract_binary(path, needles, loose=loose)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if suffix == ".py" or suffix == ".pyi":
+        return extract_python(path, text)
+    if suffix in SHELL_SUFFIX or _looks_like_shell(path, text):
+        return extract_shell(path, text) + extract_by_regex(path, text, "shell-calls")
+    if suffix in SOURCE_SUFFIX:
+        return extract_by_regex(path, text, suffix)
+    # Shebang scripts without a known suffix.
+    if _looks_like_shell(path, text):
+        return extract_shell(path, text)
+    if text.startswith("#!") and "python" in text.splitlines()[0].lower():
+        return extract_python(path, text)
+    if is_probably_binary_blob(path):
+        return extract_binary(path, needles, loose=loose)
+    return extract_by_regex(path, text, "unknown")
+
+
+def _looks_like_shell(path: Path, text: str) -> bool:
+    if path.suffix.lower() in SHELL_SUFFIX:
+        return True
+    if text.startswith("#!"):
+        head = text.splitlines()[0].lower()
+        return any(s in head for s in ("bash", "zsh", "ksh", "sh"))
+    return False
+
+
+def is_probably_binary_blob(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        try:
+            chunk = path.read_bytes()[:4096]
+        except OSError:
+            return False
+        return b"\0" in chunk
+    return False
+
+
+def should_skip_dir(name: str) -> bool:
+    return name in SKIP_DIRS or name.startswith(".")
+
+
+def iter_walk(root: Path) -> Iterator[Path]:
+    if root.is_file():
+        yield root
+        return
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        for fn in filenames:
+            if fn.startswith("."):
+                # Still allow .env* as env files, not as programs.
+                continue
+            yield Path(dirpath) / fn
+
+
+# ---------------------------------------------------------------------------
+# loaded images (otool -L / ldd)
+# ---------------------------------------------------------------------------
+
+
+def is_system_install_name(name: str) -> bool:
+    text = name.replace("\\", "/")
+    for pfx in SYSTEM_IMAGE_PREFIXES:
+        if text.startswith(pfx) or text.startswith("/private" + pfx):
+            return True
+    base = text.rsplit("/", 1)[-1]
+    if base in {"libSystem.B.dylib", "libobjc.A.dylib", "libc++.1.dylib", "linux-vdso.so.1"}:
+        return True
+    return False
+
+
+def is_system_image(path: Path) -> bool:
+    try:
+        text = str(path.resolve())
+    except OSError:
+        text = str(path)
+    return is_system_install_name(text)
+
+
+def parse_otool_L(text: str) -> list[str]:
+    names: list[str] = []
+    for i, raw in enumerate(text.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        if i == 0 and line.endswith(":"):
+            continue
+        m = re.match(r"^(.+?) \((?:compatibility version|architecture)\b", line)
+        if m:
+            names.append(m.group(1).strip())
+            continue
+        if line.startswith(("@", "/")) or ".dylib" in line or ".so" in line:
+            names.append(line.split(" (", 1)[0].strip())
+    return names
+
+
+def parse_otool_rpaths(text: str) -> list[str]:
+    rpaths: list[str] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "LC_RPATH" not in line:
+            continue
+        for j in range(i + 1, min(i + 8, len(lines))):
+            m = re.search(r"\bpath\s+(\S+)", lines[j])
+            if m:
+                rpaths.append(m.group(1))
+                break
+    return rpaths
+
+
+def parse_ldd(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if " => " in line:
+            right = line.split(" => ", 1)[1].strip()
+            path = right.split(" (", 1)[0].strip()
+            if path and path != "not found":
+                out.append(path)
+        elif line.startswith("/") and ".so" in line:
+            out.append(line.split()[0])
+    return out
+
+
+def parse_objdump_dynamic(text: str) -> tuple[list[str], list[str]]:
+    needed: list[str] = []
+    rpaths: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("NEEDED"):
+            needed.append(line.split()[-1])
+        elif line.startswith("RPATH") or line.startswith("RUNPATH"):
+            val = line.split()[-1]
+            rpaths.extend(p for p in val.split(":") if p)
+    return needed, rpaths
+
+
+def _run_tool(argv: list[str], timeout: float = 8.0) -> str:
+    try:
+        return subprocess.check_output(
+            argv, text=True, stderr=subprocess.DEVNULL, timeout=timeout
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
+def macho_install_names(path: Path) -> list[str]:
+    return parse_otool_L(_run_tool(["otool", "-L", str(path)]))
+
+
+def macho_rpaths(path: Path) -> list[str]:
+    return parse_otool_rpaths(_run_tool(["otool", "-l", str(path)]))
+
+
+def expand_load_special(spec: str, *, loader: Path, executable: Path) -> str:
+    loader_dir = str(loader.parent)
+    exec_dir = str(executable.parent)
+    return spec.replace("@loader_path", loader_dir).replace(
+        "@executable_path", exec_dir
+    )
+
+
+def resolve_load_name(
+    name: str,
+    *,
+    loader: Path,
+    executable: Path,
+    rpaths: list[str],
+) -> Path | None:
+    name = name.strip()
+    if not name:
+        return None
+    if name.startswith("@rpath/"):
+        rest = name[len("@rpath/") :]
+        expanded = [expand_load_special(r, loader=loader, executable=executable) for r in rpaths]
+        extra = [
+            str(loader.parent),
+            str(loader.parent / "lib"),
+            str(loader.parent.parent / "lib"),
+            str(executable.parent),
+            str(executable.parent / "lib"),
+            str(executable.parent.parent / "lib"),
+        ]
+        seen_dir: set[str] = set()
+        for rp in expanded + extra:
+            if not rp or rp in seen_dir:
+                continue
+            seen_dir.add(rp)
+            cand = Path(rp) / rest
+            if cand.is_file():
+                return cand.resolve()
+        return None
+
+    expanded = expand_load_special(name, loader=loader, executable=executable)
+    if expanded.startswith("@rpath/"):
+        return resolve_load_name(
+            expanded, loader=loader, executable=executable, rpaths=rpaths
+        )
+    path = Path(expanded)
+    if path.is_file():
+        return path.resolve()
+    rel = loader.parent / name
+    if rel.is_file():
+        return rel.resolve()
+    return None
+
+
+def elf_needed_and_rpaths(path: Path) -> tuple[list[str], list[str]]:
+    ldd = shutil.which("ldd")
+    if ldd:
+        resolved = parse_ldd(_run_tool([ldd, str(path)]))
+        if resolved:
+            return resolved, []
+    dump = shutil.which("objdump") or shutil.which("llvm-objdump")
+    if dump:
+        return parse_objdump_dynamic(_run_tool([dump, "-p", str(path)]))
+    return [], []
+
+
+@dataclass
+class ImageRow:
+    role: str  # main | load | skip | missing
+    path: Path | None
+    raw: str
+    bytes: int = 0
+
+
+def iter_loaded_images(
+    root: Path,
+    *,
+    system: bool = False,
+    closure: bool = False,
+    depth: int = 1,
+) -> list[ImageRow]:
+    """Direct dependents of root (otool -L / ldd). closure=BFS of non-system."""
+    root = root.resolve()
+    rows: list[ImageRow] = []
+    try:
+        size = root.stat().st_size
+    except OSError:
+        size = 0
+    rows.append(ImageRow("main", root, str(root), size))
+    if not is_macho_or_elf(root):
+        return rows
+
+    max_depth = 64 if closure else max(0, depth)
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    seen: set[Path] = {root}
+    listed_raw: set[str] = set()
+
+    while pending:
+        current, d = pending.pop(0)
+        if d >= max_depth:
+            continue
+        rpaths = macho_rpaths(current) if is_macho_or_elf(current) else []
+        names: list[str] = []
+        magic_ok = False
+        try:
+            with current.open("rb") as fh:
+                magic = fh.read(4)
+        except OSError:
+            magic = b""
+        if magic in MACH_O_MAGICS:
+            magic_ok = True
+            names = macho_install_names(current)
+        elif magic == b"\x7fELF":
+            magic_ok = True
+            needed, elf_rpaths = elf_needed_and_rpaths(current)
+            rpaths = list(elf_rpaths) + rpaths
+            names = needed
+        if not magic_ok:
+            continue
+
+        for raw in names:
+            if raw in listed_raw:
+                continue
+            listed_raw.add(raw)
+            resolved = resolve_load_name(
+                raw, loader=current, executable=root, rpaths=rpaths
+            )
+            if resolved is None:
+                role = "skip" if (not system) and is_system_install_name(raw) else "missing"
+                rows.append(ImageRow(role, None, raw, 0))
+                continue
+            if resolved == root or resolved == current:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                sz = resolved.stat().st_size
+            except OSError:
+                sz = 0
+            skip = (not system) and is_system_image(resolved)
+            role = "skip" if skip else "load"
+            rows.append(ImageRow(role, resolved, raw, sz))
+            if not skip:
+                pending.append((resolved, d + 1))
+    return rows
+
+
+def harvest(
+    paths: Iterable[Path],
+    needles: Iterable[str] | None = None,
+    *,
+    walk_images: bool = True,
+    system: bool = False,
+    closure: bool = False,
+    depth: int = 1,
+    loose: bool = False,
+) -> list[Need]:
+    acc: list[Need] = []
+    needle_list = list(needles) if needles else None
+    seen_images: set[Path] = set()
+
+    def add_image_tree(binary: Path) -> None:
+        if not walk_images or not is_macho_or_elf(binary):
+            return
+        for row in iter_loaded_images(
+            binary, system=system, closure=closure, depth=depth
+        ):
+            if row.role != "load" or row.path is None:
+                continue
+            rp = row.path.resolve()
+            if rp in seen_images:
+                continue
+            seen_images.add(rp)
+            acc.extend(extract_file(rp, needle_list, loose=loose))
+
+    for path in paths:
+        path = path.resolve()
+        seen_images.add(path)
+        if path.is_dir():
+            for child in iter_walk(path):
+                if child.suffix.lower() in SOURCE_SUFFIX or is_macho_or_elf(child):
+                    acc.extend(extract_file(child, needle_list, loose=loose))
+                    add_image_tree(child)
+                elif child.is_file() and os.access(child, os.X_OK):
+                    acc.extend(extract_file(child, needle_list, loose=loose))
+                    add_image_tree(child)
+            continue
+        if path.is_file():
+            acc.extend(extract_file(path, needle_list, loose=loose))
+            add_image_tree(path)
+    return merge_needs(acc)
+
+
+def merge_needs(needs: Iterable[Need]) -> list[Need]:
+    best: dict[str, Need] = {}
+    extras: dict[str, list[Need]] = defaultdict(list)
+    for need in needs:
+        cur = best.get(need.name)
+        if cur is None:
+            best[need.name] = need
+            continue
+        hows = cur.hows | need.hows
+        if EVIDENCE_RANK.get(need.evidence, 0) > EVIDENCE_RANK.get(cur.evidence, 0):
+            extras[need.name].append(cur)
+            best[need.name] = Need(
+                need.name, need.evidence, need.source, need.detail, hows
+            )
+        else:
+            best[need.name] = Need(
+                cur.name, cur.evidence, cur.source, cur.detail, hows
+            )
+            if need.source != cur.source:
+                extras[need.name].append(need)
+    # Keep the winning row per name; source notes extra loci in detail if few.
+    out = []
+    for name in sorted(best):
+        win = best[name]
+        others = extras.get(name, [])
+        extra_srcs = sorted({o.source for o in others if o.source != win.source})
+        if extra_srcs:
+            more = extra_srcs[:3]
+            suffix = f" (+{len(extra_srcs)} more)" if extra_srcs[3:] else ""
+            detail = win.detail
+            extra = ",".join(more) + suffix
+            if detail:
+                detail = f"{detail}; also {extra}"
+            else:
+                detail = f"also {extra}"
+            win = Need(win.name, win.evidence, win.source, detail, win.hows)
+        out.append(win)
+    return out
+
+
+def resolve_program(spec: str) -> Path:
+    path = Path(spec)
+    if path.exists():
+        return path
+    found = shutil.which(spec)
+    if found:
+        return Path(found)
+    raise FileNotFoundError(f"not a file, directory, or PATH command: {spec}")
+
+
+def parse_abi_text(text: str, origin: str) -> list[Need]:
+    needs: list[Need] = []
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("name\t"):
+            continue
+        parts = line.split("\t")
+        name = parts[0].strip()
+        idx = 1
+        kind_hint = ""
+        if len(parts) > 1 and parts[1].strip() in {"DUE", "LATENT", "BOTH"}:
+            kind_hint = parts[1].strip()
+            idx = 2
+        evidence = parts[idx].strip() if len(parts) > idx else "call"
+        source = parts[idx + 1].strip() if len(parts) > idx + 1 else origin
+        detail = parts[idx + 2].strip() if len(parts) > idx + 2 else "abi"
+        hows_s = parts[idx + 3].strip() if len(parts) > idx + 3 else ""
+        n = _need(name, evidence or "call", source, detail)
+        if n is None and ENV_NAME_RE.match(name):
+            n = Need(name, evidence or "call", source, detail)
+        if n is None:
+            raise ValueError(f"{origin}:{i}: bad ABI name {name!r}")
+        if hows_s:
+            n.hows = frozenset(h for h in hows_s.split(",") if h)
+        elif kind_hint == "LATENT":
+            n.hows = frozenset({"help", "string"})
+        elif kind_hint == "BOTH":
+            n.hows = frozenset({"getenv", "call", "help", "string"})
+        elif kind_hint == "DUE":
+            n.hows = frozenset({"getenv", "call"})
+        needs.append(n)
+    return merge_needs(needs)
+
+
+# ---------------------------------------------------------------------------
+# join
+# ---------------------------------------------------------------------------
+
+
+def classify(
+    needs: list[Need],
+    left: EnvMap | None,
+    right: EnvMap | None,
+    example: EnvMap | None,
+    *,
+    spare: bool,
+) -> list[Row]:
+    by_name = {n.name: n for n in needs}
+    owed = set(by_name)
+    rows: list[Row] = []
+
+    names = set(owed)
+    if left:
+        names.update(left.values)
+    if right:
+        names.update(right.values)
+    if example:
+        names.update(example.values)
+
+    for name in sorted(names):
+        need = by_name.get(name)
+        lv = left.values.get(name) if left else None
+        rv = right.values.get(name) if right else None
+        ev = example.values.get(name) if example else None
+        in_left = left is not None and name in left.values
+        in_right = right is not None and name in right.values
+        in_ex = example is not None and name in example.values
+
+        if name not in owed:
+            if example is not None and in_ex:
+                rows.append(
+                    Row(
+                        "STALE_EXAMPLE",
+                        name,
+                        lv if in_left else None,
+                        rv if in_right else None,
+                        ev,
+                        "example",
+                        example.origin,
+                        "documented but unread",
+                    )
+                )
+            elif spare and (in_left or in_right):
+                rows.append(
+                    Row(
+                        "SPARE",
+                        name,
+                        lv if in_left else None,
+                        rv if in_right else None,
+                        ev if in_ex else None,
+                        "-",
+                        "-",
+                        "set but unread",
+                    )
+                )
+            continue
+
+        assert need is not None
+        if example is not None and not in_ex:
+            # Still also emit the env-join status; UNDOCUMENTED is extra signal.
+            rows.append(
+                Row(
+                    "UNDOCUMENTED",
+                    name,
+                    lv if in_left else None,
+                    rv if in_right else None,
+                    None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+
+        if left is None and right is None:
+            rows.append(
+                Row(
+                    "DUE",
+                    name,
+                    None,
+                    None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if right is None:
+            status = "DUE" if in_left else "MISSING"
+            rows.append(
+                Row(
+                    status,
+                    name,
+                    lv if in_left else None,
+                    None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if left is None:
+            status = "DUE" if in_right else "MISSING"
+            rows.append(
+                Row(
+                    status,
+                    name,
+                    None,
+                    rv if in_right else None,
+                    ev if in_ex else None,
+                    need.evidence,
+                    need.source,
+                    need.detail,
+                )
+            )
+            continue
+
+        if in_left and in_right:
+            status = "DUE" if lv == rv else "DIFF"
+        elif in_left:
+            status = "UNSET_RIGHT"
+        elif in_right:
+            status = "UNSET_LEFT"
+        else:
+            status = "MISSING"
+        rows.append(
+            Row(
+                status,
+                name,
+                lv if in_left else None,
+                rv if in_right else None,
+                ev if in_ex else None,
+                need.evidence,
+                need.source,
+                need.detail,
+            )
+        )
+
+    # Prefer the env-join row over a duplicate UNDOCUMENTED-only listing
+    # when we already emitted both; keep both — they answer different questions.
+    for row in rows:
+        need = by_name.get(row.name)
+        if need is not None:
+            row.kind = kind_of(need)
+    if left is None and right is None:
+        for row in rows:
+            if row.status == "DUE":
+                row.status = row.kind
+    rows.sort(
+        key=lambda r: (
+            STATUS_ORDER.index(r.status) if r.status in STATUS_ORDER else 99,
+            KIND_ORDER.index(r.kind) if r.kind in KIND_ORDER else 99,
+            r.name,
+        )
+    )
+    return rows
+
+
+def classify_abi(left: list[Need], right: list[Need]) -> list[Row]:
+    lmap = {n.name: n for n in left}
+    rmap = {n.name: n for n in right}
+    rows: list[Row] = []
+    for name in sorted(set(lmap) | set(rmap)):
+        ln = lmap.get(name)
+        rn = rmap.get(name)
+        if ln and rn:
+            status = "BOTH"
+        elif ln:
+            status = "LEFT_ONLY"
+        else:
+            status = "RIGHT_ONLY"
+        need = ln or rn
+        rows.append(
+            Row(
+                status,
+                name,
+                ln.source if ln else None,
+                rn.source if rn else None,
+                None,
+                (ln.evidence if ln else rn.evidence) if (ln or rn) else "-",
+                (ln.source if ln else rn.source) if (ln or rn) else "-",
+                f"{ln.detail if ln else '-'} | {rn.detail if rn else '-'}",
+                kind_of(need) if need else "DUE",
+            )
+        )
+    rows.sort(
+        key=lambda r: (
+            STATUS_ORDER.index(r.status) if r.status in STATUS_ORDER else 99,
+            r.name,
+        )
+    )
+    return rows
+
+
+def is_libc_name(name: str) -> bool:
+    if name in LIBC_ENV:
+        return True
+    if name.startswith("LC_"):
+        return True
+    if name.startswith("LD_") or name.startswith("DYLD_"):
+        return True
+    if name.startswith("XPC_") or name.startswith("SSH_"):
+        return True
+    return False
+
+
+def looks_secret(name: str, value: str | None) -> bool:
+    if SECRET_NAME_RE.search(name):
+        return True
+    if value is None:
+        return False
+    if value.startswith(("sk-", "ghp_", "github_pat_", "xoxb-", "AKIA")):
+        return True
+    return False
+
+
+def display_value(name: str, value: str | None, *, show: bool) -> str:
+    if value is None:
+        return "-"
+    if not show and looks_secret(name, value):
+        return "«redacted»"
+    if len(value) > 72:
+        return value[:69] + "..."
+    return value
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def format_human(
+    rows: list[Row],
+    *,
+    show: bool,
+    have_right: bool,
+    have_example: bool,
+    kind_view: bool = False,
+) -> str:
+    if not rows:
+        return "(no owed names)\n"
+    if kind_view:
+        cols = ["KIND", "NAME", "EVIDENCE", "SOURCE", "HOW"]
+        table: list[list[str]] = [cols]
+        for row in rows:
+            table.append([row.kind, row.name, row.evidence, row.source, row.detail])
+    else:
+        cols = ["STATUS", "KIND", "NAME", "LEFT"]
+        if have_right:
+            cols.append("RIGHT")
+        if have_example:
+            cols.append("EXAMPLE")
+        cols.extend(["EVIDENCE", "SOURCE"])
+        table = [cols]
+        for row in rows:
+            line = [
+                row.status,
+                row.kind,
+                row.name,
+                display_value(row.name, row.left, show=show),
+            ]
+            if have_right:
+                line.append(display_value(row.name, row.right, show=show))
+            if have_example:
+                line.append(display_value(row.name, row.example, show=show))
+            line.extend([row.evidence, row.source])
+            table.append(line)
+    widths = [max(len(r[i]) for r in table) for i in range(len(cols))]
+    out = []
+    for i, rec in enumerate(table):
+        out.append("  ".join(cell.ljust(widths[j]) for j, cell in enumerate(rec)))
+        if i == 0:
+            out.append("  ".join("-" * widths[j] for j in range(len(cols))))
+    return "\n".join(out) + "\n"
+
+
+def format_tsv(rows: list[Row], *, show: bool) -> str:
+    lines = ["status\tkind\tname\tleft\tright\texample\tevidence\tsource\tdetail"]
+    for row in rows:
+        fields = [
+            row.status,
+            row.kind,
+            row.name,
+            display_value(row.name, row.left, show=show),
+            display_value(row.name, row.right, show=show),
+            display_value(row.name, row.example, show=show),
+            row.evidence,
+            row.source,
+            row.detail,
+        ]
+        lines.append("\t".join(fields))
+    return "\n".join(lines) + "\n"
+
+
+def format_json(rows: list[Row], *, show: bool) -> str:
+    payload = []
+    for row in rows:
+        payload.append(
+            {
+                "status": row.status,
+                "kind": row.kind,
+                "name": row.name,
+                "left": None
+                if row.left is None
+                else display_value(row.name, row.left, show=show),
+                "right": None
+                if row.right is None
+                else display_value(row.name, row.right, show=show),
+                "example": None
+                if row.example is None
+                else display_value(row.name, row.example, show=show),
+                "evidence": row.evidence,
+                "source": row.source,
+                "detail": row.detail,
+            }
+        )
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def format_abi(needs: list[Need]) -> str:
+    lines = ["name\tkind\tevidence\tsource\tdetail\thows"]
+    for n in needs:
+        hows = ",".join(sorted(n.hows)) if n.hows else n.detail
+        lines.append(
+            "\t".join([n.name, kind_of(n), n.evidence, n.source, n.detail, hows])
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_emit(needs: list[Need], env: EnvMap, *, show: bool) -> str:
+    lines = []
+    for n in needs:
+        if n.name not in env.values:
+            continue
+        val = env.values[n.name]
+        if not show and looks_secret(n.name, val):
+            continue
+        lines.append(f"{n.name}={_emit_quote(val)}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _emit_quote(val: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_./:@+-]*", val):
+        return val
+    return json.dumps(val, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="lash",
+        description=(
+            "DUE vs LATENT env of a load image set: names a getenv/env::var "
+            "call site uses versus names the image documented. Isolated "
+            "cstrings are DUE only with a call-site xref. One-hop wrappers "
+            "(arg→x0 then bl getenv) are getenv-shaped at that argv index."
+        ),
+    )
+    p.add_argument("programs", nargs="*", help="binary, script, source file, or tree")
+    p.add_argument("-C", dest="chdir", metavar="DIR", help="change directory first")
+    p.add_argument("--vs", dest="vs", metavar="FILE", help="right-hand env file")
+    p.add_argument("--left", dest="left", metavar="FILE", help="left-hand env file")
+    p.add_argument("--right", dest="right", metavar="FILE", help="alias for --vs")
+    p.add_argument("--example", dest="example", metavar="FILE", help=".env.example join")
+    p.add_argument("--vs-pid", dest="vs_pid", type=int, metavar="PID")
+    p.add_argument(
+        "--vs-program",
+        dest="vs_program",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="compare owed names against another program/tree (source vs image)",
+    )
+    p.add_argument(
+        "--abi",
+        dest="abi",
+        metavar="FILE",
+        help="load owed names from a lode --dump-abi table (or -)",
+    )
+    p.add_argument("--dump-abi", action="store_true", help="emit the owed-name table")
+    p.add_argument("--names", action="store_true", help="print owed names only")
+    p.add_argument(
+        "--emit",
+        action="store_true",
+        help="print KEY=VAL for owed names set on the left",
+    )
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true", help="alias for --tsv")
+    p.add_argument("--spare", action="store_true", help="include unread set variables")
+    p.add_argument("--app", action="store_true", help="hide well-known libc/runtime names")
+    p.add_argument(
+        "--due",
+        action="store_true",
+        help="keep names a getenv/env::var call site uses",
+    )
+    p.add_argument(
+        "--latent",
+        action="store_true",
+        help="keep names the image documented (help tables / $VAR / NAME =)",
+    )
+    p.add_argument(
+        "--loose",
+        action="store_true",
+        help="include packed/prefix/orphan cstrings (search aid, not xref)",
+    )
+    p.add_argument(
+        "--calls",
+        action="store_true",
+        help="print getenv/env::var/wrapper xref sites (name, how, va, source) and exit",
+    )
+    p.add_argument(
+        "--wrappers",
+        action="store_true",
+        help="print one-hop getenv wrappers (va, arg, offset, symbol, source) and exit",
+    )
+    p.add_argument(
+        "--min-evidence",
+        choices=("call", "shell", "string"),
+        default=None,
+        help="drop weaker evidence (call > shell > string)",
+    )
+    p.add_argument("--show-values", action="store_true", help="do not redact secrets")
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if MISSING/DIFF/UNSET/UNDOCUMENTED",
+    )
+    p.add_argument("--report-only", action="store_true", help="always exit 0")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument(
+        "--solo",
+        action="store_true",
+        help="do not walk loaded dylibs/so (ancestor: main executable only)",
+    )
+    p.add_argument(
+        "--images",
+        action="store_true",
+        help="print the load image set (main + otool/ldd dependents) and exit",
+    )
+    p.add_argument(
+        "--system",
+        action="store_true",
+        help="include /usr/lib /System images when walking the load list",
+    )
+    p.add_argument(
+        "--closure",
+        action="store_true",
+        help="BFS the non-system load graph instead of direct dependents",
+    )
+    p.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        metavar="N",
+        help="max load-list hops (default 1 = otool -L / ldd of the binary)",
+    )
+    return p
+
+
+def filter_needs(
+    needs: list[Need],
+    *,
+    app: bool,
+    min_evidence: str | None,
+    loose: bool = False,
+) -> list[Need]:
+    out = []
+    min_rank = EVIDENCE_RANK[min_evidence] if min_evidence else 0
+    for n in needs:
+        if app and is_libc_name(n.name):
+            continue
+        if EVIDENCE_RANK.get(n.evidence, 0) < min_rank:
+            continue
+        due = uses_getenv(n)
+        latent = is_documented(n)
+        hows = _hows_of(n)
+        if not due and not latent and not loose and "needle" not in hows:
+            # Orphan cstring / packed LLVM opcode / COLOR_FORCE peel.
+            continue
+        if (
+            n.evidence == "string"
+            and not due
+            and not loose
+            and not is_likely_env_name(n.name)
+        ):
+            continue
+        out.append(n)
+    return out
+
+
+def filter_kind(needs: list[Need], *, due: bool, latent: bool) -> list[Need]:
+    if due and latent:
+        return [n for n in needs if kind_of(n) == "BOTH"]
+    if due:
+        return [n for n in needs if kind_of(n) in {"DUE", "BOTH"}]
+    if latent:
+        return [n for n in needs if kind_of(n) in {"LATENT", "BOTH"}]
+    return needs
+
+
+def wants_env_join(args: argparse.Namespace) -> bool:
+    return bool(
+        args.left
+        or args.right
+        or args.vs
+        or args.vs_pid is not None
+        or args.example
+        or args.emit
+        or args.spare
+    )
+
+
+def run(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.selftest:
+        return run_selftest()
+
+    if args.chdir:
+        os.chdir(args.chdir)
+
+    if args.images:
+        if not args.programs:
+            print("lash: --images needs a program", file=sys.stderr)
+            return 2
+        try:
+            return emit_images(args)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"lash: {exc}", file=sys.stderr)
+            return 2
+
+    if args.wrappers:
+        if not args.programs:
+            print("lash: --wrappers needs a program", file=sys.stderr)
+            return 2
+        try:
+            return emit_wrappers(args)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"lash: {exc}", file=sys.stderr)
+            return 2
+
+    if args.calls:
+        if not args.programs:
+            print("lash: --calls needs a program", file=sys.stderr)
+            return 2
+        try:
+            return emit_calls(args)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"lash: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        needs = collect_needs(args)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"lash: {exc}", file=sys.stderr)
+        return 2
+
+    needs = filter_needs(
+        needs, app=args.app, min_evidence=args.min_evidence, loose=args.loose
+    )
+    needs = filter_kind(needs, due=args.due, latent=args.latent)
+
+    if args.vs_program:
+        if args.vs or args.right or args.vs_pid is not None:
+            print("lash: --vs-program cannot mix with --vs/--right/--vs-pid", file=sys.stderr)
+            return 2
+        try:
+            right_paths = [resolve_program(p) for p in args.vs_program]
+            right_needs = harvest(
+                right_paths,
+                needles=[n.name for n in needs],
+                walk_images=not args.solo,
+                system=args.system,
+                closure=args.closure,
+                depth=args.depth,
+                loose=args.loose,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            print(f"lash: {exc}", file=sys.stderr)
+            return 2
+        right_needs = filter_needs(
+            right_needs, app=args.app, min_evidence=None, loose=args.loose
+        )
+        right_needs = filter_kind(right_needs, due=args.due, latent=args.latent)
+        if args.names:
+            sys.stdout.write("".join(n.name + "\n" for n in needs))
+            return 0
+        if args.dump_abi:
+            sys.stdout.write(format_abi(needs))
+            return 0
+        rows = classify_abi(needs, right_needs)
+        show = True
+        if args.json:
+            sys.stdout.write(format_json(rows, show=show))
+        elif args.tsv or args.porcelain:
+            sys.stdout.write(format_tsv(rows, show=show))
+        else:
+            sys.stdout.write(
+                format_human(rows, show=show, have_right=True, have_example=False)
+            )
+        if args.report_only:
+            return 0
+        fail = ABI_FAIL_STATUSES if args.check else set()
+        if any(r.status in fail for r in rows):
+            return 1
+        return 0
+
+    if args.names:
+        sys.stdout.write("".join(n.name + "\n" for n in needs))
+        return 0
+    if args.dump_abi:
+        sys.stdout.write(format_abi(needs))
+        return 0
+
+    if not wants_env_join(args):
+        rows = classify(needs, None, None, None, spare=False)
+        show = args.show_values
+        if args.json:
+            sys.stdout.write(format_json(rows, show=show))
+        elif args.tsv or args.porcelain:
+            sys.stdout.write(format_tsv(rows, show=show))
+        else:
+            sys.stdout.write(
+                format_human(
+                    rows,
+                    show=show,
+                    have_right=False,
+                    have_example=False,
+                    kind_view=True,
+                )
+            )
+        if args.report_only:
+            return 0
+        return 0
+
+    try:
+        left, right, example = load_envs(args)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"lash: {exc}", file=sys.stderr)
+        return 2
+
+    if args.emit:
+        env = left or current_env()
+        sys.stdout.write(format_emit(needs, env, show=args.show_values))
+        return 0
+
+    rows = classify(
+        needs,
+        left,
+        right,
+        example,
+        spare=args.spare,
+    )
+    show = args.show_values
+    if args.json:
+        sys.stdout.write(format_json(rows, show=show))
+    elif args.tsv or args.porcelain:
+        sys.stdout.write(format_tsv(rows, show=show))
+    else:
+        sys.stdout.write(
+            format_human(
+                rows,
+                show=show,
+                have_right=right is not None,
+                have_example=example is not None,
+            )
+        )
+
+    if args.report_only:
+        return 0
+    if args.check and any(r.status in FAIL_STATUSES for r in rows):
+        return 1
+    if not args.check and any(r.status in FAIL_STATUSES for r in rows):
+        return 1
+    return 0
+
+
+def collect_needs(args: argparse.Namespace) -> list[Need]:
+    needs: list[Need] = []
+    if args.abi:
+        if args.abi == "-":
+            needs.extend(parse_abi_text(sys.stdin.read(), "stdin"))
+        else:
+            path = Path(args.abi)
+            needs.extend(parse_abi_text(path.read_text(encoding="utf-8"), str(path)))
+    programs = list(args.programs)
+    if not programs and not args.abi:
+        raise ValueError("need a program/tree or --abi")
+    paths = [resolve_program(p) for p in programs]
+    if paths:
+        needs.extend(
+            harvest(
+                paths,
+                walk_images=not args.solo,
+                system=args.system,
+                closure=args.closure,
+                depth=args.depth,
+                loose=args.loose,
+            )
+        )
+    return merge_needs(needs)
+
+
+def format_images(rows: list[ImageRow], *, tsv: bool = False) -> str:
+    lines = []
+    if tsv:
+        lines.append("role\tbytes\tpath\traw")
+        for row in rows:
+            path = str(row.path) if row.path is not None else "-"
+            lines.append(f"{row.role}\t{row.bytes}\t{path}\t{row.raw}")
+        return "\n".join(lines) + "\n"
+    for row in rows:
+        path = str(row.path) if row.path is not None else row.raw
+        extra = f"  ({row.bytes})" if row.bytes else ""
+        if row.role == "skip":
+            lines.append(f"skip  {path}")
+        elif row.role == "missing":
+            lines.append(f"miss  {row.raw}")
+        elif row.role == "main":
+            lines.append(f"main  {path}{extra}")
+        else:
+            lines.append(f"load  {path}{extra}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def emit_images(args: argparse.Namespace) -> int:
+    chunks: list[str] = []
+    for spec in args.programs:
+        path = resolve_program(spec)
+        rows = iter_loaded_images(
+            path.resolve(),
+            system=args.system,
+            closure=args.closure,
+            depth=args.depth,
+        )
+        chunks.append(format_images(rows, tsv=args.tsv or args.porcelain))
+    sys.stdout.write("".join(chunks))
+    return 0
+
+
+def emit_calls(args: argparse.Namespace) -> int:
+    """Print getenv-shaped xref sites. One row per (name, source, va)."""
+    seen_images: set[Path] = set()
+    lines = ["name\thow\tva\tsource"]
+
+    def one(path: Path) -> None:
+        try:
+            path = path.resolve()
+        except OSError:
+            return
+        if path in seen_images:
+            return
+        seen_images.add(path)
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return
+        hits = extract_getenv_xrefs(path, raw)
+        for name, how, va in hits:
+            if not ENV_NAME_RE.match(name):
+                continue
+            if args.app and is_libc_name(name):
+                continue
+            lines.append(f"{name}\t{how}\t{va:#x}\t{path}")
+        if args.solo or not is_macho_or_elf(path):
+            return
+        for row in iter_loaded_images(
+            path,
+            system=args.system,
+            closure=args.closure,
+            depth=args.depth,
+        ):
+            if row.role == "load" and row.path is not None:
+                one(row.path)
+
+    for spec in args.programs:
+        one(resolve_program(spec))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def emit_wrappers(args: argparse.Namespace) -> int:
+    """Print one-hop getenv wrappers. One row per (va, arg, offset, symbol)."""
+    seen_images: set[Path] = set()
+    lines = ["va\targ\toffset\tsymbol\tsource"]
+
+    def one(path: Path) -> None:
+        try:
+            path = path.resolve()
+        except OSError:
+            return
+        if path in seen_images:
+            return
+        seen_images.add(path)
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return
+        for va, arg, offset, symbol in extract_wrappers(path, raw):
+            lines.append(f"{va:#x}\t{arg}\t{offset}\t{symbol}\t{path}")
+        if args.solo or not is_macho_or_elf(path):
+            return
+        for row in iter_loaded_images(
+            path,
+            system=args.system,
+            closure=args.closure,
+            depth=args.depth,
+        ):
+            if row.role == "load" and row.path is not None:
+                one(row.path)
+
+    for spec in args.programs:
+        one(resolve_program(spec))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def load_envs(args: argparse.Namespace) -> tuple[EnvMap | None, EnvMap | None, EnvMap | None]:
+    left = load_env_file(Path(args.left)) if args.left else current_env()
+    right_path = args.right or args.vs
+    right = load_env_file(Path(right_path)) if right_path else None
+    if args.vs_pid is not None:
+        pid_env = env_from_pid(args.vs_pid)
+        if right is None:
+            right = pid_env
+        else:
+            raise ValueError("use only one of --vs/--right and --vs-pid")
+    example = load_env_file(Path(args.example)) if args.example else None
+    return left, right, example
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def run_selftest() -> int:
+    import tempfile
+    import traceback
+
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            failures += 1
+            extra = f" — {detail}" if detail else ""
+            print(f"  FAIL  {name}{extra}", file=sys.stderr)
+
+    tmp = Path(tempfile.mkdtemp(prefix="lash-selftest-"))
+    try:
+        py = tmp / "app.py"
+        py.write_text(
+            "import os\n"
+            "from os import getenv as g\n"
+            'KEY = "DUE_CONST"\n'
+            'os.environ["DUE_PORT"]\n'
+            'os.getenv("DUE_API_KEY", "")\n'
+            "g(KEY)\n"
+            'os.environ["DUE_PORT"] = "nope"\n',
+            encoding="utf-8",
+        )
+        got = {n.name: n for n in extract_python(py, py.read_text(encoding="utf-8"))}
+        check("py environ load", "DUE_PORT" in got)
+        check("py getenv", "DUE_API_KEY" in got)
+        check("py const alias", "DUE_CONST" in got)
+        check("py ignores store", got["DUE_PORT"].detail == "os.environ[]")
+
+        rs = tmp / "file with spaces.rs"
+        rs.write_text(
+            'fn main() { let _ = std::env::var("DUE_TOKEN"); }\n',
+            encoding="utf-8",
+        )
+        rsn = extract_file(rs)
+        check("rust env::var + spaces", [n.name for n in rsn] == ["DUE_TOKEN"])
+
+        sh = tmp / "計画.sh"
+        sh.write_text(
+            "#!/bin/sh\n"
+            'echo "${DUE_HOME}/x"\n'
+            "echo $DUE_PORT\n"
+            "# $DUE_COMMENTED\n",
+            encoding="utf-8",
+        )
+        shn = {n.name for n in extract_file(sh)}
+        check("shell brace", "DUE_HOME" in shn)
+        check("shell dollar", "DUE_PORT" in shn)
+        check("shell comment ignored", "DUE_COMMENTED" not in shn)
+
+        js = tmp / "x.ts"
+        js.write_text('const x = process.env.DUE_BIN ?? process.env["DUE_PORT"];\n')
+        jsn = {n.name for n in extract_file(js)}
+        check("process.env", jsn == {"DUE_BIN", "DUE_PORT"})
+
+        go = tmp / "x.go"
+        go.write_text('package m\nimport "os"\nfunc f() { os.Getenv("DUE_TOKEN") }\n')
+        check("go Getenv", {n.name for n in extract_file(go)} == {"DUE_TOKEN"})
+
+        env_a = parse_env_text(
+            "DUE_PORT=3000\nDUE_API_KEY=secret\nSPARE_VAR=1\nexport DUE_HOME=/tmp\n",
+            "a",
+        )
+        env_b = parse_env_text(
+            'DUE_PORT="8080"\nDUE_API_KEY=secret\n# only\n',
+            "b",
+        )
+        ex = parse_env_text("DUE_PORT=3000\nDUE_UNUSED=x\n", "ex")
+        needs = [
+            Need("DUE_PORT", "call", "app.py:1", "os.environ[]"),
+            Need("DUE_API_KEY", "call", "app.py:2", "os.getenv"),
+            Need("DUE_HOME", "shell", "x.sh:1", "${}"),
+            Need("DUE_TOKEN", "call", "x.rs:1", "env::var"),
+        ]
+        rows = classify(needs, env_a, env_b, ex, spare=True)
+        by = defaultdict(list)
+        for r in rows:
+            by[r.name].append(r.status)
+        check("DIFF port", "DIFF" in by["DUE_PORT"])
+        check("DUE secret", "DUE" in by["DUE_API_KEY"])
+        check("UNSET_RIGHT home", "UNSET_RIGHT" in by["DUE_HOME"])
+        check("MISSING token", "MISSING" in by["DUE_TOKEN"])
+        check("SPARE unread", "SPARE" in by["SPARE_VAR"])
+        check("STALE_EXAMPLE", "STALE_EXAMPLE" in by["DUE_UNUSED"])
+        check("UNDOCUMENTED key", "UNDOCUMENTED" in by["DUE_API_KEY"])
+
+        check(
+            "redact",
+            display_value("DUE_API_KEY", "secret", show=False) == "«redacted»",
+        )
+        check("show", display_value("DUE_PORT", "3000", show=False) == "3000")
+
+        dumped = format_abi(needs)
+        reparsed = parse_abi_text(dumped, "roundtrip")
+        check("abi roundtrip", {n.name for n in reparsed} == {n.name for n in needs})
+
+        skip = tmp / "node_modules" / "x.js"
+        skip.parent.mkdir()
+        skip.write_text("process.env.SHOULD_NOT\n")
+        keep = tmp / "src" / "ok.py"
+        keep.parent.mkdir()
+        keep.write_text('import os\nos.getenv("DUE_KEEP")\n')
+        walked = harvest([tmp])
+        names = {n.name for n in walked}
+        check("walk skips node_modules", "SHOULD_NOT" not in names)
+        check("walk finds src", "DUE_KEEP" in names)
+
+        json_env = parse_env_text('{"DUE_PORT": 9, "X": null}', "j")
+        check("json env", json_env.values["DUE_PORT"] == "9" and json_env.values["X"] == "")
+
+        packed = "junkKIZU_CONFIGXDG_CONFIG_HOMEtailKITTY_LISTEN_ONTERM_PROGRAM"
+        toks = split_packed(packed, env_prefixes(["KIZU_CONFIG"]))
+        check("split KIZU_CONFIG", "KIZU_CONFIG" in toks)
+        check("split XDG_CONFIG_HOME", "XDG_CONFIG_HOME" in toks)
+        check("split KITTY_LISTEN_ON", "KITTY_LISTEN_ON" in toks)
+        check("split TERM_PROGRAM", "TERM_PROGRAM" in toks)
+        check("reject D_0", not is_valid_env_token("D_0"))
+        check("reject T4_", not is_valid_env_token("T4_"))
+
+        blob = tmp / "packed.bin"
+        blob.write_bytes(b"\x10\x02\xd6DUE_FIXTURE_C\x00HOME\x00" + packed.encode("ascii") + b"\x00")
+        tight = {n.name for n in extract_binary(blob)}
+        check("default skips packed tokens", "DUE_FIXTURE_C" not in tight)
+        bnames = {n.name for n in extract_binary(blob, loose=True)}
+        check("packed DUE_FIXTURE_C", "DUE_FIXTURE_C" in bnames)
+        check("packed HOME cstring", "HOME" in bnames)
+        check("packed KIZU_CONFIG", "KIZU_CONFIG" in bnames)
+        check("name_in_blob TMUX", name_in_blob(b"<!--TMUX.git", "TMUX"))
+        check(
+            "name_in_blob ZELLIJ packed",
+            name_in_blob(b"kizuZELLIJKITTY_LISTEN_ON", "ZELLIJ"),
+        )
+        check(
+            "name_in_blob packed boundary",
+            name_in_blob(b"KIZU_CONFIGXDG_CONFIG_HOME", "KIZU_CONFIG"),
+        )
+        check(
+            "name_in_blob rejects longer word",
+            not name_in_blob(b"KIZU_CONFIGURATION\x00", "KIZU_CONFIG"),
+        )
+        check(
+            "name_in_blob titlecase path",
+            name_in_blob(b"KIZU_STATE_DIRLibrary/Application", "KIZU_STATE_DIR"),
+        )
+        check("likely env KIZU_CONFIG", is_likely_env_name("KIZU_CONFIG"))
+        check("unlikely BITSET_CANONICAL", not is_likely_env_name("BITSET_CANONICAL"))
+        glued = split_packed("KIZU_STATE_DIRLibrary/Application", env_prefixes())
+        check("trim titlecase glue", "KIZU_STATE_DIR" in glued and "KIZU_STATE_DIRL" not in glued)
+        home_tail = split_packed("XDG_CONFIG_HOMEtailKITTY_LISTEN_ON", env_prefixes())
+        check(
+            "do not trim HOME+tail",
+            "XDG_CONFIG_HOME" in home_tail and "XDG_CONFIG_HOM" not in home_tail,
+        )
+        # explicit needle on a fresh blob
+        zblob = tmp / "mux.bin"
+        zblob.write_bytes(b"detectkizuZELLIJKITTY_LISTEN_ON\x00")
+        znames = {n.name for n in extract_binary(zblob, ["ZELLIJ", "TMUX"])}
+        check("needle ZELLIJ in packed rust", "ZELLIJ" in znames)
+
+        left_abi = [Need("KIZU_CONFIG", "call", "paths.rs:10", "env::var")]
+        right_abi = [Need("KIZU_CONFIG", "string", "kizu", "packed"), Need("RUST_LOG", "string", "kizu", "rodata")]
+        arows = {r.name: r.status for r in classify_abi(left_abi, right_abi)}
+        check("abi BOTH", arows["KIZU_CONFIG"] == "BOTH")
+        check("abi RIGHT_ONLY", arows["RUST_LOG"] == "RIGHT_ONLY")
+
+        otool_l = (
+            "/opt/host:\n"
+            "\t@rpath/libplugin.dylib (compatibility version 0.0.0, current version 0.0.0)\n"
+            "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)\n"
+        )
+        parsed = parse_otool_L(otool_l)
+        check("otool -L rpath", parsed[0] == "@rpath/libplugin.dylib")
+        check("otool -L system", parsed[1].endswith("libSystem.B.dylib"))
+        otool_r = (
+            "          cmd LC_RPATH\n"
+            "      cmdsize 32\n"
+            "         path @loader_path/../lib (offset 12)\n"
+        )
+        check("otool rpath", parse_otool_rpaths(otool_r) == ["@loader_path/../lib"])
+        ldd_txt = (
+            "\tlinux-vdso.so.1 (0x0000)\n"
+            "\tlibpython3.14.so.1.0 => /usr/lib/libpython3.14.so.1.0 (0x1234)\n"
+            "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x5678)\n"
+        )
+        ldd_parsed = parse_ldd(ldd_txt)
+        check("ldd python", "/usr/lib/libpython3.14.so.1.0" in ldd_parsed)
+
+        plug_dir = tmp / "lib"
+        plug_dir.mkdir()
+        plug = plug_dir / "libplugin.dylib"
+        plug.write_bytes(b"\xcf\xfa\xed\xfeLODE_PLUGIN_HOME\x00HOME\x00")
+        host = tmp / "bin"
+        host.mkdir()
+        exe = host / "host"
+        resolved = resolve_load_name(
+            "@rpath/libplugin.dylib",
+            loader=exe,
+            executable=exe,
+            rpaths=["@loader_path/../lib"],
+        )
+        check("resolve @rpath", resolved == plug.resolve())
+        check("system image", is_system_image(Path("/usr/lib/libSystem.B.dylib")))
+        check(
+            "homebrew python not system",
+            not is_system_image(
+                Path("/opt/homebrew/Cellar/python@3.14/Python.framework/Versions/3.14/Python")
+            ),
+        )
+
+        pref = peel_prefix_tokens(
+            b"junkRUSTC_LOG\x00moreLODE_PLUGIN_HOMEXDG_CACHE_HOME",
+            env_prefixes(["RUSTC_LOG", "LODE_PLUGIN_HOME"]),
+        )
+        check("prefix peel RUSTC_LOG", "RUSTC_LOG" in pref)
+        check("prefix peel LODE_PLUGIN_HOME", "LODE_PLUGIN_HOME" in pref)
+
+        helpb = tmp / "help.bin"
+        helpb.write_bytes(
+            b"header\nPYTHONHOME      : alternate <prefix>\n"
+            b"\x00  PYTHONPATH = \x00Consider setting $PYTHONSTARTUP to x\x00"
+        )
+        hfound = {n.name: n for n in extract_binary(helpb)}
+        hnames = set(hfound)
+        check("doc PYTHONHOME", "PYTHONHOME" in hnames)
+        check("assign PYTHONPATH", "PYTHONPATH" in hnames)
+        check("dollar PYTHONSTARTUP", "PYTHONSTARTUP" in hnames)
+        check("likely PYTHONHOME", is_likely_env_name("PYTHONHOME"))
+        check("runtime family PYTHONHOME", is_runtime_family("PYTHONHOME"))
+        check("unlikely JAVASCRIPT", not is_runtime_family("ERROR"))
+        check("kind PYTHONHOME LATENT", kind_of(hfound["PYTHONHOME"]) == "LATENT")
+        check("kind PYTHONPATH LATENT", kind_of(hfound["PYTHONPATH"]) == "LATENT")
+        check("kind PYTHONSTARTUP LATENT", kind_of(hfound["PYTHONSTARTUP"]) == "LATENT")
+
+        splitb = tmp / "split.bin"
+        splitb.write_bytes(
+            b"\x00ASSAY_GETENV_ONLY\x00ASSAY_BOTH\x00"
+            b"ASSAY_DOC_ONLY      : documented, never getenv\n"
+            b"ASSAY_BOTH      : getenv and documented\n"
+            b"Consider setting $ASSAY_DOLLAR to x\x00"
+        )
+        sfound = {n.name: n for n in extract_binary(splitb)}
+        sloose = {n.name: n for n in extract_binary(splitb, loose=True)}
+        # A raw blob has no getenv call site. Isolated cstrings are not DUE.
+        check(
+            "default harvest skips getenv-only cstring",
+            "ASSAY_GETENV_ONLY" not in sfound,
+        )
+        check("loose harvests getenv-only cstring", "ASSAY_GETENV_ONLY" in sloose)
+        check(
+            "split getenv-only is not a use",
+            not uses_getenv(sloose["ASSAY_GETENV_ONLY"]),
+        )
+        check("split doc only", kind_of(sfound["ASSAY_DOC_ONLY"]) == "LATENT")
+        check("split dollar", kind_of(sfound["ASSAY_DOLLAR"]) == "LATENT")
+        check(
+            "split both stays LATENT without xref",
+            kind_of(sfound["ASSAY_BOTH"]) == "LATENT",
+        )
+        filtered = filter_needs(list(sloose.values()), app=True, min_evidence=None)
+        fnames = {n.name for n in filtered}
+        check("filter drops orphan cstring", "ASSAY_GETENV_ONLY" not in fnames)
+        check("filter keeps help", "ASSAY_DOC_ONLY" in fnames)
+        glued = tmp / "glued-help.bin"
+        glued.write_bytes(b"\xd6ASSAY_PACKED_DOC      : glued to a code byte\n")
+        gfound = {n.name: n for n in extract_binary(glued)}
+        check("packed help name", "ASSAY_PACKED_DOC" in gfound)
+        check(
+            "packed help LATENT",
+            kind_of(gfound["ASSAY_PACKED_DOC"]) == "LATENT",
+        )
+        proseb = tmp / "prose.bin"
+        proseb.write_bytes(
+            b"overridden by setting environment variable `ASSAY_PROSE` (default: x)"
+            b"incremental compilation CARGO_INCREMENTAL=0 via environment variable CARGO_INCREMENTAL=0"
+        )
+        pfound = {n.name: n for n in extract_binary(proseb)}
+        check("prose backtick ASSAY_PROSE", "ASSAY_PROSE" in pfound)
+        check("prose ASSAY_PROSE LATENT", kind_of(pfound["ASSAY_PROSE"]) == "LATENT")
+        check("prose CARGO_INCREMENTAL", "CARGO_INCREMENTAL" in pfound)
+        check(
+            "prose CARGO_INCREMENTAL LATENT",
+            kind_of(pfound["CARGO_INCREMENTAL"]) == "LATENT",
+        )
+        dumped = format_abi(list(sfound.values()) + list(sloose.values()))
+        reparsed = {n.name: kind_of(n) for n in parse_abi_text(dumped, "kind-roundtrip")}
+        check(
+            "kind abi roundtrip LATENT both-without-xref",
+            reparsed.get("ASSAY_BOTH") == "LATENT",
+        )
+        check("kind abi roundtrip LATENT", reparsed.get("ASSAY_DOC_ONLY") == "LATENT")
+
+        check("sym getenv", getenv_sym_kind("_getenv") == "getenv")
+        check("sym Py_GETENV", getenv_sym_kind("_Py_GETENV") == "getenv")
+        check("sym skip NSGetEnviron", getenv_sym_kind("__NSGetEnviron") is None)
+        check(
+            "sym rust __var",
+            getenv_sym_kind("__RNvNtCsaLOjE9VYtxK_3std3env4__var") == "env::var",
+        )
+
+        cc = shutil.which("cc")
+        if cc:
+            host_c = tmp / "host.c"
+            host_c.write_text(
+                "#include <stdlib.h>\n"
+                "static const char help[] __attribute__((used)) =\n"
+                '    "\\nASSAY_DOC_ONLY      : documented, never getenv\\n"\n'
+                '    "ASSAY_BOTH      : getenv and documented\\n"\n'
+                '    "Consider setting $ASSAY_DOLLAR to x\\n";\n'
+                "int main(void) {\n"
+                '    getenv("ASSAY_GETENV_ONLY");\n'
+                '    getenv("ASSAY_BOTH");\n'
+                "    return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            host_bin = tmp / "host"
+            try:
+                subprocess.check_call(
+                    [cc, "-o", str(host_bin), str(host_c)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                host_bin = None
+            if host_bin and host_bin.is_file():
+                hneeds = {
+                    n.name: n
+                    for n in filter_needs(
+                        extract_binary(host_bin), app=True, min_evidence=None
+                    )
+                }
+                check(
+                    "compiled GETENV_ONLY DUE",
+                    kind_of(hneeds["ASSAY_GETENV_ONLY"]) == "DUE"
+                    if "ASSAY_GETENV_ONLY" in hneeds
+                    else False,
+                    str(sorted(hneeds)),
+                )
+                check(
+                    "compiled DOC_ONLY LATENT",
+                    kind_of(hneeds.get("ASSAY_DOC_ONLY", Need("x", "string", "-", "help")))
+                    == "LATENT"
+                    if "ASSAY_DOC_ONLY" in hneeds
+                    else False,
+                    str(sorted(hneeds)),
+                )
+                check(
+                    "compiled BOTH is BOTH",
+                    kind_of(hneeds["ASSAY_BOTH"]) == "BOTH"
+                    if "ASSAY_BOTH" in hneeds
+                    else False,
+                    str(sorted(hneeds)),
+                )
+                orphan_c = tmp / "orphan.c"
+                orphan_c.write_text(
+                    '#include <stdio.h>\n'
+                    'static const char *msg __attribute__((used)) = "ORPHAN_ENV_NAME";\n'
+                    "int main(void) { puts(msg); return 0; }\n",
+                    encoding="utf-8",
+                )
+                orphan_bin = tmp / "orphan"
+                try:
+                    subprocess.check_call(
+                        [cc, "-o", str(orphan_bin), str(orphan_c)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except (OSError, subprocess.CalledProcessError):
+                    orphan_bin = None
+                if orphan_bin and orphan_bin.is_file():
+                    onames = {
+                        n.name
+                        for n in filter_needs(
+                            extract_binary(orphan_bin), app=True, min_evidence=None
+                        )
+                    }
+                    check("orphan cstring not DUE", "ORPHAN_ENV_NAME" not in onames)
+                    oloose = {
+                        n.name
+                        for n in filter_needs(
+                            extract_binary(orphan_bin, loose=True),
+                            app=True,
+                            min_evidence=None,
+                            loose=True,
+                        )
+                    }
+                    check(
+                        "orphan visible with --loose",
+                        "ORPHAN_ENV_NAME" in oloose,
+                    )
+                wrap_c = tmp / "wrap.c"
+                wrap_c.write_text(
+                    "#include <stdlib.h>\n"
+                    "static const char help[] __attribute__((used)) =\n"
+                    '    "\\nLASH_DOC_ONLY      : documented, never getenv\\n"\n'
+                    '    "LASH_WRAP_BOTH      : wrapper getenv and documented\\n";\n'
+                    "static char *wrap_dup(void *a, void *b, void *c, const char *name) "
+                    "__attribute__((noinline));\n"
+                    "static char *wrap_dup(void *a, void *b, void *c, const char *name) {\n"
+                    "    return getenv(name);\n"
+                    "}\n"
+                    "static char *env_to(const char *key) __attribute__((noinline));\n"
+                    "static char *env_to(const char *key) {\n"
+                    "    return getenv(key + 4);\n"
+                    "}\n"
+                    "int main(void) {\n"
+                    '    wrap_dup(0, 0, 0, "LASH_WRAP_ARG3");\n'
+                    '    wrap_dup(0, 0, 0, "LASH_WRAP_BOTH");\n'
+                    '    env_to("ENV_LASH_OFFSET");\n'
+                    '    getenv("LASH_DIRECT");\n'
+                    "    return 0;\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
+                wrap_bin = tmp / "wrap"
+                try:
+                    subprocess.check_call(
+                        [cc, "-O0", "-o", str(wrap_bin), str(wrap_c)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except (OSError, subprocess.CalledProcessError):
+                    wrap_bin = None
+                if wrap_bin and wrap_bin.is_file():
+                    wneeds = {
+                        n.name: n
+                        for n in filter_needs(
+                            extract_binary(wrap_bin), app=True, min_evidence=None
+                        )
+                    }
+                    check(
+                        "wrapper arg3 is DUE",
+                        kind_of(wneeds["LASH_WRAP_ARG3"]) == "DUE"
+                        if "LASH_WRAP_ARG3" in wneeds
+                        else False,
+                        str(sorted(wneeds)),
+                    )
+                    check(
+                        "wrapper+doc is BOTH",
+                        kind_of(wneeds["LASH_WRAP_BOTH"]) == "BOTH"
+                        if "LASH_WRAP_BOTH" in wneeds
+                        else False,
+                        str(sorted(wneeds)),
+                    )
+                    check(
+                        "offset-4 ENV_ prefix is DUE",
+                        kind_of(wneeds["LASH_OFFSET"]) == "DUE"
+                        if "LASH_OFFSET" in wneeds
+                        else False,
+                        str(sorted(wneeds)),
+                    )
+                    check(
+                        "ENV_ prefix itself is not DUE",
+                        "ENV_LASH_OFFSET" not in wneeds,
+                        str(sorted(wneeds)),
+                    )
+                    check(
+                        "direct getenv still DUE",
+                        kind_of(wneeds["LASH_DIRECT"]) == "DUE"
+                        if "LASH_DIRECT" in wneeds
+                        else False,
+                        str(sorted(wneeds)),
+                    )
+                    check(
+                        "wrapper doc-only stays LATENT",
+                        kind_of(wneeds["LASH_DOC_ONLY"]) == "LATENT"
+                        if "LASH_DOC_ONLY" in wneeds
+                        else False,
+                        str(sorted(wneeds)),
+                    )
+                    mcall = {
+                        n.name
+                        for n in filter_needs(
+                            extract_binary(wrap_bin),
+                            app=True,
+                            min_evidence="call",
+                        )
+                    }
+                    check(
+                        "min-evidence call keeps wrapper hop",
+                        "LASH_WRAP_ARG3" in mcall and "LASH_OFFSET" in mcall,
+                        str(sorted(mcall)),
+                    )
+                    wraps = extract_wrappers(wrap_bin, wrap_bin.read_bytes())
+                    args_seen = {(w[3], w[1], w[2]) for w in wraps}
+                    check(
+                        "discovered wrap_dup arg3",
+                        any(a == 3 and o == 0 and "wrap_dup" in s for s, a, o in args_seen)
+                        or any(a == 3 and o == 0 for s, a, o in args_seen),
+                        str(wraps),
+                    )
+                    check(
+                        "discovered env_to offset 4",
+                        any(o == 4 for s, a, o in args_seen),
+                        str(wraps),
+                    )
+    except Exception:
+        traceback.print_exc()
+        failures += 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if failures:
+        print(f"selftest: {failures} failure(s)", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

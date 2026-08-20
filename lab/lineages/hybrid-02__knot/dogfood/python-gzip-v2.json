@@ -1,0 +1,235 @@
+{
+  "tool": "knot",
+  "version": "0.2.0",
+  "command": [
+    "cat /Users/annenpolka/.grok/worktrees/annenpolka-brrr/subagent-01a01ac6-9c54-76b0-8e7b-36d3195ee12b/knot | bash -lc python3 -c 'import sys,gzip; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' | wc -c"
+  ],
+  "wall_s": 0.199,
+  "exit": 0,
+  "samples": 2,
+  "knot": {
+    "pid": 29760,
+    "comm": "sh",
+    "cmd": "bash -lc python3 -c 'import sys,gzip; sys.stdout.buffer.write(gzip.compress(sys\u2026",
+    "label": "sh python3 -c 'import sys,gzip; sys.stdout.buffer.write\u2026",
+    "kind": "wait",
+    "incoming_s": 0.062,
+    "running_s": 0.0,
+    "blocked_s": 0.041,
+    "reason": "wait-source of the tree (wait; cat knot, wc -c waited here; via pipe-full)",
+    "path": [
+      {
+        "pid": 29759,
+        "cmd": "cat knot",
+        "kind": null
+      },
+      {
+        "pid": 29760,
+        "cmd": "bash -lc python3 -c 'import sys,gzip; sys.stdout.\u2026",
+        "kind": "pipe-full",
+        "s": 0.017
+      }
+    ],
+    "via": [
+      "pipe-full"
+    ]
+  },
+  "conversation": [
+    {
+      "src": 29737,
+      "dst": 29744,
+      "kind": "child-wait",
+      "s": 0.097,
+      "detail": "1 child",
+      "src_cmd": "bash -c set -o pipefail; '/opt/homebrew/o\u2026",
+      "dst_cmd": "Python",
+      "source": "tree"
+    },
+    {
+      "src": 29761,
+      "dst": 29760,
+      "kind": "pipe-empty",
+      "s": 0.046,
+      "detail": "21255B",
+      "src_cmd": "wc -c",
+      "dst_cmd": "bash -lc python3 -c 'import sys,gzip; sys\u2026",
+      "source": "meter"
+    },
+    {
+      "src": 29759,
+      "dst": 29760,
+      "kind": "pipe-full",
+      "s": 0.017,
+      "detail": "82684B",
+      "src_cmd": "cat knot",
+      "dst_cmd": "bash -lc python3 -c 'import sys,gzip; sys\u2026",
+      "source": "meter"
+    }
+  ],
+  "graph": [
+    {
+      "src": 29737,
+      "dst": 29744,
+      "kind": "child-wait",
+      "s": 0.097,
+      "detail": "1 child",
+      "src_cmd": "bash -c set -o pipefail; '/opt/homebrew/o\u2026",
+      "dst_cmd": "Python",
+      "source": "tree"
+    },
+    {
+      "src": 29761,
+      "dst": 29760,
+      "kind": "pipe-empty",
+      "s": 0.046,
+      "detail": "21255B",
+      "src_cmd": "wc -c",
+      "dst_cmd": "bash -lc python3 -c 'import sys,gzip; sys\u2026",
+      "source": "meter"
+    },
+    {
+      "src": 29759,
+      "dst": 29760,
+      "kind": "pipe-full",
+      "s": 0.017,
+      "detail": "82684B",
+      "src_cmd": "cat knot",
+      "dst_cmd": "bash -lc python3 -c 'import sys,gzip; sys\u2026",
+      "source": "meter"
+    }
+  ],
+  "stages": [
+    {
+      "i": 0,
+      "argv": [
+        "cat",
+        "/Users/annenpolka/.grok/worktrees/annenpolka-brrr/subagent-01a01ac6-9c54-76b0-8e7b-36d3195ee12b/knot"
+      ],
+      "label": "cat /Users/annenpolka/.grok/worktrees/annenpolka-brrr/s\u2026",
+      "exit": 0,
+      "pid": 29759,
+      "wall_s": 0.003988791,
+      "ru_utime": 0.000601,
+      "ru_stime": 0.00147,
+      "cpu_s": 0.002071,
+      "cpu_frac": 0.5192049420488564
+    },
+    {
+      "i": 1,
+      "argv": [
+        "bash",
+        "-lc",
+        "python3 -c 'import sys,gzip; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))'"
+      ],
+      "label": "sh python3 -c 'import sys,gzip; sys.stdout.buffer.write\u2026",
+      "exit": 0,
+      "pid": 29760,
+      "wall_s": 0.04054075,
+      "ru_utime": 0.020432,
+      "ru_stime": 0.008236,
+      "cpu_s": 0.028668,
+      "cpu_frac": 0.7071403464415433
+    },
+    {
+      "i": 2,
+      "argv": [
+        "wc",
+        "-c"
+      ],
+      "label": "wc -c",
+      "exit": 0,
+      "pid": 29761,
+      "wall_s": 0.051598625,
+      "ru_utime": 0.00056,
+      "ru_stime": 0.00116,
+      "cpu_s": 0.00172,
+      "cpu_frac": 0.03333422159989728
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "bytes": 82684,
+      "reads": 2,
+      "writes": 2,
+      "read_stall_s": 0.003259917,
+      "write_stall_s": 0.016529417,
+      "both_stall_s": 0.006994917,
+      "copy_s": 2.9916e-05,
+      "wall_s": 0.026865833,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-write",
+      "toward": 1
+    },
+    {
+      "from": 1,
+      "to": 2,
+      "bytes": 21255,
+      "reads": 1,
+      "writes": 1,
+      "read_stall_s": 0.045584374,
+      "write_stall_s": 0.0,
+      "both_stall_s": 0.0,
+      "copy_s": 1.9083e-05,
+      "wall_s": 0.045641709,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-read",
+      "toward": 1
+    }
+  ],
+  "procs": [
+    {
+      "pid": 29737,
+      "ppid": 29724,
+      "comm": "bash",
+      "cmd": "bash -c set -o pipefail; '/opt/homebrew/opt/python@3.14/bin/python3.14' '/Use\u2026",
+      "running_s": 0.0,
+      "blocked_s": 0.097,
+      "instrument": false,
+      "user_wrapper": true
+    },
+    {
+      "pid": 29744,
+      "ppid": 29737,
+      "comm": "Python",
+      "cmd": "Python",
+      "running_s": 0.097,
+      "blocked_s": 0.0,
+      "instrument": false,
+      "user_wrapper": false
+    },
+    {
+      "pid": 29761,
+      "ppid": 0,
+      "comm": "wc",
+      "cmd": "wc -c",
+      "running_s": 0.0,
+      "blocked_s": 0.052,
+      "instrument": false,
+      "user_wrapper": false
+    },
+    {
+      "pid": 29760,
+      "ppid": 0,
+      "comm": "sh",
+      "cmd": "bash -lc python3 -c 'import sys,gzip; sys.stdout.buffer.write(gzip.compress(s\u2026",
+      "running_s": 0.0,
+      "blocked_s": 0.041,
+      "instrument": false,
+      "user_wrapper": false
+    },
+    {
+      "pid": 29759,
+      "ppid": 0,
+      "comm": "cat",
+      "cmd": "cat knot",
+      "running_s": 0.0,
+      "blocked_s": 0.004,
+      "instrument": false,
+      "user_wrapper": false
+    }
+  ]
+}

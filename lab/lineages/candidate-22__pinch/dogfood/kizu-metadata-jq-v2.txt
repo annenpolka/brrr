@@ -1,0 +1,17 @@
+pinch 0.2.0   wall 0.234s   exit 0   stages 2
+
+  [0] sh cargo metadata --format-version 1 --offline 2>/dev/n… cpu  0.093s  ████████░░░░   67%   ◀ PINCH (compute)
+       │   1.26MB   read-stall  0.134s   write-stall  0.009s   blocked-on-read  stage 1 waited on stage 0
+       ▼
+  [1] jq .packages | length                      cpu  0.014s  █░░░░░░░░░░░   10%
+
+who waited for whom:
+  [1] jq .packages | length  waited 0.134s  (blocked-on-read)  on  [0] sh cargo metadata --format-version 1 --offline 2>/dev/n…
+
+verdict: pinch is [0] sh cargo metadata --format-version 1 --offline 2>/dev/n… (compute) — stage 0 (sh cargo metadata --format-version 1 --offline 2>/dev/n…) absorbed 0.134s of neighbor stall and looks compute-bound
+inner tree (wrappers omitted):
+  cargo                  ████████████  100% run  2/2   ◀ inner pinch
+  jq                     ░░░░░░░░░░░░    0% run  0/2
+phases:
+   0.00- 0.05s  (idle) RUN
+   0.05- 0.18s  cargo RUN   jq SLEEP

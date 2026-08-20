@@ -1,0 +1,20 @@
+pinch 0.2.0   wall 1.038s   exit 0   stages 2
+
+  [0] sh swift build 2>&1                        cpu  0.613s  ███████░░░░░   62%   ◀ PINCH (compute)
+       │     119B   read-stall  0.986s   write-stall  0.000s   blocked-on-read  stage 1 waited on stage 0
+       ▼
+  [1] tee .build/logs/pinch-compile.log          cpu  0.002s  ░░░░░░░░░░░░    0%
+
+who waited for whom:
+  [1] tee .build/logs/pinch-compile.log  waited 0.986s  (blocked-on-read)  on  [0] sh swift build 2>&1
+
+verdict: pinch is [0] sh swift build 2>&1 (compute) — stage 0 (sh swift build 2>&1) absorbed 0.986s of neighbor stall and looks compute-bound; inner pinch is swift-build (compute, 4 run / 13 sleep samples)
+inner tree (wrappers omitted):
+  swift-build            ███░░░░░░░░░   24% run  4/17   ◀ inner pinch
+phases:
+   0.00- 0.06s  (idle) RUN
+   0.06- 0.16s  swift-build RUN
+   0.16- 0.22s  (idle) RUN   swift-build SLEEP
+   0.22- 0.28s  swift-build RUN
+   0.28- 0.92s  (idle) RUN   swift-build SLEEP
+   0.92- 0.98s  swift-build RUN

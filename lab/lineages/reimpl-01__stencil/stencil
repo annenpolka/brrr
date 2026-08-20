@@ -1,0 +1,1175 @@
+#!/usr/bin/env python3
+"""stencil — inverse printf.
+
+Paste a runtime string (error, log line, assertion). Locate the source
+format template that could have produced it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator
+
+VERSION = "0.2.0"
+DEFAULT_MIN_SCORE = 0.34
+DEFAULT_MAX_HITS = 5
+MATCH_MIN_STATIC_HOLED = 6
+INDEX_MIN_STATIC_PLAIN = 4
+# No-hole substring policy (observed empirically on inverse-printf):
+#   exact match: static >= 4
+#   prefix of query (leftover suffix only): static >= 10
+#   leftover prefix (template is a suffix or a middle span): static >= 16
+NOHOLE_PREFIX_MIN = 10
+NOHOLE_SPAN_MIN = 16
+MAX_FILE_BYTES = 4_000_000
+
+LANG_BY_EXT = {
+    ".rs": "rust",
+    ".py": "py",
+    ".go": "go",
+    ".js": "js",
+    ".ts": "js",
+    ".tsx": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".swift": "swift",
+    ".sh": "sh",
+    ".bash": "sh",
+    ".zsh": "sh",
+    ".rb": "rb",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "c",
+    ".cc": "c",
+    ".cxx": "c",
+    ".hpp": "c",
+    ".hh": "c",
+    ".cs": "cs",
+    ".kt": "kt",
+    ".kts": "kt",
+    ".java": "java",
+}
+
+SKIP_DIRS = {
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    ".git",
+    ".svn",
+    ".hg",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".build",
+    "Pods",
+    "coverage",
+    ".next",
+    "out",
+    ".idea",
+    ".vscode",
+    "DerivedData",
+    "Carthage",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cache",
+    ".gradle",
+    "Pods",
+}
+
+SKIP_FILE_SUFFIXES = (".min.js", ".min.css", ".min.mjs", ".map")
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+ISO_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+"
+)
+LEVEL_RE = re.compile(
+    r"^(?:ERROR|INFO|WARN|WARNING|DEBUG|TRACE|FATAL|"
+    r"error|info|warn|warning|debug|trace|fatal)"
+    r"(?:\s*\[[^\]]*\])?[:\s]\s*"
+)
+ERROR_COLON_RE = re.compile(r"^(?:error|warning|fatal|info|debug):\s+", re.I)
+
+BRACE_HOLE_RE = re.compile(
+    r"\{\{|\}\}|"
+    r"\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)?(?::[^}]*)?\}"
+)
+PRINTF_HOLE_RE = re.compile(
+    r"%%|%[-+#0 ]*(?:\d+|\*)?(?:\.\d+|\.\*)?[sdviouxXeEfFgGcqpbwtT]|%#?[vVw]"
+)
+SH_HOLE_RE = re.compile(r"\$\{[^}]*\}")
+
+
+@dataclass
+class Template:
+    path: str
+    line: int
+    col: int
+    lang: str
+    raw: str
+    template: str
+    holes: int
+    static: int
+    _regex: re.Pattern[str] | None = field(default=None, repr=False)
+    _needles: tuple[str, ...] = field(default=(), repr=False)
+
+    def needles(self) -> tuple[str, ...]:
+        if not self._needles:
+            parts = [p for p in self.template.split("{}") if len(p) >= 4]
+            object.__setattr__(self, "_needles", tuple(parts))
+        return self._needles
+
+    def regex(self) -> re.Pattern[str]:
+        if self._regex is None:
+            object.__setattr__(self, "_regex", compile_template(self.template))
+        return self._regex
+
+
+@dataclass
+class Match:
+    tmpl: Template
+    score: float
+    via: str
+    query: str
+    prefix: str
+    suffix: str
+    fills: list[str]
+    start: int
+    end: int
+
+
+def compile_template(template: str) -> re.Pattern[str]:
+    parts = template.split("{}")
+    holes = len(parts) - 1
+    out: list[str] = []
+    for i, part in enumerate(parts):
+        out.append(re.escape(part))
+        if i < holes:
+            if i == holes - 1 and parts[-1] == "":
+                out.append(r"(.+)")
+            else:
+                out.append(r"(.+?)")
+    return re.compile("".join(out))
+
+
+def unescape(s: str) -> str:
+    """Decode C-style escapes. Unknown sequences (including Swift \\() are kept."""
+    out: list[str] = []
+    i = 0
+    escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'", "`": "`"}
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "u" and i + 2 < len(s):
+                i += 2
+                if i < len(s) and s[i] == "{":
+                    j = s.find("}", i)
+                    if j != -1:
+                        try:
+                            out.append(chr(int(s[i + 1 : j], 16)))
+                            i = j + 1
+                            continue
+                        except ValueError:
+                            pass
+                hexpart = s[i : i + 4]
+                if len(hexpart) == 4 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                    out.append(chr(int(hexpart, 16)))
+                    i += 4
+                    continue
+                out.append("\\u")
+                continue
+            if nxt == "x" and i + 3 < len(s):
+                hexpart = s[i + 2 : i + 4]
+                if all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                    out.append(chr(int(hexpart, 16)))
+                    i += 4
+                    continue
+            # Swift interpolations, line continuations, etc. keep the backslash.
+            out.append("\\")
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def flatten_swift_multiline(s: str) -> str:
+    if s.startswith("\n"):
+        s = s[1:]
+    s = re.sub(r"[ \t]*\\[ \t]*\n[ \t]*", " ", s)
+    s = s.strip("\n")
+    lines = s.split("\n")
+    nonempty = [ln for ln in lines if ln.strip()]
+    if len(lines) > 1 and nonempty:
+        indent = min(len(ln) - len(ln.lstrip(" ")) for ln in nonempty)
+        lines = [ln[indent:] if ln.startswith(" " * indent) else ln for ln in lines]
+        s = "\n".join(lines)
+    return s.strip()
+
+
+def brace_holes(s: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        tok = m.group(0)
+        if tok in ("{{", "}}"):
+            return tok
+        return "{}"
+
+    return BRACE_HOLE_RE.sub(repl, s)
+
+
+def printf_holes(s: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        return "%" if m.group(0) == "%%" else "{}"
+
+    return PRINTF_HOLE_RE.sub(repl, s)
+
+
+def js_holes(s: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
+            i += 2
+            depth = 1
+            while i < n and depth:
+                if s[i] == "{":
+                    depth += 1
+                elif s[i] == "}":
+                    depth -= 1
+                i += 1
+            out.append("{}")
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def swift_holes(s: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n and s[i + 1] == "(":
+            i += 2
+            depth = 1
+            while i < n and depth:
+                ch = s[i]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                i += 1
+            out.append("{}")
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def sh_holes(s: str) -> str:
+    return SH_HOLE_RE.sub("{}", s)
+
+
+def looks_like_json(s: str) -> bool:
+    t = s.strip()
+    if not t or t[0] not in "{[":
+        return False
+    try:
+        val = json.loads(t)
+    except Exception:
+        return False
+    return isinstance(val, (dict, list))
+
+
+def literal_text(raw: str, lang: str, is_raw: bool) -> str:
+    s = raw if is_raw else unescape(raw)
+    if s.endswith("\r\n"):
+        s = s[:-2]
+    elif s.endswith("\n"):
+        s = s[:-1]
+    if lang == "swift":
+        s = flatten_swift_multiline(s)
+    return s
+
+
+def to_template(raw: str, lang: str, is_raw: bool) -> str:
+    s = literal_text(raw, lang, is_raw)
+    if lang == "swift":
+        s = swift_holes(s)
+    elif lang == "js":
+        s = js_holes(s)
+    elif lang in ("go", "c", "java"):
+        s = printf_holes(s)
+    elif lang == "sh":
+        s = sh_holes(s)
+    elif lang == "rb":
+        s = brace_holes(s)
+    elif lang == "kt":
+        s = js_holes(s)
+    elif lang == "py":
+        s = brace_holes(s)
+        s = printf_holes(s)
+    elif lang in ("rust", "cs"):
+        if not is_raw:
+            s = brace_holes(s)
+    return s
+
+
+def keep_template(raw: str, template: str) -> bool:
+    if looks_like_json(raw) or looks_like_json(template):
+        return False
+    holes = template.count("{}")
+    static = template.replace("{}", "")
+    if not template.strip():
+        return False
+    if holes == 0:
+        return len(static) >= INDEX_MIN_STATIC_PLAIN
+    return True
+
+
+# --- source scan -------------------------------------------------------------
+
+def _linecol_at(text: str, idx: int) -> tuple[int, int]:
+    line = text.count("\n", 0, idx) + 1
+    last_nl = text.rfind("\n", 0, idx)
+    col = idx - last_nl
+    return line, col
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] not in "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        i += 1
+    return i + 2 if i + 1 < n else n
+
+
+def _read_swift_ordinary(text: str, i: int) -> tuple[str, int]:
+    """Read a Swift \"...\" string, allowing quotes inside \\(...) interpolations."""
+    n = len(text)
+    start = i
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            if text[i + 1] == "(":
+                i += 2
+                depth = 1
+                while i < n and depth:
+                    if text[i] == "\\" and i + 1 < n and text[i + 1] == "(":
+                        i += 2
+                        depth += 1
+                        continue
+                    if text[i] in "'\"":
+                        q = text[i]
+                        i += 1
+                        while i < n and text[i] != q:
+                            if text[i] == "\\":
+                                i += 2
+                                continue
+                            i += 1
+                        if i < n:
+                            i += 1
+                        continue
+                    if text[i] == "(":
+                        depth += 1
+                    elif text[i] == ")":
+                        depth -= 1
+                    i += 1
+                continue
+            i += 2
+            continue
+        if ch == '"':
+            return text[start:i], i + 1
+        if ch == "\n":
+            return text[start:i], i
+        i += 1
+    return text[start:i], i
+
+
+def _read_until_quote(text: str, i: int, quote: str, raw: bool) -> tuple[str, int]:
+    n = len(text)
+    start = i
+    while i < n:
+        ch = text[i]
+        if not raw and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == quote:
+            return text[start:i], i + 1
+        if ch == "\n" and quote != "`" and not raw:
+            # unclosed ordinary string; abort at newline
+            return text[start:i], i
+        i += 1
+    return text[start:i], i
+
+
+def _read_triple(text: str, i: int, quote: str) -> tuple[str, int]:
+    n = len(text)
+    start = i
+    delim = quote * 3
+    while i + 2 < n:
+        if text[i : i + 3] == delim:
+            return text[start:i], i + 3
+        i += 1
+    return text[start:], n
+
+
+def _read_rust_raw(text: str, i: int) -> tuple[str, int] | None:
+    # caller is on first '"' or '#' of r"..." / r#"..."# / r##"..."##
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    start = i
+    close = '"' + ("#" * hashes)
+    while i < n:
+        if text.startswith(close, i):
+            return text[start:i], i + len(close)
+        i += 1
+    return None
+
+
+def _py_prefix(text: str, i: int) -> tuple[str, int]:
+    n = len(text)
+    j = i
+    chars = []
+    while j < n and text[j] in "rRfFbBuU":
+        chars.append(text[j])
+        j += 1
+        if len(chars) >= 2:
+            break
+    if j < n and text[j] in "'\"":
+        return "".join(chars), j
+    if len(chars) == 2:
+        # one-char prefix then quote? already consumed 2
+        pass
+    return "", i
+
+
+def extract_strings(text: str, lang: str) -> list[tuple[int, int, str, bool]]:
+    """Return (line, col, raw_content, is_raw) for each string literal."""
+    n = len(text)
+    i = 0
+    out: list[tuple[int, int, str, bool]] = []
+
+    def emit(token_at: int, raw: str, is_raw: bool) -> None:
+        line, col = _linecol_at(text, token_at)
+        out.append((line, col, raw, is_raw))
+
+    while i < n:
+        ch = text[i]
+
+        # comments
+        if lang in ("py", "sh") and ch == "#":
+            i = _skip_line_comment(text, i)
+            continue
+        if lang not in ("py", "sh") and ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i = _skip_line_comment(text, i)
+                continue
+            if text[i + 1] == "*":
+                i = _skip_block_comment(text, i + 2)
+                continue
+
+        # rust raw / byte / ordinary
+        if lang == "rust":
+            token_at = i
+            j = i
+            if text[j] == "b":
+                j += 1
+            if j < n and text[j] == "r":
+                got = _read_rust_raw(text, j + 1)
+                if got is not None:
+                    raw, nxt = got
+                    emit(token_at, raw, True)
+                    i = nxt
+                    continue
+            if j < n and text[j] == '"':
+                raw, nxt = _read_until_quote(text, j + 1, '"', raw=False)
+                emit(j, raw, False)
+                i = nxt
+                continue
+            i += 1
+            continue
+
+        # python prefixes + triples
+        if lang == "py" and ch in "rRfFbBuU'\"":
+            pref, qat = _py_prefix(text, i)
+            if qat < n and text[qat] in "'\"":
+                quote = text[qat]
+                is_raw = "r" in pref.lower()
+                token_at = i if pref else qat
+                if text.startswith(quote * 3, qat):
+                    raw, nxt = _read_triple(text, qat + 3, quote)
+                    emit(token_at, raw, is_raw)
+                    i = nxt
+                    continue
+                raw, nxt = _read_until_quote(text, qat + 1, quote, is_raw)
+                emit(token_at, raw, is_raw)
+                i = nxt
+                continue
+            i += 1
+            continue
+
+        # swift triples then ordinary
+        if lang == "swift" and ch == '"':
+            if text.startswith('"""', i):
+                raw, nxt = _read_triple(text, i + 3, '"')
+                emit(i, raw, False)
+                i = nxt
+                continue
+            raw, nxt = _read_swift_ordinary(text, i + 1)
+            emit(i, raw, False)
+            i = nxt
+            continue
+
+        # go raw
+        if lang == "go" and ch == "`":
+            raw, nxt = _read_until_quote(text, i + 1, "`", raw=True)
+            emit(i, raw, True)
+            i = nxt
+            continue
+
+        # js / sh / others: ", ', `
+        if ch in "'\"" or (ch == "`" and lang in ("js", "sh", "kt", "rb")):
+            if lang == "js" and ch == "`":
+                # template literal: allow ${}
+                j = i + 1
+                start = j
+                nlen = n
+                while j < nlen:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == "`":
+                        emit(i, text[start:j], False)
+                        j += 1
+                        break
+                    if text[j] == "$" and j + 1 < nlen and text[j + 1] == "{":
+                        # skip interpolation so nested ` does not end us blindly
+                        j += 2
+                        depth = 1
+                        while j < nlen and depth:
+                            if text[j] == "{":
+                                depth += 1
+                            elif text[j] == "}":
+                                depth -= 1
+                            elif text[j] == "`":
+                                # nested template — skip until its end roughly
+                                j += 1
+                                while j < nlen and text[j] != "`":
+                                    if text[j] == "\\":
+                                        j += 2
+                                        continue
+                                    j += 1
+                            elif text[j] in "'\"":
+                                q = text[j]
+                                j += 1
+                                while j < nlen and text[j] != q:
+                                    if text[j] == "\\":
+                                        j += 2
+                                        continue
+                                    j += 1
+                            j += 1
+                        continue
+                    j += 1
+                else:
+                    emit(i, text[start:], False)
+                    j = nlen
+                i = j
+                continue
+            raw_mode = ch == "'" and lang == "sh"
+            raw, nxt = _read_until_quote(text, i + 1, ch, raw=raw_mode)
+            emit(i, raw, raw_mode)
+            i = nxt
+            continue
+
+        i += 1
+    return out
+
+
+# --- file inventory ----------------------------------------------------------
+
+def lang_of(path: str) -> str | None:
+    base = os.path.basename(path)
+    low = base.lower()
+    if low.endswith(SKIP_FILE_SUFFIXES):
+        return None
+    _, ext = os.path.splitext(low)
+    return LANG_BY_EXT.get(ext)
+
+
+def path_has_skip_dir(rel: str) -> bool:
+    parts = rel.replace("\\", "/").split("/")
+    return any(p in SKIP_DIRS for p in parts)
+
+
+def git_list(root: str, cached_only: bool) -> list[str] | None:
+    cmd = ["git", "-C", root, "ls-files", "-z"]
+    if cached_only:
+        cmd.append("--cached")
+    else:
+        cmd.extend(["--cached", "--others", "--exclude-standard"])
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    rels = [p for p in proc.stdout.split(b"\0") if p]
+    out: list[str] = []
+    for raw in rels:
+        try:
+            rel = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            rel = raw.decode("utf-8", "surrogateescape")
+        rel = rel.replace("\\", "/")
+        if rel.startswith("./"):
+            rel = rel[2:]
+        if path_has_skip_dir(rel):
+            continue
+        if lang_of(rel):
+            out.append(rel)
+    return out
+
+
+def walk_list(root: str) -> list[str]:
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != ".git"]
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            if path_has_skip_dir(rel):
+                continue
+            if lang_of(rel):
+                out.append(rel)
+    return out
+
+
+def list_source_files(root: str, walk: bool, cached_only: bool) -> list[str]:
+    if walk:
+        return walk_list(root)
+    listed = git_list(root, cached_only=cached_only)
+    if listed is None:
+        return walk_list(root)
+    return listed
+
+
+def read_text(path: str) -> str | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def index_tree(root: str, walk: bool, cached_only: bool) -> list[Template]:
+    templates: list[Template] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for rel in list_source_files(root, walk, cached_only):
+        lang = lang_of(rel)
+        if not lang:
+            continue
+        full = os.path.join(root, rel)
+        text = read_text(full)
+        if text is None:
+            continue
+        for line, col, raw, is_raw in extract_strings(text, lang):
+            tmpl = to_template(raw, lang, is_raw)
+            if not keep_template(raw, tmpl):
+                continue
+            key = (rel, line, col, tmpl)
+            if key in seen:
+                continue
+            seen.add(key)
+            holes = tmpl.count("{}")
+            static = len(tmpl.replace("{}", ""))
+            templates.append(
+                Template(
+                    path=rel,
+                    line=line,
+                    col=col,
+                    lang=lang,
+                    raw=literal_text(raw, lang, is_raw),
+                    template=tmpl,
+                    holes=holes,
+                    static=static,
+                )
+            )
+    return templates
+
+
+# --- query side --------------------------------------------------------------
+
+def strip_decorations(q: str) -> str:
+    q = ANSI_RE.sub("", q)
+    q = q.strip()
+    changed = True
+    while changed and q:
+        changed = False
+        nq = ISO_TS_RE.sub("", q, count=1)
+        if nq != q:
+            q = nq.strip()
+            changed = True
+            continue
+        nq = LEVEL_RE.sub("", q, count=1)
+        if nq != q:
+            q = nq.strip()
+            changed = True
+            continue
+        nq = ERROR_COLON_RE.sub("", q, count=1)
+        if nq != q:
+            q = nq.strip()
+            changed = True
+    return q
+
+
+def is_test_path(path: str) -> bool:
+    norm = path.replace("\\", "/")
+    low = norm.lower()
+    base = low.rsplit("/", 1)[-1]
+    if ".test." in base or ".spec." in base:
+        return True
+    if base.startswith("test_") or "_test." in base or base.endswith("_test.py"):
+        return True
+    if "/__tests__/" in low or "/tests/" in low or "/test/" in low:
+        return True
+    if re.search(r"/[^/]*tests?/", low):
+        return True
+    return False
+
+
+def compute_score(query: str, static: int, fills: list[str], start: int, end: int) -> float:
+    qlen = max(len(query), 1)
+    span = max(end - start, 1)
+    leftover = qlen - (end - start)
+    holes = len(fills)
+    if holes == 0 and leftover == 0:
+        return 1.0
+    cover = (end - start) / qlen
+    strength = 1.0 - math.exp(-static / 20.0)
+    purity = static / span
+    s = 0.40 * cover + 0.35 * strength + 0.25 * purity
+    return round(min(1.0, max(0.0, s)), 4)
+
+
+def classify_via(prefix: str) -> str:
+    if not prefix:
+        return "full"
+    parts = prefix.split(": ")
+    if len(parts) > 1:
+        return f"suffix:{len(parts) - 1}"
+    return "full"
+
+
+def match_template(tmpl: Template, query: str) -> Match | None:
+    if tmpl.holes == 0:
+        if tmpl.static < INDEX_MIN_STATIC_PLAIN:
+            return None
+        idx = query.find(tmpl.template)
+        if idx < 0:
+            return None
+        start, end = idx, idx + len(tmpl.template)
+        has_pre = start > 0
+        has_suf = end < len(query)
+        if has_pre and tmpl.static < NOHOLE_SPAN_MIN:
+            return None
+        if has_suf and not has_pre and tmpl.static < NOHOLE_PREFIX_MIN:
+            return None
+        fills: list[str] = []
+    else:
+        if tmpl.static < MATCH_MIN_STATIC_HOLED:
+            return None
+        for needle in tmpl.needles():
+            if needle not in query:
+                return None
+        m = tmpl.regex().search(query)
+        if not m:
+            return None
+        start, end = m.start(), m.end()
+        fills = list(m.groups())
+        if any(f is None or f == "" for f in fills):
+            return None
+    prefix = query[:start]
+    leftover = query[end:]
+    via = classify_via(prefix)
+    if leftover:
+        suffix = leftover
+    elif tmpl.template.endswith("{}") and fills:
+        suffix = fills[-1]
+    else:
+        suffix = ""
+    score = compute_score(query, tmpl.static, fills, start, end)
+    return Match(
+        tmpl=tmpl,
+        score=score,
+        via=via,
+        query=query,
+        prefix=prefix,
+        suffix=suffix,
+        fills=fills,
+        start=start,
+        end=end,
+    )
+
+
+def search_index(
+    templates: list[Template],
+    query: str,
+    min_score: float,
+    max_hits: int,
+) -> list[Match]:
+    q = strip_decorations(query)
+    if not q:
+        return []
+    hits: list[Match] = []
+    for tmpl in templates:
+        m = match_template(tmpl, q)
+        if m is None or m.score < min_score:
+            continue
+        hits.append(m)
+    hits.sort(
+        key=lambda m: (
+            -m.score,
+            is_test_path(m.tmpl.path),
+            m.tmpl.path,
+            m.tmpl.line,
+            m.tmpl.col,
+        )
+    )
+    if max_hits <= 0:
+        return []
+    return hits[:max_hits]
+
+
+# --- output ------------------------------------------------------------------
+
+def format_hit(m: Match) -> str:
+    t = m.tmpl
+    head = (
+        f"{t.path}:{t.line}:{t.col}: score={m.score:.2f} "
+        f"lang={t.lang} holes={t.holes} via={m.via}"
+    )
+    lines = [head, f"  query: {m.query}", f"  tmpl:  {t.template}"]
+    if m.via.startswith("suffix:"):
+        lines.append(f"  note:  via {m.via}")
+    elif m.prefix and t.template.startswith("{}"):
+        lines.append(f"  note:  prefix={m.prefix!r}")
+    elif m.prefix:
+        lines.append(f"  note:  prefix={m.prefix!r}")
+    elif m.suffix and t.holes == 0:
+        lines.append(f"  note:  suffix={m.suffix!r}")
+    return "\n".join(lines)
+
+
+def hit_json(m: Match) -> dict:
+    t = m.tmpl
+    return {
+        "path": t.path,
+        "line": t.line,
+        "col": t.col,
+        "lang": t.lang,
+        "holes": t.holes,
+        "score": m.score,
+        "via": m.via,
+        "template": t.template,
+        "raw": t.raw,
+        "query": m.query,
+        "prefix": m.prefix,
+        "suffix": m.suffix,
+    }
+
+
+def index_line(t: Template) -> str:
+    return (
+        f"{t.path}:{t.line}:{t.col}: lang={t.lang} holes={t.holes} "
+        f"static={t.static} {t.template}"
+    )
+
+
+def index_json(t: Template) -> dict:
+    return {
+        "path": t.path,
+        "line": t.line,
+        "col": t.col,
+        "lang": t.lang,
+        "holes": t.holes,
+        "template": t.template,
+        "raw": t.raw,
+        "static": t.static,
+    }
+
+
+# --- selftest ----------------------------------------------------------------
+
+def _selftest() -> None:
+    failures: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if not cond:
+            failures.append(f"{name}: {detail}")
+
+    samples = {
+        "py": 'raise KeyError(f"user {uid} not found")\n',
+        "rust": 'Err(format!("git diff single file failed: {}", stderr.trim()))\n',
+        "js": "throw new Error(`Duplicate event ID: ${id}`);\n",
+        "swift": 'Logger.x.info("session started profile=\\(name, privacy: .private)")\n',
+        "go": 'return fmt.Errorf("open %s: %v", path, err)\n',
+        "swift_ml": 'Logger.x.error("""\n        cumulative save failed path=\\(path) \\\n        error=\\(err)\n        """)\n',
+        "json": 'export const oracle = \'{"schema_version":1,"has_more":false}\';\n',
+    }
+    py = extract_strings(samples["py"], "py")
+    check("py extract", any("user {uid} not found" in r for _, _, r, _ in py), str(py))
+    rust = extract_strings(samples["rust"], "rust")
+    check("rust extract", any("git diff" in r for _, _, r, _ in rust), str(rust))
+    js = extract_strings(samples["js"], "js")
+    check("js extract", any("Duplicate" in r for _, _, r, _ in js), str(js))
+    sw = extract_strings(samples["swift"], "swift")
+    check("swift extract", any("session started" in r for _, _, r, _ in sw), str(sw))
+    go = extract_strings(samples["go"], "go")
+    check("go extract", any("open %s" in r for _, _, r, _ in go), str(go))
+    ml = extract_strings(samples["swift_ml"], "swift")
+    check("swift ml extract", bool(ml), str(ml))
+    if ml:
+        tmpl = to_template(ml[0][2], "swift", False)
+        check(
+            "swift ml flatten",
+            tmpl == "cumulative save failed path={} error={}",
+            tmpl,
+        )
+    js_json = extract_strings(samples["json"], "js")
+    if js_json:
+        tmpl = to_template(js_json[0][2], "js", False)
+        check("json drop", not keep_template(js_json[0][2], tmpl), tmpl)
+
+    t = Template(
+        path="src/user.py",
+        line=2,
+        col=20,
+        lang="py",
+        raw="user {uid} not found",
+        template="user {} not found",
+        holes=1,
+        static=15,
+    )
+    m = match_template(t, "user 42 not found")
+    check("match user", m is not None and m.score >= 0.5, str(m))
+    m2 = match_template(t, strip_decorations("ERROR [worker] user 7 not found"))
+    check("strip+match", m2 is not None, str(m2))
+    check("miss", match_template(t, "nope xyzzy") is None, "")
+
+    cam_src = (
+        'Logger.coreSession.info(\n'
+        '    "camera presence \\(self.isCameraEnabled ? "enabled" : "disabled", privacy: .public)"\n'
+        ')\n'
+    )
+    cam = extract_strings(cam_src, "swift")
+    check("swift nested quote extract", len(cam) >= 1, str(cam))
+    if cam:
+        cam_t = to_template(cam[0][2], "swift", False)
+        check("swift nested quote holes", cam_t == "camera presence {}", cam_t)
+        cam_tmpl = Template(
+            path="SitboneCore.swift", line=1, col=1, lang="swift",
+            raw=cam[0][2], template=cam_t, holes=1,
+            static=len(cam_t.replace("{}", "")),
+        )
+        cm = match_template(cam_tmpl, "camera presence enabled")
+        check("swift camera match", cm is not None, str(cm))
+
+    short = Template(
+        path="x.swift", line=1, col=1, lang="swift",
+        raw="has_more", template="has_more", holes=0, static=8,
+    )
+    check("short no-hole exact", match_template(short, "has_more") is not None, "")
+    check(
+        "short no-hole not a prefix of longer query",
+        match_template(short, "has_more cannot be true when units is empty") is None,
+        "",
+    )
+
+    if failures:
+        sys.stderr.write("selftest: FAILED\n")
+        for f in failures:
+            sys.stderr.write(f"  {f}\n")
+        sys.exit(1)
+    print("selftest: ok")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="stencil",
+        description=(
+            "Inverse printf: locate source format templates that can produce a runtime string."
+        ),
+    )
+    p.add_argument(
+        "messages",
+        nargs="*",
+        help="runtime message(s); '-' reads stdin",
+    )
+    p.add_argument(
+        "-e",
+        "--message",
+        dest="dash_messages",
+        action="append",
+        default=[],
+        metavar="MSG",
+        help="runtime message (repeatable; use for strings that look like flags)",
+    )
+    p.add_argument("-C", "--root", default=".", help="tree to scan (default: .)")
+    p.add_argument("--walk", action="store_true", help="walk files; do not use git ls-files")
+    p.add_argument(
+        "--cached-only",
+        action="store_true",
+        help="index only git-cached files (default also includes untracked)",
+    )
+    p.add_argument("-n", "--max", type=int, default=DEFAULT_MAX_HITS, help="max hits per message")
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=DEFAULT_MIN_SCORE,
+        help=f"minimum score (default {DEFAULT_MIN_SCORE})",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--index", action="store_true", help="print extracted templates and exit")
+    p.add_argument("-q", "--quiet", action="store_true", help="exit status only")
+    p.add_argument("--any", action="store_true", help="succeed if any query matches")
+    p.add_argument("--selftest", action="store_true", help="run built-in tests")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def collect_queries(args: argparse.Namespace) -> tuple[list[str], bool]:
+    """Return (queries, from_stdin)."""
+    msgs: list[str] = []
+    from_stdin = False
+    for m in args.messages:
+        if m == "-":
+            from_stdin = True
+        else:
+            msgs.append(m)
+    msgs.extend(args.dash_messages)
+    if from_stdin or (not msgs and not args.index and not sys.stdin.isatty()):
+        stdin_lines = [ln.rstrip("\n") for ln in sys.stdin]
+        if from_stdin or not msgs:
+            return stdin_lines, True
+    return msgs, from_stdin
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parse_args(argv)
+    except SystemExit as e:
+        code = e.code
+        return int(code) if isinstance(code, int) else 2
+
+    if args.version:
+        print(f"stencil {VERSION}")
+        return 0
+    if args.selftest:
+        _selftest()
+        return 0
+
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        sys.stderr.write(f"stencil: root not found: {args.root}\n")
+        return 2
+
+    templates = index_tree(root, walk=args.walk, cached_only=args.cached_only)
+
+    if args.index:
+        if args.json:
+            print(json.dumps([index_json(t) for t in templates], ensure_ascii=False, indent=2))
+        else:
+            for t in templates:
+                if not args.quiet:
+                    print(index_line(t))
+        return 0
+
+    queries, from_stdin = collect_queries(args)
+    if not queries:
+        return 0
+
+    any_hit = False
+    all_hit = True
+    json_rows: list[dict] = []
+
+    for raw_q in queries:
+        if from_stdin and not strip_decorations(raw_q):
+            continue
+        hits = search_index(templates, raw_q, args.min_score, args.max)
+        shown_q = strip_decorations(raw_q) or raw_q
+        if hits:
+            any_hit = True
+        else:
+            if not from_stdin:
+                all_hit = False
+            if from_stdin:
+                continue
+        if args.json:
+            json_rows.append({"query": shown_q, "matches": [hit_json(h) for h in hits]})
+            continue
+        if args.quiet:
+            continue
+        if not hits:
+            print(f"— no template for: {shown_q}")
+            continue
+        blocks = [format_hit(h) for h in hits]
+        print("\n\n".join(blocks))
+        print()
+
+    if args.json and not args.quiet:
+        print(json.dumps(json_rows, ensure_ascii=False, indent=2))
+
+    if from_stdin:
+        return 0 if any_hit else 1
+    if not queries:
+        return 0
+    if args.any:
+        return 0 if any_hit else 1
+    return 0 if all_hit else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

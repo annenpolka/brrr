@@ -1,0 +1,1353 @@
+#!/usr/bin/env python3
+"""aka — protocol tokens that live under several names.
+
+A wire token is a quoted string, YAML/JSON key, or flag. Identifiers that
+inflect the same way (has_more / hasMore / HAS_MORE) are the same token.
+`aka` lists those identities and, given a patch, reports one-sided edits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator, Sequence
+
+VERSION = "0.2.0"
+
+SKIP_DIR_PARTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "vendor",
+    ".cache",
+    ".idea",
+    ".vscode",
+    "Pods",
+    "Carthage",
+}
+
+SKIP_SUFFIXES = {
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".wasm",
+    ".so",
+    ".dylib",
+    ".a",
+    ".o",
+    ".class",
+    ".jar",
+    ".pyc",
+    ".pyo",
+}
+
+SKIP_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    ".DS_Store",
+}
+
+GENERATED_RE = re.compile(
+    r"(?:^|/)(?:.*\.(?:generated|gen|min)|.*_generated|.*Generated|.*_pb2)(?:\.[^/]+)?$",
+    re.IGNORECASE,
+)
+
+# Quoted strings. Single-quoted skip the common rust/char case of len 1 later.
+STRING_RE = re.compile(
+    r"""(?P<dq>"(?:\\.|[^"\\])*")|(?P<sq>'(?:\\.|[^'\\])*')"""
+)
+
+# --kebab-flag or --camelFlag
+FLAG_RE = re.compile(r"--([A-Za-z][A-Za-z0-9_-]{1,})")
+
+# YAML-ish keys at the start of a line (indent ok).
+YAML_KEY_RE = re.compile(
+    r"^[ \t]{0,16}(?P<key>[A-Za-z_][A-Za-z0-9_-]{1,64})[ \t]*:",
+    re.MULTILINE,
+)
+
+IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{1,64})\b")
+
+CAMEL_RE = re.compile(r"^[a-z]+[A-Z][A-Za-z0-9]+$")
+PASCAL_RE = re.compile(r"^[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]+$")
+SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*_[a-z0-9_]+$")
+CONST_RE = re.compile(r"^[A-Z][A-Z0-9]*_[A-Z0-9_]+$")
+KEBAB_RE = re.compile(r"^[a-z][a-z0-9]*-[a-z0-9-]+$")
+DOTTED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9._-]+$")
+
+SPLIT_CAMEL_1 = re.compile(r"([a-z0-9])([A-Z])")
+SPLIT_CAMEL_2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
+SEP_RE = re.compile(r"[_\-./:]+")
+
+KEYWORDS = {
+    "if",
+    "else",
+    "elif",
+    "for",
+    "while",
+    "return",
+    "class",
+    "struct",
+    "enum",
+    "func",
+    "function",
+    "fn",
+    "let",
+    "var",
+    "const",
+    "import",
+    "from",
+    "export",
+    "default",
+    "public",
+    "private",
+    "protected",
+    "static",
+    "void",
+    "int",
+    "string",
+    "true",
+    "false",
+    "none",
+    "null",
+    "nil",
+    "undefined",
+    "self",
+    "this",
+    "super",
+    "try",
+    "catch",
+    "except",
+    "finally",
+    "throw",
+    "raise",
+    "async",
+    "await",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "package",
+    "namespace",
+    "using",
+    "module",
+    "type",
+    "interface",
+    "impl",
+    "mut",
+    "ref",
+    "pub",
+    "crate",
+    "use",
+    "mod",
+    "where",
+    "select",
+    "when",
+    "then",
+    "with",
+    "as",
+    "in",
+    "of",
+    "or",
+    "and",
+    "not",
+    "new",
+    "delete",
+    "typeof",
+    "instanceof",
+    "yield",
+    "pass",
+    "lambda",
+    "def",
+    "async",
+    "await",
+    "match",
+    "loop",
+    "move",
+    "box",
+    "dyn",
+    "trait",
+    "unsafe",
+    "extern",
+    "sizeof",
+    "typedef",
+    "template",
+    "typename",
+    "virtual",
+    "override",
+    "final",
+    "extends",
+    "implements",
+    "throws",
+    "boolean",
+    "number",
+    "object",
+    "unknown",
+    "never",
+    "any",
+    "ok",
+    "err",
+    "some",
+    "error",
+    "result",
+    "option",
+    "list",
+    "dict",
+    "map",
+    "set",
+    "vec",
+    "array",
+    "slice",
+    "str",
+    "bool",
+    "int",
+    "uint",
+    "float",
+    "double",
+    "char",
+    "byte",
+    "long",
+    "short",
+    "unsigned",
+    "signed",
+    "auto",
+    "goto",
+    "do",
+    "done",
+    "fi",
+    "esac",
+    "then",
+    "endif",
+    "end",
+    "begin",
+    "each",
+    "include",
+    "require",
+    "ifdef",
+    "ifndef",
+    "define",
+    "pragma",
+    "todo",
+    "fixme",
+    "xxx",
+    "hack",
+    "note",
+    "http",
+    "https",
+    "utf",
+    "ascii",
+    "json",
+    "html",
+    "css",
+    "xml",
+    "yaml",
+    "toml",
+    "true",
+    "false",
+}
+
+# Single English-ish parts that make two-part tokens boring (file_name, etc.)
+# Applied only when BOTH parts are in this set.
+BORING_PARTS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "from",
+    "by",
+    "is",
+    "it",
+    "be",
+    "as",
+    "at",
+    "no",
+    "not",
+    "new",
+    "old",
+    "get",
+    "set",
+    "put",
+    "add",
+    "has",
+    "can",
+    "may",
+    "use",
+    "run",
+    "all",
+    "any",
+    "one",
+    "two",
+    "max",
+    "min",
+    "end",
+    "top",
+    "key",
+    "val",
+    "id",
+    "ids",
+    "ok",
+    "err",
+    "msg",
+    "src",
+    "dst",
+    "tmp",
+    "obj",
+    "num",
+    "str",
+    "int",
+    "bool",
+    "true",
+    "false",
+    "null",
+    "nil",
+    "self",
+    "this",
+    "type",
+    "name",
+    "data",
+    "info",
+    "item",
+    "file",
+    "path",
+    "line",
+    "text",
+    "value",
+    "values",
+    "index",
+    "count",
+    "size",
+    "length",
+    "width",
+    "height",
+    "test",
+    "tests",
+    "spec",
+    "main",
+    "init",
+    "config",
+    "default",
+    "option",
+    "options",
+    "error",
+    "errors",
+    "result",
+    "results",
+    "output",
+    "input",
+    "string",
+    "number",
+    "object",
+    "array",
+    "list",
+    "map",
+    "set",
+    "user",
+    "name",
+    "code",
+    "mode",
+    "kind",
+    "case",
+    "part",
+    "body",
+    "head",
+    "left",
+    "right",
+    "next",
+    "prev",
+    "last",
+    "first",
+    "open",
+    "close",
+    "read",
+    "write",
+    "load",
+    "save",
+    "make",
+    "create",
+    "update",
+    "delete",
+    "remove",
+    "start",
+    "stop",
+    "reset",
+    "clear",
+    "check",
+    "valid",
+    "empty",
+    "full",
+    "base",
+    "root",
+    "home",
+    "work",
+    "temp",
+    "time",
+    "date",
+    "year",
+    "day",
+}
+
+CODE_EXTS = {
+    ".rs",
+    ".go",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".swift",
+    ".m",
+    ".mm",
+    ".java",
+    ".kt",
+    ".kts",
+    ".rb",
+    ".php",
+    ".cs",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".scala",
+    ".hs",
+    ".lua",
+    ".r",
+    ".jl",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    ".pkl",
+    ".proto",
+    ".graphql",
+    ".vue",
+    ".svelte",
+    ".elm",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".clj",
+    ".cljs",
+    ".nim",
+    ".zig",
+    ".dart",
+}
+
+CONFIG_EXTS = {
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+}
+
+DOC_EXTS = {".md", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm"}
+
+TEST_HINTS = (
+    "/test/",
+    "/tests/",
+    "/__tests__/",
+    "_test.",
+    ".test.",
+    ".spec.",
+    "test_",
+    "_spec.",
+)
+
+
+@dataclass(frozen=True)
+class Hit:
+    path: str
+    line: int
+    surface: str
+    kind: str  # lit | key | ident | flag
+    canon: tuple[str, ...]
+
+
+@dataclass
+class Pact:
+    canon: tuple[str, ...]
+    hits: list[Hit] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return ".".join(self.canon)
+
+    @property
+    def files(self) -> list[str]:
+        return sorted({h.path for h in self.hits})
+
+    @property
+    def forms(self) -> list[str]:
+        return sorted({h.surface for h in self.hits})
+
+    @property
+    def kinds(self) -> set[str]:
+        return {h.kind for h in self.hits}
+
+    @property
+    def exts(self) -> set[str]:
+        return {Path(h.path).suffix.lower() for h in self.hits}
+
+
+@dataclass(frozen=True)
+class Split:
+    canon: tuple[str, ...]
+    changed_files: tuple[str, ...]
+    leftover_files: tuple[str, ...]
+    leftover_forms: tuple[str, ...]
+    new_forms: tuple[str, ...]
+
+
+def canon_of(token: str) -> tuple[str, ...] | None:
+    raw = token.strip().strip("`'\"")
+    if not raw or len(raw) > 80:
+        return None
+    if " " in raw or "\t" in raw:
+        return None
+    tmp = SPLIT_CAMEL_1.sub(r"\1 \2", raw)
+    tmp = SPLIT_CAMEL_2.sub(r"\1 \2", tmp)
+    tmp = SEP_RE.sub(" ", tmp)
+    parts = tuple(p.lower() for p in tmp.split() if p and p.isalnum())
+    if not parts:
+        return None
+    if any(len(p) > 32 for p in parts):
+        return None
+    if len(parts) > 8:
+        return None
+    return parts
+
+
+def is_keyish_literal(surface: str) -> bool:
+    s = surface.strip()
+    if len(s) < 3 or len(s) > 64:
+        return False
+    if s.lower() in KEYWORDS:
+        return False
+    return bool(
+        SNAKE_RE.match(s)
+        or CONST_RE.match(s)
+        or KEBAB_RE.match(s)
+        or DOTTED_RE.match(s)
+        or CAMEL_RE.match(s)
+        or PASCAL_RE.match(s)
+        or ("/" in s and re.match(r"^[A-Za-z0-9_./@+-]+$", s) and s.count("/") <= 4)
+        or (s.startswith("@") and re.match(r"^@[A-Za-z][A-Za-z0-9_[\]-]*$", s))
+        or (s.startswith("x-") and KEBAB_RE.match(s))
+        or (s.startswith("X-") and re.match(r"^X-[A-Za-z0-9-]+$", s))
+    )
+
+
+def is_inflected_ident(surface: str) -> bool:
+    if surface.lower() in KEYWORDS:
+        return False
+    return bool(
+        SNAKE_RE.match(surface)
+        or CONST_RE.match(surface)
+        or CAMEL_RE.match(surface)
+        or PASCAL_RE.match(surface)
+    )
+
+
+def boring_canon(c: tuple[str, ...]) -> bool:
+    if not c:
+        return True
+    if all(len(p) <= 1 for p in c):
+        return True
+    if any(p in KEYWORDS and len(c) == 1 for p in c):
+        return True
+    if len(c) == 1:
+        # One English word is never a protocol identity. Real wire
+        # names inflect (has_more / hasMore) or carry a separator.
+        return True
+    if len(c) == 2 and c[0] in BORING_PARTS and c[1] in BORING_PARTS:
+        return True
+    return False
+
+
+_SIMPLE_UNESCAPE = {
+    r"\\": "\\",
+    r"\"": '"',
+    r"\'": "'",
+    r"\n": "\n",
+    r"\t": "\t",
+    r"\r": "\r",
+    r"\0": "\0",
+}
+
+
+def unescape_quoted(q: str) -> str:
+    body = q[1:-1]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body):
+            pair = body[i : i + 2]
+            out.append(_SIMPLE_UNESCAPE.get(pair, body[i + 1]))
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def layer_of(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    low = "/" + path.replace("\\", "/").lower()
+    if any(h in low for h in TEST_HINTS):
+        return "test"
+    if ext in DOC_EXTS:
+        return "doc"
+    if ext in CODE_EXTS:
+        return "code"
+    if ext in CONFIG_EXTS:
+        return "config"
+    return "other"
+
+
+def should_skip_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(p in SKIP_DIR_PARTS for p in parts):
+        return True
+    name = Path(rel).name
+    if name in SKIP_NAMES:
+        return True
+    lower = rel.lower()
+    if any(lower.endswith(suf) for suf in SKIP_SUFFIXES):
+        return True
+    if GENERATED_RE.search(rel.replace("\\", "/")):
+        return True
+    return False
+
+
+def looks_binary(data: bytes) -> bool:
+    return b"\x00" in data[:8192]
+
+
+def iter_repo_files(root: Path, walk: bool) -> Iterator[str]:
+    if not walk and (root / ".git").exists():
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", str(root), "ls-files", "-z"],
+                stderr=subprocess.DEVNULL,
+            )
+            for raw in out.split(b"\0"):
+                if not raw:
+                    continue
+                rel = raw.decode("utf-8", "surrogateescape")
+                if not should_skip_path(rel):
+                    yield rel
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_PARTS]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = str(full.relative_to(root))
+            except ValueError:
+                continue
+            if not should_skip_path(rel):
+                yield rel
+
+
+def extract_hits(rel: str, text: str) -> list[Hit]:
+    hits: list[Hit] = []
+    # line offsets
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+
+    def line_of(idx: int) -> int:
+        lo, hi = 0, len(starts) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if starts[mid] <= idx:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return hi + 1
+
+    def add(surface: str, kind: str, idx: int) -> None:
+        c = canon_of(surface)
+        if c is None:
+            return
+        if kind == "lit" and not is_keyish_literal(surface):
+            return
+        if kind == "ident" and not is_inflected_ident(surface):
+            return
+        if kind == "key" and boring_canon(c) and not is_keyish_literal(surface):
+            return
+        hits.append(Hit(rel, line_of(idx), surface, kind, c))
+
+    string_spans = [(m.start(), m.end()) for m in STRING_RE.finditer(text)]
+
+    for a, b in string_spans:
+        raw = text[a:b]
+        if len(raw) < 5:  # quotes + at least 3
+            continue
+        add(unescape_quoted(raw), "lit", a)
+
+    for m in YAML_KEY_RE.finditer(text):
+        add(m.group("key"), "key", m.start("key"))
+
+    for m in FLAG_RE.finditer(text):
+        add(m.group(1), "flag", m.start(1))
+
+    # Identifiers outside string literals only. Inside a string the
+    # literal itself is the wire witness; double-counting "has_more"
+    # as both lit and ident made every JSON key look like an ident.
+    si = 0
+    nspans = len(string_spans)
+    for m in IDENT_RE.finditer(text):
+        start = m.start()
+        while si < nspans and string_spans[si][1] <= start:
+            si += 1
+        if si < nspans and string_spans[si][0] <= start < string_spans[si][1]:
+            continue
+        add(m.group(1), "ident", start)
+
+    # Dedup exact (path, line, surface, kind) — YAML key + ident on the
+    # same word is kept (different kind); two IDENT_RE hits are not.
+    uniq: list[Hit] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    for h in hits:
+        k = (h.path, h.line, h.surface, h.kind)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(h)
+    return uniq
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except (OSError, PermissionError):
+        return None
+    if len(data) > 1_500_000 or looks_binary(data):
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def build_index(root: Path, walk: bool) -> dict[tuple[str, ...], list[Hit]]:
+    index: dict[tuple[str, ...], list[Hit]] = defaultdict(list)
+    for rel in iter_repo_files(root, walk):
+        text = read_text(root / rel)
+        if text is None:
+            continue
+        for hit in extract_hits(rel, text):
+            index[hit.canon].append(hit)
+    return index
+
+
+def score_pact(p: Pact) -> float:
+    files = p.files
+    nfiles = len(files)
+    forms = p.forms
+    layers = {layer_of(f) for f in files}
+    kinds = p.kinds
+    score = 0.0
+    score += min(nfiles, 6) * 1.4
+    score += min(len(forms), 6) * 2.2
+    score += min(len(p.exts), 5) * 1.6
+    score += min(len(layers), 4) * 2.0
+    if "lit" in kinds:
+        score += 2.5
+    if "key" in kinds:
+        score += 1.5
+    if "flag" in kinds:
+        score += 1.5
+    if "ident" in kinds and ("lit" in kinds or "key" in kinds):
+        score += 3.5  # the actual inflection story
+    if "code" in layers and ("config" in layers or "doc" in layers):
+        score += 2.5
+    if layers <= {"doc"}:
+        score -= 5.0
+    if layers <= {"test"}:
+        score -= 2.0
+    if nfiles > 8:
+        score -= (nfiles - 8) * 0.6
+    if boring_canon(p.canon):
+        score -= 4.0
+    # Prefer tokens with a quoted/key witness.
+    if kinds <= {"ident"}:
+        score -= 8.0
+    return score
+
+
+def select_pacts(
+    index: dict[tuple[str, ...], list[Hit]],
+    min_files: int,
+    max_files: int,
+    code_only: bool,
+    min_forms: int,
+) -> list[Pact]:
+    pacts: list[Pact] = []
+    for c, hits in index.items():
+        if boring_canon(c):
+            continue
+        if code_only:
+            hits = [h for h in hits if layer_of(h.path) in {"code", "config", "test"}]
+        # A pact needs a wire witness: literal, key, or flag.
+        if not any(h.kind in {"lit", "key", "flag"} for h in hits):
+            continue
+        files = {h.path for h in hits}
+        if len(files) < min_files or len(files) > max_files:
+            continue
+        forms = {h.surface for h in hits}
+        if len(forms) < min_forms:
+            continue
+        pacts.append(Pact(c, hits))
+    pacts.sort(key=lambda p: (-score_pact(p), p.key))
+    return pacts
+
+
+def lookup(
+    index: dict[tuple[str, ...], list[Hit]], token: str
+) -> Pact | None:
+    c = canon_of(token)
+    if c is None:
+        return None
+    hits = index.get(c)
+    if not hits:
+        return None
+    return Pact(c, hits)
+
+
+DIFF_FILE_RE = re.compile(r"^\+\+\+ [ab]/(.+)$")
+DIFF_DEVNULL = re.compile(r"^\+\+\+ /dev/null$")
+HUNK_RE = re.compile(r"^@@ ")
+
+
+def parse_unified_diff(text: str) -> dict[str, dict[str, set[str]]]:
+    """Return {path: {'removed': set(surfaces), 'added': set(surfaces)}}."""
+    current: str | None = None
+    acc: dict[str, dict[str, set[str]]] = {}
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+            continue
+        m = DIFF_FILE_RE.match(line)
+        if m:
+            current = m.group(1)
+            acc.setdefault(current, {"removed": set(), "added": set()})
+            continue
+        if DIFF_DEVNULL.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("+++ ") or line.startswith("--- ") or HUNK_RE.match(line):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["added"].add(hit.surface)
+        elif line.startswith("-") and not line.startswith("---"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["removed"].add(hit.surface)
+    return acc
+
+
+def working_tree_diff(root: Path) -> str:
+    try:
+        staged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "--cached", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        unstaged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        return (staged + unstaged).decode("utf-8", "replace")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def is_checkable(hits: list[Hit], min_files: int, min_forms: int) -> bool:
+    """True if this canon is a protocol pact worth splitting over.
+
+    Identifier-only names (backgroundColor in two Swift files) are
+    ordinary code, not a wire contract. A single exact spelling is
+    checkable only when it is a keyish literal in multiple files.
+    """
+    if not hits or boring_canon(hits[0].canon):
+        return False
+    if not any(h.kind in {"lit", "key", "flag"} for h in hits):
+        return False
+    files = {h.path for h in hits if not should_skip_path(h.path)}
+    if len(files) < min_files:
+        return False
+    forms = {h.surface for h in hits}
+    if len(forms) >= max(2, min_forms):
+        return True
+    lit_files = {
+        h.path
+        for h in hits
+        if h.kind in {"lit", "key", "flag"} and is_keyish_literal(h.surface)
+    }
+    return len(lit_files) >= min_files
+
+
+def find_splits(
+    index: dict[tuple[str, ...], list[Hit]],
+    diffmap: dict[str, dict[str, set[str]]],
+    min_files: int,
+    min_forms: int = 2,
+) -> list[Split]:
+    files_by_canon: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    forms_by_canon_file: dict[tuple[tuple[str, ...], str], set[str]] = defaultdict(set)
+    eligible: set[tuple[str, ...]] = set()
+    for c, hits in index.items():
+        if is_checkable(hits, min_files, min_forms):
+            eligible.add(c)
+        for h in hits:
+            if should_skip_path(h.path):
+                continue
+            files_by_canon[c].add(h.path)
+            forms_by_canon_file[(c, h.path)].add(h.surface)
+
+    splits: list[Split] = []
+    seen: set[tuple[str, ...]] = set()
+
+    # Canons touched by the diff.
+    touched: dict[tuple[str, ...], dict[str, set[str]]] = defaultdict(
+        lambda: {"removed_files": set(), "added_files": set(), "new_forms": set()}
+    )
+    for path, sides in diffmap.items():
+        if should_skip_path(path):
+            continue
+        rem_c = {canon_of(s) for s in sides["removed"]}
+        add_c = {canon_of(s) for s in sides["added"]}
+        rem_c.discard(None)
+        add_c.discard(None)
+        for s in sides["added"]:
+            c = canon_of(s)
+            if c:
+                touched[c]["added_files"].add(path)
+                touched[c]["new_forms"].add(s)
+        for s in sides["removed"]:
+            c = canon_of(s)
+            if c and c not in add_c:
+                touched[c]["removed_files"].add(path)
+
+    for c, info in touched.items():
+        if c in seen:
+            continue
+        if c not in eligible:
+            continue
+        files = files_by_canon.get(c, set())
+        if len(files) < min_files and not files:
+            continue
+        # leftover: still has this canon in the *current* tree and was not
+        # updated in the patch. After a working-tree diff, the index is the
+        # current tree, so leftovers are files that still mention the token
+        # and are not among the files that removed it.
+        changed = set(info["removed_files"]) | set(info["added_files"])
+        leftover = files - set(info["removed_files"])
+        # If the token was only added (new usage), not a split.
+        if not info["removed_files"]:
+            continue
+        leftover = leftover - set(info["removed_files"])
+        if not leftover:
+            continue
+        # Ignore leftovers that only live in docs when the change is code,
+        # unless docs were the only other witness? Keep them — docs going
+        # stale is the afterimage people want.
+        leftover_forms = sorted(
+            {
+                form
+                for f in leftover
+                for form in forms_by_canon_file.get((c, f), ())
+            }
+        )
+        new_forms = tuple(
+            sorted(s for s in info["new_forms"] if s not in leftover_forms)
+        )
+        splits.append(
+            Split(
+                canon=c,
+                changed_files=tuple(sorted(info["removed_files"])),
+                leftover_files=tuple(sorted(leftover)),
+                leftover_forms=tuple(leftover_forms),
+                new_forms=new_forms,
+            )
+        )
+        seen.add(c)
+
+    splits.sort(key=lambda s: (-len(s.leftover_files), ".".join(s.canon)))
+    return splits
+
+
+def format_pact_human(p: Pact, why: bool) -> str:
+    forms = ", ".join(p.forms)
+    layers = ",".join(sorted({layer_of(f) for f in p.files}))
+    lines = [
+        f"{p.key}  forms: {forms}  files: {len(p.files)}  layers: {layers}"
+    ]
+    # unique file:line:surface, keep first few per file
+    shown = 0
+    per_file: dict[str, int] = defaultdict(int)
+    for h in sorted(p.hits, key=lambda x: (x.path, x.line, x.kind)):
+        if per_file[h.path] >= (4 if why else 2):
+            continue
+        per_file[h.path] += 1
+        lines.append(f"  {h.path}:{h.line}  {h.kind:<5}  {h.surface}")
+        shown += 1
+        if not why and shown >= 16:
+            extra = len(p.hits) - shown
+            if extra > 0:
+                lines.append(f"  … {extra} more hits")
+            break
+    return "\n".join(lines)
+
+
+def format_split_human(s: Split) -> str:
+    key = ".".join(s.canon)
+    lines = [f"SPLIT  {key}"]
+    lines.append("  changed:   " + ", ".join(s.changed_files))
+    lines.append("  leftover:  " + ", ".join(s.leftover_files))
+    if s.leftover_forms:
+        lines.append("  still as:  " + ", ".join(s.leftover_forms))
+    if s.new_forms:
+        lines.append("  became:    " + ", ".join(s.new_forms))
+    return "\n".join(lines)
+
+
+def pact_to_json(p: Pact) -> dict:
+    return {
+        "canon": p.key,
+        "parts": list(p.canon),
+        "forms": p.forms,
+        "files": p.files,
+        "score": round(score_pact(p), 3),
+        "hits": [
+            {
+                "path": h.path,
+                "line": h.line,
+                "surface": h.surface,
+                "kind": h.kind,
+            }
+            for h in p.hits
+        ],
+    }
+
+
+def split_to_json(s: Split) -> dict:
+    return {
+        "canon": ".".join(s.canon),
+        "changed_files": list(s.changed_files),
+        "leftover_files": list(s.leftover_files),
+        "leftover_forms": list(s.leftover_forms),
+        "new_forms": list(s.new_forms),
+    }
+
+
+def stdin_is_diff(text: str) -> bool:
+    head = text.lstrip()
+    return (
+        head.startswith("diff --git ")
+        or head.startswith("--- ")
+        or head.startswith("+++ ")
+        or head.startswith("@@ ")
+    )
+
+
+def find_root(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).resolve()
+    here = Path.cwd()
+    for p in [here, *here.parents]:
+        if (p / ".git").exists():
+            return p
+    return here
+
+
+def run_selftest() -> int:
+    failures = 0
+
+    def expect(name: str, cond: bool) -> None:
+        nonlocal failures
+        if not cond:
+            print(f"FAIL {name}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"ok   {name}")
+
+    expect("canon snake/camel", canon_of("has_more") == canon_of("hasMore"))
+    expect("canon const", canon_of("HAS_MORE") == ("has", "more"))
+    expect("canon kebab", canon_of("hook-post-tool") == ("hook", "post", "tool"))
+    expect("canon header", canon_of("X-Request-Id") == ("x", "request", "id"))
+    expect("canon dotted", canon_of("sensors.presence") == ("sensors", "presence"))
+    expect("keyish snake", is_keyish_literal("source_text"))
+    expect("not keyish the", not is_keyish_literal("the"))
+    expect("boring default", boring_canon(("default",)))
+    expect("not boring has_more", not boring_canon(("has", "more")))
+
+    sample = (
+        'const k = "has_more";\n'
+        "let hasMore = false;\n"
+        "has_more: true\n"
+        "  --has-more\n"
+    )
+    hits = extract_hits("x.ts", sample)
+    canons = {h.canon for h in hits}
+    expect("extract same canon", ("has", "more") in canons)
+    kinds = {h.kind for h in hits if h.canon == ("has", "more")}
+    expect("extract kinds", {"lit", "ident", "key", "flag"} <= kinds)
+    # The quoted has_more must not also be counted as an identifier.
+    ident_on_line1 = [
+        h for h in hits if h.line == 1 and h.kind == "ident" and h.surface == "has_more"
+    ]
+    expect("no ident inside string", ident_on_line1 == [])
+    expect("N/A boring", boring_canon(canon_of("N/A") or ("n", "a")))
+    expect(
+        "skip OraclesGenerated",
+        should_skip_path("Engine/Tests/TenaoshiEngineTests/OraclesGenerated.swift"),
+    )
+    expect("keep EditPlan.swift", not should_skip_path("Engine/Sources/TenaoshiEngine/EditPlan.swift"))
+    expect("spec dir is not a test", layer_of("spec/api.yaml") == "config")
+    expect("html is doc", layer_of("docs/design/panel-mock.html") == "doc")
+
+    diff = """\
+diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-TOKEN = "has_more"
++TOKEN = "has_extra"
+"""
+    dm = parse_unified_diff(diff)
+    expect("diff file", "a.py" in dm)
+    expect("diff removed", "has_more" in dm["a.py"]["removed"])
+    expect("diff added", "has_extra" in dm["a.py"]["added"])
+
+    idx = {
+        ("has", "more"): [
+            Hit("a.py", 1, "has_more", "lit", ("has", "more")),
+            Hit("b.yaml", 3, "has_more", "key", ("has", "more")),
+        ]
+    }
+    splits = find_splits(idx, dm, min_files=2)
+    expect("split detected", len(splits) == 1 and splits[0].leftover_files == ("b.yaml",))
+    ident_only = {
+        ("bg", "color"): [
+            Hit("a.swift", 1, "backgroundColor", "ident", ("bg", "color")),
+            Hit("b.swift", 4, "backgroundColor", "ident", ("bg", "color")),
+        ]
+    }
+    expect(
+        "ident-only not checkable",
+        not is_checkable(ident_only[("bg", "color")], 2, 2),
+    )
+
+    # complete rename is not a split
+    dm2 = {
+        "a.py": {"removed": {"has_more"}, "added": {"has_extra"}},
+        "b.yaml": {"removed": {"has_more"}, "added": {"has_extra"}},
+    }
+    splits2 = find_splits(idx, dm2, min_files=2)
+    expect("complete rename clean", splits2 == [])
+
+    return 1 if failures else 0
+
+
+def emit_pacts(pacts: Sequence[Pact], args: argparse.Namespace) -> None:
+    if args.json:
+        json.dump([pact_to_json(p) for p in pacts], sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for p in pacts:
+            for h in p.hits:
+                sys.stdout.write(
+                    f"{p.key}\t{h.surface}\t{h.kind}\t{h.path}\t{h.line}\n"
+                )
+        return
+    if not pacts:
+        print("aka: no cognate protocol tokens")
+        return
+    chunks = [format_pact_human(p, args.why) for p in pacts]
+    print("\n\n".join(chunks))
+
+
+def emit_splits(splits: Sequence[Split], args: argparse.Namespace) -> None:
+    if args.json:
+        json.dump([split_to_json(s) for s in splits], sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for s in splits:
+            sys.stdout.write(
+                "split\t"
+                + ".".join(s.canon)
+                + "\t"
+                + ",".join(s.changed_files)
+                + "\t"
+                + ",".join(s.leftover_files)
+                + "\n"
+            )
+        return
+    if not splits:
+        print("aka: no one-sided protocol edits")
+        return
+    print("\n\n".join(format_split_human(s) for s in splits))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="aka",
+        description=(
+            "Find protocol tokens that live under several names "
+            "(has_more / hasMore / HAS_MORE) and catch one-sided edits."
+        ),
+    )
+    ap.add_argument("token", nargs="?", help="lookup one token (any surface form)")
+    ap.add_argument("-C", "--repo", help="repository root")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument(
+        "--porcelain",
+        action="store_true",
+        help="stable TSV: canon<TAB>surface<TAB>kind<TAB>path<TAB>line",
+    )
+    ap.add_argument("--min-files", type=int, default=2)
+    ap.add_argument("--max-files", type=int, default=24)
+    ap.add_argument(
+        "--min-forms",
+        type=int,
+        default=2,
+        help="minimum distinct surface forms (default 2 = actual cognates)",
+    )
+    ap.add_argument("--limit", type=int, default=40, help="max pacts to print")
+    ap.add_argument("--all", action="store_true", help="do not apply --limit")
+    ap.add_argument("--code", action="store_true", help="ignore markdown/text files")
+    ap.add_argument("--walk", action="store_true", help="walk the tree instead of git ls-files")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if a patch updates a token on only some of its files",
+    )
+    ap.add_argument("--diff", metavar="FILE", help="patch file to check ('-' = stdin)")
+    ap.add_argument("--why", action="store_true", help="show more hit sites")
+    ap.add_argument("--selftest", action="store_true", help="run built-in tests")
+    ap.add_argument("--version", action="version", version=f"aka {VERSION}")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return run_selftest()
+
+    root = find_root(args.repo)
+    stdin_data = ""
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+
+    want_check = args.check or args.diff is not None
+    if stdin_data and stdin_is_diff(stdin_data):
+        want_check = True
+
+    index = build_index(root, walk=args.walk)
+
+    if want_check:
+        if args.diff and args.diff != "-":
+            patch = Path(args.diff).read_text(encoding="utf-8", errors="replace")
+        elif stdin_data and stdin_is_diff(stdin_data):
+            patch = stdin_data
+        else:
+            patch = working_tree_diff(root)
+        diffmap = parse_unified_diff(patch)
+        splits = find_splits(
+            index,
+            diffmap,
+            min_files=args.min_files,
+            min_forms=args.min_forms,
+        )
+        emit_splits(splits, args)
+        return 1 if splits else 0
+
+    if args.token:
+        p = lookup(index, args.token)
+        emit_pacts([p] if p else [], args)
+        return 0 if p else 1
+
+    if stdin_data and not stdin_is_diff(stdin_data):
+        wanted = {line.strip() for line in stdin_data.splitlines() if line.strip()}
+        pacts = select_pacts(
+            index, args.min_files, args.max_files, args.code, args.min_forms
+        )
+        pacts = [p for p in pacts if wanted & set(p.files)]
+    else:
+        pacts = select_pacts(
+            index, args.min_files, args.max_files, args.code, args.min_forms
+        )
+
+    if not args.all:
+        pacts = pacts[: max(0, args.limit)]
+    emit_pacts(pacts, args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

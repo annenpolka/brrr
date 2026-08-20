@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Write during the process, then spawn a writer that mutates disk AFTER we exit.
+
+Stays alive long enough that an external clinger can attach, then exits
+before the late writer touches disk.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+out = Path(sys.argv[1] if len(sys.argv) > 1 else "fixtures/work/afterexit")
+out.mkdir(parents=True, exist_ok=True)
+during = out / "during.txt"
+late = out / "late.txt"
+ready = out / "ready"
+during.write_text("during\n", encoding="utf-8")
+ready.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+late_script = (
+    "import signal, time, pathlib\n"
+    "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "time.sleep(0.70)\n"
+    f"pathlib.Path({str(late)!r}).write_text('late\\n', encoding='utf-8')\n"
+)
+subprocess.Popen(
+    [sys.executable, "-c", late_script],
+    start_new_session=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    stdin=subprocess.DEVNULL,
+)
+# Attach window: clinger must latch on before this sleep ends.
+time.sleep(float(os.environ.get("CLING_HOLD", "0.50")))

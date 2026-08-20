@@ -1,0 +1,2546 @@
+#!/usr/bin/env python3
+"""dowel — a contract token: template fingerprint + bound holes + locus.
+
+Mint once from path:line and a runtime instance. The token is not a pin
+and not an invert query. Resolve later onto another tree answers two
+questions together: where the template sits now, and whether the same
+hole names still bind.
+
+Seating uses the template's static parts plus locus (path, neighbors,
+stem-split). Hole names are assayed after the seat is chosen — a clone
+that kept the old names cannot steal a body that renamed them.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+PREFIX = "dowel1."
+_TOKEN_BODY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+SOURCE_EXTS = {
+    ".rs": "rust",
+    ".ts": "js",
+    ".tsx": "js",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".py": "py",
+    ".pyi": "py",
+    ".go": "go",
+    ".swift": "swift",
+    ".c": "c",
+    ".h": "c",
+    ".hh": "c",
+    ".cc": "c",
+    ".cpp": "c",
+    ".cxx": "c",
+    ".hpp": "c",
+    ".java": "java",
+    ".kt": "kt",
+    ".kts": "kt",
+    ".rb": "rb",
+    ".cs": "cs",
+    ".zig": "zig",
+    ".sh": "sh",
+    ".bash": "sh",
+    ".zsh": "sh",
+}
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".build",
+    "vendor",
+    "coverage",
+    ".cargo",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "DerivedData",
+    ".swiftpm",
+}
+SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".o",
+    ".so",
+    ".dylib",
+    ".a",
+    ".rlib",
+    ".rmeta",
+    ".exe",
+    ".dll",
+    ".wasm",
+    ".lock",
+    ".bin",
+    ".pyc",
+    ".class",
+}
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEF_RE = re.compile(
+    r"""^(\s*)(?:(?:pub(?:\s*\([^)]*\))?|crate|async|unsafe|static|
+         private|protected|public|internal|open|override|fileprivate|
+         export|default)\s+)*
+        (?:fn|def|func|function|class|struct|enum|trait|interface|impl|
+         extension|typedef|type)\b""",
+    re.VERBOSE,
+)
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "class",
+    "const",
+    "crate",
+    "def",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "int",
+    "let",
+    "mod",
+    "mut",
+    "none",
+    "not",
+    "of",
+    "or",
+    "pub",
+    "return",
+    "self",
+    "static",
+    "str",
+    "struct",
+    "the",
+    "this",
+    "to",
+    "true",
+    "type",
+    "use",
+    "var",
+    "void",
+    "where",
+    "with",
+}
+TRIVIAL_NORMS = {
+    "",
+    "{",
+    "}",
+    "};",
+    "[",
+    "]",
+    "(",
+    ")",
+    "else",
+    "else:",
+    "pass",
+    "break",
+    "continue",
+    "end",
+    "end;",
+    "//",
+    "#",
+    "*/",
+    "/*",
+}
+
+PRINTF_RE = re.compile(
+    r"%(?:%|[-+0 #]*\d*(?:\.\d+)?(?:hh|h|ll|l|z|j|t|L)?[sdifugGxXeEpc@voOqTwWcS])"
+)
+SWIFT_CONTINUATION_RE = re.compile(r"\\[ \t]*\n[ \t]*")
+COMPILER_LOCATOR_RE = re.compile(
+    r"""(?x)
+    ^-->\s+\S+:\d+
+    |^(?:error|warning|note|help)\[E\d+\]
+    |^=\s+(?:note|help|warning|error):
+    |^\^\s*(?:expected|found|error)\b
+    |^\^+$
+    """
+)
+DATA_LITERAL_RE = re.compile(r"""^\s*[{\[]\s*(?:"|\{|\[|\d)""")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+HARD_MAX_BYTES = 48_000_000
+MAX_TEXT_CHARS = 240
+MAX_NEIGHBOR_CHARS = 140
+MAX_TOKEN_PLAIN = 64_000
+MIN_STATIC_EXACT = 4
+MIN_STATIC_PREFIX = 10
+MIN_STATIC_HOLE = 6
+SEAT_STATIC_FLOOR = 0.72
+RESOLVE_THRESHOLD = 0.40
+TIE_EPS = 1e-6
+EXACT_NS_KEEP = 0.15
+STRONG_NS_FLOOR = 0.40
+LOCUS_WINDOW = 12
+
+HINT = (
+    "dowel mints a contract token (template + bound holes + locus).\n"
+    "  dowel mint --repo PATH --from <sha> path:line 'runtime instance'\n"
+    "  dowel resolve --repo PATH --to HEAD dowel1.…\n"
+    "  dowel show dowel1.…\n"
+    "Resolve refuses path:line. The token is the object."
+)
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Template:
+    path: str
+    line: int
+    col: int
+    lang: str
+    raw: str
+    parts: tuple[str, ...]
+    holes: int
+    names: tuple[str, ...] = ()
+
+    @property
+    def static_len(self) -> int:
+        return sum(len(p) for p in self.parts)
+
+    @property
+    def hole_names(self) -> tuple[str, ...]:
+        if self.names and len(self.names) == self.holes:
+            return self.names
+        return tuple(str(i + 1) for i in range(self.holes))
+
+    @property
+    def display(self) -> str:
+        names = self.hole_names
+        out: list[str] = []
+        for i, p in enumerate(self.parts):
+            if i:
+                name = names[i - 1] if i - 1 < len(names) else ""
+                out.append("{" + name + "}")
+            out.append(p.replace("\n", "\\n").replace("\t", "\\t"))
+        return "".join(out)
+
+    @property
+    def static_blob(self) -> str:
+        return "".join(self.parts)
+
+
+@dataclass
+class Bind:
+    score: float
+    prefix: str
+    suffix: str
+    bindings: tuple[tuple[str, str], ...]
+    truncated: bool = False
+    remainder: str = ""
+
+
+@dataclass
+class Contract:
+    """The minted object: template fingerprint + bound holes + locus."""
+
+    path: str
+    line: int
+    col: Optional[int]
+    text: str
+    parts: tuple[str, ...]
+    names: tuple[str, ...]
+    bound: tuple[str, ...]
+    instance: str
+    bindings: tuple[tuple[str, str], ...]
+    tokens: list[str] = field(default_factory=list)
+    unique: list[str] = field(default_factory=list)
+    before: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)
+    lang: str = ""
+    origin: Optional[str] = None
+    truncated: bool = False
+    remainder: str = ""
+
+    @property
+    def display(self) -> str:
+        return template_of(self.path, self.line, self.col or 1, self.lang or "any", "", self.parts, self.names).display
+
+    def payload(self) -> dict:
+        d: dict = {
+            "v": 1,
+            "p": self.path,
+            "n": self.line,
+            "t": self.text,
+            "parts": list(self.parts),
+            "names": list(self.names),
+            "bound": list(self.bound),
+            "inst": self.instance,
+            "bind": [list(x) for x in self.bindings],
+        }
+        if self.col is not None:
+            d["c"] = self.col
+        if self.tokens:
+            d["k"] = self.tokens
+        if self.unique:
+            d["u"] = self.unique
+        if self.before:
+            d["b"] = self.before
+        if self.after:
+            d["a"] = self.after
+        if self.lang:
+            d["lang"] = self.lang
+        if self.origin:
+            d["o"] = self.origin
+        if self.truncated:
+            d["trunc"] = True
+        if self.remainder:
+            d["rem"] = self.remainder
+        return d
+
+    @classmethod
+    def from_payload(cls, d: dict) -> "Contract":
+        if not isinstance(d, dict) or d.get("v") != 1:
+            raise ValueError("unsupported dowel version")
+        path = d.get("p")
+        line = d.get("n")
+        text = d.get("t")
+        parts = d.get("parts")
+        names = d.get("names")
+        inst = d.get("inst")
+        if not isinstance(path, str) or not isinstance(line, int) or not isinstance(text, str):
+            raise ValueError("dowel missing path/line/text")
+        if not isinstance(parts, list) or not isinstance(names, list) or not isinstance(inst, str):
+            raise ValueError("dowel missing template fingerprint")
+        bound = d.get("bound")
+        if not isinstance(bound, list) or not bound:
+            raise ValueError("dowel missing bound holes")
+        raw_bind = d.get("bind") or []
+        bindings: list[tuple[str, str]] = []
+        if isinstance(raw_bind, list):
+            for item in raw_bind:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    bindings.append((str(item[0]), str(item[1])))
+        origin = d.get("o")
+        return cls(
+            path=canon_path(path),
+            line=line,
+            col=d.get("c") if isinstance(d.get("c"), int) else None,
+            text=text,
+            parts=tuple(str(x) for x in parts),
+            names=tuple(str(x) for x in names),
+            bound=tuple(str(x) for x in bound),
+            instance=inst,
+            bindings=tuple(bindings),
+            tokens=_str_list(d.get("k")),
+            unique=_str_list(d.get("u")),
+            before=_str_list(d.get("b")),
+            after=_str_list(d.get("a")),
+            lang=d.get("lang") if isinstance(d.get("lang"), str) else "",
+            origin=origin if isinstance(origin, str) and origin else None,
+            truncated=bool(d.get("trunc")),
+            remainder=d.get("rem") if isinstance(d.get("rem"), str) else "",
+        )
+
+
+@dataclass
+class Hit:
+    contract: Contract
+    token: str
+    status: str
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    dest_tmpl: str = ""
+    dest_names: tuple[str, ...] = ()
+    dest_bindings: tuple[tuple[str, str], ...] = ()
+    score: float = 0.0
+    note: str = ""
+    rename: list[tuple[str, str]] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+    drifted: list[str] = field(default_factory=list)
+    alts: list[tuple[str, int]] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass
+class ScoredTmpl:
+    score: float
+    tmpl: Template
+    ns: float
+    exact: bool
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    git_names: dict[str, str] = field(default_factory=dict)
+    origin: Optional[str] = None
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    paths: tuple[str, ...] = ()
+
+    def index(self) -> None:
+        self.by_norm = {}
+        keyed = {canon_path(p): lines for p, lines in self.files.items()}
+        self.files = keyed
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm.setdefault(n, []).append((path, i))
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def _str_list(val: object) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    return [x for x in val if isinstance(x, str)]
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/") if p.startswith("/") and not p.startswith("//") else p
+
+
+def canon_path(path: str) -> str:
+    return unicodedata.normalize("NFC", posix_rel(path))
+
+
+def path_forms(path: str) -> set[str]:
+    raw = posix_rel(path)
+    return {raw, unicodedata.normalize("NFC", raw), unicodedata.normalize("NFD", raw)}
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS:
+            continue
+        if len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def clip(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def normalize_query(s: str) -> str:
+    s = strip_ansi(s).replace("\r\n", "\n").replace("\r", "\n")
+    return s.strip()
+
+
+def is_compiler_locator(q: str) -> bool:
+    s = (q or "").strip()
+    if not s:
+        return False
+    if COMPILER_LOCATOR_RE.match(s):
+        return True
+    if s.startswith("|") and (s == "|" or set(s[1:].strip()) <= set("^~ ")):
+        return True
+    return False
+
+
+def decode_bytes(data: bytes, *, required: bool = False, path: str = "") -> Optional[str]:
+    if b"\x00" in data[:8192]:
+        if required:
+            die(f"dowel: binary file cannot be fingerprinted: {path or '?'}")
+        return None
+    if len(data) > HARD_MAX_BYTES:
+        if required:
+            die(f"dowel: file exceeds {HARD_MAX_BYTES} bytes: {path or '?'}")
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def verify_git_ref(root: Path, ref: str) -> str:
+    cp = git(root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{object}}"], check=False)
+    sha = cp.stdout.decode("ascii", "replace").strip()
+    if cp.returncode != 0 or not sha:
+        die(f"dowel: unknown ref: {ref}")
+    return sha
+
+
+def repo_origin(root: Optional[Path], ref: Optional[str] = None) -> Optional[str]:
+    if root is None:
+        return None
+    raw = git_ok(root, ["rev-list", "--max-parents=0", "--all"])
+    if not raw or not raw.strip():
+        hint = ref or "HEAD"
+        raw = git_ok(root, ["rev-list", "--max-parents=0", hint])
+    if not raw or not raw.strip():
+        return None
+    roots = sorted({ln.strip()[:16] for ln in raw.splitlines() if ln.strip()})
+    if not roots:
+        return None
+    return "git:" + ",".join(roots[:4])
+
+
+def load_git_paths(root: Path, ref: Optional[str]) -> list[tuple[str, str]]:
+    if ref is None:
+        cp = git(root, ["ls-files", "-z"], check=False)
+        label = "worktree"
+    else:
+        verify_git_ref(root, ref)
+        cp = git(root, ["ls-tree", "-r", "--name-only", "-z", ref], check=False)
+        label = ref
+    if cp.returncode != 0:
+        err = cp.stderr.decode("utf-8", "replace").strip() or "git list failed"
+        die(f"dowel: cannot list {label}: {err}")
+    raw = cp.stdout.decode("utf-8", "surrogateescape")
+    out: list[tuple[str, str]] = []
+    for p in raw.split("\0"):
+        if not p or should_skip_path(p):
+            continue
+        out.append((canon_path(p), p))
+    return out
+
+
+def read_git_file(
+    root: Path,
+    ref: Optional[str],
+    git_name: str,
+    *,
+    required: bool = False,
+) -> Optional[list[str]]:
+    if ref is None:
+        return read_fs_file(root / git_name, required=required, display=git_name)
+    try:
+        cp = git(root, ["show", f"{ref}:{git_name}"], check=True)
+    except subprocess.CalledProcessError:
+        if required:
+            die(f"dowel: cannot read {ref}:{git_name}")
+        return None
+    text = decode_bytes(cp.stdout, required=required, path=git_name)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def walk_dir_files(root: Path) -> Iterator[tuple[str, Path]]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield canon_path(rel), full
+
+
+def read_fs_file(fp: Path, *, required: bool = False, display: str = "") -> Optional[list[str]]:
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        if required:
+            die(f"dowel: cannot read {display or fp}")
+        return None
+    text = decode_bytes(data, required=required, path=display or str(fp))
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    label: str,
+    empty_ok: bool = False,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    git_names: dict[str, str] = {}
+    origin: Optional[str] = None
+    if directory is not None:
+        if not directory.is_dir():
+            die(f"dowel: not a directory: {directory}")
+        nested = discover_repo(directory)
+        if nested is not None and nested == directory.resolve():
+            origin = repo_origin(nested)
+        for path, full in walk_dir_files(directory):
+            lines = read_fs_file(full, display=path)
+            if lines is not None:
+                files[path] = lines
+        if not files and not empty_ok:
+            die(f"dowel: destination snapshot is empty: {directory}")
+        snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+        snap.index()
+        return snap
+    if git_root is None:
+        die("dowel: not a git repository (use --repo or --from-dir/--to-dir)")
+    origin = repo_origin(git_root, ref)
+    pairs = load_git_paths(git_root, ref)
+    for nfc, git_name in pairs:
+        lines = read_git_file(git_root, ref, git_name)
+        if lines is not None:
+            files[nfc] = lines
+            git_names[nfc] = git_name
+    if not files and not empty_ok:
+        die(f"dowel: snapshot is empty: {label}")
+    snap = Snapshot(label=label, files=files, git_names=git_names, origin=origin)
+    snap.index()
+    return snap
+
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    forms = path_forms(raw)
+    nfc = canon_path(raw)
+    known_map = {canon_path(k): k for k in known}
+    if nfc in known_map:
+        return known_map[nfc]
+    for f in forms:
+        key = canon_path(f)
+        if key in known_map:
+            return known_map[key]
+    best = None
+    for kp in known_map:
+        if any(nfc.endswith("/" + f) or kp.endswith("/" + f) for f in forms):
+            if nfc.endswith("/" + kp) or kp.endswith("/" + nfc):
+                if best is None or len(kp) > len(best):
+                    best = kp
+    return best
+
+
+def parse_locator(text: str, known: Iterable[str]) -> tuple[str, int, Optional[int]]:
+    if is_dowel_token(text):
+        die("dowel mint: that looks like a dowel token; use resolve")
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        die(f"dowel: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    bound = bind_path(rest, known)
+    path = bound or canon_path(rest)
+    if not path:
+        die(f"dowel: missing path in {text}")
+    return path, line, col
+
+
+def is_dowel_token(s: str) -> bool:
+    s = s.strip()
+    if not s.startswith(PREFIX):
+        return False
+    body = s[len(PREFIX) :]
+    return len(body) >= 12 and bool(_TOKEN_BODY_RE.fullmatch(body))
+
+
+def encode_dowel(c: Contract) -> str:
+    raw = json.dumps(c.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    packed = zlib.compress(raw, 9)
+    return PREFIX + base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+def decode_dowel(token: str) -> Contract:
+    token = token.strip()
+    if not is_dowel_token(token):
+        raise ValueError("not a dowel token")
+    b64 = token[len(PREFIX) :]
+    pad = "=" * (-len(b64) % 4)
+    try:
+        packed = base64.urlsafe_b64decode(b64 + pad)
+        raw = zlib.decompress(packed)
+    except Exception as e:
+        raise ValueError(f"corrupt dowel: {e}") from e
+    if len(raw) > MAX_TOKEN_PLAIN:
+        raise ValueError("dowel payload too large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt dowel json: {e}") from e
+    return Contract.from_payload(data)
+
+
+# ---------------------------------------------------------------------------
+# template extract / named holes (harvested invert/stump kernel)
+# ---------------------------------------------------------------------------
+
+
+def unescape_basic(s: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'", "`": "`"}
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "(":
+                out.append("\\(")
+                i += 2
+                continue
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "x" and i + 3 < n:
+                try:
+                    out.append(chr(int(s[i + 2 : i + 4], 16)))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _matching_brace(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch in {'"', "'"}:
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _matching_paren(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch in {'"', "'"}:
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _is_format_hole(s: str, i: int) -> int | None:
+    if i >= len(s) or s[i] != "{":
+        return None
+    n = len(s)
+    j = i + 1
+    if j < n and s[j] in '{"[ \n\t':
+        return None
+    if j < n and s[j] == "}":
+        return j + 1
+    if j < n and s[j].isdigit():
+        while j < n and s[j].isdigit():
+            j += 1
+    elif j < n and (s[j].isalpha() or s[j] == "_"):
+        while j < n and (s[j].isalnum() or s[j] in "_."):
+            j += 1
+    if j < n and s[j] == "!":
+        j += 1
+        while j < n and s[j].isalpha():
+            j += 1
+    if j < n and s[j] == ":":
+        k = s.find("}", j)
+        if k < 0:
+            return None
+        return k + 1
+    if j < n and s[j] == "}":
+        return j + 1
+    return None
+
+
+def _brace_hole_name(inner: str) -> str:
+    inner = inner.strip()
+    if not inner:
+        return ""
+    if "!" in inner:
+        inner = inner.split("!", 1)[0]
+    if ":" in inner:
+        inner = inner.split(":", 1)[0]
+    return inner.strip()
+
+
+def _swift_hole_name(inner: str) -> str:
+    s = inner.strip()
+    if not s:
+        return ""
+    m = re.match(
+        r"((?:self\.)?[A-Za-z_][A-Za-z0-9_]*|(?:\#)[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:[.#][A-Za-z_][A-Za-z0-9_]*)*",
+        s,
+    )
+    if m:
+        return m.group(0)
+    return s.split(",", 1)[0].strip()[:48]
+
+
+def _dollar_hole_name(inner: str) -> str:
+    return inner.strip()
+
+
+def _assign_hole_names(raw: list[str]) -> tuple[str, ...]:
+    n = 1
+    out: list[str] = []
+    for name in raw:
+        if name:
+            out.append(name)
+        else:
+            out.append(str(n))
+            n += 1
+    return tuple(out)
+
+
+def swift_string_value(raw: str) -> str:
+    s = SWIFT_CONTINUATION_RE.sub("", raw)
+    if "\n" not in s:
+        return s
+    if s.startswith("\n"):
+        s = s[1:]
+    lines = s.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty:
+        cut = min(len(ln) - len(ln.lstrip(" \t")) for ln in nonempty)
+        lines = [ln[cut:] if len(ln) >= cut else ln for ln in lines]
+    return "\n".join(lines).strip()
+
+
+def looks_like_data_literal(body: str, holes: int) -> bool:
+    if holes:
+        return False
+    s = body.strip()
+    if len(s) >= 280:
+        return True
+    if DATA_LITERAL_RE.match(s) and (":" in s or "," in s):
+        return True
+    return False
+
+
+def tokenize_named(s: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    buf: list[str] = []
+    parts: list[str] = []
+    raw_names: list[str] = []
+    i = 0
+    n = len(s)
+
+    def flush() -> None:
+        parts.append("".join(buf))
+        buf.clear()
+
+    while i < n:
+        if s.startswith("{{", i):
+            buf.append("{")
+            i += 2
+            continue
+        if s.startswith("}}", i):
+            buf.append("}")
+            i += 2
+            continue
+        if s.startswith("%%", i):
+            buf.append("%")
+            i += 2
+            continue
+        if s.startswith("${", i):
+            end = _matching_brace(s, i + 1)
+            if end is not None:
+                flush()
+                raw_names.append(_dollar_hole_name(s[i + 2 : end]))
+                i = end + 1
+                continue
+        if s.startswith("\\(", i):
+            end = _matching_paren(s, i + 1)
+            if end is not None:
+                flush()
+                raw_names.append(_swift_hole_name(s[i + 2 : end]))
+                i = end + 1
+                continue
+        if s[i] == "{":
+            end = _is_format_hole(s, i)
+            if end is not None:
+                flush()
+                raw_names.append(_brace_hole_name(s[i + 1 : end - 1]))
+                i = end
+                continue
+        m = PRINTF_RE.match(s, i)
+        if m:
+            if m.group(0) == "%%":
+                buf.append("%")
+                i = m.end()
+                continue
+            flush()
+            raw_names.append("")
+            i = m.end()
+            continue
+        buf.append(s[i])
+        i += 1
+    flush()
+    return tuple(parts), _assign_hole_names(raw_names)
+
+
+def template_of(
+    path: str,
+    line: int,
+    col: int,
+    lang: str,
+    raw: str,
+    parts: tuple[str, ...] | None = None,
+    names: tuple[str, ...] | None = None,
+) -> Template:
+    if parts is None or names is None:
+        parts, names = tokenize_named(raw)
+    return Template(
+        path=path,
+        line=line,
+        col=col,
+        lang=lang,
+        raw=raw,
+        parts=parts,
+        holes=len(names),
+        names=names,
+    )
+
+
+def _line_starts(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _linecol(starts: list[int], index: int) -> tuple[int, int]:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= index:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    line_idx = hi
+    return line_idx + 1, index - starts[line_idx] + 1
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] != "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    n = len(text)
+    i += 2
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        i += 1
+    return min(n, i + 2)
+
+
+def _read_quoted(
+    text: str, i: int, quote: str, interpolations: bool = False
+) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    start = i
+    while i < n:
+        if interpolations and text.startswith("\\(", i):
+            end = _matching_paren(text, i + 1)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1, text[start:i]
+        if ch == "\n" and quote != "`":
+            return None
+        i += 1
+    return None
+
+
+def _read_raw_hash(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    start = i
+    close = '"' + ("#" * hashes)
+    while i < n:
+        if text.startswith(close, i):
+            return i + len(close), text[start:i]
+        i += 1
+    return None
+
+
+def _read_triple(
+    text: str, i: int, quote: str, interpolations: bool = False
+) -> tuple[int, str] | None:
+    delim = quote * 3
+    if not text.startswith(delim, i):
+        return None
+    i += 3
+    start = i
+    n = len(text)
+    while i + 2 < n:
+        if interpolations and text.startswith("\\(", i):
+            end = _matching_paren(text, i + 1)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if text.startswith(delim, i):
+            return i + 3, text[start:i]
+        if text[i] == "\\":
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _read_js_template(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    chunks: list[str] = []
+    last = i
+    depth_expr = 0
+    in_expr = False
+    while i < n:
+        ch = text[i]
+        if not in_expr:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                chunks.append(text[last:i])
+                return i + 1, "".join(chunks)
+            if ch == "$" and i + 1 < n and text[i + 1] == "{":
+                chunks.append(text[last:i])
+                chunks.append("${")
+                i += 2
+                last = i
+                in_expr = True
+                depth_expr = 1
+                continue
+            i += 1
+            continue
+        if ch == "{":
+            depth_expr += 1
+        elif ch == "}":
+            depth_expr -= 1
+            if depth_expr == 0:
+                chunks.append(text[last:i])
+                chunks.append("}")
+                i += 1
+                last = i
+                in_expr = False
+                continue
+        elif ch in {'"', "'", "`"}:
+            q = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return None
+
+
+def lang_for(path: str | Path, default: str = "any") -> str:
+    suf = Path(str(path)).suffix.lower()
+    return SOURCE_EXTS.get(suf, default)
+
+
+def extract_templates(text: str, lang: str, path: str) -> list[Template]:
+    starts = _line_starts(text)
+    n = len(text)
+    i = 0
+    out: list[Template] = []
+    any_lang = lang in {"any", ""}
+    rustish = lang == "rust" or any_lang
+    pyish = lang == "py" or any_lang
+    jsish = lang == "js" or any_lang
+    goish = lang == "go" or any_lang
+    swiftish = lang == "swift" or any_lang
+    hash_comment = lang in {"py", "sh", "rb"}
+
+    def emit(raw_inner: str, at: int, unesc: bool) -> None:
+        body = raw_inner
+        if lang == "swift" or (any_lang and ("\\(" in body or "\\\n" in body)):
+            body = swift_string_value(body)
+        if unesc:
+            body = unescape_basic(body)
+        if not body or body.isspace():
+            return
+        if body.endswith("\r\n"):
+            body = body[:-2]
+        elif body.endswith("\n"):
+            body = body[:-1]
+        if len(body.strip()) < MIN_STATIC_EXACT:
+            return
+        parts, names = tokenize_named(body)
+        holes = len(names)
+        if looks_like_data_literal(body, holes):
+            return
+        if holes == 0 and sum(len(p) for p in parts) < MIN_STATIC_EXACT:
+            return
+        line, col = _linecol(starts, at)
+        out.append(
+            template_of(
+                path=path,
+                line=line,
+                col=col,
+                lang=lang if lang and lang != "any" else lang_for(path),
+                raw=body,
+                parts=parts,
+                names=names,
+            )
+        )
+
+    while i < n:
+        ch = text[i]
+        if hash_comment and ch == "#":
+            i = _skip_line_comment(text, i)
+            continue
+        if lang != "py" and ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i = _skip_line_comment(text, i)
+                continue
+            if text[i + 1] == "*":
+                i = _skip_block_comment(text, i)
+                continue
+        if rustish and ch in {"r", "b", "c"}:
+            j = i
+            if text[j] in {"b", "c"}:
+                j += 1
+            if j < n and text[j] == "r":
+                j += 1
+                got = _read_raw_hash(text, j)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=False)
+                    i = end
+                    continue
+        if pyish and ch.isalpha():
+            j = i
+            while j < n and text[j] in "rRfFbBuU":
+                j += 1
+            if j > i and j < n and text[j] in {'"', "'"}:
+                is_raw = any(c in "rR" for c in text[i:j])
+                if text.startswith(text[j] * 3, j):
+                    got = _read_triple(text, j, text[j], interpolations=False)
+                else:
+                    got = _read_quoted(text, j, text[j], interpolations=False)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=not is_raw)
+                    i = end
+                    continue
+        if (goish or jsish) and ch == "`":
+            if jsish or "${" in text[i : i + 400]:
+                got = _read_js_template(text, i)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=True)
+                    i = end
+                    continue
+            if goish:
+                j = text.find("`", i + 1)
+                if j >= 0:
+                    emit(text[i + 1 : j], i, unesc=False)
+                    i = j + 1
+                    continue
+        if ch in {'"', "'"} and text.startswith(ch * 3, i):
+            got = _read_triple(text, i, ch, interpolations=swiftish or "\\(" in text[i : i + 80])
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        if ch == '"' or (ch == "'" and lang in {"js", "py", "sh", "rb", "go", "java", "kt", "c", "any", ""}):
+            got = _read_quoted(
+                text, i, ch, interpolations=swiftish or text.startswith("\\(", i + 1)
+            )
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        i += 1
+    return out
+
+
+def _longest_prefix_as_suffix(part: str, rest: str) -> int:
+    if not part or not rest:
+        return 0
+    max_k = min(len(part) - 1, len(rest))
+    for k in range(max_k, 0, -1):
+        if rest.endswith(part[:k]):
+            return k
+    return 0
+
+
+def _align_parts(
+    parts: tuple[str, ...], query: str, allow_truncated: bool = True
+) -> tuple[str, str, list[tuple[int, int]], bool, int] | None:
+    loc: list[tuple[int, int]] = [(-1, -1)] * len(parts)
+    pos = 0
+    first = True
+    prefix = ""
+    truncated = False
+    stop_at = len(parts)
+
+    for i, part in enumerate(parts):
+        if part == "":
+            continue
+        idx = query.find(part, pos)
+        if idx >= 0:
+            if first:
+                prefix = query[:idx]
+                first = False
+            loc[i] = (idx, idx + len(part))
+            pos = idx + len(part)
+            continue
+        if not allow_truncated:
+            return None
+        rest = query[pos:]
+        if first:
+            min_k = MIN_STATIC_PREFIX
+            max_k = min(len(part) - 1, len(query))
+            found_k = 0
+            found_idx = -1
+            for cand in range(max_k, min_k - 1, -1):
+                frag = part[:cand]
+                fidx = query.rfind(frag)
+                if fidx >= 0 and fidx + cand == len(query):
+                    found_k = cand
+                    found_idx = fidx
+                    break
+            if found_k:
+                loc[i] = (found_idx, found_idx + found_k)
+                prefix = query[:found_idx]
+                first = False
+                truncated = True
+                stop_at = i
+                pos = len(query)
+                break
+            return None
+        k = _longest_prefix_as_suffix(part, rest)
+        if k > 0:
+            loc[i] = (pos + len(rest) - k, pos + len(rest))
+            truncated = True
+            stop_at = i
+            pos = len(query)
+            break
+        truncated = True
+        stop_at = i
+        pos = len(query)
+        break
+
+    if first:
+        return None
+    if parts and parts[0] == "":
+        prefix = ""
+    suffix = "" if truncated else (query[pos:] if pos <= len(query) else "")
+    return prefix, suffix, loc, truncated, stop_at
+
+
+def _remainder_of(tmpl: Template, loc: list[tuple[int, int]], stop_at: int) -> str:
+    """Unmatched template tail. Do not re-emit a hole that was already bound.
+
+    A prefix match on a later literal (`s` of `s deserted=`) is not a
+    bound hole. The hole *after* that literal is still outstanding.
+    """
+    names = tmpl.hole_names
+    parts = tmpl.parts
+    if stop_at >= len(parts):
+        return ""
+    out: list[str] = []
+    i = stop_at
+    if i < len(parts) and loc[i][0] >= 0:
+        matched = loc[i][1] - loc[i][0]
+        tail = parts[i][matched:]
+        if tail:
+            out.append(tail)
+        # prefix of this literal: the following hole was not consumed
+        if matched < len(parts[i]) and i < len(names):
+            out.append("{" + names[i] + "}")
+        i += 1
+    while i < len(parts):
+        if i > 0:
+            prev = loc[i - 1]
+            prev_full = (
+                prev[0] >= 0
+                and (i - 1 >= len(parts) or prev[1] - prev[0] == len(parts[i - 1]))
+            ) or parts[i - 1] == ""
+            if not prev_full:
+                name = names[i - 1] if i - 1 < len(names) else ""
+                if not out or out[-1] != "{" + name + "}":
+                    out.append("{" + name + "}")
+        out.append(parts[i])
+        i += 1
+    return "".join(out)
+
+
+def match_template(tmpl: Template, query: str, allow_truncated: bool = True) -> Bind | None:
+    parts = tmpl.parts
+    names = tmpl.hole_names
+    static = tmpl.static_len
+    if tmpl.holes == 0:
+        body = parts[0] if parts else ""
+        if not body or body.isspace():
+            return None
+        if body == query:
+            return Bind(1.0, "", "", ())
+        if query.startswith(body) and static >= MIN_STATIC_PREFIX:
+            return None
+        idx = query.find(body)
+        if idx >= 0 and static >= 16:
+            return None
+        return None
+
+    if static < MIN_STATIC_HOLE and tmpl.holes < 2:
+        return None
+
+    aligned = _align_parts(parts, query, allow_truncated=allow_truncated)
+    if aligned is None:
+        return None
+    prefix, suffix, loc, truncated, stop_at = aligned
+
+    bindings: list[tuple[str, str]] = []
+    n_holes = len(parts) - 1
+    for j in range(n_holes):
+        name = names[j] if j < len(names) else str(j + 1)
+        left = loc[j]
+        right = loc[j + 1]
+        if left[0] >= 0:
+            hole_start = left[1]
+        elif j == 0:
+            hole_start = 0
+        else:
+            hole_start = loc[j - 1][1] if loc[j - 1][0] >= 0 else 0
+        if right[0] >= 0:
+            hole_end = right[0]
+        else:
+            hole_end = len(query)
+        if hole_start > hole_end:
+            continue
+        # skip holes that sit after a truncation stop
+        if truncated and j >= stop_at:
+            continue
+        if left[0] < 0 and right[0] < 0 and truncated:
+            continue
+        bindings.append((name, query[hole_start:hole_end]))
+
+    if not bindings:
+        return None
+
+    leftover = len(prefix) + len(suffix)
+    qn = max(len(query), 1)
+    explained = max(qn - leftover, 0) / qn
+    uniqueness = min(static / qn, 1.0)
+    hole_reward = 0.03 * min(len(bindings), 7)
+    score = 0.55 * explained + 0.32 * uniqueness + hole_reward + 0.10 * min(static / 40.0, 1.0)
+    if truncated:
+        score = max(0.0, score - 0.04)
+    rem = ""
+    if truncated:
+        rem = _remainder_of(tmpl, loc, stop_at)
+    return Bind(min(score, 1.25), prefix, suffix, tuple(bindings), truncated, rem)
+
+
+# ---------------------------------------------------------------------------
+# locus (pin-shaped, but only used to seat a template)
+# ---------------------------------------------------------------------------
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def is_def_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "//", "/*", "*", "///", "--", "!", "{", "}")):
+        return False
+    return bool(DEF_RE.match(line.rstrip()))
+
+
+def is_comment_or_attr(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith(("#", "//", "/*", "*", "///", "--", "@", "#[", "#[derive"))
+
+
+def collect_neighbors(lines: list[str], idx: int, ctx: int = 3) -> tuple[list[str], list[str]]:
+    here = lines[idx - 1]
+    here_indent = indent_of(here)
+    here_is_def = is_def_line(here)
+    before: list[str] = []
+    j = idx - 1
+    while j >= 1 and len(before) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j -= 1
+            continue
+        if here_is_def and is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        if here_is_def and indent_of(raw) > here_indent and not is_comment_or_attr(raw):
+            j -= 1
+            continue
+        before.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j -= 1
+    before.reverse()
+    after: list[str] = []
+    j = idx + 1
+    while j <= len(lines) and len(after) < ctx:
+        raw = lines[j - 1]
+        if normalize(raw) in TRIVIAL_NORMS:
+            j += 1
+            continue
+        if is_def_line(raw) and indent_of(raw) <= here_indent:
+            break
+        after.append(clip(raw, MAX_NEIGHBOR_CHARS))
+        j += 1
+    return before, after
+
+
+def lookup_lines(src: Snapshot, path: str) -> tuple[str, list[str]]:
+    nfc = canon_path(path)
+    if nfc in src.files:
+        return nfc, src.files[nfc]
+    for form in path_forms(path):
+        key = canon_path(form)
+        if key in src.files:
+            return key, src.files[key]
+    hits = [p for p in src.files if p == nfc or p.endswith("/" + nfc)]
+    if len(hits) == 1:
+        return hits[0], src.files[hits[0]]
+    if not hits:
+        raise SystemExit(f"dowel mint: source path not in snapshot: {path}")
+    raise SystemExit(f"dowel mint: source path ambiguous: {path}")
+
+
+def is_stem_split(src: str, dst: str) -> bool:
+    src, dst = canon_path(src), canon_path(dst)
+    stem, _ = os.path.splitext(src)
+    return dst.startswith(stem + "/")
+
+
+def path_score(src: str, dst: str) -> float:
+    src, dst = canon_path(src), canon_path(dst)
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    s_stem, s_ext = os.path.splitext(src)
+    score = 0.0
+    if dst.startswith(s_stem + "/") or is_stem_split(src, dst):
+        score += 0.88
+    elif s_base == d_base:
+        score += 0.42
+    else:
+        s_stem_base = os.path.splitext(s_base)[0]
+        if s_stem_base and os.path.splitext(d_base)[0] == s_stem_base:
+            score += 0.28
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.04
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.12 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def neighbor_window_score(c: Contract, dst_lines: list[str], dst_i: int, ctx: int = 4) -> float:
+    neigh = c.before + c.after
+    if not neigh or ctx <= 0 or not dst_lines:
+        return 0.0
+    lo = max(1, dst_i - ctx)
+    hi = min(len(dst_lines), dst_i + ctx)
+    window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+    hits = sum(1 for n in neigh if normalize(n) in window)
+    return hits / len(neigh)
+
+
+def distinctive_needles(parts: tuple[str, ...]) -> list[str]:
+    needles = [p for p in parts if len(p) >= 8]
+    needles.sort(key=len, reverse=True)
+    return needles[:4]
+
+
+def static_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# ---------------------------------------------------------------------------
+# mint
+# ---------------------------------------------------------------------------
+
+
+def file_templates(path: str, lines: list[str]) -> list[Template]:
+    text = "\n".join(lines)
+    if lines and not text.endswith("\n"):
+        # keep extract line numbers aligned with original
+        text = "\n".join(lines) + ("\n" if False else "")
+    return extract_templates("\n".join(lines) + "\n", lang_for(path), path)
+
+
+def pick_template_for_mint(
+    tmpls: list[Template], path: str, line: int, instance: str
+) -> tuple[Template, Bind]:
+    near = [t for t in tmpls if abs(t.line - line) <= LOCUS_WINDOW]
+    pool = near or tmpls
+    ranked: list[tuple[float, Template, Bind]] = []
+    for t in pool:
+        if t.holes < 1:
+            continue
+        got = match_template(t, instance, allow_truncated=True)
+        if got is None:
+            continue
+        dist = abs(t.line - line)
+        prox = 0.08 if dist == 0 else (0.04 if dist < 8 else 0.0)
+        ranked.append((got.score + prox + 0.02 * min(t.holes, 7), t, got))
+    if not ranked and near:
+        for t in tmpls:
+            if t.holes < 1:
+                continue
+            got = match_template(t, instance, allow_truncated=True)
+            if got is None:
+                continue
+            ranked.append((got.score, t, got))
+    if not ranked:
+        raise SystemExit(
+            f"dowel mint: instance does not bind a holed template at {path}:{line}"
+        )
+    ranked.sort(key=lambda x: (-x[0], x[1].line, x[1].path))
+    _, tmpl, bind = ranked[0]
+    return tmpl, bind
+
+
+def mint_contract(
+    src: Snapshot, path: str, line: int, col: Optional[int], instance: str
+) -> Contract:
+    instance = normalize_query(instance)
+    if not instance:
+        raise SystemExit("dowel mint: empty instance")
+    if is_compiler_locator(instance):
+        raise SystemExit(f"dowel mint: rustc locator, not an instance: {instance}")
+    path, src_lines = lookup_lines(src, path)
+    if line < 1 or line > len(src_lines):
+        raise SystemExit(f"dowel mint: line {line} out of range ({path} has {len(src_lines)} lines)")
+    raw = src_lines[line - 1]
+    tmpls = file_templates(path, src_lines)
+    tmpl, bind = pick_template_for_mint(tmpls, path, line, instance)
+    bound_names = tuple(n for n, _ in bind.bindings)
+    if not bound_names:
+        raise SystemExit(f"dowel mint: no holes bound at {path}:{line}")
+    toks = tokens(raw)
+    ranked = sorted(set(toks), key=lambda t: (-len(t), t.lower()))[:8]
+    before, after = collect_neighbors(src_lines, tmpl.line, 3)
+    return Contract(
+        path=path,
+        line=tmpl.line,
+        col=col if col is not None else tmpl.col,
+        text=clip(raw if abs(tmpl.line - line) <= 1 else src_lines[tmpl.line - 1], MAX_TEXT_CHARS),
+        parts=tmpl.parts,
+        names=tmpl.hole_names,
+        bound=bound_names,
+        instance=instance,
+        bindings=bind.bindings,
+        tokens=ranked,
+        unique=[],
+        before=before,
+        after=after,
+        lang=tmpl.lang,
+        origin=src.origin,
+        truncated=bind.truncated,
+        remainder=bind.remainder,
+    )
+
+
+# ---------------------------------------------------------------------------
+# resolve: seat by template fingerprint + locus, then assay holes
+# ---------------------------------------------------------------------------
+
+
+def candidate_files(dst: Snapshot, c: Contract) -> list[str]:
+    files: set[str] = set()
+    nfc = canon_path(c.path)
+    if nfc in dst.files:
+        files.add(nfc)
+    stem, _ = os.path.splitext(nfc)
+    base = os.path.basename(nfc)
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + base):
+            files.add(p)
+    needles = distinctive_needles(c.parts)
+    if needles:
+        primary = needles[0]
+        hits = []
+        for p, lines in dst.files.items():
+            blob = "\n".join(lines)
+            if primary in blob:
+                hits.append(p)
+        if len(hits) <= 40:
+            files.update(hits)
+        elif len(needles) > 1:
+            files.update(p for p in hits if needles[1] in "\n".join(dst.files[p]))
+        else:
+            files.update(hits[:40])
+    return sorted(files)
+
+
+def score_seat(c: Contract, tmpl: Template, dst: Snapshot) -> tuple[float, float, bool]:
+    static = static_ratio(c.display.split("{")[0] and "".join(c.parts), tmpl.static_blob)
+    # prefer exact static parts over fuzzy wrap
+    if c.parts == tmpl.parts:
+        static = 1.0
+    else:
+        static = static_ratio("".join(c.parts), tmpl.static_blob)
+    ns = neighbor_window_score(c, dst.files.get(tmpl.path, []), tmpl.line)
+    ps = path_score(c.path, tmpl.path)
+    exact = c.parts == tmpl.parts or static >= 0.995
+    # Seating does not use hole names. Names are the contract, after the seat.
+    score = 0.56 * static + 0.28 * ps + 0.16 * ns
+    if exact:
+        score = max(score, 0.56 + 0.28 * ps + 0.16 * ns)
+    return min(1.0, score), ns, exact
+
+
+def _pick_exact_seat(c: Contract, exacts: list[ScoredTmpl]) -> Optional[ScoredTmpl]:
+    if not exacts:
+        return None
+    if len(exacts) == 1:
+        return exacts[0]
+    # Stem-split before neighbors. A rename at the extracted body
+    # (`uid` → `user_id`) changes neighbor identifiers; the clone that
+    # kept the old names would otherwise win on ns and hide `renamed`.
+    splits = [s for s in exacts if is_stem_split(c.path, s.tmpl.path)]
+    if len(splits) == 1:
+        return splits[0]
+    best_ns = max(s.ns for s in exacts)
+    strong = [s for s in exacts if s.ns >= best_ns - EXACT_NS_KEEP]
+    if best_ns >= STRONG_NS_FLOOR:
+        strong = [s for s in strong if s.ns >= STRONG_NS_FLOOR]
+    if len(strong) == 1:
+        return strong[0]
+    pool = strong or exacts
+    same = [s for s in pool if canon_path(s.tmpl.path) == canon_path(c.path) and s.ns >= 0.5]
+    if len(same) == 1:
+        return same[0]
+    if len(pool) > 1:
+        return None
+    return max(pool, key=lambda s: (s.ns, s.score, -len(s.tmpl.path)))
+
+
+def find_seat(
+    c: Contract, dst: Snapshot
+) -> tuple[Optional[Template], float, list[tuple[str, int]], str]:
+    files = candidate_files(dst, c)
+    scored: list[ScoredTmpl] = []
+    nohole_hits: list[ScoredTmpl] = []
+    for path in files:
+        lines = dst.files.get(path) or []
+        for tmpl in file_templates(path, lines):
+            static = 1.0 if c.parts == tmpl.parts else static_ratio("".join(c.parts), tmpl.static_blob)
+            if static < SEAT_STATIC_FLOOR and c.parts != tmpl.parts:
+                continue
+            sc, ns, exact = score_seat(c, tmpl, dst)
+            item = ScoredTmpl(sc, tmpl, ns, exact)
+            if tmpl.holes < 1:
+                nohole_hits.append(item)
+                continue
+            scored.append(item)
+
+    # A holed seat always beats a specialized (no-hole) copy of the static.
+    if not scored and nohole_hits:
+        nohole_hits.sort(key=lambda s: (-s.score, s.tmpl.path, s.tmpl.line))
+        return nohole_hits[0].tmpl, nohole_hits[0].score, [], "nohole"
+
+    if not scored:
+        return None, 0.0, [], ""
+
+    exacts = [s for s in scored if s.exact]
+    picked: Optional[ScoredTmpl] = None
+    ambiguous: list[ScoredTmpl] = []
+    if len(exacts) > 1:
+        picked = _pick_exact_seat(c, exacts)
+        if picked is None:
+            best_ns = max(s.ns for s in exacts)
+            ambiguous = [
+                s
+                for s in exacts
+                if s.ns >= best_ns - EXACT_NS_KEEP
+                and (best_ns < STRONG_NS_FLOOR or s.ns >= STRONG_NS_FLOOR)
+            ]
+            if len(ambiguous) < 2:
+                ambiguous = exacts
+    if picked is None and not ambiguous:
+        scored.sort(key=lambda s: (-s.score, s.tmpl.path, s.tmpl.line))
+        top = scored[0].score
+        ties = [s for s in scored if abs(s.score - top) <= TIE_EPS and s.score >= RESOLVE_THRESHOLD]
+        if len(ties) > 1:
+            ambiguous = ties
+        else:
+            picked = scored[0]
+
+    skipped = ""
+    if picked is not None and exacts and len(exacts) > 1:
+        bits: list[str] = []
+        for s in exacts:
+            if s.tmpl.path == picked.tmpl.path and s.tmpl.line == picked.tmpl.line:
+                continue
+            if canon_path(s.tmpl.path) == canon_path(c.path) and s.ns < STRONG_NS_FLOOR:
+                bits.append(f"leftover stub {s.tmpl.path}:{s.tmpl.line}")
+            elif os.path.basename(s.tmpl.path) == os.path.basename(c.path):
+                bits.append(f"basename bait {s.tmpl.path}:{s.tmpl.line}")
+            else:
+                bits.append(f"{s.tmpl.path}:{s.tmpl.line}")
+        if bits:
+            skipped = "skipped " + "; ".join(bits[:4])
+    # Same-path leftover with no holed template never enters exacts.
+    # Name it when dest still has the old path as a non-seat.
+    if picked is not None and canon_path(picked.tmpl.path) != canon_path(c.path):
+        if canon_path(c.path) in dst.files and "leftover stub" not in skipped:
+            old_has = any(
+                t.holes and (c.parts == t.parts or static_ratio("".join(c.parts), t.static_blob) >= 0.995)
+                for t in file_templates(c.path, dst.files[c.path])
+            )
+            if not old_has:
+                stub = f"leftover stub {c.path}"
+                skipped = (skipped + "; " if skipped else "skipped ") + stub
+
+    if ambiguous:
+        ambiguous.sort(key=lambda s: (s.tmpl.path, s.tmpl.line))
+        alts = [(s.tmpl.path, s.tmpl.line) for s in ambiguous]
+        return None, max(s.score for s in ambiguous), alts, skipped
+
+    assert picked is not None
+    return picked.tmpl, picked.score, [], skipped
+
+
+def assay_holes(
+    c: Contract, tmpl: Template, instance: str
+) -> tuple[str, Bind | None, list[tuple[str, str]], list[str], list[str], list[str]]:
+    """Return (kind, bind, rename, dropped, extra, drifted).
+
+    kind is bind | renamed | unbound. Seating already happened.
+    The contract is the names that bound at mint, not every template hole.
+    """
+    got = match_template(tmpl, instance, allow_truncated=True)
+    dest_names = list(tmpl.hole_names)
+    mint_bound = list(c.bound)
+    mint_map = {n: v for n, v in c.bindings}
+
+    if got is None:
+        return "unbound", None, [], mint_bound, dest_names, []
+
+    dest_map = {n: v for n, v in got.bindings}
+    dest_bound = [n for n, _ in got.bindings]
+    dropped = [n for n in mint_bound if n not in dest_names]
+    extra = [n for n in dest_names if n not in mint_bound]
+    drifted: list[str] = []
+    for n in mint_bound:
+        if n in dest_map and n in mint_map and dest_map[n] != mint_map[n]:
+            drifted.append(n)
+
+    rename: list[tuple[str, str]] = []
+    # Same static parts, same arity: names drifted in place.
+    # Match by position, not by stored values — a rebound instance
+    # (`user 99`) must still report uid→user_id.
+    if tuple(c.parts) == tuple(tmpl.parts) and len(mint_bound) == len(dest_names) and mint_bound != dest_names:
+        rename = list(zip(mint_bound, dest_names))
+        if all(a != b for a, b in rename):
+            return "renamed", got, rename, [], [], []
+        rename = [(a, b) for a, b in rename if a != b]
+        if rename and not dropped:
+            return "renamed", got, rename, [], [], []
+    if dropped and extra:
+        unused = list(extra)
+        for old in list(dropped):
+            val = mint_map.get(old)
+            match = None
+            for new in unused:
+                if dest_map.get(new) == val:
+                    match = new
+                    break
+            if match is not None:
+                rename.append((old, match))
+                unused.remove(match)
+        if rename and len(rename) == len(dropped) and not unused:
+            return "renamed", got, rename, [], [], []
+
+    # contracted names still present and still bind the same values
+    still = [n for n in mint_bound if n in dest_bound]
+    if still == mint_bound and not drifted:
+        return "bind", got, [], [], extra if extra and not c.truncated else [], []
+
+    if still == mint_bound and drifted:
+        return "unbound", got, rename, dropped, extra, drifted
+
+    return "unbound", got, rename, dropped, extra, drifted
+
+
+def classify_status(
+    c: Contract,
+    tmpl: Optional[Template],
+    kind: str,
+    nohole: bool,
+) -> str:
+    if tmpl is None:
+        return "gone"
+    if nohole or tmpl.holes < 1:
+        return "unbound"
+    if kind == "unbound":
+        return "unbound"
+    if kind == "renamed":
+        return "renamed"
+    if canon_path(c.path) == canon_path(tmpl.path) and c.line == tmpl.line:
+        return "seated"
+    return "shifted"
+
+
+def resolve_contract(c: Contract, dst: Snapshot, instance: Optional[str] = None) -> Hit:
+    token = encode_dowel(c)
+    inst = normalize_query(instance) if instance else c.instance
+    if is_compiler_locator(inst):
+        return Hit(
+            contract=c,
+            token=token,
+            status="gone",
+            note="rustc locator, not an instance",
+            score=0.0,
+        )
+    tmpl, score, alts, skipped = find_seat(c, dst)
+    if alts:
+        return Hit(
+            contract=c,
+            token=token,
+            status="ambiguous",
+            score=score,
+            note=(f"{len(alts)} copies: " + "; ".join(f"{p}:{n}" for p, n in alts[:8])),
+            alts=alts,
+        )
+    if tmpl is None:
+        note = "no matching template"
+        if skipped:
+            note = note + "; " + skipped
+        return Hit(contract=c, token=token, status="gone", score=0.0, note=note)
+
+    nohole = tmpl.holes < 1
+    kind, got, rename, dropped, extra, drifted = assay_holes(c, tmpl, inst)
+    status = classify_status(c, tmpl, kind, nohole)
+    bits: list[str] = []
+    if rename:
+        bits.append(" ".join(f"{{{a}}}→{{{b}}}" for a, b in rename))
+    if dropped:
+        bits.append("dropped " + ",".join("{" + n + "}" for n in dropped))
+    if extra and status == "unbound":
+        bits.append("extra " + ",".join("{" + n + "}" for n in extra))
+    if drifted:
+        bits.append("drifted " + ",".join("{" + n + "}" for n in drifted))
+    if skipped:
+        bits.append(skipped)
+    if status == "shifted":
+        if canon_path(c.path) != canon_path(tmpl.path):
+            bits.insert(0, "path or surrounding file changed")
+        else:
+            bits.insert(0, "same file, line number drifted")
+    if status == "seated" and not bits:
+        bits.append("holes=" + ",".join(c.bound))
+    if status == "unbound" and nohole:
+        bits.insert(0, "template lost its holes")
+    dest_bind = got.bindings if got else ()
+    return Hit(
+        contract=c,
+        token=token,
+        status=status,
+        dest_path=tmpl.path,
+        dest_line=tmpl.line,
+        dest_tmpl=tmpl.display,
+        dest_names=tmpl.hole_names,
+        dest_bindings=dest_bind,
+        score=score,
+        note="; ".join(bits),
+        rename=rename,
+        dropped=dropped,
+        extra=extra,
+        drifted=drifted,
+        truncated=bool(got and got.truncated),
+    )
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def format_from(c: Contract) -> str:
+    col = f":{c.col}" if c.col is not None else ""
+    return f"{c.path}:{c.line}{col}"
+
+
+def format_to(hit: Hit) -> str:
+    if hit.status == "ambiguous" and hit.alts:
+        return ",".join(f"{p}:{n}" for p, n in hit.alts)
+    if hit.dest_path is None or hit.dest_line is None or hit.status == "gone":
+        return "-"
+    return f"{hit.dest_path}:{hit.dest_line}"
+
+
+def print_human(hit: Hit) -> None:
+    src = format_from(hit.contract)
+    dst = format_to(hit)
+    if hit.status == "gone":
+        dst = "(gone)"
+    extra = f"  {hit.note}" if hit.note else ""
+    print(f"{hit.status:10} {src:40} → {dst:40} {hit.score:5.3f}{extra}")
+    print(f"  tmpl:  {hit.dest_tmpl or hit.contract.display}")
+    shown = False
+    if hit.rename:
+        mint_map = {n: v for n, v in hit.contract.bindings}
+        dest_map = {n: v for n, v in hit.dest_bindings}
+        for old, new in hit.rename:
+            val = dest_map.get(new, mint_map.get(old, ""))
+            print(f"  {{{old}}} → {{{new}}} = {val}")
+            shown = True
+    if not shown:
+        if hit.dest_bindings:
+            for n, v in hit.dest_bindings:
+                print(f"  {{{n}}} = {v}")
+        else:
+            for n, v in hit.contract.bindings:
+                print(f"  {{{n}}} = {v}  (mint)")
+    if hit.contract.truncated and hit.contract.remainder:
+        print(f"  truncated: {hit.contract.remainder}")
+
+
+def print_porcelain(hit: Hit) -> None:
+    note = hit.note.replace("\t", " ").replace("\n", " ")
+    holes = ",".join(hit.contract.bound)
+    if hit.rename:
+        holes = ",".join(f"{a}→{b}" for a, b in hit.rename)
+    print(
+        f"{hit.status}\t-\t{format_from(hit.contract)}\t{format_to(hit)}\t"
+        f"{hit.score:.3f}\t{holes}\t{note}"
+    )
+
+
+def print_json(hit: Hit) -> None:
+    obj = {
+        "dowel": hit.token,
+        "from": {"path": hit.contract.path, "line": hit.contract.line, "col": hit.contract.col},
+        "to": (
+            None
+            if hit.dest_path is None or hit.status in {"gone", "ambiguous"}
+            else {"path": hit.dest_path, "line": hit.dest_line}
+        ),
+        "status": hit.status,
+        "score": round(hit.score, 4),
+        "note": hit.note,
+        "tmpl": hit.dest_tmpl or hit.contract.display,
+        "bound": list(hit.contract.bound),
+        "dest_names": list(hit.dest_names),
+        "bindings": [{"name": n, "value": v} for n, v in (hit.dest_bindings or hit.contract.bindings)],
+        "rename": [{"from": a, "to": b} for a, b in hit.rename],
+        "dropped": hit.dropped,
+        "extra": hit.extra,
+        "drifted": hit.drifted,
+        "origin": hit.contract.origin,
+        "instance": hit.contract.instance,
+    }
+    if hit.alts:
+        obj["candidates"] = [{"path": p, "line": n} for p, n in hit.alts]
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def print_show(c: Contract, token: str, file=sys.stdout) -> None:
+    print(token, file=file)
+    print(f"  minted: {format_from(c)}", file=file)
+    print(f"  tmpl:   {c.display}", file=file)
+    print(f"  bound:  {', '.join('{' + n + '}' for n in c.bound)}", file=file)
+    for n, v in c.bindings:
+        print(f"    {{{n}}} = {v}", file=file)
+    print(f"  inst:   {c.instance}", file=file)
+    print(f"  text:   {c.text}", file=file)
+    if c.origin:
+        print(f"  origin: {c.origin}", file=file)
+    if c.truncated:
+        print(f"  truncated: {c.remainder}", file=file)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def origins_match(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return True
+    return a == b
+
+
+def git_root_from_args(args: argparse.Namespace, need_git: bool) -> Optional[Path]:
+    if not need_git:
+        return None
+    cwd = Path.cwd()
+    start = args.repo if getattr(args, "repo", None) is not None else cwd
+    git_root = discover_repo(start)
+    if git_root is None:
+        die("dowel: not a git repository (use --repo or --from-dir/--to-dir)")
+    return git_root
+
+
+def add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--repo", type=Path, default=None, help="git repository root")
+    p.add_argument("--porcelain", action="store_true", help="stable tab-separated output")
+    p.add_argument("--json", action="store_true", help="JSON object per result")
+    p.add_argument("--strict", action="store_true", help="exit 1 on unbound/gone/ambiguous")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dowel", description=HINT, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"dowel {VERSION}")
+    p.add_argument("--selftest", action="store_true", help="run internal checks and exit")
+    sub = p.add_subparsers(dest="cmd")
+
+    m = sub.add_parser("mint", help="capture path:line + instance as a dowel token")
+    add_common(m)
+    m.add_argument("location", help="path:line of the template")
+    m.add_argument("instance", nargs="?", default=None, help="runtime string that binds the holes")
+    m.add_argument("-e", "--instance", dest="instance_flag", default=None, help="runtime instance (use for dashed strings)")
+    m.add_argument("--from", dest="from_ref", default=None, help="source git ref")
+    m.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory")
+
+    r = sub.add_parser("resolve", help="seat a stored dowel on --to / --to-dir; no path:line")
+    add_common(r)
+    r.add_argument("tokens", nargs="*", help="dowel1.… tokens")
+    r.add_argument("--to", dest="to_ref", default=None, help="destination git ref (must exist if given)")
+    r.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    r.add_argument("--instance", dest="rebind", default=None, help="re-bind a new runtime string against dest")
+    r.add_argument("--any-repo", action="store_true", help="allow a foreign repository origin")
+
+    s = sub.add_parser("show", help="decode a dowel without resolving")
+    s.add_argument("tokens", nargs="+", help="dowel1.… tokens")
+    s.add_argument("--json", action="store_true", help="JSON payload")
+
+    sub.add_parser("selftest", help="internal checks")
+    return p
+
+
+def cmd_mint(args: argparse.Namespace) -> int:
+    inst = args.instance_flag if args.instance_flag is not None else args.instance
+    if inst is None:
+        die("dowel mint: instance required (path:line INSTANCE)")
+    if args.from_dir is None and args.from_ref is None:
+        die("dowel mint: --from REF or --from-dir DIR is required")
+    need_git = args.from_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.from_ref:
+        verify_git_ref(git_root, args.from_ref)
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else args.from_ref,
+        directory=args.from_dir,
+        label=str(args.from_dir or args.from_ref or "worktree"),
+        empty_ok=True,
+    )
+    path, line, col = parse_locator(args.location, src.paths)
+    if canon_path(path) not in src.files:
+        die(f"dowel mint: source path not in snapshot: {path}")
+    try:
+        c = mint_contract(src, path, line, col, inst)
+    except SystemExit as e:
+        msg = str(e)
+        if msg and msg not in {"1", "2"}:
+            print(msg if msg.startswith("dowel") else f"dowel mint: {msg}", file=sys.stderr)
+        return 1 if msg not in {"2"} else 2
+    token = encode_dowel(c)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "dowel": token,
+                    "from": {"path": c.path, "line": c.line, "col": c.col},
+                    "tmpl": c.display,
+                    "bound": list(c.bound),
+                    "bindings": [{"name": n, "value": v} for n, v in c.bindings],
+                    "instance": c.instance,
+                    "origin": c.origin,
+                    "truncated": c.truncated,
+                },
+                ensure_ascii=False,
+            )
+        )
+    elif args.porcelain:
+        print(f"minted\t-\t{format_from(c)}\t{token}")
+    else:
+        print(token)
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    raws = list(args.tokens)
+    if not raws:
+        if sys.stdin.isatty():
+            build_parser().parse_args(["resolve", "-h"])
+            return 2
+        raws = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip() and not ln.startswith("#")]
+    if args.to_dir is None and args.to_ref is None:
+        die("dowel resolve: --to REF or --to-dir DIR is required")
+    contracts: list[Contract] = []
+    for raw in raws:
+        if re.search(r":\d+$", raw) and not is_dowel_token(raw):
+            print(
+                f"dowel resolve: {raw} is a locator; dowels are minted tokens, not path:line",
+                file=sys.stderr,
+            )
+            return 2
+        if not is_dowel_token(raw):
+            print(f"dowel resolve: not a dowel token: {raw}", file=sys.stderr)
+            return 2
+        try:
+            contracts.append(decode_dowel(raw))
+        except ValueError as e:
+            print(f"dowel resolve: corrupt dowel: {e}", file=sys.stderr)
+            return 1
+
+    need_git = args.to_dir is None
+    git_root = git_root_from_args(args, need_git)
+    if need_git and git_root is not None and args.to_ref:
+        verify_git_ref(git_root, args.to_ref)
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else args.to_ref,
+        directory=args.to_dir,
+        label=str(args.to_dir or args.to_ref or "worktree"),
+    )
+    rc = 0
+    for c in contracts:
+        if not args.any_repo and not origins_match(c.origin, dst.origin):
+            print(
+                f"dowel belongs to a different repository "
+                f"({c.origin or '-'} vs {dst.origin or '-'})",
+                file=sys.stderr,
+            )
+            return 1
+        hit = resolve_contract(c, dst, instance=args.rebind)
+        if args.json:
+            print_json(hit)
+        elif args.porcelain:
+            print_porcelain(hit)
+        else:
+            print_human(hit)
+        if args.strict and hit.status in {"unbound", "gone", "ambiguous"}:
+            rc = 1
+    return rc
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    for raw in args.tokens:
+        try:
+            c = decode_dowel(raw)
+        except ValueError as e:
+            print(f"dowel show: corrupt dowel: {e}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(c.payload(), ensure_ascii=False))
+        else:
+            print_show(c, raw)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def cmd_selftest() -> int:
+    errors: list[str] = []
+
+    def expect(cond: object, msg: str) -> None:
+        if not cond:
+            errors.append(msg)
+
+    parts, names = tokenize_named("user {uid} not found")
+    expect(names == ("uid",), f"named uid: {names}")
+    expect(parts == ("user ", " not found"), f"parts: {parts}")
+
+    parts, names = tokenize_named("cannot reach {host}:{port} after {n} retries")
+    expect(names == ("host", "port", "n"), f"three names: {names}")
+
+    parts, names = tokenize_named("failed to spawn `{cmd}`")
+    expect(names == ("cmd",), f"cmd name: {names}")
+
+    parts, names = tokenize_named(r"camera presence \(self.isCameraEnabled ? " + '"enabled"' + r" : " + '"disabled"' + ", privacy: .public)")
+    # tokenize on already-extracted body with \(
+    body = 'camera presence \\(self.isCameraEnabled ? "enabled" : "disabled", privacy: .public)'
+    parts, names = tokenize_named(body)
+    expect(names == ("self.isCameraEnabled",), f"swift camera: {names}")
+
+    seven = (
+        "transition \\(oldPhase.rawValue, privacy: .public) → \\(newPhase.rawValue, privacy: .public) "
+        "reason=\\(reason.name, privacy: .public) idle=\\(idle, privacy: .public)s "
+        "deserted=\\(counters.deserted.value, privacy: .public) "
+        "driftRecovered=\\(counters.driftRecovered.value, privacy: .public) "
+        "awayRecovered=\\(counters.awayRecovered.value, privacy: .public)"
+    )
+    parts, names = tokenize_named(seven)
+    expect(len(names) == 7, f"7-hole names {len(names)}: {names}")
+    expect("oldPhase.rawValue" in names and "idle" in names, f"7-hole contents: {names}")
+
+    expect(is_compiler_locator("   --> src/git/revert.rs:46:18".strip()), "--> locator")
+    expect(is_compiler_locator("error[E0308]: mismatched types"), "E0308")
+    expect(not is_compiler_locator("failed to spawn `git apply --reverse`"), "spawn not locator")
+
+    t = template_of("u.py", 1, 1, "py", "user {uid} not found")
+    got = match_template(t, "user 42 not found")
+    expect(got is not None and dict(got.bindings).get("uid") == "42", f"bind uid: {got}")
+    trunc = match_template(t, "user 42 not")
+    expect(trunc is not None and trunc.truncated and dict(trunc.bindings).get("uid") == "42", f"trunc: {trunc}")
+    expect(trunc is not None and "found" in (trunc.remainder or ""), f"user remainder: {trunc.remainder if trunc else None}")
+
+    seven_t = template_of("log.swift", 554, 1, "swift", seven)
+    seven_q = "transition focused → idle reason=timeout idle=12s"
+    seven_hit = match_template(seven_t, seven_q)
+    expect(
+        seven_hit is not None
+        and seven_hit.truncated
+        and dict(seven_hit.bindings).get("idle") == "12"
+        and "{counters.deserted.value}" in (seven_hit.remainder or ""),
+        f"7-hole remainder must name the next hole: {seven_hit.remainder if seven_hit else None}",
+    )
+
+    decoy = template_of("p.rs", 3, 1, "rust", "2026-08-19T23:50:01Z ERROR failed to spawn")
+    expect(match_template(decoy, "2026-08-19T23:50:01Z ERROR failed to spawn `git apply --reverse`") is None, "no-hole prefix decoy")
+
+    rust = template_of("p.rs", 7, 1, "rust", "failed to spawn `{cmd}`")
+    spawn = match_template(rust, "2026-08-19T23:50:01Z ERROR failed to spawn `git apply --reverse`")
+    expect(spawn is not None and dict(spawn.bindings).get("cmd") == "git apply --reverse", f"spawn span: {spawn}")
+
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="dowel-self-"))
+    try:
+        src = tmp / "from"
+        dst = tmp / "to"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "user.py").write_text(
+            "def report(uid):\n    raise Error(f\"user {uid} not found\")\n\n"
+            "def reach(host, port, n):\n"
+            '    raise Error(f"cannot reach {host}:{port} after {n} retries")\n',
+            encoding="utf-8",
+        )
+        snap = load_snapshot(git_root=None, ref=None, directory=src, label="from")
+        c = mint_contract(snap, "src/user.py", 2, None, "user 42 not found")
+        expect(c.bound == ("uid",), f"mint bound: {c.bound}")
+        token = encode_dowel(c)
+        expect(token.startswith(PREFIX), token)
+        back = decode_dowel(token)
+        expect(back.bound == ("uid",) and back.instance == "user 42 not found", "roundtrip")
+
+        # dest: leftover stub + renamed body + basename bait
+        (dst / "src" / "user").mkdir(parents=True)
+        (dst / "src" / "legacy").mkdir(parents=True)
+        (dst / "src" / "user.py").write_text(
+            "def report(uid):\n    from src.user.messages import report as impl\n    return impl(uid)\n",
+            encoding="utf-8",
+        )
+        (dst / "src" / "user" / "messages.py").write_text(
+            "def report(user_id):\n    raise Error(f\"user {user_id} not found\")\n\n"
+            "def reach(host, n):\n"
+            '    raise Error(f"cannot reach {host} after {n} retries")\n',
+            encoding="utf-8",
+        )
+        (dst / "src" / "legacy" / "user.py").write_text(
+            "def report(uid):\n    raise Error(f\"user {uid} not found\")\n",
+            encoding="utf-8",
+        )
+        dest = load_snapshot(git_root=None, ref=None, directory=dst, label="to")
+        hit = resolve_contract(c, dest)
+        expect(hit.status == "renamed", f"expected renamed, got {hit.status} {hit.dest_path} {hit.note}")
+        expect(hit.dest_path == "src/user/messages.py", f"seat {hit.dest_path}")
+        expect(hit.rename == [("uid", "user_id")], f"rename {hit.rename}")
+        hit_new = resolve_contract(c, dest, instance="user 99 not found")
+        expect(hit_new.status == "renamed", f"rebind renamed: {hit_new.status} {hit_new.note}")
+        expect(dict(hit_new.dest_bindings).get("user_id") == "99", f"rebind val {hit_new.dest_bindings}")
+        expect("legacy" not in (hit.dest_path or ""), "basename bait stole seat")
+        expect("user.py" != os.path.basename(hit.dest_path or "") or "messages" in (hit.dest_path or ""), "leftover?")
+        expect("leftover stub" in hit.note, f"note leftover: {hit.note}")
+        expect("basename bait" in hit.note, f"note bait: {hit.note}")
+
+        # same holes still bind after a move (no rename)
+        (dst / "src" / "user" / "messages.py").write_text(
+            "def report(uid):\n    raise Error(f\"user {uid} not found\")\n",
+            encoding="utf-8",
+        )
+        dest2 = load_snapshot(git_root=None, ref=None, directory=dst, label="to2")
+        hit2 = resolve_contract(c, dest2)
+        expect(hit2.status == "shifted", f"moved same holes: {hit2.status} {hit2.note}")
+        expect(hit2.dest_path == "src/user/messages.py", f"shifted seat {hit2.dest_path}")
+
+        # identity
+        hit3 = resolve_contract(c, snap)
+        expect(hit3.status == "seated", f"identity {hit3.status}")
+
+        # hole dropped
+        c_reach = mint_contract(snap, "src/user.py", 5, None, "cannot reach db.internal:5432 after 3 retries")
+        expect(set(c_reach.bound) == {"host", "port", "n"}, f"reach bound {c_reach.bound}")
+        (dst / "src" / "user" / "messages.py").write_text(
+            "def reach(host, n):\n"
+            '    raise Error(f"cannot reach {host} after {n} retries")\n',
+            encoding="utf-8",
+        )
+        dest3 = load_snapshot(git_root=None, ref=None, directory=dst, label="to3")
+        hit4 = resolve_contract(c_reach, dest3)
+        expect(hit4.status == "unbound", f"dropped port should unbound: {hit4.status} {hit4.note}")
+        expect("port" in hit4.dropped, f"dropped {hit4.dropped}")
+
+        # gone
+        empty = tmp / "empty"
+        empty.mkdir()
+        (empty / "README").write_text("nothing\n", encoding="utf-8")
+        dest_e = load_snapshot(git_root=None, ref=None, directory=empty, label="empty")
+        hit5 = resolve_contract(c, dest_e)
+        expect(hit5.status == "gone", f"empty dest {hit5.status}")
+
+        # truncated token
+        try:
+            decode_dowel(token[:24])
+            errors.append("truncated token decoded")
+        except ValueError:
+            pass
+
+        # rustc locator mint
+        try:
+            mint_contract(snap, "src/user.py", 2, None, "   --> src/git/revert.rs:46:18")
+            errors.append("locator mint succeeded")
+        except SystemExit:
+            pass
+
+        # no-hole refuse: instance that is the whole static
+        (src / "src" / "plain.py").write_text('MSG = "hello world"\n', encoding="utf-8")
+        snap_p = load_snapshot(git_root=None, ref=None, directory=src, label="plain")
+        try:
+            mint_contract(snap_p, "src/plain.py", 1, None, "hello world")
+            errors.append("no-hole mint succeeded")
+        except SystemExit:
+            pass
+
+        # canonical mint
+        again = mint_contract(snap, "src/user.py", 2, None, "user 42 not found")
+        expect(encode_dowel(c) == encode_dowel(again), "canonical mint")
+
+        # NFD path
+        cafe = src / "src" / ("caf" + "\u00e9" + ".py")
+        cafe.write_text('def cafe_fn(uid):\n    raise Error(f"café user {uid} gone")\n', encoding="utf-8")
+        snap_c = load_snapshot(git_root=None, ref=None, directory=src, label="cafe")
+        nfd = unicodedata.normalize("NFD", "src/café.py")
+        c_cafe = mint_contract(snap_c, nfd, 2, None, "café user 7 gone")
+        expect("uid" in c_cafe.bound, f"cafe bound {c_cafe.bound}")
+        dest_c = load_snapshot(git_root=None, ref=None, directory=src, label="cafe-d")
+        hit_c = resolve_contract(c_cafe, dest_c)
+        expect(hit_c.status == "seated", f"cafe seated {hit_c.status} {hit_c.dest_path}")
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if errors:
+        print("selftest: FAILED", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"-h", "--help"}:
+        build_parser().print_help()
+        print()
+        print(HINT)
+        return 0
+    # bare token implies resolve, flags on either side
+    if argv and any(is_dowel_token(a) for a in argv) and not any(
+        a in {"mint", "resolve", "show", "selftest", "--selftest"} for a in argv
+    ):
+        argv = ["resolve", *argv]
+    args = build_parser().parse_args(argv)
+    if args.selftest or args.cmd == "selftest":
+        return cmd_selftest()
+    if args.cmd == "mint":
+        return cmd_mint(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    if args.cmd == "show":
+        return cmd_show(args)
+    build_parser().print_help()
+    print()
+    print(HINT)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

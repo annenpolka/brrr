@@ -1,0 +1,1480 @@
+#!/usr/bin/env python3
+"""yoke — clause-level slack between spec source-of-truth and generated artifacts.
+
+The object is a *join* keyed by stable clause ids (EPF-001, FLT-001, BEM-001).
+The verb is: say whether each id is taut, slack, hand, split, or riven,
+without running the generator.
+
+    taut   spec and generated witnesses agree
+    slack  spec is ahead (generated missing or older body)
+    hand   generated has no live spec parent (hand-edit or leftover)
+    split  generated witnesses disagree with each other
+    riven  a spec or generated witness still contains conflict markers
+
+Exit 0 when nothing but taut remains (after filters). Exit 1 on slack/hand/split/riven.
+Exit 2 on tool error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator
+
+CLAUSE_ID = re.compile(r"[A-Z][A-Z0-9]{2}-\d{3}")
+# SHA-256 / MD5-128 etc. match the clause shape but are hash names, not clauses.
+NOT_CLAUSE_PREFIX = {"SHA", "MD5", "CRC", "UTF", "ISO", "RFC", "CVE", "UUID"}
+ID_ASSIGN = re.compile(
+    r"""(?P<kw>id)\s*[:=]\s*["'`](?P<id>[A-Z][A-Z0-9]{2}-\d{3})["'`]""",
+    re.I,
+)
+PKL_ID = re.compile(r'id\s*=\s*"(?P<id>[A-Z][A-Z0-9]{2}-\d{3})"')
+SWIFT_TEST = re.compile(
+    r'@Test\(\s*"(?P<id>[A-Z][A-Z0-9]{2}-\d{3})\s+(?P<desc>[^"]*)"'
+)
+RUST_DOC = re.compile(
+    r"""///\s*(?P<id>[A-Z][A-Z0-9]{2}-\d{3})\s*:\s*(?P<desc>.+)"""
+)
+MD_ROW = re.compile(
+    r"""^\|\s*`?(?P<id>[A-Z][A-Z0-9]{2}-\d{3})`?\s*\|(?P<rest>.*)\|\s*$""",
+    re.M,
+)
+BANNER_HINT = re.compile(
+    r"@generated|generated from|do not edit|手編集禁止|生成物|GENERATED",
+    re.I,
+)
+BANNER_FROM = re.compile(
+    r"""(?:from|正本は|Source:)\s*[`'" ]*([^\s`'"、。]+?\.(?:pkl|md))""",
+    re.I,
+)
+CONFLICT_RE = re.compile(r"^<<<<<<< ", re.M)
+WORK_ALIASES = {":", "WORK", "work", "working", ".", ""}
+
+SKIP_DIR_NAMES = {
+    ".git",
+    "node_modules",
+    "target",
+    "target.noindex",
+    "dist",
+    "build",
+    ".build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "vendor",
+    ".pnpm-store",
+    "DerivedData",
+    ".idea",
+    ".next",
+    "wdio-logs",
+    "test-results",
+    "Coverage",
+}
+SKIP_FILE_SUFFIX = {
+    ".lock",
+    ".lockb",
+    ".min.js",
+    ".map",
+    ".o",
+    ".rmeta",
+    ".rlib",
+    ".dylib",
+    ".a",
+    ".so",
+    ".wasm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+}
+SKIP_BASENAMES = {
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "Cargo.lock",
+    "bun.lock",
+    "justfile",
+    "Justfile",
+}
+SKIP_PATH_PARTS = ("tools/spec-gen", "tools/spec-check", "/spec-gen/", "/spec-check/")
+
+PAYLOAD_KEYS = (
+    "desc",
+    "description",
+    "intent",
+    "input",
+    "expected_output",
+    "expectedoutput",
+    "expectedOutput",
+    "pattern",
+    "label",
+    "guarantee",
+)
+FIELD_CANON = {
+    "description": "desc",
+    "expectedoutput": "expected_output",
+    "expectedOutput": "expected_output",
+    "expected_output": "expected_output",
+}
+
+MAX_FILE_BYTES = 2_000_000
+
+
+@dataclass
+class Hit:
+    cid: str
+    path: str
+    line: int
+    fields: dict[str, str] = field(default_factory=dict)
+    riven: bool = False
+
+    @property
+    def desc(self) -> str:
+        return self.fields.get("desc", "")
+
+    @property
+    def fingerprint(self) -> str | None:
+        parts: list[str] = []
+        for key in ("desc", "intent", "input", "expected_output"):
+            val = self.fields.get(key, "").strip()
+            if val:
+                parts.append(f"{key}={norm(val)}")
+        if not parts:
+            return None
+        return "|".join(parts)
+
+
+@dataclass
+class ClauseRow:
+    cid: str
+    verdict: str
+    spec: Hit | None
+    witnesses: list[Hit]
+    note: str
+    missing: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FileEdge:
+    spec: str
+    generated: str
+    verdict: str
+    note: str
+
+
+@dataclass
+class Report:
+    repo: str
+    spec_ref: str
+    gen_ref: str
+    rows: list[ClauseRow]
+    edges: list[FileEdge]
+    spec_files: list[str]
+    gen_files: list[str]
+    riven_files: list[str]
+
+
+def norm(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def is_work(ref: str | None) -> bool:
+    return ref is None or ref in WORK_ALIASES
+
+
+def display_ref(ref: str | None) -> str:
+    return ":" if is_work(ref) else str(ref)
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git_ok(repo: Path) -> bool:
+    p = git(repo, "rev-parse", "--is-inside-work-tree", check=False)
+    return p.returncode == 0 and p.stdout.strip() == "true"
+
+
+def skip_path(rel: str) -> bool:
+    parts = rel.replace("\\", "/").split("/")
+    if any(part in SKIP_DIR_NAMES for part in parts):
+        return True
+    base = parts[-1] if parts else rel
+    if base in SKIP_BASENAMES:
+        return True
+    lower = rel.lower()
+    if any(s in lower for s in SKIP_PATH_PARTS):
+        return True
+    suffix = Path(base).suffix.lower()
+    if suffix in SKIP_FILE_SUFFIX:
+        return True
+    return False
+
+
+def looks_spec(rel: str) -> bool:
+    posix = rel.replace("\\", "/")
+    if posix.startswith("specs/") and posix.endswith(".pkl"):
+        return True
+    if posix.endswith(".pkl") and "/specs/" in f"/{posix}":
+        return True
+    return False
+
+
+def looks_generated_path(rel: str) -> bool:
+    posix = rel.replace("\\", "/")
+    base = posix.rsplit("/", 1)[-1]
+    if "generated" in base.lower() or "generated" in posix.lower():
+        if posix.startswith("specs/"):
+            return False
+        return True
+    if posix in {"docs/SPEC.md", "contracts/rules.md"} or posix.endswith("/docs/SPEC.md"):
+        return True
+    if posix.startswith("docs/generated/") or "/docs/generated/" in posix:
+        return True
+    if posix.startswith("contracts/testcases/") and posix.endswith(".json"):
+        return True
+    if posix.startswith("packages/spec-artifacts/"):
+        return "generated" in base.lower() or posix.endswith((".json", ".ts"))
+    if base.endswith(".proptest-regressions"):
+        return False
+    if base.startswith("oracles_generated") or "oracles_generated" in base:
+        return True
+    return False
+
+
+def is_clause_id(token: str) -> bool:
+    if not CLAUSE_ID.fullmatch(token or ""):
+        return False
+    return token.split("-", 1)[0] not in NOT_CLAUSE_PREFIX
+
+
+def looks_generated(rel: str, head: str) -> bool:
+    if looks_spec(rel):
+        return False
+    if looks_generated_path(rel):
+        return True
+    # require an actual codegen banner, not the word "generated" in a README
+    if re.search(r"@generated|Generated from |生成物\s*[—-]\s*手編集禁止", head):
+        return True
+    return False
+
+
+def list_work_paths(repo: Path) -> list[str]:
+    paths: set[str] = set()
+    if git_ok(repo):
+        proc = git(repo, "ls-files", "-co", "--exclude-standard", check=False)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line and not skip_path(line):
+                    paths.add(line)
+    # walk likely roots so untracked spec/generated is visible without
+    # descending into target/ or node_modules (pathlib glob would).
+    for root_name in (
+        "specs",
+        "docs",
+        "contracts",
+        "packages",
+        "tests",
+        "Engine",
+        "src-tauri/tests",
+    ):
+        root = repo / root_name
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+            for name in filenames:
+                full = Path(dirpath) / name
+                try:
+                    rel = full.relative_to(repo).as_posix()
+                except ValueError:
+                    continue
+                if not skip_path(rel):
+                    paths.add(rel)
+    out: list[str] = []
+    for rel in sorted(paths):
+        if (repo / rel).is_file():
+            out.append(rel)
+    return out
+
+
+def list_ref_paths(repo: Path, ref: str) -> list[str]:
+    proc = git(repo, "ls-tree", "-r", "--name-only", ref, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"git ls-tree failed for {ref}")
+    return [line for line in proc.stdout.splitlines() if line and not skip_path(line)]
+
+
+def read_work(repo: Path, rel: str) -> str | None:
+    path = repo / rel
+    try:
+        if not path.is_file():
+            return None
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def read_ref(repo: Path, ref: str, rel: str) -> str | None:
+    proc = git(repo, "show", f"{ref}:{rel}", check=False)
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout
+    if len(text.encode("utf-8", errors="replace")) > MAX_FILE_BYTES:
+        return None
+    return text
+
+
+def read_text(repo: Path, ref: str | None, rel: str) -> str | None:
+    if is_work(ref):
+        return read_work(repo, rel)
+    return read_ref(repo, str(ref), rel)
+
+
+def list_paths(repo: Path, ref: str | None) -> list[str]:
+    if is_work(ref):
+        return list_work_paths(repo)
+    return list_ref_paths(repo, str(ref))
+
+
+_ESCAPE = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "'": "'"}
+
+
+def unescape_pkl(raw: str) -> str:
+    if "\\" not in raw:
+        return raw
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            if nxt in _ESCAPE:
+                out.append(_ESCAPE[nxt])
+                i += 2
+                continue
+            if nxt == "u" and i + 2 < len(raw) and raw[i + 2] == "{":
+                end = raw.find("}", i + 3)
+                if end != -1:
+                    try:
+                        out.append(chr(int(raw[i + 3 : end], 16)))
+                        i = end + 1
+                        continue
+                    except ValueError:
+                        pass
+            if nxt == "u" and i + 6 <= len(raw):
+                try:
+                    out.append(chr(int(raw[i + 2 : i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
+def take_quoted(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] != '"':
+        return None
+    i = start + 1
+    out: list[str] = []
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 < len(text):
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            break
+        if ch == '"':
+            return unescape_pkl("".join(out)), i + 1
+        if ch == "\n":
+            break
+        out.append(ch)
+        i += 1
+    return None
+
+
+def line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def harvest_fields(window: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for m in re.finditer(
+        r"""(?P<key>desc|description|intent|input|expectedOutput|expected_output|pattern|label|guarantee)\s*=\s*""",
+        window,
+    ):
+        key = FIELD_CANON.get(m.group("key"), m.group("key"))
+        j = m.end()
+        while j < len(window) and window[j] in " \t\n":
+            j += 1
+        taken = take_quoted(window, j)
+        if taken:
+            val, _ = taken
+            if val and key not in fields:
+                fields[key] = val
+    return fields
+
+
+def parse_pkl_hits(rel: str, text: str) -> list[Hit]:
+    hits: list[Hit] = []
+    riven = bool(CONFLICT_RE.search(text))
+    matches = list(PKL_ID.finditer(text))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else min(len(text), m.end() + 8000)
+        window = text[m.start() : end]
+        fields = harvest_fields(window)
+        hits.append(
+            Hit(
+                cid=m.group("id"),
+                path=rel,
+                line=line_of(text, m.start()),
+                fields=fields,
+                riven=riven and bool(CONFLICT_RE.search(window)),
+            )
+        )
+    return hits
+
+
+def parse_json_hits(rel: str, text: str) -> list[Hit]:
+    riven = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+
+    def walk(obj: object, line_hint: int) -> None:
+        if isinstance(obj, dict):
+            cid = obj.get("id")
+            if isinstance(cid, str) and CLAUSE_ID.fullmatch(cid):
+                fields: dict[str, str] = {}
+                for key, val in obj.items():
+                    if isinstance(val, str) and key in {
+                        "desc",
+                        "description",
+                        "intent",
+                        "input",
+                        "expected_output",
+                        "expectedOutput",
+                        "pattern",
+                        "label",
+                        "guarantee",
+                    }:
+                        fields[FIELD_CANON.get(key, key)] = val
+                hits.append(Hit(cid=cid, path=rel, line=line_hint, fields=fields, riven=riven))
+            for val in obj.values():
+                walk(val, line_hint)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, line_hint)
+
+    try:
+        walk(json.loads(text), 1)
+        if hits:
+            return hits
+    except json.JSONDecodeError:
+        pass
+
+    # conflicted / trailing-comma / jsonc: pull id + nearby desc
+    for m in re.finditer(r'''"id"\s*:\s*"(?P<id>[A-Z][A-Z0-9]{2}-\d{3})"''', text):
+        window = text[m.start() : m.start() + 2000]
+        fields: dict[str, str] = {}
+        dm = re.search(r'''"(?:desc|description)"\s*:\s*"(?P<d>(?:\\.|[^"\\])*)"''', window)
+        if dm:
+            fields["desc"] = unescape_pkl(dm.group("d"))
+        im = re.search(r'''"intent"\s*:\s*"(?P<d>(?:\\.|[^"\\])*)"''', window)
+        if im:
+            fields["intent"] = unescape_pkl(im.group("d"))
+        inm = re.search(r'''"input"\s*:\s*"(?P<d>(?:\\.|[^"\\])*)"''', window)
+        if inm:
+            fields["input"] = unescape_pkl(inm.group("d"))
+        hits.append(
+            Hit(
+                cid=m.group("id"),
+                path=rel,
+                line=line_of(text, m.start()),
+                fields=fields,
+                riven=riven,
+            )
+        )
+    return hits
+
+
+def _md_cells(line: str) -> list[str]:
+    line = line.strip()
+    if not line.startswith("|"):
+        return []
+    return [c.strip().strip("`") for c in line.strip("|").split("|")]
+
+
+def _md_colmap(header: list[str]) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for i, raw in enumerate(header):
+        name = raw.lower()
+        if name in {"id", "条項"} or CLAUSE_ID.fullmatch(raw):
+            mapping[i] = "id"
+        elif any(tok in name for tok in ("内容", "desc", "statement", "normative", "条項内容")):
+            mapping[i] = "desc"
+        elif any(tok in name for tok in ("意図", "intent")):
+            mapping[i] = "intent"
+        elif any(tok in name for tok in ("パターン", "pattern")):
+            mapping[i] = "pattern"
+        elif any(tok in name for tok in ("保証", "label", "guarantee")):
+            mapping[i] = "label"
+        else:
+            mapping[i] = "_"
+    return mapping
+
+
+def parse_markdown_hits(rel: str, text: str) -> list[Hit]:
+    riven_file = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+    lines = text.splitlines()
+    colmap: dict[int, str] | None = None
+    for idx, line in enumerate(lines):
+        cells = _md_cells(line)
+        if not cells:
+            colmap = None
+            continue
+        if all(re.fullmatch(r":?-{2,}:?", c or "") for c in cells):
+            continue
+        joined = " ".join(cells).lower()
+        if colmap is None and any(tok in joined for tok in ("id", "条項")):
+            colmap = _md_colmap(cells)
+            continue
+        if not colmap:
+            # fallback: first cell is id, last cell desc when it looks like prose
+            m = CLAUSE_ID.fullmatch(cells[0] or "")
+            if not m:
+                continue
+            fields: dict[str, str] = {}
+            last = cells[-1] if len(cells) > 1 else ""
+            if last and (len(last) >= 24 or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", last)):
+                fields["desc"] = last
+            hits.append(
+                Hit(
+                    cid=m.group(0),
+                    path=rel,
+                    line=idx + 1,
+                    fields=fields,
+                    riven=riven_file and bool(CONFLICT_RE.search("\n".join(lines[max(0, idx - 2) : idx + 2]))),
+                )
+            )
+            continue
+        id_idx = next((i for i, k in colmap.items() if k == "id"), 0)
+        if id_idx >= len(cells) or not CLAUSE_ID.fullmatch(cells[id_idx] or ""):
+            continue
+        fields = {}
+        for i, key in colmap.items():
+            if key in {"id", "_"} or i >= len(cells):
+                continue
+            val = cells[i]
+            if val:
+                fields[key] = val
+        hits.append(
+            Hit(
+                cid=cells[id_idx],
+                path=rel,
+                line=idx + 1,
+                fields=fields,
+                riven=riven_file and bool(CONFLICT_RE.search("\n".join(lines[max(0, idx - 2) : idx + 2]))),
+            )
+        )
+    return hits
+
+
+def parse_swift_hits(rel: str, text: str) -> list[Hit]:
+    riven = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+    seen: set[tuple[str, int]] = set()
+    for m in SWIFT_TEST.finditer(text):
+        hit = Hit(
+            cid=m.group("id"),
+            path=rel,
+            line=line_of(text, m.start()),
+            fields={"desc": m.group("desc")},
+            riven=riven,
+        )
+        hits.append(hit)
+        seen.add((hit.cid, hit.line))
+    for m in re.finditer(r'''id:\s*"(?P<id>[A-Z][A-Z0-9]{2}-\d{3})"''', text):
+        ln = line_of(text, m.start())
+        if (m.group("id"), ln) in seen:
+            continue
+        hits.append(Hit(cid=m.group("id"), path=rel, line=ln, fields={}, riven=riven))
+    return hits
+
+
+def parse_rust_hits(rel: str, text: str) -> list[Hit]:
+    riven = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+    for m in RUST_DOC.finditer(text):
+        hits.append(
+            Hit(
+                cid=m.group("id"),
+                path=rel,
+                line=line_of(text, m.start()),
+                fields={"desc": m.group("desc").strip()},
+                riven=riven,
+            )
+        )
+    if hits:
+        return hits
+    for m in re.finditer(r"""["'](?P<id>[A-Z][A-Z0-9]{2}-\d{3})["']""", text):
+        hits.append(Hit(cid=m.group("id"), path=rel, line=line_of(text, m.start()), riven=riven))
+    return hits
+
+
+def parse_ts_hits(rel: str, text: str) -> list[Hit]:
+    riven = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+    for m in re.finditer(
+        r"^\s*//[/!]?\s*(?P<id>[A-Z][A-Z0-9]{2}-\d{3})\s*:\s*(?P<desc>.+)$",
+        text,
+        re.M,
+    ):
+        hits.append(
+            Hit(
+                cid=m.group("id"),
+                path=rel,
+                line=line_of(text, m.start()),
+                fields={"desc": m.group("desc").strip()},
+                riven=riven,
+            )
+        )
+    if hits:
+        return hits
+    for m in re.finditer(
+        r'''(?:test|it|describe)\(\s*["'`](?P<id>[A-Z][A-Z0-9]{2}-\d{3})(?:\s+(?P<desc>[^"'`]*))?["'`]''',
+        text,
+    ):
+        desc = (m.group("desc") or "").strip()
+        fields = {}
+        if desc and (" " in desc or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", desc)):
+            fields["desc"] = desc
+        hits.append(Hit(cid=m.group("id"), path=rel, line=line_of(text, m.start()), fields=fields, riven=riven))
+    if hits:
+        return hits
+    for m in re.finditer(r'''["'](?P<id>[A-Z][A-Z0-9]{2}-\d{3})["']''', text):
+        hits.append(Hit(cid=m.group("id"), path=rel, line=line_of(text, m.start()), riven=riven))
+    return hits
+
+
+def parse_generic_hits(rel: str, text: str) -> list[Hit]:
+    riven = bool(CONFLICT_RE.search(text))
+    hits: list[Hit] = []
+    for m in ID_ASSIGN.finditer(text):
+        hits.append(
+            Hit(
+                cid=m.group("id"),
+                path=rel,
+                line=line_of(text, m.start()),
+                riven=riven,
+            )
+        )
+    return hits
+
+
+def parse_hits(rel: str, text: str, *, spec_side: bool) -> list[Hit]:
+    posix = rel.replace("\\", "/")
+    lower = posix.lower()
+    if spec_side or posix.endswith(".pkl"):
+        return parse_pkl_hits(rel, text)
+    if lower.endswith(".json"):
+        return parse_json_hits(rel, text)
+    if lower.endswith(".md"):
+        return parse_markdown_hits(rel, text)
+    if lower.endswith(".swift"):
+        return parse_swift_hits(rel, text)
+    if lower.endswith(".rs"):
+        return parse_rust_hits(rel, text)
+    if lower.endswith((".ts", ".tsx", ".js", ".mjs")):
+        return parse_ts_hits(rel, text)
+    return parse_generic_hits(rel, text)
+
+
+def shard_id_from_path(rel: str) -> str | None:
+    base = rel.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0]
+    if CLAUSE_ID.fullmatch(stem):
+        return stem
+    return None
+
+
+def banner_sources(text: str) -> list[str]:
+    head = "\n".join(text.splitlines()[:16])
+    found: list[str] = []
+    for m in BANNER_FROM.finditer(head):
+        src = m.group(1).strip().strip("`\"'")
+        if src and src not in found:
+            found.append(src)
+    return found
+
+
+def collect_side(
+    repo: Path, ref: str | None, *, spec_side: bool
+) -> tuple[dict[str, list[Hit]], list[str], list[str], dict[str, str]]:
+    by_id: dict[str, list[Hit]] = defaultdict(list)
+    files: list[str] = []
+    riven_files: list[str] = []
+    contents: dict[str, str] = {}
+    for rel in list_paths(repo, ref):
+        if spec_side and not looks_spec(rel):
+            continue
+        if not spec_side and not looks_generated_path(rel):
+            # skip binaries / handwritten trees before git-show
+            if not rel.endswith((".md", ".json", ".ts", ".tsx", ".js", ".swift", ".rs", ".txt")):
+                continue
+        text = read_text(repo, ref, rel)
+        if text is None:
+            continue
+        if not spec_side and not looks_generated(rel, "\n".join(text.splitlines()[:16])):
+            continue
+        if spec_side is False and looks_spec(rel):
+            continue
+        files.append(rel)
+        contents[rel] = text
+        if CONFLICT_RE.search(text):
+            riven_files.append(rel)
+        for hit in parse_hits(rel, text, spec_side=spec_side):
+            if is_clause_id(hit.cid):
+                by_id[hit.cid].append(hit)
+    return by_id, files, riven_files, contents
+
+
+def pick_spec(hits: list[Hit]) -> Hit:
+    # prefer a hit that actually has a description
+    for hit in hits:
+        if hit.desc:
+            return hit
+    return hits[0]
+
+
+def dump_files(spec_ids: set[str], gen_by_id: dict[str, list[Hit]], gen_files: list[str]) -> set[str]:
+    dumps: set[str] = set()
+    if not spec_ids:
+        return dumps
+    file_ids: dict[str, set[str]] = defaultdict(set)
+    for cid, hits in gen_by_id.items():
+        for hit in hits:
+            file_ids[hit.path].add(cid)
+    for path in gen_files:
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        ids = file_ids.get(path, set())
+        ratio = len(ids & spec_ids) / max(1, len(spec_ids))
+        named = base in {"SPEC.md", "spec-manifest.generated.json", "ids.generated.ts"} or base.startswith(
+            "spec-manifest"
+        )
+        if named or ratio >= 0.70:
+            dumps.add(path)
+    return dumps
+
+
+def shard_prefixes(gen_files: list[str]) -> set[str]:
+    prefixes: set[str] = set()
+    for path in gen_files:
+        cid = shard_id_from_path(path)
+        if cid:
+            prefixes.add(cid.split("-", 1)[0])
+    return prefixes
+
+
+def overlap_mismatch(spec: Hit, wit: Hit) -> bool:
+    """True when a witness field exists on both sides and disagrees.
+
+    A SPEC.md dump only carries `desc`. A fixture JSON also carries intent/input.
+    Missing fields are not slack — they are a narrower projection.
+    """
+    for key in ("desc", "intent", "input", "expected_output"):
+        wv = (wit.fields.get(key) or "").strip()
+        if not wv:
+            continue
+        sv = (spec.fields.get(key) or "").strip()
+        if not sv:
+            continue
+        nv, ns = norm(wv), norm(sv)
+        if nv == ns:
+            continue
+        # generated oracles often append a case qualifier or keep a prefix
+        if nv.startswith(ns) or ns.startswith(nv):
+            continue
+        return True
+    return False
+
+
+def classify(
+    spec_by_id: dict[str, list[Hit]],
+    gen_by_id: dict[str, list[Hit]],
+    gen_files: list[str],
+) -> list[ClauseRow]:
+    spec_ids = set(spec_by_id)
+    dumps = dump_files(spec_ids, gen_by_id, gen_files)
+    prefixes = shard_prefixes(gen_files)
+    all_ids = sorted(spec_ids | set(gen_by_id))
+    rows: list[ClauseRow] = []
+    for cid in all_ids:
+        spec_hits = spec_by_id.get(cid, [])
+        witnesses = gen_by_id.get(cid, [])
+        spec = pick_spec(spec_hits) if spec_hits else None
+        missing: list[str] = []
+        note_parts: list[str] = []
+
+        if spec is None:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="hand",
+                    spec=None,
+                    witnesses=witnesses,
+                    note="generated id has no spec parent",
+                    missing=[],
+                )
+            )
+            continue
+
+        required_shard = None
+        if cid.split("-", 1)[0] in prefixes:
+            # a family of per-id files exists (contracts/testcases/FOO-001.json)
+            for path in gen_files:
+                if shard_id_from_path(path) == cid:
+                    required_shard = path
+                    break
+            if required_shard is None:
+                # invent the expected relative name from an existing sibling
+                sibling = next((p for p in gen_files if shard_id_from_path(p)), None)
+                if sibling:
+                    parent = sibling.rsplit("/", 1)[0]
+                    ext = sibling.rsplit(".", 1)[-1]
+                    missing.append(f"{parent}/{cid}.{ext}")
+
+        for dump in sorted(dumps):
+            present = any(h.path == dump for h in witnesses)
+            if not present:
+                missing.append(dump)
+
+        if spec.riven or any(w.riven for w in witnesses):
+            where = []
+            if spec.riven:
+                where.append(spec.path)
+            where.extend(w.path for w in witnesses if w.riven)
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="riven",
+                    spec=spec,
+                    witnesses=witnesses,
+                    note="conflict markers on " + ", ".join(dict.fromkeys(where)),
+                    missing=missing,
+                )
+            )
+            continue
+
+        body_wits = [
+            w
+            for w in witnesses
+            if any(w.fields.get(k) for k in ("desc", "intent", "input", "expected_output"))
+        ]
+        disagree = [w for w in body_wits if overlap_mismatch(spec, w)]
+        agree = [w for w in body_wits if not overlap_mismatch(spec, w)]
+        desc_variants = {norm(w.desc) for w in witnesses if w.desc}
+
+        if not witnesses and missing:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="slack",
+                    spec=spec,
+                    witnesses=[],
+                    note="spec clause has no generated witness",
+                    missing=missing,
+                )
+            )
+            continue
+        if not witnesses:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="slack",
+                    spec=spec,
+                    witnesses=[],
+                    note="spec clause never appears in generated files",
+                )
+            )
+            continue
+
+        if disagree and agree:
+            note_parts.append("partial regen: some witnesses match spec, others drifted")
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="split",
+                    spec=spec,
+                    witnesses=witnesses,
+                    note="; ".join(note_parts),
+                    missing=missing,
+                )
+            )
+            continue
+        if disagree:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="slack",
+                    spec=spec,
+                    witnesses=witnesses,
+                    note="generated body lags spec",
+                    missing=missing,
+                )
+            )
+            continue
+        ns = norm(spec.desc) if spec.desc else ""
+        unrelated_descs = [
+            d
+            for d in desc_variants
+            if ns and not (d == ns or d.startswith(ns) or ns.startswith(d))
+        ]
+        if unrelated_descs and len(desc_variants) > 1:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="split",
+                    spec=spec,
+                    witnesses=witnesses,
+                    note="generated witnesses disagree",
+                    missing=missing,
+                )
+            )
+            continue
+        if missing:
+            rows.append(
+                ClauseRow(
+                    cid=cid,
+                    verdict="split",
+                    spec=spec,
+                    witnesses=witnesses,
+                    note="present in some generated files, missing from " + ", ".join(missing[:4]),
+                    missing=missing,
+                )
+            )
+            continue
+        rows.append(
+            ClauseRow(
+                cid=cid,
+                verdict="taut",
+                spec=spec,
+                witnesses=witnesses,
+                note="spec and generated agree",
+            )
+        )
+    return rows
+
+
+def dirty_set(repo: Path) -> set[str]:
+    if not git_ok(repo):
+        return set()
+    proc = git(repo, "status", "--porcelain", "-uall", check=False)
+    out: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        out.add(path)
+    return out
+
+
+def last_touch(repo: Path, rel: str) -> str:
+    if not git_ok(repo):
+        return ""
+    proc = git(repo, "log", "-1", "--format=%h %ci", "--", rel, check=False)
+    return proc.stdout.strip()
+
+
+PRIMARY_SPEC_BASENAMES = {"main.pkl", "tenaoshi.pkl", "notifier.pkl", "app.pkl"}
+
+
+def primary_spec_files(spec_files: list[str]) -> list[str]:
+    named = [s for s in spec_files if s.rsplit("/", 1)[-1] in PRIMARY_SPEC_BASENAMES]
+    if named:
+        return named
+    rest = [
+        s
+        for s in spec_files
+        if not s.endswith("patterns.pkl") and not s.endswith("base.pkl") and "/patterns/" not in s
+    ]
+    return rest or spec_files[:]
+
+
+def is_clause_dump(path: str) -> bool:
+    posix = path.replace("\\", "/")
+    base = posix.rsplit("/", 1)[-1]
+    if base in {"SPEC.md", "rules.md"} or base.startswith("spec-manifest"):
+        return True
+    if base.endswith(".proptest-regressions"):
+        return False
+    if "oracles_generated" in base or "OraclesGenerated" in base:
+        return True
+    if base.endswith(".generated.ts") or base.endswith(".generated.json"):
+        return True
+    if posix.startswith("docs/generated/") or "/docs/generated/" in posix:
+        return True
+    if shard_id_from_path(posix):
+        return True
+    return False
+
+
+def _resolve_spec_name(src: str, spec_files: list[str]) -> str | None:
+    src_n = src.lstrip("./")
+    if src_n in spec_files:
+        return src_n
+    if src_n.endswith("/"):
+        matches = [s for s in spec_files if s.startswith(src_n)]
+    else:
+        matches = [s for s in spec_files if s == src_n or s.endswith("/" + src_n)]
+    return matches[0] if matches else None
+
+
+def _edge_verdict(
+    repo: Path,
+    spec_path: str,
+    gen_path: str,
+    spec_text: str | None,
+    gen_text: str,
+    dirty: set[str],
+    spec_work: bool,
+    gen_work: bool,
+) -> tuple[str, str]:
+    spec_dirty = spec_path in dirty and spec_work
+    if gen_path.endswith("/*"):
+        prefix = gen_path[:-1]
+        gen_dirty = gen_work and any(p.startswith(prefix) for p in dirty)
+        gen_riven = bool(CONFLICT_RE.search(gen_text))
+    else:
+        gen_dirty = gen_path in dirty and gen_work
+        gen_riven = bool(CONFLICT_RE.search(gen_text))
+    spec_riven = bool(spec_text and CONFLICT_RE.search(spec_text))
+    if spec_riven or gen_riven:
+        where = "spec+generated" if spec_riven and gen_riven else "spec" if spec_riven else "generated"
+        return "riven", f"conflict markers in {where}"
+    if spec_dirty and not gen_dirty:
+        return "slack", "spec dirty, generated clean"
+    if gen_dirty and not spec_dirty:
+        return "hand", "generated dirty, spec clean"
+    if spec_dirty and gen_dirty:
+        return "taut", "both dirty"
+    st = last_touch(repo, spec_path)
+    gt_path = gen_path[:-2] if gen_path.endswith("/*") else gen_path
+    gt = last_touch(repo, gt_path) if not gen_path.endswith("/*") else last_touch(repo, spec_path and gt_path)
+    if gen_path.endswith("/*"):
+        return "taut", "shard family"
+    if st and gt and st.split()[0] == gt.split()[0]:
+        return "taut", f"same commit {st.split()[0]}"
+    if st and gt:
+        proc = git(repo, "log", "-1", "--format=%ct", "--", spec_path, check=False)
+        gs = git(repo, "log", "-1", "--format=%ct", "--", gen_path, check=False)
+        try:
+            spec_t = int((proc.stdout or "0").strip() or "0")
+            gen_t = int((gs.stdout or "0").strip() or "0")
+        except ValueError:
+            spec_t = gen_t = 0
+        if spec_t > gen_t:
+            return "slack", f"spec {st.split()[0]} newer than generated {gt.split()[0]}"
+        if gen_t > spec_t:
+            return "hand", f"generated {gt.split()[0]} newer than spec {st.split()[0]}"
+        return "taut", "same mtime-epoch"
+    return "taut", "no git history to compare"
+
+
+def file_edges(
+    repo: Path,
+    spec_files: list[str],
+    gen_files: list[str],
+    gen_contents: dict[str, str],
+    spec_ref: str | None,
+    gen_ref: str | None,
+) -> list[FileEdge]:
+    dirty = dirty_set(repo) if is_work(spec_ref) or is_work(gen_ref) else set()
+    edges: list[FileEdge] = []
+    claimed: set[tuple[str, str]] = set()
+    default_specs = primary_spec_files(spec_files)
+    family_of: dict[str, str] = {}
+    for gpath in gen_contents:
+        if shard_id_from_path(gpath):
+            family_of[gpath] = gpath.rsplit("/", 1)[0] + "/*"
+    seen_family = set()
+    for gpath, text in gen_contents.items():
+        display_gen = family_of.get(gpath, gpath)
+        if display_gen.endswith("/*"):
+            if display_gen in seen_family:
+                continue
+            seen_family.add(display_gen)
+        sources = banner_sources(text)
+        if not sources:
+            # never invent a pair from "first spec alphabetically" onto a
+            # bannerless schema; only dumps/oracles/shards default-bind.
+            if is_clause_dump(gpath) and default_specs:
+                sources = default_specs[:1]
+            else:
+                continue
+        for src in sources:
+            src_n = _resolve_spec_name(src, spec_files)
+            if not src_n:
+                continue
+            key = (src_n, display_gen)
+            if key in claimed:
+                continue
+            claimed.add(key)
+            spec_text = read_text(repo, spec_ref, src_n)
+            verdict, note = _edge_verdict(
+                repo,
+                src_n,
+                display_gen,
+                spec_text,
+                text,
+                dirty,
+                is_work(spec_ref),
+                is_work(gen_ref),
+            )
+            edges.append(FileEdge(spec=src_n, generated=display_gen, verdict=verdict, note=note))
+    edges.sort(key=lambda e: (e.verdict != "taut", e.spec, e.generated))
+    return edges
+
+
+def scan(repo: Path, spec_ref: str | None, gen_ref: str | None) -> Report:
+    spec_by_id, spec_files, spec_riven, _ = collect_side(repo, spec_ref, spec_side=True)
+    gen_by_id, gen_files, gen_riven, gen_contents = collect_side(repo, gen_ref, spec_side=False)
+    rows = classify(spec_by_id, gen_by_id, gen_files)
+    edges = file_edges(repo, spec_files, gen_files, gen_contents, spec_ref, gen_ref)
+    return Report(
+        repo=str(repo),
+        spec_ref=display_ref(spec_ref),
+        gen_ref=display_ref(gen_ref),
+        rows=rows,
+        edges=edges,
+        spec_files=spec_files,
+        gen_files=gen_files,
+        riven_files=sorted(set(spec_riven + gen_riven)),
+    )
+
+
+def punch(repo: Path, old_ref: str, new_ref: str | None, gen_ref: str | None) -> list[dict[str, object]]:
+    """Clauses whose spec fingerprint moved between two spec snapshots, plus current witnesses."""
+    old_by, _, _, _ = collect_side(repo, old_ref, spec_side=True)
+    new_by, _, _, _ = collect_side(repo, new_ref, spec_side=True)
+    gen_by, _, _, _ = collect_side(repo, gen_ref, spec_side=False)
+    old_gen, _, _, _ = collect_side(repo, old_ref, spec_side=False)
+    old_fp = {cid: pick_spec(hits).fingerprint for cid, hits in old_by.items()}
+    new_fp = {cid: pick_spec(hits).fingerprint for cid, hits in new_by.items()}
+    ids = sorted(set(old_fp) | set(new_fp))
+    out: list[dict[str, object]] = []
+    for cid in ids:
+        if old_fp.get(cid) == new_fp.get(cid) and cid in old_fp and cid in new_fp:
+            continue
+        kind = "changed"
+        if cid not in old_fp:
+            kind = "added"
+        elif cid not in new_fp:
+            kind = "removed"
+        wits = old_gen.get(cid, []) if kind == "removed" else gen_by.get(cid, [])
+        out.append(
+            {
+                "id": cid,
+                "kind": kind,
+                "old": old_by[cid][0].path + f":{old_by[cid][0].line}" if cid in old_by else None,
+                "new": new_by[cid][0].path + f":{new_by[cid][0].line}" if cid in new_by else None,
+                "witnesses": [f"{w.path}:{w.line}" for w in wits],
+            }
+        )
+    return out
+
+
+def filter_rows(rows: list[ClauseRow], only: set[str] | None, cid_prefix: str | None) -> list[ClauseRow]:
+    out = rows
+    if only:
+        out = [r for r in out if r.verdict in only]
+    if cid_prefix:
+        out = [r for r in out if r.cid.startswith(cid_prefix)]
+    return out
+
+
+def counts(rows: Iterable[ClauseRow]) -> Counter[str]:
+    return Counter(r.verdict for r in rows)
+
+
+def format_text(report: Report, rows: list[ClauseRow], *, files: bool, explain: bool) -> str:
+    c = counts(report.rows)
+    head = (
+        f"yoke  spec={report.spec_ref}  gen={report.gen_ref}  "
+        f"clauses={len(report.rows)}  "
+        f"taut={c.get('taut', 0)} slack={c.get('slack', 0)} "
+        f"hand={c.get('hand', 0)} split={c.get('split', 0)} riven={c.get('riven', 0)}"
+    )
+    lines = [head]
+    if files:
+        lines.append(f"  spec-files {len(report.spec_files)}  gen-files {len(report.gen_files)}")
+        for edge in report.edges:
+            lines.append(f"FILE  {edge.verdict:<5}  {edge.spec}  →  {edge.generated}  {edge.note}")
+    for row in rows:
+        spec_loc = f"{row.spec.path}:{row.spec.line}" if row.spec else "-"
+        wit_n = len(row.witnesses)
+        lines.append(f"{row.verdict:<5}  {row.cid:<9}  spec {spec_loc:<40}  gen×{wit_n}  {row.note}")
+        if explain:
+            if row.spec and row.spec.desc:
+                lines.append(f"      spec  {row.spec.desc[:140]}")
+            for w in row.witnesses[:6]:
+                extra = w.desc[:100] if w.desc else "(presence)"
+                flag = " riven" if w.riven else ""
+                lines.append(f"      gen   {w.path}:{w.line}  {extra}{flag}")
+            if row.missing:
+                lines.append("      miss  " + ", ".join(row.missing[:8]))
+    return "\n".join(lines) + "\n"
+
+
+def row_dict(row: ClauseRow) -> dict[str, object]:
+    return {
+        "id": row.cid,
+        "verdict": row.verdict,
+        "note": row.note,
+        "spec": {"path": row.spec.path, "line": row.spec.line, "desc": row.spec.desc} if row.spec else None,
+        "witnesses": [
+            {"path": w.path, "line": w.line, "desc": w.desc, "riven": w.riven} for w in row.witnesses
+        ],
+        "missing": row.missing,
+    }
+
+
+def format_tsv(rows: list[ClauseRow]) -> str:
+    lines = ["verdict\tid\tspec\twitnesses\tnote"]
+    for row in rows:
+        spec = f"{row.spec.path}:{row.spec.line}" if row.spec else ""
+        wits = ",".join(f"{w.path}:{w.line}" for w in row.witnesses)
+        lines.append(f"{row.verdict}\t{row.cid}\t{spec}\t{wits}\t{row.note}")
+    return "\n".join(lines) + "\n"
+
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    def check(name: str, cond: bool) -> None:
+        if not cond:
+            failures.append(name)
+
+    pkl = '''
+    new patterns.EditPlanFixture {
+      id = "EPF-001"
+      desc = "fix a typo"
+      intent = "typo"
+      input = "しまた"
+      expectedOutput = "しました"
+    }
+    new patterns.Manual {
+      id = "MAN-001"
+      desc = "click apply"
+    }
+    '''
+    hits = parse_pkl_hits("specs/app.pkl", pkl)
+    check("pkl count", [h.cid for h in hits] == ["EPF-001", "MAN-001"])
+    check("pkl desc", hits[0].fields.get("intent") == "typo")
+    check("pkl expected", hits[0].fields.get("expected_output") == "しました")
+
+    md = "| ID | pattern | label | desc |\n| EPF-001 | `edit_plan_fixture` | example-tested | fix a typo |\n"
+    md_hits = parse_markdown_hits("docs/SPEC.md", md)
+    check("md id", md_hits and md_hits[0].cid == "EPF-001")
+    check("md desc", md_hits[0].desc == "fix a typo")
+
+    js = json.dumps({"id": "EPF-001", "description": "fix a typo", "intent": "typo", "input": "しまた"})
+    jh = parse_json_hits("contracts/testcases/EPF-001.json", js)
+    check("json id", jh and jh[0].cid == "EPF-001" and jh[0].fields.get("intent") == "typo")
+
+    swift = '@Test("EPF-001 fix a typo")\nfunc epf_001() {}'
+    sh = parse_swift_hits("OraclesGenerated.swift", swift)
+    check("swift", sh and sh[0].cid == "EPF-001")
+
+    rust = "/// FLT-001: steel path rejects normal\nfn flt_001() {}"
+    rh = parse_rust_hits("oracles_generated.rs", rust)
+    check("rust", rh and rh[0].cid == "FLT-001")
+
+    # SHA-256 must never become a clause
+    check("sha not id", parse_pkl_hits("x.pkl", 'desc = "SHA-256 fingerprint"') == [])
+    check("sha rejected", not is_clause_id("SHA-256") and is_clause_id("EPF-001"))
+
+    spec = {"EPF-001": [hits[0]], "MAN-001": [hits[1]]}
+    gen = {
+        "EPF-001": [
+            Hit("EPF-001", "docs/SPEC.md", 2, {"desc": "fix a typo", "intent": "typo", "input": "しまた"}),
+            Hit(
+                "EPF-001",
+                "contracts/testcases/EPF-001.json",
+                1,
+                {"desc": "fix a typo", "intent": "typo", "input": "しまた"},
+            ),
+        ],
+        "MAN-001": [Hit("MAN-001", "docs/SPEC.md", 3, {"desc": "click apply"})],
+        "BAZ-001": [Hit("BAZ-001", "docs/SPEC.md", 4, {"desc": "orphan"})],
+    }
+    gen_files = ["docs/SPEC.md", "contracts/testcases/EPF-001.json"]
+    rows = {r.cid: r for r in classify(spec, gen, gen_files)}
+    check("taut epf", rows["EPF-001"].verdict == "taut")
+    check("taut man", rows["MAN-001"].verdict == "taut")
+    check("hand baz", rows["BAZ-001"].verdict == "hand")
+
+    # slack: spec desc moved
+    spec2 = {
+        "EPF-001": [
+            Hit("EPF-001", "specs/app.pkl", 1, {"desc": "NEW", "intent": "typo", "input": "しまた"})
+        ]
+    }
+    gen2 = {
+        "EPF-001": [
+            Hit("EPF-001", "docs/SPEC.md", 2, {"desc": "OLD", "intent": "typo", "input": "しまた"})
+        ]
+    }
+    rows2 = classify(spec2, gen2, ["docs/SPEC.md"])
+    check("slack body", rows2[0].verdict == "slack")
+
+    # split: witnesses disagree, one matches
+    spec3 = {"FOO-001": [Hit("FOO-001", "specs/a.pkl", 1, {"desc": "A"})]}
+    gen3 = {
+        "FOO-001": [
+            Hit("FOO-001", "docs/SPEC.md", 1, {"desc": "A"}),
+            Hit("FOO-001", "oracles.generated.rs", 2, {"desc": "B"}),
+        ]
+    }
+    rows3 = classify(spec3, gen3, ["docs/SPEC.md", "oracles.generated.rs"])
+    check("split", rows3[0].verdict == "split")
+
+    riven_text = "<<<<<<< HEAD\nid = \"ZZZ-001\"\n=======\nid = \"ZZZ-002\"\n>>>>>>> x\n"
+    check("conflict detect", bool(CONFLICT_RE.search(riven_text)))
+
+    if failures:
+        eprint("self-test FAIL:", ", ".join(failures))
+        return 1
+    print("self-test ok")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="yoke",
+        description="Join spec clauses to generated witnesses and print the slack.",
+    )
+    p.add_argument("-C", "--repo", default=".", help="repository root (default: .)")
+    p.add_argument("--spec", dest="spec_opt", default=None, help="spec snapshot (: = worktree)")
+    p.add_argument("--gen", dest="gen_opt", default=None, help="generated snapshot (: = worktree)")
+    p.add_argument("spec_pos", nargs="?", help="spec snapshot (shorthand)")
+    p.add_argument("gen_pos", nargs="?", help="generated snapshot (shorthand)")
+    p.add_argument("--only", default=None, help="comma verdicts to keep (slack,hand,split,riven,taut)")
+    p.add_argument("--id", dest="id_prefix", default=None, help="clause id prefix filter")
+    p.add_argument("--all", action="store_true", help="include taut rows")
+    p.add_argument("--files", action="store_true", help="also print file-level yoke edges")
+    p.add_argument("--explain", action="store_true", help="print desc + witness paths")
+    p.add_argument("--json", action="store_true", help="JSON on stdout")
+    p.add_argument("--tsv", action="store_true", help="TSV on stdout")
+    p.add_argument(
+        "--punch",
+        metavar="OLD",
+        default=None,
+        help="list spec clauses that moved since OLD (default gen/worktree witnesses)",
+    )
+    p.add_argument("selftest_cmd", nargs="?", default=None)
+    return p
+
+
+def resolve_refs(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    spec = args.spec_opt if args.spec_opt is not None else args.spec_pos
+    gen = args.gen_opt if args.gen_opt is not None else args.gen_pos
+    if spec and gen is None and args.spec_opt is None and args.gen_opt is None:
+        # `yoke HEAD` means both at HEAD
+        gen = spec
+    return spec, gen
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"self-test", "selftest"}:
+        return self_test()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        eprint(f"yoke: not a directory: {repo}")
+        return 2
+    spec_ref, gen_ref = resolve_refs(args)
+
+    if args.punch is not None:
+        items = punch(repo, args.punch, spec_ref if spec_ref else None, gen_ref)
+        if args.json:
+            print(json.dumps({"punch_since": args.punch, "clauses": items}, ensure_ascii=False, indent=2))
+        else:
+            print(f"yoke punch since {args.punch}  moved={len(items)}")
+            for item in items:
+                wits = ",".join(item["witnesses"][:5]) or "-"
+                print(f"{item['kind']:<8}  {item['id']:<9}  {item['old'] or '-'}  →  {item['new'] or '-'}  gen {wits}")
+        return 0 if not items else 1
+
+    try:
+        report = scan(repo, spec_ref, gen_ref)
+    except RuntimeError as exc:
+        eprint(f"yoke: {exc}")
+        return 2
+
+    only: set[str] | None = None
+    if args.only:
+        only = {part.strip() for part in args.only.split(",") if part.strip()}
+    elif not args.all and not args.json and not args.tsv:
+        only = {"slack", "hand", "split", "riven"}
+    rows = filter_rows(report.rows, only, args.id_prefix)
+
+    if args.json:
+        payload = {
+            "repo": report.repo,
+            "spec": report.spec_ref,
+            "gen": report.gen_ref,
+            "counts": dict(counts(report.rows)),
+            "spec_files": report.spec_files,
+            "gen_files": report.gen_files,
+            "riven_files": report.riven_files,
+            "files": [edge.__dict__ for edge in report.edges],
+            "clauses": [row_dict(r) for r in (report.rows if args.all else rows)],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.tsv:
+        sys.stdout.write(format_tsv(rows if rows or only else report.rows))
+    else:
+        sys.stdout.write(format_text(report, rows, files=args.files, explain=args.explain))
+
+    bad = sum(1 for r in report.rows if r.verdict != "taut")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1404 @@
+#!/usr/bin/env python3
+"""stint — interval occupancy of files and symbols that lived between two refs.
+
+No leftover-name search. The object is occupancy (when a path/def held the
+tree) plus --pick of the last blob of an ephemeral path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Iterator
+
+VERSION = "0.2.0"
+
+RE_RUST = [
+    re.compile(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+        r"(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
+        r"(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+        r"(?:fn|struct|enum|trait|type|mod)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+    re.compile(
+        r"^\s*impl(?:\s*<[^>]*>)?\s+(?:[A-Za-z_][A-Za-z0-9_:]*\s+for\s+)?"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+]
+RE_PY = [
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_RB = [
+    re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*module\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_JS = [
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*(?:export\s+)?(?:type|interface|enum|namespace)\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r"(?:async\s+)?(?:function\b|\()"
+    ),
+]
+RE_GO = [
+    re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_SWIFT = [
+    re.compile(
+        r"^\s*(?:(?:public|private|internal|fileprivate|open|final|override|"
+        r"mutating|static|class)\s+)*"
+        r"(?:func|class|struct|enum|protocol|actor|typealias)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+]
+RE_KT = [
+    re.compile(
+        r"^\s*(?:(?:public|private|internal|protected|override|final)\s+)*"
+        r"(?:fun|class|object|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    ),
+]
+RE_SH = [
+    re.compile(
+        r"^\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)|(?:function\s+)?"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\(\))"
+    ),
+]
+RE_PKL = [
+    re.compile(r"^\s*(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*typealias\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^\s*module\s+([A-Za-z_][A-Za-z0-9_]*)"),
+]
+RE_FALLBACK = RE_RUST + RE_PY + RE_GO + RE_SWIFT
+
+EXT_RES: dict[str, list[re.Pattern[str]]] = {}
+for _exts, _res in (
+    ((".rs",), RE_RUST),
+    ((".py",), RE_PY),
+    ((".rb",), RE_RB),
+    ((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"), RE_JS),
+    ((".go",), RE_GO),
+    ((".swift",), RE_SWIFT),
+    ((".kt", ".kts"), RE_KT),
+    ((".sh", ".bash", ".zsh"), RE_SH),
+    ((".pkl",), RE_PKL),
+):
+    for _e in _exts:
+        EXT_RES[_e] = _res
+
+KIND_HINT = (
+    (re.compile(r"\bfn\b|\bfunc\b|\bfunction\b|\bdef\b|\bfun\b"), "fn"),
+    (re.compile(r"\bstruct\b"), "struct"),
+    (re.compile(r"\benum\b"), "enum"),
+    (re.compile(r"\bclass\b|\bobject\b"), "class"),
+    (re.compile(r"\btrait\b|\bprotocol\b|\binterface\b"), "trait"),
+    (re.compile(r"\btype\b|\btypealias\b"), "type"),
+    (re.compile(r"\bmod\b|\bmodule\b|\bnamespace\b"), "mod"),
+)
+
+STOP = {
+    "a", "an", "the", "and", "or", "if", "else", "for", "while", "do", "in",
+    "of", "to", "from", "with", "by", "as", "is", "it", "at", "on", "be",
+    "this", "that", "self", "super", "true", "false", "none", "null", "nil",
+    "let", "var", "const", "mut", "pub", "use", "import", "export", "return",
+    "new", "get", "set", "main", "init", "test", "tests", "spec", "keep",
+}
+
+SKIP_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".pdf", ".zip",
+    ".gz", ".tgz", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mov", ".wav",
+    ".mp3", ".bin", ".wasm", ".lock", ".min.js", ".min.css", ".map", ".sum",
+    ".snap", ".exe", ".dll", ".so", ".dylib",
+}
+
+SKIP_PATH_PARTS = (
+    "/node_modules/",
+    "/.pnpm-store/",
+    "/target/",
+    "/.build/",
+    "/dist/",
+    "/vendor/",
+    "/.git/",
+)
+
+COMMENT_LINE = re.compile(r"^\s*(?:#|//|--|/\*|\*|<!--|;;|;)")
+DOC_EXT = {".md", ".mdx", ".rst", ".txt", ".adoc", ".org"}
+CODE_EXT = {
+    ".rs", ".py", ".go", ".js", ".jsx", ".ts", ".tsx", ".swift", ".rb", ".c",
+    ".h", ".cc", ".cpp", ".java", ".kt", ".kts", ".cs", ".php", ".sh", ".bash",
+    ".zsh", ".lua", ".r", ".jl", ".scala", ".hs", ".ex", ".exs", ".ml",
+    ".m", ".mm", ".vue", ".svelte", ".pkl",
+}
+
+ZERO_BLOB = "0" * 40
+
+
+class StintError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def color_enabled(no_color: bool) -> bool:
+    if no_color or os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+class Ink:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _c(self, code: str, text: str) -> str:
+        if not self.enabled:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def bold(self, t: str) -> str:
+        return self._c("1", t)
+
+    def dim(self, t: str) -> str:
+        return self._c("2", t)
+
+    def red(self, t: str) -> str:
+        return self._c("31", t)
+
+    def green(self, t: str) -> str:
+        return self._c("32", t)
+
+    def yellow(self, t: str) -> str:
+        return self._c("33", t)
+
+    def cyan(self, t: str) -> str:
+        return self._c("36", t)
+
+
+def git(repo: str, *args: str, check: bool = True) -> str:
+    proc = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if check and proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"git {' '.join(args)} failed"
+        raise StintError(err)
+    return proc.stdout
+
+
+def git_bytes(repo: str, *args: str, check: bool = True) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        capture_output=True,
+    )
+    if check and proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
+        raise StintError(err or f"git {' '.join(args)} failed")
+    return proc.stdout
+
+
+def git_ok(repo: str, *args: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", repo, "-c", "core.quotepath=false", *args],
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
+def short_sha(sha: str) -> str:
+    return sha[:8] if sha else ""
+
+
+def normalize_blob(sha: str) -> str:
+    if not sha or set(sha) <= {"0"}:
+        return ""
+    return sha
+
+
+@dataclass
+class CommitInfo:
+    sha: str
+    ts: int
+    subject: str
+
+
+@dataclass
+class Range:
+    repo: str
+    base: str | None
+    head: str
+    base_label: str
+    head_label: str
+    truncated: bool
+    commit_count: int = 0
+
+
+@dataclass
+class Occupancy:
+    enter: CommitInfo
+    leave: CommitInfo
+    died: CommitInfo | None
+    blob: str
+    commits: int
+    paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FileStint:
+    path: str
+    spans: list[Occupancy] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    bytes: int = 0
+
+    @property
+    def born(self) -> CommitInfo | None:
+        return self.spans[0].enter if self.spans else None
+
+    @property
+    def leave(self) -> CommitInfo | None:
+        return self.spans[-1].leave if self.spans else None
+
+    @property
+    def died(self) -> CommitInfo | None:
+        return self.spans[-1].died if self.spans else None
+
+    @property
+    def blob(self) -> str:
+        return self.spans[-1].blob if self.spans else ""
+
+    @property
+    def commits(self) -> int:
+        return sum(s.commits for s in self.spans)
+
+
+@dataclass
+class SymbolHist:
+    name: str
+    kinds: set[str] = field(default_factory=set)
+    adds: list[tuple[CommitInfo, str, str]] = field(default_factory=list)
+    dels: list[tuple[CommitInfo, str, str]] = field(default_factory=list)
+    commits: int = 0
+    present_now: bool = False
+    last_path: str = ""
+    last_snippet: str = ""
+
+
+@dataclass
+class SymbolStint:
+    name: str
+    kind: str
+    path: str
+    born: CommitInfo | None
+    died: CommitInfo | None
+    leave: CommitInfo | None
+    commits: int
+    snippet: str
+    testlike: bool
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    proc = subprocess.run(
+        ["git", "-C", start, "-c", "core.quotepath=false", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if proc.returncode != 0:
+        raise StintError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+def rev_parse(repo: str, ref: str) -> str:
+    try:
+        return git(repo, "rev-parse", "--verify", ref).strip()
+    except StintError as e:
+        raise StintError(f"unknown ref {ref!r}: {e}") from e
+
+
+def default_branch_ref(repo: str) -> str | None:
+    proc = subprocess.run(
+        [
+            "git", "-C", repo, "-c", "core.quotepath=false",
+            "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    for name in ("main", "master", "trunk", "develop"):
+        if git_ok(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return f"refs/heads/{name}"
+    return None
+
+
+def log_prefix(rng: Range) -> list[str]:
+    if rng.base is None:
+        return ["log", "--root", rng.head]
+    return ["log", f"{rng.base}..{rng.head}"]
+
+
+def count_commits(rng: Range, max_commits: int) -> int:
+    args = log_prefix(rng) + [f"--max-count={max_commits + 1}", "--pretty=format:%H"]
+    shas = [line for line in git(rng.repo, *args).splitlines() if line]
+    if len(shas) > max_commits:
+        rng.truncated = True
+        return max_commits
+    return len(shas)
+
+
+def auto_range(repo: str, max_commits: int, root: bool) -> Range:
+    head = rev_parse(repo, "HEAD")
+    head_label = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() or "HEAD"
+    if head_label == "HEAD":
+        head_label = short_sha(head)
+
+    if root:
+        count = int(git(repo, "rev-list", "--count", "HEAD").strip() or "0")
+        truncated = count > max_commits
+        if truncated:
+            window = git(repo, "rev-list", f"--max-count={max_commits + 1}", "HEAD").splitlines()
+            base = window[-1]
+            return Range(repo, base, head, short_sha(base), head_label, True, max_commits)
+        return Range(repo, None, head, "∅", head_label, False, count)
+
+    branch = default_branch_ref(repo)
+    if branch:
+        base = git(repo, "merge-base", branch, "HEAD").strip()
+        branch_sha = rev_parse(repo, branch)
+        if base != head:
+            count = int(git(repo, "rev-list", "--count", f"{base}..{head}").strip() or "0")
+            label = branch.replace("refs/heads/", "").replace("refs/remotes/", "")
+            truncated = count > max_commits
+            return Range(
+                repo, base, head, label, head_label, truncated, min(count, max_commits)
+            )
+        if branch_sha == head:
+            pass
+
+    window = git(repo, "rev-list", f"--max-count={max_commits + 1}", "HEAD").splitlines()
+    if not window:
+        raise StintError("repository has no commits")
+    if len(window) == 1:
+        return Range(repo, None, head, "∅", head_label, False, 1)
+    if len(window) > max_commits:
+        base = window[-1]
+        return Range(repo, base, head, short_sha(base), head_label, True, max_commits)
+    oldest = window[-1]
+    parents = git(repo, "rev-list", "--parents", "-n", "1", oldest).split()
+    if len(parents) <= 1:
+        return Range(repo, None, head, "∅", head_label, False, len(window))
+    return Range(repo, oldest, head, short_sha(oldest), head_label, False, len(window) - 1)
+
+
+def resolve_range(
+    repo: str,
+    base_arg: str | None,
+    head_arg: str | None,
+    max_commits: int,
+    root: bool,
+) -> Range:
+    if root and (base_arg or head_arg):
+        raise StintError("--root cannot be combined with explicit refs")
+    if not base_arg and not head_arg:
+        rng = auto_range(repo, max_commits, root)
+        rng.commit_count = count_commits(rng, max_commits)
+        return rng
+    head_label = head_arg or "HEAD"
+    head = rev_parse(repo, head_label)
+    if not base_arg:
+        rng = Range(repo, None, head, "∅", head_label, False)
+        rng.commit_count = count_commits(rng, max_commits)
+        return rng
+    base = rev_parse(repo, base_arg)
+    rng = Range(repo, base, head, base_arg, head_label, False)
+    rng.commit_count = count_commits(rng, max_commits)
+    return rng
+
+
+def skip_path(path: str) -> bool:
+    norm = "/" + path.replace("\\", "/").lstrip("/")
+    if any(part in norm for part in SKIP_PATH_PARTS):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(ext) for ext in SKIP_EXT)
+
+
+def ext_of(path: str) -> str:
+    return os.path.splitext(path.lower().replace("\\", "/"))[1]
+
+
+def def_regexes_for(path: str) -> list[re.Pattern[str]]:
+    ext = ext_of(path)
+    if ext in DOC_EXT:
+        return []
+    return EXT_RES.get(ext, RE_FALLBACK if ext in CODE_EXT else [])
+
+
+def extract_def(line: str, path: str = "") -> tuple[str, str] | None:
+    raw = line[1:] if line[:1] in "+-" else line
+    if raw.startswith("+++") or raw.startswith("---"):
+        return None
+    if COMMENT_LINE.match(raw):
+        return None
+    regexes = def_regexes_for(path) if path else RE_FALLBACK
+    if not regexes:
+        return None
+    for cre in regexes:
+        m = cre.match(raw)
+        if not m:
+            continue
+        name = next((g for g in m.groups() if g), None)
+        if not name:
+            continue
+        kind = "def"
+        for kre, label in KIND_HINT:
+            if kre.search(raw):
+                kind = label
+                break
+        return name, kind
+    return None
+
+
+def looks_like_source(path: str) -> bool:
+    return ext_of(path) in CODE_EXT
+
+
+def interesting_name(name: str, min_length: int) -> bool:
+    ascii_only = all(ord(c) < 128 for c in name)
+    if ascii_only and len(name) < min_length:
+        return False
+    if name in STOP or name.lower() in STOP:
+        return False
+    if ascii_only and name.isupper() and len(name) < 5:
+        return False
+    return True
+
+
+def is_testlike(name: str, path: str) -> bool:
+    n = name.lower()
+    p = path.replace("\\", "/").lower()
+    if n.startswith("test_") or n.endswith("_test") or n.startswith("it_") or n.startswith("should_"):
+        return True
+    if n.endswith("tests") and n[:1].isupper():
+        return True
+    if n == name and n.count("_") >= 3:
+        return True
+    if "/tests/" in f"/{p}/" or "/test/" in f"/{p}/" or "/__tests__/" in f"/{p}/":
+        return True
+    if p.endswith("_test.rs") or p.endswith("_test.go") or p.endswith(".test.ts") or p.endswith(".test.js"):
+        return True
+    if p.endswith("_spec.rb") or p.endswith(".spec.ts"):
+        return True
+    return False
+
+
+def ls_tree_blobs(repo: str, ref: str | None) -> dict[str, str]:
+    if ref is None:
+        return {}
+    out = git(repo, "ls-tree", "-r", "-z", ref)
+    blobs: dict[str, str] = {}
+    for entry in out.split("\0"):
+        if not entry or "\t" not in entry:
+            continue
+        meta, path = entry.split("\t", 1)
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        mode, typ, sha = parts[0], parts[1], parts[2]
+        if typ != "blob" or mode == "160000":
+            continue
+        blobs[path] = sha
+    return blobs
+
+
+def blob_sizes(repo: str, shas: list[str]) -> dict[str, int]:
+    wanted = [s for s in dict.fromkeys(shas) if s]
+    if not wanted:
+        return {}
+    proc = subprocess.run(
+        ["git", "-C", repo, "cat-file", "--batch-check=%(objectname) %(objectsize)"],
+        input="\n".join(wanted) + "\n",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    sizes: dict[str, int] = {}
+    for src, line in zip(wanted, proc.stdout.splitlines()):
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].isdigit():
+            n = int(parts[-1])
+            sizes[src] = n
+            sizes[parts[0]] = n
+    return sizes
+
+
+def parse_raw_events(raw: str) -> list[tuple[str, str, str, str]]:
+    """Return (status, old_path, new_path, blob_after_or_before_delete)."""
+    events: list[tuple[str, str, str, str]] = []
+    for line in raw.splitlines():
+        if not line.startswith(":"):
+            continue
+        # :oldmode newmode oldsha newsha status[\tscore] \t path [\t path2]
+        try:
+            meta, rest = line[1:].split("\t", 1)
+        except ValueError:
+            continue
+        bits = meta.split()
+        if len(bits) < 5:
+            continue
+        old_sha, new_sha, status = bits[2], bits[3], bits[4]
+        letter = status[:1]
+        paths = rest.split("\t")
+        if letter in {"R", "C"}:
+            if len(paths) < 2:
+                continue
+            blob = normalize_blob(new_sha) or normalize_blob(old_sha)
+            events.append((letter, paths[0], paths[1], blob))
+        elif letter == "D":
+            events.append(("D", paths[0], paths[0], normalize_blob(old_sha)))
+        elif letter == "A":
+            events.append(("A", paths[0], paths[0], normalize_blob(new_sha)))
+        else:
+            events.append((letter, paths[0], paths[0], normalize_blob(new_sha)))
+    return events
+
+
+def walk_file_occupancy(
+    rng: Range,
+    max_commits: int,
+    pathspec: str | None,
+) -> tuple[dict[str, FileStint], dict[str, CommitInfo], list[CommitInfo]]:
+    args = log_prefix(rng) + [
+        f"--max-count={max_commits}",
+        "--reverse",
+        "-M",
+        "--raw",
+        "--no-abbrev",
+        "--pretty=format:COMMIT\t%H\t%ct\t%s",
+    ]
+    if pathspec:
+        args += ["--", pathspec]
+    out = git(rng.repo, *args)
+
+    commits: dict[str, CommitInfo] = {}
+    order: list[CommitInfo] = []
+    current: CommitInfo | None = None
+    buf: list[str] = []
+    parsed: list[tuple[CommitInfo, list[tuple[str, str, str, str]]]] = []
+
+    def flush() -> None:
+        if current is None:
+            return
+        parsed.append((current, parse_raw_events("\n".join(buf))))
+
+    for line in out.splitlines():
+        if line.startswith("COMMIT\t"):
+            flush()
+            _, sha, ts, subject = (line.split("\t", 3) + [""])[:4]
+            current = CommitInfo(sha, int(ts or 0), subject)
+            commits[sha] = current
+            order.append(current)
+            buf = []
+            continue
+        buf.append(line)
+    flush()
+
+    present = ls_tree_blobs(rng.repo, rng.base)
+    open_spans: dict[str, Occupancy] = {}
+    closed: dict[str, list[Occupancy]] = defaultdict(list)
+    aliases: dict[str, list[str]] = defaultdict(list)
+    identity: dict[str, str] = {}  # current path -> identity key (first path)
+
+    def ident_of(path: str) -> str:
+        return identity.get(path, path)
+
+    def close(path: str, died: CommitInfo | None) -> None:
+        span = open_spans.pop(path, None)
+        if span is None:
+            return
+        span.died = died
+        key = ident_of(path)
+        closed[key].append(span)
+
+    for commit, events in parsed:
+        next_present = dict(present)
+        renamed: dict[str, str] = {}
+
+        for letter, old_p, new_p, blob in events:
+            if skip_path(old_p) or skip_path(new_p):
+                if letter == "D":
+                    next_present.pop(old_p, None)
+                continue
+            if letter == "R":
+                next_present.pop(old_p, None)
+                if blob:
+                    next_present[new_p] = blob
+                elif old_p in present:
+                    next_present[new_p] = present[old_p]
+                renamed[old_p] = new_p
+            elif letter == "D":
+                next_present.pop(old_p, None)
+            elif letter == "C":
+                if blob:
+                    next_present[new_p] = blob
+            else:
+                if blob:
+                    next_present[new_p] = blob
+
+        # Renames continue the same occupancy identity.
+        for old_p, new_p in renamed.items():
+            span = open_spans.pop(old_p, None)
+            key = ident_of(old_p)
+            identity.pop(old_p, None)
+            identity[new_p] = key
+            aliases[key].append(new_p)
+            if span is not None:
+                if new_p not in span.paths:
+                    span.paths.append(new_p)
+                open_spans[new_p] = span
+
+        for path in list(present):
+            if path not in next_present and path not in renamed:
+                close(path, commit)
+
+        for path, blob in next_present.items():
+            if skip_path(path):
+                continue
+            span = open_spans.get(path)
+            if span is None:
+                key = ident_of(path)
+                identity[path] = key
+                span = Occupancy(
+                    enter=commit,
+                    leave=commit,
+                    died=None,
+                    blob=blob,
+                    commits=0,
+                    paths=[path],
+                )
+                open_spans[path] = span
+            span.leave = commit
+            if blob:
+                span.blob = blob
+            span.commits += 1
+
+        present = next_present
+
+    # Anything still open at HEAD is not ephemeral (lives at the end).
+    # Leave those spans attached so we can drop them by endpoint presence.
+    still: dict[str, FileStint] = {}
+    for path, span in open_spans.items():
+        key = ident_of(path)
+        fs = still.setdefault(key, FileStint(path=path, aliases=aliases.get(key, [])))
+        fs.spans.append(span)
+        fs.path = path
+
+    files: dict[str, FileStint] = {}
+    for key, spans in closed.items():
+        last_path = spans[-1].paths[-1] if spans[-1].paths else key
+        fs = FileStint(path=last_path, spans=list(spans), aliases=aliases.get(key, []))
+        if key in still:
+            fs.spans.extend(still[key].spans)
+            fs.path = still[key].path
+        files[fs.path] = fs
+    for key, fs in still.items():
+        if fs.path not in files:
+            files[fs.path] = fs
+
+    return files, commits, order
+
+
+def ephemeral_files(
+    tracked: dict[str, FileStint],
+    base_names: set[str],
+    head_names: set[str],
+) -> list[FileStint]:
+    out: list[FileStint] = []
+    for path, fs in tracked.items():
+        if skip_path(path):
+            continue
+        names = {path, *fs.aliases}
+        if any(n in base_names for n in names):
+            continue
+        if any(n in head_names for n in names):
+            continue
+        if not fs.spans:
+            continue
+        # Must have left the tree (last span closed by a delete).
+        if fs.died is None:
+            continue
+        out.append(fs)
+    out.sort(key=lambda f: (-f.commits, f.born.ts if f.born else 0, f.path))
+    return out
+
+
+def parse_symbol_occupancy(
+    rng: Range,
+    max_commits: int,
+    pathspec: str | None,
+    commits: dict[str, CommitInfo],
+) -> dict[str, SymbolHist]:
+    args = log_prefix(rng) + [
+        f"--max-count={max_commits}",
+        "--reverse",
+        "-U0",
+        "--pretty=format:COMMIT\t%H\t%ct\t%s",
+    ]
+    if pathspec:
+        args += ["--", pathspec]
+    out = git(rng.repo, *args)
+
+    symbols: dict[str, SymbolHist] = {}
+    current: CommitInfo | None = None
+    file_path = ""
+    old_path = ""
+    pending_name: str | None = None
+    pending_sign: str | None = None
+    pending_snippet: list[str] = []
+    seen_this_commit: set[str] = set()
+
+    def hist(name: str) -> SymbolHist:
+        return symbols.setdefault(name, SymbolHist(name))
+
+    def flush_pending() -> None:
+        nonlocal pending_name, pending_sign, pending_snippet
+        if pending_name and current:
+            snip = "\n".join(pending_snippet[:4])
+            h = hist(pending_name)
+            if pending_sign == "+":
+                h.adds.append((current, file_path, snip))
+                h.present_now = True
+                h.last_path = file_path
+                h.last_snippet = snip
+            else:
+                h.dels.append((current, file_path, snip))
+                h.present_now = False
+                h.last_path = file_path or h.last_path
+                if snip:
+                    h.last_snippet = snip
+        pending_name = None
+        pending_sign = None
+        pending_snippet = []
+
+    def end_commit() -> None:
+        flush_pending()
+        for h in symbols.values():
+            if h.present_now:
+                h.commits += 1
+
+    for raw in out.splitlines():
+        if raw.startswith("COMMIT\t"):
+            if current is not None:
+                end_commit()
+            _, sha, ts, subject = (raw.split("\t", 3) + [""])[:4]
+            current = commits.get(sha) or CommitInfo(sha, int(ts or 0), subject)
+            commits[sha] = current
+            file_path = ""
+            old_path = ""
+            seen_this_commit = set()
+            continue
+        if raw.startswith("diff --git "):
+            flush_pending()
+            rest = raw[len("diff --git "):]
+            idx = rest.find(" b/")
+            file_path = rest[idx + 3 :] if idx >= 0 else ""
+            old_path = ""
+            continue
+        if raw.startswith("--- a/"):
+            old_path = raw[6:]
+            continue
+        if raw.startswith("+++ b/"):
+            file_path = raw[6:]
+            continue
+        if raw.startswith("+++ /dev/null"):
+            file_path = old_path or file_path
+            continue
+        if (
+            not raw
+            or raw.startswith("@@")
+            or raw.startswith("index ")
+            or raw.startswith("new file")
+            or raw.startswith("deleted file")
+            or raw.startswith("similarity ")
+            or raw.startswith("rename ")
+        ):
+            if raw.startswith("@@"):
+                flush_pending()
+            continue
+        sign = raw[:1]
+        if sign not in "+-":
+            continue
+        found = extract_def(raw, file_path)
+        if found:
+            flush_pending()
+            pending_name, kind = found
+            pending_sign = sign
+            pending_snippet = [raw[1:]]
+            hist(pending_name).kinds.add(kind)
+            seen_this_commit.add(pending_name)
+        elif pending_name and sign == pending_sign and len(pending_snippet) < 4:
+            pending_snippet.append(raw[1:])
+    if current is not None:
+        end_commit()
+    return symbols
+
+
+def iter_tree_blobs(repo: str, ref: str | None) -> Iterator[tuple[str, str]]:
+    if ref is None:
+        return
+    out = git(repo, "ls-tree", "-r", "-z", ref)
+    batch: list[tuple[str, str]] = []
+    for entry in [e for e in out.split("\0") if e]:
+        if "\t" not in entry:
+            continue
+        meta, path = entry.split("\t", 1)
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        mode, typ, sha = parts[0], parts[1], parts[2]
+        if typ != "blob" or mode == "160000" or skip_path(path):
+            continue
+        batch.append((path, sha))
+    if not batch:
+        return
+    proc = subprocess.Popen(
+        ["git", "-C", repo, "-c", "core.quotepath=false", "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin and proc.stdout
+    try:
+        for _path, sha in batch:
+            proc.stdin.write(f"{sha}\n".encode("ascii"))
+        proc.stdin.close()
+        for path, _sha in batch:
+            header = proc.stdout.readline()
+            if not header:
+                break
+            try:
+                rec = header.decode("utf-8", "replace").rstrip("\n")
+                _hsha, kind, size_s = rec.split()
+                size = int(size_s)
+            except ValueError:
+                continue
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)
+            if kind != "blob" or size > 512_000:
+                continue
+            if b"\0" in data[:4096]:
+                continue
+            yield path, data.decode("utf-8", errors="replace")
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def collect_defs(repo: str, ref: str | None) -> dict[str, list[tuple[str, int, str]]]:
+    found: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    if ref is None:
+        return found
+    for path, text in iter_tree_blobs(repo, ref):
+        if not looks_like_source(path):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            hit = extract_def(line, path)
+            if hit:
+                found[hit[0]].append((path, i, hit[1]))
+    return found
+
+
+def build_symbol_stints(
+    hist: dict[str, SymbolHist],
+    base_defs: dict[str, list[tuple[str, int, str]]],
+    head_defs: dict[str, list[tuple[str, int, str]]],
+    min_length: int,
+) -> list[SymbolStint]:
+    out: list[SymbolStint] = []
+    for name, h in hist.items():
+        if not interesting_name(name, min_length):
+            continue
+        if name in base_defs or name in head_defs:
+            continue
+        if not h.adds:
+            continue
+        last_add = h.adds[-1]
+        last_del = h.dels[-1] if h.dels else None
+        path = (last_del[1] if last_del else last_add[1]) or h.last_path
+        snippet = h.last_snippet or (last_del[2] if last_del else last_add[2])
+        leave = None
+        if last_del is not None:
+            # leave is the last commit the def occupied; we only have die + birth.
+            leave = last_add[0]
+            if h.adds:
+                # last add before the last delete
+                before = [a[0] for a in h.adds if a[0].ts <= last_del[0].ts]
+                if before:
+                    leave = before[-1]
+        else:
+            leave = last_add[0]
+        out.append(
+            SymbolStint(
+                name=name,
+                kind=next(iter(h.kinds), "def"),
+                path=path,
+                born=h.adds[0][0],
+                died=last_del[0] if last_del else None,
+                leave=leave,
+                commits=h.commits,
+                snippet=snippet.strip(),
+                testlike=is_testlike(name, path),
+            )
+        )
+    out.sort(key=lambda s: (s.testlike, -s.commits, s.born.ts if s.born else 0, s.name))
+    return out
+
+
+def match_files(files: list[FileStint], query: str) -> list[FileStint]:
+    q = query.replace("\\", "/")
+    exact = [f for f in files if f.path == q]
+    if exact:
+        return exact
+    if q.endswith("/"):
+        return [f for f in files if f.path.startswith(q)]
+    prefix = [f for f in files if f.path.startswith(q.rstrip("/") + "/")]
+    if prefix and "/" in q.rstrip("/"):
+        # a directory-ish query without slash: treat as prefix only when unique later
+        pass
+    suffix = [
+        f
+        for f in files
+        if f.path.endswith(q) and (f.path == q or f.path.endswith("/" + q))
+    ]
+    if len(suffix) == 1:
+        return suffix
+    base = [f for f in files if os.path.basename(f.path) == os.path.basename(q)]
+    if len(base) == 1:
+        return base
+    if len(suffix) > 1:
+        return suffix
+    if len(base) > 1:
+        return base
+    if len(prefix) == 1:
+        return prefix
+    if prefix:
+        return prefix
+    return []
+
+
+def cinfo(c: CommitInfo | None) -> dict | None:
+    if not c:
+        return None
+    return {"sha": c.sha, "short": short_sha(c.sha), "ts": c.ts, "subject": c.subject}
+
+
+def emit_json(rng: Range, files: list[FileStint], symbols: list[SymbolStint]) -> None:
+    payload = {
+        "base": rng.base,
+        "base_label": rng.base_label,
+        "head": rng.head,
+        "head_label": rng.head_label,
+        "commits": rng.commit_count,
+        "truncated": rng.truncated,
+        "files": [
+            {
+                "path": f.path,
+                "aliases": f.aliases,
+                "born": cinfo(f.born),
+                "leave": cinfo(f.leave),
+                "died": cinfo(f.died),
+                "commits": f.commits,
+                "spans": [
+                    {
+                        "enter": cinfo(s.enter),
+                        "leave": cinfo(s.leave),
+                        "died": cinfo(s.died),
+                        "commits": s.commits,
+                        "blob": s.blob,
+                        "paths": s.paths,
+                    }
+                    for s in f.spans
+                ],
+                "blob": f.blob,
+                "bytes": f.bytes,
+            }
+            for f in files
+        ],
+        "symbols": [
+            {
+                "name": s.name,
+                "kind": s.kind,
+                "path": s.path,
+                "testlike": s.testlike,
+                "born": cinfo(s.born),
+                "leave": cinfo(s.leave),
+                "died": cinfo(s.died),
+                "commits": s.commits,
+                "snippet": s.snippet,
+            }
+            for s in symbols
+        ],
+    }
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def emit_tsv(files: list[FileStint], symbols: list[SymbolStint]) -> None:
+    for f in files:
+        print(
+            "file\t"
+            f"{f.path}\t{f.commits}\t{len(f.spans)}\t"
+            f"{short_sha(f.born.sha) if f.born else ''}\t"
+            f"{short_sha(f.leave.sha) if f.leave else ''}\t"
+            f"{short_sha(f.died.sha) if f.died else ''}\t"
+            f"{short_sha(f.blob)}\t{f.bytes}"
+        )
+    for s in symbols:
+        print(
+            "symbol\t"
+            f"{s.name}\t{s.kind}\t{s.path}\t{s.commits}\t"
+            f"{short_sha(s.born.sha) if s.born else ''}\t"
+            f"{short_sha(s.died.sha) if s.died else ''}"
+        )
+
+
+def fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}K"
+    return f"{n / (1024 * 1024):.1f}M"
+
+
+def death_cohorts(files: list[FileStint]) -> list[tuple[str, str, list[FileStint]]]:
+    """Group ephemeral files by the commit that killed them (one experiment)."""
+    groups: dict[str, list[FileStint]] = {}
+    order: list[str] = []
+    for f in files:
+        key = f.died.sha if f.died else ""
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+    out: list[tuple[str, str, list[FileStint]]] = []
+    for key in order:
+        rows = groups[key]
+        rows.sort(key=lambda f: (-f.commits, f.path))
+        subj = rows[0].died.subject if rows[0].died else ""
+        out.append((key, subj, rows))
+    out.sort(key=lambda g: (-max(f.commits for f in g[2]), -(g[2][0].died.ts if g[2][0].died else 0)))
+    return out
+
+
+def emit_file_row(ink: Ink, f: FileStint, indent: str = "  ") -> None:
+    born = short_sha(f.born.sha) if f.born else "?"
+    died = short_sha(f.died.sha) if f.died else "?"
+    leave = short_sha(f.leave.sha) if f.leave else "?"
+    span_n = f"  {len(f.spans)} spans" if len(f.spans) > 1 else ""
+    subj = f.died.subject[:60] if f.died else ""
+    print(f"{indent}{ink.bold(f.path)}")
+    print(
+        f"{indent}  occupied {ink.bold(str(f.commits))}  "
+        f"{ink.green(born)}..{leave}{span_n}  "
+        f"{fmt_bytes(f.bytes)}  blob {short_sha(f.blob)}"
+    )
+    print(f"{indent}  {ink.green('+' + born)} {ink.red('-' + died)}  {ink.dim(subj)}")
+
+
+def emit_human(
+    ink: Ink,
+    rng: Range,
+    files: list[FileStint],
+    symbols: list[SymbolStint],
+    show_files: bool,
+    show_symbols: bool,
+) -> None:
+    trunc = " truncated" if rng.truncated else ""
+    print(
+        ink.bold("stint")
+        + f" {rng.base_label}..{rng.head_label}"
+        + ink.dim(f"  {rng.commit_count} commits{trunc}")
+    )
+    print()
+
+    if show_files:
+        print(
+            ink.cyan(f"EPHEMERAL FILES ({len(files)})")
+            + ink.dim("  occupied the interval, gone at both ends")
+        )
+        if not files:
+            print(ink.dim("  (none)"))
+        cohorts = death_cohorts(files)
+        use_headers = len(cohorts) > 1 or (len(cohorts) == 1 and len(files) > 1)
+        for sha, subj, rows in cohorts:
+            if use_headers:
+                occ = [f.commits for f in rows]
+                if min(occ) == max(occ):
+                    occ_s = str(occ[0])
+                else:
+                    occ_s = f"{min(occ)}–{max(occ)}"
+                print(
+                    ink.yellow(f"  COHORT -{short_sha(sha)}")
+                    + ink.dim(f"  {subj[:70]}")
+                    + ink.dim(f"  ({len(rows)} file{'s' if len(rows) != 1 else ''}, occupied {occ_s})")
+                )
+            for f in rows:
+                emit_file_row(ink, f, indent="    " if use_headers else "  ")
+        print()
+
+    if show_symbols:
+        code_syms = [s for s in symbols if not s.testlike]
+        test_syms = [s for s in symbols if s.testlike]
+        print(
+            ink.cyan(f"EPHEMERAL SYMBOLS ({len(code_syms)})")
+            + ink.dim("  defined in-range, absent at both ends")
+        )
+        if not code_syms:
+            print(ink.dim("  (none)"))
+        for s in code_syms:
+            born = short_sha(s.born.sha) if s.born else "?"
+            died = short_sha(s.died.sha) if s.died else "?"
+            print(f"  {ink.bold(s.name)}  {ink.dim(s.kind)}  {s.path}")
+            print(f"    occupied {s.commits}  {ink.green('+' + born)} {ink.red('-' + died)}")
+            if s.snippet:
+                first = s.snippet.splitlines()[0].strip()
+                print(ink.dim(f"    {first[:100]}"))
+        if test_syms:
+            print()
+            print(ink.dim(f"EPHEMERAL TESTS ({len(test_syms)})"))
+            for s in test_syms[:40]:
+                print(ink.dim(f"  {s.name}  occupied {s.commits}  {s.path}"))
+            if len(test_syms) > 40:
+                print(ink.dim(f"  … {len(test_syms) - 40} more"))
+        print()
+
+
+def pick_write(dest: str, data: bytes, force: bool) -> None:
+    if os.path.exists(dest) and not force:
+        raise StintError(f"refusing to overwrite {dest} (pass --force)")
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(dest, "wb") as fh:
+        fh.write(data)
+
+
+def pick_record(fs: FileStint, data: bytes, dest: str | None) -> dict:
+    return {
+        "path": fs.path,
+        "blob": fs.blob,
+        "bytes": len(data),
+        "commits": fs.commits,
+        "spans": len(fs.spans),
+        "born": cinfo(fs.born),
+        "leave": cinfo(fs.leave),
+        "died": cinfo(fs.died),
+        "written": dest,
+    }
+
+
+def do_pick(
+    repo: str,
+    files: list[FileStint],
+    query: str,
+    write: bool,
+    to_dir: str | None,
+    force: bool,
+    as_json: bool,
+    quiet: bool,
+) -> int:
+    hits = match_files(files, query)
+    if not hits:
+        raise StintError(f"no ephemeral path matching {query!r}", 1)
+    hits = sorted(hits, key=lambda f: f.path)
+
+    # One file: last blob on stdout (Unix). Many files: last tree, via --to/--write.
+    if len(hits) > 1 and not (write or to_dir or as_json):
+        listing = "\n".join(f"  {f.path}" for f in hits[:20])
+        extra = "" if len(hits) <= 20 else f"\n  … {len(hits) - 20} more"
+        raise StintError(
+            f"{query!r} matches {len(hits)} ephemeral paths (a deleted tree). "
+            f"Pass --to DIR or --write to restore every last blob, or a unique suffix:\n"
+            f"{listing}{extra}",
+            1,
+        )
+
+    records: list[dict] = []
+    for fs in hits:
+        if not fs.blob:
+            raise StintError(f"{fs.path} has no last blob", 1)
+        data = git_bytes(repo, "cat-file", "blob", fs.blob)
+        dest = None
+        if to_dir:
+            dest = os.path.join(to_dir, fs.path)
+        elif write:
+            dest = os.path.join(repo, fs.path)
+        if dest:
+            pick_write(dest, data, force)
+        records.append(pick_record(fs, data, dest))
+
+        if len(hits) == 1 and not dest and not as_json:
+            if not quiet:
+                print(
+                    f"stint: pick {fs.path}  {short_sha(fs.blob)}  {len(data)} bytes  "
+                    f"occupied {fs.commits}  last {short_sha(fs.leave.sha) if fs.leave else '?'}",
+                    file=sys.stderr,
+                )
+            sys.stdout.buffer.write(data)
+            if data and not data.endswith(b"\n"):
+                sys.stdout.buffer.write(b"\n")
+            return 0
+
+    if as_json:
+        payload: dict = {"picks": records}
+        if len(records) == 1:
+            payload.update(records[0])
+        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+
+    if not quiet:
+        for rec in records:
+            print(f"{rec['written']}\t{short_sha(rec['blob'])}\t{rec['bytes']}")
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="stint",
+        description=(
+            "Interval occupancy of files and symbols that were born and killed "
+            "between two git refs. Optional --pick restores the last blob. "
+            "No leftover-name search."
+        ),
+    )
+    p.add_argument("base", nargs="?", help="older ref (default: auto)")
+    p.add_argument("head", nargs="?", help="newer ref (default: HEAD)")
+    p.add_argument("-C", dest="repo", help="git repository path")
+    p.add_argument("--root", action="store_true", help="scan empty tree → HEAD")
+    p.add_argument("--max-commits", type=int, default=400, help="cap commits walked")
+    p.add_argument("--path", help="limit to a pathspec")
+    p.add_argument("--json", action="store_true", help="JSON on stdout")
+    p.add_argument("--tsv", action="store_true", help="TSV on stdout")
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if any ephemeral file occupied the interval",
+    )
+    p.add_argument("-q", "--quiet", action="store_true", help="no listing; useful with --check")
+    p.add_argument("--files", action="store_true", help="only ephemeral files")
+    p.add_argument("--symbols", action="store_true", help="only ephemeral symbols")
+    p.add_argument("--hide-tests", action="store_true", help="drop testlike symbols")
+    p.add_argument("--min-length", type=int, default=4, help="minimum identifier length")
+    p.add_argument(
+        "--pick",
+        metavar="PATH",
+        help="restore last blob(s): unique path, or PREFIX/ for a deleted tree",
+    )
+    p.add_argument("--write", action="store_true", help="with --pick, write back into the repo")
+    p.add_argument("--to", dest="to_dir", help="with --pick, write under this directory")
+    p.add_argument("--force", action="store_true", help="allow --write/--to to overwrite")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="version", version=f"stint {VERSION}")
+    return p.parse_args(argv)
+
+
+def select_sections(args: argparse.Namespace) -> tuple[bool, bool]:
+    if args.pick:
+        return True, False
+    specified = args.files or args.symbols
+    if not specified:
+        return True, True
+    return args.files, args.symbols
+
+
+def run(argv: list[str]) -> int:
+    args = parse_args(argv)
+    repo = resolve_repo(args.repo)
+    rng = resolve_range(repo, args.base, args.head, args.max_commits, args.root)
+    show_files, show_symbols = select_sections(args)
+
+    tracked, commits, _order = walk_file_occupancy(rng, args.max_commits, args.path)
+    base_names = set(ls_tree_blobs(repo, rng.base))
+    head_names = set(ls_tree_blobs(repo, rng.head))
+    files = ephemeral_files(tracked, base_names, head_names) if show_files or args.pick else []
+    if files:
+        sizes = blob_sizes(repo, [f.blob for f in files])
+        for f in files:
+            f.bytes = sizes.get(f.blob, 0)
+
+    symbols: list[SymbolStint] = []
+    if show_symbols:
+        hist = parse_symbol_occupancy(rng, args.max_commits, args.path, commits)
+        base_defs = collect_defs(repo, rng.base)
+        head_defs = collect_defs(repo, rng.head)
+        symbols = build_symbol_stints(hist, base_defs, head_defs, args.min_length)
+        if args.hide_tests:
+            symbols = [s for s in symbols if not s.testlike]
+
+    if args.pick:
+        return do_pick(
+            repo,
+            files,
+            args.pick,
+            args.write,
+            args.to_dir,
+            args.force,
+            args.json,
+            args.quiet,
+        )
+
+    if args.quiet:
+        pass
+    elif args.json:
+        emit_json(rng, files, symbols)
+    elif args.tsv:
+        emit_tsv(files, symbols)
+    else:
+        emit_human(
+            Ink(color_enabled(args.no_color)),
+            rng,
+            files,
+            symbols,
+            show_files,
+            show_symbols,
+        )
+
+    if args.check and files:
+        return 1
+    return 0
+
+
+def main() -> None:
+    try:
+        sys.exit(run(sys.argv[1:]))
+    except StintError as e:
+        print(f"stint: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

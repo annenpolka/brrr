@@ -1,0 +1,2642 @@
+#!/usr/bin/env python3
+"""wane — exclusive-A path-conditions (what died), occupied through history.
+
+thatch covers a two-tree delta with a mixed budget: exclusive-A
+reservation, exclusive-B births, leftover AB moves/`else` spreads.
+sheaf covers with grep/exists. tenure occupies one user-pinned FILE:LINE.
+
+wane's object is only the stacks that died: true on A, false on B.
+No exclusive-B flood. No generic AB `else`. Invert the trees to ask
+what was born. Occupancy still detaches identity from the walk end.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Sequence
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from whenline.model import Frame, Locus, collapse  # noqa: E402
+from whenline.query import FileIndex  # noqa: E402
+
+
+class WaneError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+HEXISH_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
+
+SOURCE_EXTS = {
+    ".py",
+    ".pyi",
+    ".rs",
+    ".go",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".swift",
+    ".java",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cs",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".scala",
+    ".php",
+    ".zig",
+}
+
+CONTAINER_KINDS = {
+    "class",
+    "impl",
+    "struct",
+    "enum",
+    "protocol",
+    "extension",
+    "module",
+}
+FN_KINDS = {"fn"}
+SKIP_STACK_KINDS = {"eval"}
+
+SKIP_PATH_PARTS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "__pycache__",
+    ".venv",
+}
+
+SKIP_TOKEN_SUFFIXES = (
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bin",
+)
+SKIP_TOKEN_NAMES = {
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+    "gemfile.lock",
+}
+SKIP_TOKEN_PARTS = ("/docs/generated/", "/generated/", ".generated.")
+
+IDENT_STOP = {
+    "none",
+    "some",
+    "true",
+    "false",
+    "self",
+    "this",
+    "super",
+    "return",
+    "bytes",
+    "byte",
+    "len",
+    "let",
+    "var",
+    "const",
+    "async",
+    "await",
+    "func",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "impl",
+    "pub",
+    "public",
+    "private",
+    "static",
+    "given",
+    "guard",
+    "else",
+    "elif",
+    "then",
+    "with",
+    "from",
+    "import",
+    "null",
+    "undefined",
+    "option",
+    "result",
+    "pathbuf",
+    "string",
+    "str",
+    "int",
+    "bool",
+    "where",
+    "when",
+    "into",
+    "starts_with",
+    "ends_with",
+    "strip_prefix",
+    "strip_suffix",
+    "to_string",
+    "to_str",
+    "clone",
+    "unwrap",
+    "unwrap_or",
+    "as_bytes",
+    "as_str",
+    "is_empty",
+    "is_some",
+    "is_none",
+    "filter",
+    "collect",
+    "default",
+    "copy",
+    "push",
+    "pop",
+}
+
+_DOC_BASENAMES = {
+    "readme",
+    "readme.md",
+    "changelog",
+    "changelog.md",
+    "history.md",
+    "agents.md",
+    "claude.md",
+    "license",
+    "license.md",
+    "notice",
+    "authors",
+    "contributing.md",
+}
+
+MAX_BLOB = 1_000_000
+SKIP_GENERATED = True
+
+
+# --- git --------------------------------------------------------------------
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: str | None = None,
+    input_text: str | None = None,
+    input_bytes: bytes | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        input=input_text if text else input_bytes,
+        text=text,
+        capture_output=True,
+    )
+
+
+def git(repo: str, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", repo, *args], input_text=input_text)
+
+
+def git_bytes(repo: str, *args: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    return run(["git", "-C", repo, *args], input_bytes=input_bytes, text=False)
+
+
+def resolve_repo(path: str | None) -> str:
+    start = os.path.abspath(path or os.getcwd())
+    if not os.path.isdir(start):
+        raise WaneError(f"not a directory: {start}")
+    proc = run(["git", "-C", start, "rev-parse", "--show-toplevel"])
+    if proc.returncode != 0:
+        raise WaneError(f"not a git repository: {start}")
+    return proc.stdout.strip()
+
+
+def posix_rel(path: str) -> str:
+    return path.replace(os.sep, "/")
+
+
+def skip_path(path: str) -> bool:
+    parts = posix_rel(path).split("/")
+    return any(p in SKIP_PATH_PARTS for p in parts)
+
+
+def skip_token_path(path: str) -> bool:
+    if not SKIP_GENERATED:
+        return False
+    lower = path.lower().replace("\\", "/")
+    base = lower.rsplit("/", 1)[-1]
+    if base in SKIP_TOKEN_NAMES:
+        return True
+    if lower.endswith(SKIP_TOKEN_SUFFIXES):
+        return True
+    for part in SKIP_TOKEN_PARTS:
+        if part in lower:
+            return True
+    return False
+
+
+def is_source_path(path: str) -> bool:
+    ext = Path(path).suffix.lower()
+    return ext in SOURCE_EXTS and not skip_path(path) and not skip_token_path(path)
+
+
+# --- sides / trees ----------------------------------------------------------
+
+
+@dataclass
+class Side:
+    spec: str
+    kind: str  # commit | tree | worktree | index
+    sha: str
+    tree: str
+    subject: str
+    iso: str
+
+    @property
+    def short(self) -> str:
+        if self.kind in ("worktree", "index"):
+            return self.sha
+        return self.sha[:7] if len(self.sha) >= 7 else self.sha
+
+
+@dataclass
+class Tree:
+    side: Side
+    paths: dict[str, str]
+    blobs: dict[str, bytes]
+
+
+def _is_worktree_spec(spec: str) -> bool:
+    return spec in (".", ":worktree", "WORKTREE", ":wt")
+
+
+def _is_index_spec(spec: str) -> bool:
+    return spec in (":index", "INDEX", ":staged", ":cached")
+
+
+def resolve_side(repo: str, spec: str) -> Side:
+    if _is_worktree_spec(spec):
+        return Side(
+            spec=spec,
+            kind="worktree",
+            sha="WORKTREE",
+            tree="WORKTREE",
+            subject="uncommitted working tree",
+            iso="",
+        )
+    if _is_index_spec(spec):
+        return Side(
+            spec=spec,
+            kind="index",
+            sha="INDEX",
+            tree="INDEX",
+            subject="staged index",
+            iso="",
+        )
+    tree = git(repo, "rev-parse", "--verify", f"{spec}^{{tree}}")
+    if tree.returncode != 0:
+        err = tree.stderr.strip() or f"cannot resolve tree-ish {spec!r}"
+        probe = git(repo, "rev-parse", "--verify", spec)
+        if probe.returncode != 0 and "Needed a single revision" in (probe.stderr + tree.stderr):
+            raise WaneError(f"no commits at {spec} (empty repository?)")
+        raise WaneError(err)
+    tree_sha = tree.stdout.strip()
+    meta = git(repo, "log", "-1", "--format=%H%x09%ci%x09%s", spec)
+    if meta.returncode == 0 and meta.stdout.strip():
+        parts = meta.stdout.strip().split("\t", 2)
+        sha = parts[0]
+        iso = parts[1] if len(parts) > 1 else ""
+        subject = parts[2] if len(parts) > 2 else ""
+        return Side(spec=spec, kind="commit", sha=sha, tree=tree_sha, subject=subject, iso=iso)
+    return Side(
+        spec=spec,
+        kind="tree",
+        sha=tree_sha,
+        tree=tree_sha,
+        subject="(tree)",
+        iso="",
+    )
+
+
+def _git_blob_sha(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _load_blobs(repo: str, paths: dict[str, str]) -> dict[str, bytes]:
+    if not paths:
+        return {}
+    sha_to_paths: dict[str, list[str]] = {}
+    for path, sha in paths.items():
+        sha_to_paths.setdefault(sha, []).append(path)
+    wanted = [
+        sha
+        for sha in sha_to_paths
+        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+    ]
+    blobs: dict[str, bytes] = {}
+    if not wanted:
+        return blobs
+    payload = "".join(f"{sha}\n" for sha in wanted).encode()
+    proc = git_bytes(repo, "cat-file", "--batch", input_bytes=payload)
+    if proc.returncode != 0:
+        raise WaneError("git cat-file --batch failed")
+    data = proc.stdout
+    pos = 0
+    idx = 0
+    n = len(wanted)
+    while idx < n and pos < len(data):
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = data[pos:nl].decode("ascii", "replace")
+        pos = nl + 1
+        if header.endswith(" missing"):
+            idx += 1
+            continue
+        parts = header.split()
+        if len(parts) < 3:
+            idx += 1
+            continue
+        sha, _kind, size_s = parts[0], parts[1], parts[2]
+        try:
+            size = int(size_s)
+        except ValueError:
+            idx += 1
+            continue
+        blob = data[pos : pos + size]
+        pos += size
+        if pos < len(data) and data[pos] == 10:
+            pos += 1
+        idx += 1
+        if size > MAX_BLOB or b"\0" in blob[:8000]:
+            continue
+        for path in sha_to_paths.get(sha, []):
+            blobs[path] = blob
+    return blobs
+
+
+def load_commit_tree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-tree", "-r", "-z", side.tree]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc = git_bytes(repo, *cmd)
+    if proc.returncode != 0:
+        raise WaneError(proc.stderr.decode("utf-8", "replace").strip() or "ls-tree failed")
+    paths: dict[str, str] = {}
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        obj_type = parts[1].decode("ascii", "replace")
+        sha = parts[2].decode("ascii", "replace")
+        path = path_b.decode("utf-8", "surrogateescape")
+        if obj_type != "blob":
+            continue
+        paths[path] = sha
+    # Only fetch source blobs we might parse.
+    wanted = {p: s for p, s in paths.items() if is_source_path(p)}
+    blobs = _load_blobs(repo, wanted)
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_worktree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc = git_bytes(repo, *cmd)
+    if proc.returncode != 0:
+        raise WaneError(proc.stderr.decode("utf-8", "replace").strip() or "ls-files failed")
+    paths: dict[str, str] = {}
+    blobs: dict[str, bytes] = {}
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", "surrogateescape")
+        abs_path = os.path.join(repo, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        if size > MAX_BLOB:
+            paths[rel] = "LARGE"
+            continue
+        try:
+            with open(abs_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        paths[rel] = _git_blob_sha(data)
+        if is_source_path(rel) and b"\0" not in data[:8000]:
+            blobs[rel] = data
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_index(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    cmd = ["ls-files", "-z", "--cached", "-s"]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    proc_b = git_bytes(repo, *cmd)
+    if proc_b.returncode != 0:
+        raise WaneError(proc_b.stderr.decode("utf-8", "replace").strip() or "ls-files --cached failed")
+    paths: dict[str, str] = {}
+    for entry in proc_b.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split()
+        if len(parts) < 2:
+            continue
+        sha = parts[1].decode("ascii", "replace")
+        path = path_b.decode("utf-8", "surrogateescape")
+        paths[path] = sha
+    wanted = {p: s for p, s in paths.items() if is_source_path(p)}
+    blobs = _load_blobs(repo, wanted)
+    return Tree(side=side, paths=paths, blobs=blobs)
+
+
+def load_tree(repo: str, side: Side, pathspecs: Sequence[str]) -> Tree:
+    if side.kind == "worktree":
+        return load_worktree(repo, side, pathspecs)
+    if side.kind == "index":
+        return load_index(repo, side, pathspecs)
+    return load_commit_tree(repo, side, pathspecs)
+
+
+# --- path-conditions --------------------------------------------------------
+
+
+def fn_name(pred: str) -> str:
+    p = " ".join((pred or "").split())
+    if "(" in p:
+        p = p[: p.index("(")]
+    parts = p.replace("::", " ").split()
+    return parts[-1] if parts else ""
+
+
+def cond_frames(frames: Sequence[Frame], *, with_fn: bool = False) -> list[Frame]:
+    skip = set(CONTAINER_KINDS)
+    if not with_fn:
+        skip |= FN_KINDS
+    return [fr for fr in frames if fr.kind not in skip and fr.kind not in SKIP_STACK_KINDS]
+
+
+def cond_key(frames: Sequence[Frame], *, with_fn: bool = False) -> tuple[tuple[str, str], ...]:
+    return tuple(fr.key() for fr in cond_frames(frames, with_fn=with_fn))
+
+
+def cond_label(key: Sequence[tuple[str, str]]) -> str:
+    if not key:
+        return "(empty stack)"
+    parts = []
+    for kind, pred in key:
+        pred = pred.strip()
+        parts.append(f"{kind} {pred}".strip() if pred else kind)
+    return " | ".join(parts)
+
+
+def function_of(loc: Locus) -> str:
+    if loc.function:
+        name = fn_name(loc.function)
+        if name:
+            return name
+    for fr in reversed(loc.frames):
+        if fr.kind in FN_KINDS:
+            name = fn_name(fr.pred)
+            if name:
+                return name
+    return ""
+
+
+def holder_of(loc: Locus, grain: str) -> str:
+    path = posix_rel(loc.file)
+    if grain == "files":
+        return path
+    if grain == "functions":
+        name = function_of(loc)
+        return f"{path}:{name}" if name else path
+    if grain in ("loci", "regions"):
+        return f"{path}:{loc.line}"
+    return path
+
+
+def compress_regions(holders: Sequence[str]) -> list[str]:
+    by_path: dict[str, list[int]] = {}
+    order: list[str] = []
+    leftover: list[str] = []
+    for h in holders:
+        if ":" not in h:
+            leftover.append(h)
+            continue
+        path, _, rest = h.rpartition(":")
+        if not rest.isdigit():
+            leftover.append(h)
+            continue
+        if path not in by_path:
+            by_path[path] = []
+            order.append(path)
+        by_path[path].append(int(rest))
+    out: list[str] = []
+    for path in order:
+        nums = sorted(set(by_path[path]))
+        start = prev = nums[0]
+        runs: list[tuple[int, int]] = []
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+                continue
+            runs.append((start, prev))
+            start = prev = n
+        runs.append((start, prev))
+        for a, b in runs:
+            out.append(f"{path}:{a}" if a == b else f"{path}:{a}-{b}")
+    out.extend(leftover)
+    return out
+
+
+def holder_path(holder: str) -> str:
+    if ":" not in holder:
+        return holder
+    path, _, rest = holder.partition(":")
+    if rest.isdigit() or re.match(r"^\d+-\d+$", rest):
+        return path
+    if "/" in path or "." in path:
+        return path
+    return holder.split(":", 1)[0]
+
+
+def path_stem(path: str) -> str:
+    base = posix_rel(path).rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
+def is_doc_holder(holder: str) -> bool:
+    path = holder_path(holder)
+    name = path.rsplit("/", 1)[-1].lower()
+    if name in _DOC_BASENAMES:
+        return True
+    if path == "docs" or path.startswith("docs/") or "/docs/" in path:
+        return True
+    return False
+
+
+def is_test_holder(holder: str) -> bool:
+    path = holder_path(holder)
+    parts = path.split("/")
+    if any(p in {"tests", "test", "Tests", "Spec", "__tests__", "testdata"} for p in parts):
+        return True
+    name = parts[-1] if parts else path
+    lower = name.lower()
+    if lower.startswith("test_") or lower.endswith("_test.py") or lower.endswith("_test.rs"):
+        return True
+    if "test." in lower or lower.endswith("tests.swift") or lower.endswith("test.swift"):
+        return True
+    return False
+
+
+def is_ghost_holder(holder: str) -> bool:
+    return is_doc_holder(holder) or is_test_holder(holder)
+
+
+def _uniq(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def holder_key(holders: Sequence[str]) -> tuple[str, ...]:
+    return tuple(sorted({h for h in holders if h}))
+
+
+def _name_like_pred(pred: str) -> bool:
+    if not pred:
+        return False
+    if any("\u3040" <= c <= "\u9fff" for c in pred):
+        return len(pred) >= 3
+    if "-" in pred or "_" in pred:
+        return True
+    if re.search(r"[a-z][A-Z]", pred) or re.match(r"^[A-Z]{2,}[a-z]", pred):
+        return True
+    if re.match(r"^[A-Z][a-z]+[A-Z]", pred):
+        return True
+    idents = IDENT_RE.findall(pred)
+    return any(len(i) >= 8 and i.lower() not in IDENT_STOP for i in idents)
+
+
+def seed_from_key(
+    key: Sequence[tuple[str, str]],
+    *,
+    fn: str = "",
+    extra: Sequence[str] = (),
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(tok: str) -> None:
+        tok = tok.strip()
+        if len(tok) < 2 or tok.lower() in seen:
+            return
+        seen.add(tok.lower())
+        out.append(tok)
+
+    if fn and len(fn) >= 2:
+        add(fn)
+    for item in extra:
+        add(item)
+    text = " ".join(pred for _k, pred in key)
+    ranked = sorted(
+        {m for m in IDENT_RE.findall(text) if len(m) >= 4 and m.lower() not in IDENT_STOP},
+        key=lambda s: (-len(s), s.lower()),
+    )
+    for ident in ranked:
+        add(ident)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def decode_blob(data: bytes) -> str | None:
+    if b"\0" in data[:8000]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", "replace")
+
+
+@dataclass
+class SideHit:
+    holders: list[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+    pin: tuple[str, int] | None = None
+    fn: str = ""
+
+
+def stacks_in_source(
+    source: str,
+    path: str,
+    *,
+    grain: str,
+    with_fn: bool,
+) -> dict[tuple[tuple[str, str], ...], SideHit]:
+    """Group loci in one file by condition-stack identity."""
+    if not source:
+        return {}
+    idx = FileIndex(source, path)
+    by_key: dict[tuple[tuple[str, str], ...], list[Locus]] = {}
+    for ln in range(1, idx.nlines + 1):
+        loc = idx.at(ln)
+        if loc.error:
+            continue
+        loc.file = path
+        key = cond_key(loc.frames, with_fn=with_fn)
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(loc)
+
+    out: dict[tuple[tuple[str, str], ...], SideHit] = {}
+    grain_use = "loci" if grain == "regions" else grain
+    for key, locs in by_key.items():
+        holders = _uniq(holder_of(loc, grain_use) for loc in locs)
+        if grain == "regions":
+            holders = compress_regions(holders)
+        pin_loc = locs[len(locs) // 2]
+        out[key] = SideHit(
+            holders=holders,
+            paths=[path],
+            pin=(path, pin_loc.line),
+            fn=function_of(pin_loc),
+        )
+    return out
+
+
+def discover_tree_stacks(
+    tree: Tree,
+    *,
+    grain: str,
+    with_fn: bool,
+) -> dict[tuple[tuple[str, str], ...], SideHit]:
+    merged: dict[tuple[tuple[str, str], ...], SideHit] = {}
+    for path, blob in tree.blobs.items():
+        if not is_source_path(path):
+            continue
+        text = decode_blob(blob)
+        if text is None:
+            continue
+        for key, hit in stacks_in_source(text, path, grain=grain, with_fn=with_fn).items():
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = SideHit(
+                    holders=list(hit.holders),
+                    paths=list(hit.paths),
+                    pin=hit.pin,
+                    fn=hit.fn,
+                )
+                continue
+            for h in hit.holders:
+                if h not in cur.holders:
+                    cur.holders.append(h)
+            for p in hit.paths:
+                if p not in cur.paths:
+                    cur.paths.append(p)
+            if cur.pin is None:
+                cur.pin = hit.pin
+            if not cur.fn:
+                cur.fn = hit.fn
+    return merged
+
+
+@dataclass
+class Stack:
+    key: tuple[tuple[str, str], ...]
+    holders_a: list[str]
+    holders_b: list[str]
+    paths_a: list[str]
+    paths_b: list[str]
+    pin_a: tuple[str, int] | None
+    pin_b: tuple[str, int] | None
+    fn: str = ""
+    seeds: list[str] = field(default_factory=list)
+    covers: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return cond_label(self.key)
+
+    @property
+    def depth(self) -> int:
+        return len(self.key)
+
+    @property
+    def role(self) -> str:
+        a, b = bool(self.holders_a), bool(self.holders_b)
+        if a and not b:
+            return "exclusive_a"
+        if b and not a:
+            return "exclusive_b"
+        if not a and not b:
+            return "empty"
+        if holder_key(self.holders_a) == holder_key(self.holders_b):
+            return "shared"
+        added = set(self.holders_b) - set(self.holders_a)
+        dropped = set(self.holders_a) - set(self.holders_b)
+        if added and dropped:
+            return "move"
+        if added and not dropped:
+            return "spread"
+        if dropped and not added:
+            remaining_ghost = bool(self.holders_b) and all(is_ghost_holder(h) for h in self.holders_b)
+            lost_real = any(not is_ghost_holder(h) for h in dropped)
+            if remaining_ghost and lost_real:
+                return "ghost"
+            return "shrink"
+        return "hold"
+
+    @property
+    def true_on(self) -> str:
+        role = self.role
+        if role == "exclusive_a":
+            return "A"
+        if role == "exclusive_b":
+            return "B"
+        if role in ("move", "spread", "shrink", "ghost", "hold"):
+            return "AB"
+        return "AB"
+
+    def pin_for_true(self) -> tuple[str, int] | None:
+        role = self.role
+        if role == "exclusive_a":
+            return self.pin_a
+        if self.pin_b:
+            return self.pin_b
+        return self.pin_a
+
+    def cover_paths(self, universe: set[str]) -> list[str]:
+        a, b = set(self.paths_a), set(self.paths_b)
+        xor = (a ^ b) & universe
+        if self.role in ("move", "spread", "shrink", "ghost"):
+            return sorted((xor | ((a | b) & universe)))
+        return sorted(xor)
+
+    @property
+    def path_stem_hit(self) -> bool:
+        stems = [path_stem(p) for p in list(self.paths_a) + list(self.paths_b)]
+        label = self.label
+        holders = " ".join(self.holders_a + self.holders_b)
+        for stem in stems:
+            if len(stem) < 4:
+                continue
+            if stem in label or stem in holders:
+                return True
+            # holder path contains the exclusive file
+            if any(stem in h for h in self.holders_a + self.holders_b):
+                return True
+        return False
+
+    @property
+    def name_like(self) -> bool:
+        if self.path_stem_hit:
+            return True
+        return any(_name_like_pred(pred) for _k, pred in self.key)
+
+    @property
+    def junk(self) -> bool:
+        """Bare else/try frames and empty preds are not covering primitives."""
+        if not self.key:
+            return True
+        kinds = {k for k, _ in self.key}
+        if kinds <= {"else", "guard-else", "try-else", "for-else", "while-else"}:
+            return True
+        if len(self.key) == 1 and self.key[0][0] in {"else", "try", "defer", "for", "while"}:
+            pred = self.key[0][1].strip()
+            if not pred or pred in {"_", "true", "false"} or pred.startswith("_ "):
+                return True
+        return False
+
+    def _file_move(self) -> bool:
+        """Holders changed *and* the path stems changed — git.rs → parse.rs.
+
+        A copied `guard totalTime > 0` that still lives on HEAD is a move of
+        a predicate, but it must not spend the island file's exclusive slot.
+        """
+        if self.role not in ("move", "ghost"):
+            return False
+        stems_a = {path_stem(p) for p in self.paths_a}
+        stems_b = {path_stem(p) for p in self.paths_b}
+        if not stems_a or not stems_b or stems_a == stems_b:
+            return False
+        # A flood of `else` spreading into every new file is not a file move.
+        if len(self.paths_a) + len(self.paths_b) > 8:
+            return False
+        return True
+
+    @property
+    def quality(self) -> int:
+        if self.junk:
+            return 5
+        # Characteristic file-move of a real stack is the joint's object.
+        if self._file_move() and (self.name_like or self.depth >= 2 or self.path_stem_hit):
+            return 0
+        if self.path_stem_hit:
+            return 0
+        if self.name_like:
+            return 1
+        if self.role in ("move", "ghost"):
+            return 2
+        if self.role in ("spread", "shrink"):
+            return 3
+        return 4
+
+    @property
+    def length(self) -> int:
+        return len(self.label)
+
+    def rank_tuple(self) -> tuple:
+        return (self.quality, -self.depth, self.length, self.label)
+
+
+def merge_stacks(
+    a: dict[tuple[tuple[str, str], ...], SideHit],
+    b: dict[tuple[tuple[str, str], ...], SideHit],
+    universe: set[str],
+) -> list[Stack]:
+    keys = set(a) | set(b)
+    out: list[Stack] = []
+    for key in keys:
+        ha = a.get(key) or SideHit()
+        hb = b.get(key) or SideHit()
+        fn = hb.fn or ha.fn
+        extra = [path_stem(p) for p in ha.paths + hb.paths if len(path_stem(p)) >= 4]
+        stack = Stack(
+            key=key,
+            holders_a=list(ha.holders),
+            holders_b=list(hb.holders),
+            paths_a=list(ha.paths),
+            paths_b=list(hb.paths),
+            pin_a=ha.pin,
+            pin_b=hb.pin,
+            fn=fn,
+            seeds=seed_from_key(key, fn=fn, extra=extra),
+        )
+        if stack.role in ("empty", "shared"):
+            continue
+        if stack.junk:
+            continue
+        stack.covers = stack.cover_paths(universe)
+        if not stack.covers:
+            continue
+        out.append(stack)
+    return out
+
+
+# --- covering ---------------------------------------------------------------
+
+
+def shortest_cover(
+    stacks: Sequence[Stack],
+    universe: Sequence[str],
+    *,
+    limit: int = 12,
+) -> list[Stack]:
+    want = set(universe)
+    if not want:
+        return []
+    pool = [s for s in stacks if set(s.covers) & want]
+    if not pool:
+        return []
+    if len(want) <= 16 and len(pool) <= 40:
+        exact = _exact_cover(pool, want, limit=limit)
+        if exact:
+            return exact
+    return _greedy_cover(pool, want, limit=limit)
+
+
+def _exact_cover(pool: Sequence[Stack], universe: set[str], *, limit: int) -> list[Stack]:
+    paths = sorted(universe)
+    idx = {path: i for i, path in enumerate(paths)}
+    n = len(paths)
+    full = (1 << n) - 1
+    masks: list[tuple[Stack, int, int, int, int]] = []
+    for s in pool:
+        mask = 0
+        for path in s.covers:
+            bit = idx.get(path)
+            if bit is not None:
+                mask |= 1 << bit
+        if mask:
+            masks.append((s, mask, s.quality, -s.depth, s.length))
+    inf: tuple[int, int, int, int, tuple[int, ...]] = (10**6, 10**6, 10**9, 10**9, ())
+    dp: list[tuple[int, int, int, int, tuple[int, ...]]] = [inf] * (1 << n)
+    dp[0] = (0, 0, 0, 0, ())
+    for i, (_s, mask, q, ndepth, length) in enumerate(masks):
+        for state in range((1 << n) - 1, -1, -1):
+            cur = dp[state]
+            if cur[1] >= limit:
+                continue
+            nxt = state | mask
+            if nxt == state:
+                continue
+            # quality, cardinality, then *deeper* stacks (not shorter labels —
+            # sheaf wanted short greps; a prefix `given ready` is not the body).
+            cand = (cur[0] + q, cur[1] + 1, cur[2] + ndepth, cur[3] + length, cur[4] + (i,))
+            if cand[:4] < dp[nxt][:4]:
+                dp[nxt] = cand
+    best = dp[full]
+    if best[4] == ():
+        return []
+    return [masks[i][0] for i in best[4]]
+
+
+def _greedy_cover(pool: Sequence[Stack], universe: set[str], *, limit: int) -> list[Stack]:
+    uncovered = set(universe)
+    chosen: list[Stack] = []
+    remaining = list(pool)
+    while uncovered and remaining and len(chosen) < limit:
+        best: Stack | None = None
+        best_key: tuple | None = None
+        for s in remaining:
+            new = uncovered.intersection(s.covers)
+            if not new:
+                continue
+            key = (s.quality, -len(new), -s.depth, s.length, s.label)
+            if best_key is None or key < best_key:
+                best = s
+                best_key = key
+        if best is None:
+            break
+        chosen.append(best)
+        uncovered.difference_update(best.covers)
+        remaining = [s for s in remaining if s is not best]
+    return chosen
+
+
+def _key_nested(inner: tuple[tuple[str, str], ...], outer: tuple[tuple[str, str], ...]) -> bool:
+    """True if inner is a strict prefix or suffix of outer."""
+    if not inner or len(inner) >= len(outer):
+        return False
+    n = len(inner)
+    return outer[:n] == inner or outer[-n:] == inner
+
+
+def _pred_name_like(stack: Stack) -> bool:
+    return any(_name_like_pred(pred) for _k, pred in stack.key)
+
+
+def _positive_arm(stack: Stack) -> bool:
+    """Last frame is a true-arm if/guard, not given-negation / else."""
+    if not stack.key:
+        return False
+    kind, pred = stack.key[-1]
+    if kind in {"else", "guard-else", "elif", "try-else", "for-else", "while-else"}:
+        return False
+    if kind == "given" and pred.lstrip().startswith("¬"):
+        return False
+    return kind in {"if", "guard", "while", "match", "case", "switch"} and _name_like_pred(pred)
+
+
+def _on_deleted(stack: Stack, only_a: set[str]) -> bool:
+    return any(p in only_a for p in stack.paths_a)
+
+
+def dead_rank(stack: Stack, only_a: set[str]) -> tuple:
+    deleted = 0 if _on_deleted(stack, only_a) else 1
+    named = 0 if _pred_name_like(stack) else 1
+    positive = 0 if _positive_arm(stack) else 1
+    return (deleted, named, positive, -stack.depth, stack.length, stack.label)
+
+
+def dead_cover(
+    stacks: Sequence[Stack],
+    only_a: Sequence[str],
+    changed: Sequence[str] | None = None,  # noqa: ARG001 — leftover is more exclusive-A, not AB
+    *,
+    limit: int = 8,
+    also_changed: bool = False,
+) -> list[Stack]:
+    """Cover with exclusive-A stacks only. No exclusive-B, no AB else.
+
+    thatch's mixed budget reserved 1–2 exclusive-A slots then spent the
+    rest on HEAD births and leftover AB `else` spreads. wane's object
+    is what died: stacks true on A and false on B. Invert A/B to ask
+    what was born. `--limit` is how many dead stacks to name, not a
+    mixed file-cover of the delta.
+
+    Default leftover stays on deleted files. Vanished stacks inside
+    surviving files are `--also-changed` (v1 filled sitbone island
+    leftover with SitboneCore tick arms and walked them --full).
+    """
+    only_a_src = [p for p in only_a if is_source_path(p)]
+    only_a_set = set(only_a_src)
+    pool = [s for s in stacks if s.true_on == "A" and not s.junk]
+    if not also_changed:
+        pool = [s for s in pool if _on_deleted(s, only_a_set)]
+    if not pool:
+        return []
+    pool = sorted(pool, key=lambda s: dead_rank(s, only_a_set))
+
+    chosen: list[Stack] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+
+    def dominated_by_chosen(s: Stack) -> bool:
+        for c in chosen:
+            if not (set(s.paths_a) & set(c.paths_a)):
+                continue
+            if _key_nested(s.key, c.key):
+                return True
+        return False
+
+    def take(s: Stack) -> bool:
+        if s.key in seen:
+            return False
+        if limit >= 0 and len(chosen) >= limit:
+            return False
+        for i, c in enumerate(list(chosen)):
+            if (set(s.paths_a) & set(c.paths_a)) and _key_nested(c.key, s.key):
+                seen.discard(c.key)
+                chosen[i] = s
+                seen.add(s.key)
+                return True
+        if dominated_by_chosen(s):
+            return False
+        seen.add(s.key)
+        chosen.append(s)
+        return True
+
+    # Pass 1: every deleted source file gets its best exclusive-A stack.
+    for path in only_a_src:
+        if limit >= 0 and len(chosen) >= limit:
+            break
+        cands = [s for s in pool if path in s.paths_a]
+        if not cands:
+            continue
+        take(min(cands, key=lambda s: dead_rank(s, only_a_set)))
+
+    # Pass 2: more exclusive-A. Deleted-file + name-like first.
+    # Extra stacks on an already-named file must themselves be name-like.
+    named_files = {p for s in chosen for p in s.paths_a}
+    for s in pool:
+        if limit >= 0 and len(chosen) >= limit:
+            break
+        extra_on_named = bool(named_files) and set(s.paths_a) <= named_files
+        if extra_on_named and not _pred_name_like(s):
+            continue
+        take(s)
+    return chosen
+
+
+# --- occupancy through history (tenure kernel) ------------------------------
+
+
+@dataclass(frozen=True)
+class Sample:
+    sha: str
+    timestamp: int
+    iso: str
+    subject: str
+    kind: str = "commit"
+
+    @property
+    def short(self) -> str:
+        if self.kind != "commit":
+            return self.sha
+        return self.sha[:7]
+
+
+@dataclass
+class Era:
+    value: bool
+    start: Sample
+    end: Sample
+    count: int
+    holders: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    split: str = "start"
+    kind: str = "start"
+    echoes: list[dict[str, str]] = field(default_factory=list)
+
+
+def classify_era(
+    *,
+    value: bool,
+    split: str,
+    holders: Sequence[str],
+    added: Sequence[str],
+    dropped: Sequence[str],
+) -> str:
+    if not value:
+        return "death" if split == "boolean" else "absent"
+    if split in ("start", "boolean"):
+        return "birth"
+    if added and dropped:
+        return "move"
+    if added and not dropped:
+        return "spread"
+    if dropped and not added:
+        remaining_ghost = bool(holders) and all(is_ghost_holder(h) for h in holders)
+        lost_real = any(not is_ghost_holder(h) for h in dropped)
+        if remaining_ghost and lost_real:
+            return "ghost"
+        return "shrink"
+    return "hold"
+
+
+def count_boolean_eras(values: Sequence[bool]) -> int:
+    if not values:
+        return 0
+    n = 1
+    for i in range(1, len(values)):
+        if values[i] != values[i - 1]:
+            n += 1
+    return n
+
+
+def relate_keys(
+    echo: tuple[tuple[str, str], ...],
+    target: tuple[tuple[str, str], ...],
+) -> str:
+    if not echo:
+        return "mention"
+    if echo == target:
+        return "occupant"
+    n, m = len(echo), len(target)
+    if n > m and echo[n - m :] == target:
+        return "deeper"
+    if n > m and echo[:m] == target:
+        return "deeper"
+    if m > n and target[m - n :] == echo:
+        return "shallower"
+    if m > n and target[:n] == echo:
+        return "shallower"
+    if set(echo) & set(target):
+        return "related"
+    return "mention"
+
+
+def _union_echoes(groups: Sequence[Sequence[dict[str, str]]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for echo in group:
+            key = (echo.get("holder", ""), echo.get("kind", ""))
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(echo))
+    kind_order = {"deeper": 0, "related": 1, "shallower": 2, "mention": 3}
+    out.sort(
+        key=lambda e: (
+            kind_order.get(e.get("kind") or "", 9),
+            1 if is_test_holder(e.get("holder") or "") else 0,
+            e.get("holder") or "",
+        )
+    )
+    return out
+
+
+def compress(
+    samples: Sequence[Sample],
+    values: Sequence[bool],
+    witnesses: Sequence[Sequence[str]],
+    *,
+    split_holders: bool = True,
+    echoes: Sequence[Sequence[dict[str, str]]] | None = None,
+) -> list[Era]:
+    if not samples:
+        return []
+    echo_rows: Sequence[Sequence[dict[str, str]]] = echoes or [[] for _ in samples]
+    eras: list[Era] = []
+    start = 0
+    for i in range(1, len(samples) + 1):
+        if i < len(samples):
+            same_bool = values[i] == values[start]
+            if same_bool:
+                if not split_holders or not values[i]:
+                    continue
+                if holder_key(witnesses[i]) == holder_key(witnesses[start]):
+                    continue
+        holders = sorted(_uniq(witnesses[start])) if values[start] else []
+        split = "start"
+        added: list[str] = []
+        dropped: list[str] = []
+        if eras:
+            prev = eras[-1]
+            if bool(values[start]) != prev.value:
+                split = "boolean"
+                if values[start]:
+                    added = list(holders)
+                    dropped = list(prev.holders)
+            else:
+                split = "holders"
+                prev_set = set(prev.holders)
+                cur_set = set(holders)
+                added = [h for h in holders if h not in prev_set]
+                dropped = [h for h in prev.holders if h not in cur_set]
+        elif values[start]:
+            added = list(holders)
+        kind = classify_era(
+            value=bool(values[start]),
+            split=split,
+            holders=holders,
+            added=added,
+            dropped=dropped,
+        )
+        era_echoes = _union_echoes(echo_rows[start:i]) if values[start] else []
+        dropped_paths = {holder_path(h) for h in dropped}
+        era_echoes = [
+            e
+            for e in era_echoes
+            if not (
+                e.get("kind") == "mention"
+                and holder_path(e.get("holder") or "") in dropped_paths
+            )
+        ]
+        eras.append(
+            Era(
+                value=bool(values[start]),
+                start=samples[start],
+                end=samples[i - 1],
+                count=i - start,
+                holders=holders,
+                added=added,
+                dropped=dropped,
+                split=split,
+                kind=kind,
+                echoes=era_echoes,
+            )
+        )
+        start = i
+    return eras
+
+
+def list_samples(
+    repo: str,
+    *,
+    end_rev: str,
+    first_parent: bool,
+    limit: int | None,
+) -> list[Sample]:
+    fmt = "%H%x09%ct%x09%ci%x09%s"
+    cmd = ["log", "--reverse", f"--format={fmt}"]
+    if first_parent:
+        cmd.append("--first-parent")
+    cmd.append(end_rev)
+    proc = git(repo, *cmd)
+    if proc.returncode != 0:
+        raise WaneError(proc.stderr.strip() or f"cannot walk {end_rev}")
+    samples: list[Sample] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 3:
+            continue
+        sha, ct, iso = parts[0], parts[1], parts[2]
+        subject = parts[3] if len(parts) > 3 else ""
+        try:
+            timestamp = int(ct)
+        except ValueError:
+            timestamp = 0
+        samples.append(Sample(sha=sha, timestamp=timestamp, iso=iso, subject=subject))
+    if limit is not None and limit >= 0 and len(samples) > limit:
+        samples = samples[-limit:]
+    return samples
+
+
+def worktree_sample(repo: str) -> Sample:
+    now = datetime.now().astimezone()
+    return Sample(
+        sha="WORKTREE",
+        timestamp=int(now.timestamp()),
+        iso=now.isoformat(timespec="seconds"),
+        subject="uncommitted working tree",
+        kind="worktree",
+    )
+
+
+def read_blob(repo: str, sample: Sample, path: str) -> str | None:
+    if sample.kind == "worktree":
+        fp = os.path.join(repo, path)
+        if not os.path.isfile(fp):
+            return None
+        try:
+            return Path(fp).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    proc = git(repo, "cat-file", "--batch", input_text=f"{sample.sha}:{path}\n")
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    nl = data.find("\n")
+    if nl < 0:
+        return None
+    header = data[:nl]
+    if header.endswith(" missing"):
+        return None
+    parts = header.rsplit(" ", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        size = int(parts[-1])
+    except ValueError:
+        return None
+    return data[nl + 1 : nl + 1 + size]
+
+
+def grep_paths(repo: str, sha: str, seed: str) -> list[str]:
+    proc = git(repo, "grep", "-l", "-F", "-e", seed, sha)
+    if proc.returncode not in (0, 1):
+        return []
+    hits: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        path = line
+        if len(line) >= 41 and line[40] == ":" and SHA_RE.match(line[:40]):
+            path = line[41:]
+        elif ":" in line and SHA_RE.match(line.split(":", 1)[0]):
+            path = line.split(":", 1)[1]
+        path = posix_rel(path)
+        if is_source_path(path):
+            hits.append(path)
+    return hits
+
+
+def worktree_grep_paths(repo: str, seed: str) -> list[str]:
+    proc = git(repo, "grep", "-l", "-F", "-e", seed)
+    if proc.returncode not in (0, 1):
+        return []
+    hits: list[str] = []
+    for line in proc.stdout.splitlines():
+        path = posix_rel(line.strip())
+        if is_source_path(path):
+            hits.append(path)
+    return hits
+
+
+def scan_source(
+    source: str,
+    path: str,
+    target: tuple[tuple[str, str], ...],
+    *,
+    grain: str,
+    with_fn: bool,
+) -> tuple[list[str], list[dict[str, str]]]:
+    if not source or not target:
+        return [], []
+    idx = FileIndex(source, path)
+    by_key: dict[tuple[tuple[str, str], ...], list[Locus]] = {}
+    for ln in range(1, idx.nlines + 1):
+        loc = idx.at(ln)
+        if loc.error:
+            continue
+        loc.file = path
+        key = cond_key(loc.frames, with_fn=with_fn)
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(loc)
+
+    holders: list[str] = []
+    seen_h: set[str] = set()
+    if target in by_key:
+        grain_use = "loci" if grain == "regions" else grain
+        for loc in by_key[target]:
+            h = holder_of(loc, grain_use)
+            if h not in seen_h:
+                seen_h.add(h)
+                holders.append(h)
+        if grain == "regions":
+            holders = compress_regions(holders)
+        return holders, []
+
+    echoes: list[dict[str, str]] = []
+    ranked: list[tuple[int, str, tuple[tuple[str, str], ...], Locus]] = []
+    order = {"deeper": 0, "related": 1, "shallower": 2}
+    for key, locs in by_key.items():
+        rel = relate_keys(key, target)
+        if rel in {"mention", "occupant"}:
+            continue
+        ranked.append((order.get(rel, 9), rel, key, locs[0]))
+    ranked.sort(key=lambda row: (row[0], cond_label(row[2])))
+    seen_e: set[str] = set()
+    for _ord, rel, key, loc in ranked[:3]:
+        h = holder_of(loc, "functions")
+        if h in seen_e:
+            continue
+        seen_e.add(h)
+        echoes.append({"holder": h, "kind": rel, "stack": cond_label(key)})
+    if not echoes:
+        echoes.append({"holder": path, "kind": "mention", "stack": ""})
+    return [], echoes
+
+
+def discover_paths(
+    repo: str,
+    sample: Sample,
+    seeds: Sequence[str],
+    remembered: Iterable[str],
+) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        path = posix_rel(path)
+        if not path or path in seen or skip_path(path):
+            return
+        seen.add(path)
+        paths.append(path)
+
+    for path in remembered:
+        add(path)
+    if sample.kind == "worktree":
+        for seed in seeds:
+            for path in worktree_grep_paths(repo, seed):
+                add(path)
+        return paths
+    for seed in seeds:
+        for path in grep_paths(repo, sample.sha, seed):
+            add(path)
+    return paths
+
+
+def probe_stack(
+    repo: str,
+    samples: Sequence[Sample],
+    *,
+    target: tuple[tuple[str, str], ...],
+    seeds: Sequence[str],
+    pin_path: str,
+    grain: str,
+    with_fn: bool,
+) -> tuple[list[bool], list[list[str]], list[list[dict[str, str]]], int]:
+    values = [False] * len(samples)
+    witnesses: list[list[str]] = [[] for _ in samples]
+    echo_rows: list[list[dict[str, str]]] = [[] for _ in samples]
+    probes = 0
+    remembered = [pin_path] if pin_path else []
+    for i, sample in enumerate(samples):
+        paths = discover_paths(repo, sample, seeds, remembered)
+        holders: list[str] = []
+        occupied_paths: list[str] = []
+        echoes: list[dict[str, str]] = []
+        for path in paths:
+            probes += 1
+            source = read_blob(repo, sample, path)
+            if source is None:
+                continue
+            occ, file_echoes = scan_source(
+                source, path, target, grain=grain, with_fn=with_fn
+            )
+            if occ:
+                occupied_paths.append(path)
+                for h in occ:
+                    if h not in holders:
+                        holders.append(h)
+            else:
+                echoes.extend(file_echoes)
+        if occupied_paths:
+            for path in occupied_paths:
+                if path not in remembered:
+                    remembered.append(path)
+        values[i] = bool(holders)
+        witnesses[i] = holders
+        echo_rows[i] = _union_echoes([echoes])
+    return values, witnesses, echo_rows, probes
+
+
+@dataclass
+class OccupyReport:
+    predicate: str
+    pin: str
+    end_rev: str
+    first_parent: bool
+    holds_now: bool
+    ghost_now: bool
+    true_commits: int
+    commits_scanned: int
+    probes: int
+    boolean_eras: int
+    grain: str
+    split_holders: bool
+    eras: list[Era]
+    hints: list[str] = field(default_factory=list)
+
+
+def occupy_stack(
+    repo: str,
+    stack: Stack,
+    *,
+    samples: Sequence[Sample],
+    grain: str,
+    with_fn: bool,
+    split_holders: bool,
+    end_rev: str,
+    first_parent: bool,
+) -> OccupyReport:
+    pin = stack.pin_for_true()
+    pin_path = pin[0] if pin else (stack.paths_b[0] if stack.paths_b else (stack.paths_a[0] if stack.paths_a else ""))
+    pin_s = f"{pin[0]}:{pin[1]}" if pin else pin_path
+    seeds = list(stack.seeds)
+    if pin_path:
+        stem = path_stem(pin_path)
+        if stem and stem not in seeds:
+            seeds.append(stem)
+    values, witnesses, echo_rows, probes = probe_stack(
+        repo,
+        samples,
+        target=stack.key,
+        seeds=seeds,
+        pin_path=pin_path,
+        grain=grain,
+        with_fn=with_fn,
+    )
+    eras = compress(
+        samples, values, witnesses, split_holders=split_holders, echoes=echo_rows
+    )
+    commit_pairs = [(s, v) for s, v in zip(samples, values) if s.kind == "commit"]
+    true_commits = sum(1 for _, v in commit_pairs if v)
+    scanned = sum(1 for s in samples if s.kind == "commit")
+    holds_now = bool(values[-1]) if values else False
+    boolean_eras = count_boolean_eras(values)
+    ghost_now = bool(eras) and eras[-1].value and eras[-1].kind == "ghost"
+    hints: list[str] = []
+    if ghost_now:
+        last = eras[-1]
+        hints.append(
+            "now=TRUE only as a test/doc occupant ("
+            + ", ".join(last.holders[:4])
+            + "); production left this stack"
+        )
+        deeper = [e for e in last.echoes if e.get("kind") == "deeper"]
+        if deeper:
+            d = deeper[0]
+            hints.append(f"{d.get('holder')} now sits in a deeper stack: {d.get('stack')}")
+    if not any(values) and first_parent:
+        hints.append("never held on first-parent. island stacks need --full")
+    return OccupyReport(
+        predicate=stack.label,
+        pin=pin_s,
+        end_rev=end_rev,
+        first_parent=first_parent,
+        holds_now=holds_now,
+        ghost_now=ghost_now,
+        true_commits=true_commits,
+        commits_scanned=scanned,
+        probes=probes,
+        boolean_eras=boolean_eras,
+        grain=grain,
+        split_holders=split_holders,
+        eras=eras,
+        hints=hints,
+    )
+
+
+# --- walks ------------------------------------------------------------------
+
+
+_fp_cache: dict[tuple[str, str], set[str]] = {}
+
+
+def _first_parent_shas(repo: str, tip: str) -> set[str]:
+    key = (repo, tip)
+    hit = _fp_cache.get(key)
+    if hit is not None:
+        return hit
+    proc = git(repo, "rev-list", "--first-parent", "--max-count=400", tip)
+    shas: set[str] = set()
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line:
+                shas.add(line)
+    _fp_cache[key] = shas
+    return shas
+
+
+def _sha_in(shas: set[str], sha: str) -> bool:
+    if sha in shas:
+        return True
+    if len(sha) >= 7:
+        for item in shas:
+            if item.startswith(sha) or sha.startswith(item):
+                return True
+    return False
+
+
+def _parent_sha(repo: str, sha: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", f"{sha}^")
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _adjacent_commits(repo: str, a: Side, b: Side) -> bool:
+    if a.kind != "commit" or b.kind != "commit":
+        return False
+    pa = _parent_sha(repo, a.sha)
+    pb = _parent_sha(repo, b.sha)
+    return pa == b.sha or pb == a.sha
+
+
+def _walk_tip(a: Side, b: Side) -> Side | None:
+    if b.kind == "commit":
+        return b
+    if a.kind == "commit":
+        return a
+    return None
+
+
+def _path_exists_at(repo: str, sha: str, path: str) -> bool:
+    if not path or not sha:
+        return False
+    proc = git(repo, "cat-file", "-e", f"{sha}:{path}")
+    return proc.returncode == 0
+
+
+def needs_full_walk(repo: str, a: Side, b: Side, stack: Stack) -> bool:
+    """Island / off-first-parent *true sides of this stack's file* need --full.
+
+    thatch v1 used the other tree: sitbone 14b1d6e vs HEAD made every
+    exclusive-B HEAD stack walk 100 commits because A is off first-parent.
+    wane v1 repeated it for exclusive-A on surviving files: SitboneCore
+    tick arms inherited --full --rev 14b1d6e though the file lives on HEAD.
+    A holder that still exists at the walk tip died on first-parent.
+    """
+    tip = _walk_tip(a, b)
+    if tip is None:
+        return False
+    pin = stack.pin_for_true()
+    pin_path = pin[0] if pin else (stack.paths_a[0] if stack.paths_a else "")
+    if pin_path and tip.kind == "commit" and _path_exists_at(repo, tip.sha, pin_path):
+        return False
+    fp = _first_parent_shas(repo, tip.sha)
+    if stack.true_on in ("A", "AB") and a.kind == "commit" and not _sha_in(fp, a.sha):
+        return True
+    if stack.true_on in ("B", "AB") and b.kind == "commit" and not _sha_in(fp, b.sha):
+        return True
+    return False
+
+
+def quote(s: str) -> str:
+    if s == "":
+        return "''"
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+=,*-]+", s) and not s.startswith("-"):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def build_walks(
+    repo: str,
+    a: Side,
+    b: Side,
+    stacks: Sequence[Stack],
+    *,
+    force_full: bool | None = None,
+) -> list[dict]:
+    """Ready-to-run tenure FILE:LINE lines. Pin snapshot is the true side."""
+    out: list[dict] = []
+    tip = _walk_tip(a, b)
+    now = a.kind == "worktree" or b.kind == "worktree"
+    adjacent = _adjacent_commits(repo, a, b)
+    for stack in stacks:
+        pin = stack.pin_for_true()
+        if pin is None:
+            continue
+        full = (
+            True
+            if force_full is True
+            else (False if force_full is False else needs_full_walk(repo, a, b, stack))
+        )
+        # Exclusive-A files are gone at HEAD; tenure --rev must be the
+        # true-side commit so the pin blob exists. thatch occupy itself
+        # detaches pin identity from the walk end.
+        rev_side = a if stack.true_on == "A" else (b if b.kind == "commit" else a)
+        prefix: list[str] = ["-C", quote(repo)]
+        if now:
+            prefix.append("--now")
+        if full:
+            prefix.append("--full")
+        if rev_side.kind == "commit":
+            prefix += ["--rev", rev_side.short]
+            if adjacent:
+                prefix += ["--limit", "12"]
+        elif tip is not None:
+            prefix += ["--rev", tip.short]
+        flags = " ".join(prefix)
+        pin_s = f"{pin[0]}:{pin[1]}"
+        line = f"tenure {flags} {quote(pin_s)}"
+        out.append(
+            {
+                "tool": "tenure",
+                "line": line,
+                "pin": pin_s,
+                "true_on": stack.true_on,
+                "role": stack.role,
+                "label": stack.label,
+                "full": full,
+                "now": now,
+                "rev": rev_side.short if rev_side.kind == "commit" else None,
+            }
+        )
+    return out
+
+
+# --- format -----------------------------------------------------------------
+
+
+def color_enabled(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never" or args.json or args.oneline or args.walks:
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def paint(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _date_span(a: Sample, b: Sample) -> str:
+    da = a.iso[:10] if a.iso else ""
+    db = b.iso[:10] if b.iso else ""
+    if not da and not db:
+        return ""
+    if da == db or not db:
+        return da
+    return f"{da} → {db}"
+
+
+def format_eras(report: OccupyReport, *, color: bool, indent: str = "    ") -> list[str]:
+    lines: list[str] = []
+    if not report.eras:
+        lines.append(indent + "(no commits)")
+        return lines
+    count_w = max(len(str(e.count)) for e in report.eras) + len(" commits")
+    for era in report.eras:
+        raw = "TRUE" if era.value else "FALSE"
+        label = paint(color, "32;1" if era.value else "31", f"{raw:<5}")
+        unit = "commit" if era.count == 1 else "commits"
+        count = f"{era.count} {unit}".ljust(count_w)
+        if era.start.sha == era.end.sha:
+            span = f"{era.start.short}"
+        else:
+            span = f"{era.start.short}..{era.end.short}"
+        dates = _date_span(era.start, era.end)
+        lines.append(f"{indent}{label}  {count}  {span}  {dates}".rstrip())
+        if era.value and era.holders:
+            shown = era.holders[:6]
+            extra = f" (+{len(era.holders) - 6})" if len(era.holders) > 6 else ""
+            lines.append(f"{indent}       holders: " + ", ".join(shown) + extra)
+        if era.split == "holders":
+            for path in era.added[:6]:
+                lines.append(f"{indent}       + {path}")
+            for path in era.dropped[:6]:
+                lines.append(f"{indent}       - {path}")
+        if era.kind == "ghost":
+            lines.append(
+                f"{indent}       ghost: production left; the stack still perches in tests/docs"
+            )
+        for echo in (era.echoes or [])[:4]:
+            holder = echo.get("holder") or ""
+            kind = echo.get("kind") or "mention"
+            stack = echo.get("stack") or ""
+            if kind == "mention":
+                lines.append(f"{indent}       echo   {holder}  mention (token, no occupant)")
+            else:
+                extra = f"  {stack}" if stack else ""
+                lines.append(f"{indent}       echo   {holder}  {kind}{extra}")
+    holder_note = ""
+    if report.split_holders and report.boolean_eras and report.boolean_eras != len(report.eras):
+        extra_splits = len(report.eras) - report.boolean_eras
+        holder_note = f"  boolean={report.boolean_eras}  holder_splits={extra_splits}"
+    summary = (
+        f"{indent}now={'TRUE' if report.holds_now else 'FALSE'}  "
+        f"true={report.true_commits}/{report.commits_scanned}  "
+        f"eras={len(report.eras)}{holder_note}  probes={report.probes}"
+    )
+    if report.ghost_now:
+        summary += "  ghost_now=1"
+    if not report.first_parent:
+        summary += "  full"
+    lines.append(summary)
+    for hint in report.hints:
+        lines.append(f"{indent}hint: {hint}")
+    return lines
+
+
+def format_human(
+    *,
+    repo: str,
+    a: Side,
+    b: Side,
+    delta: dict[str, int],
+    covering: Sequence[Stack],
+    unexplained: Sequence[str],
+    walks: Sequence[dict],
+    occupies: Sequence[OccupyReport | None],
+    color: bool,
+) -> str:
+    lines: list[str] = []
+    name = os.path.basename(repo) or repo
+    lines.append(f"# wane {a.short}..{b.short}  ({name})")
+    lines.append(f"# A  {a.short}  {a.subject}")
+    lines.append(f"# B  {b.short}  {b.subject}")
+    bits = []
+    if delta["deleted"]:
+        bits.append(f"{delta['deleted']} only-A")
+    if delta["added"]:
+        bits.append(f"{delta['added']} only-B")
+    if delta["changed"]:
+        bits.append(f"{delta['changed']} changed")
+    if delta["same"]:
+        bits.append(f"{delta['same']} identical")
+    lines.append("# " + ", ".join(bits) if bits else "# identical trees")
+    lines.append("")
+    lines.append("wane  (exclusive-A path-conditions that died)")
+    if covering:
+        for s in covering:
+            side = s.true_on
+            color_code = "36" if side == "A" else ("33" if side == "AB" else "32")
+            tag = paint(color, color_code, f"{side:<2}")
+            n = len(s.covers)
+            files = f"{n} file" + ("" if n == 1 else "s")
+            lines.append(f"  {tag}  {s.role:<11}  {s.label}")
+            lines.append(f"           {files}  depth={s.depth}")
+            if s.holders_a:
+                lines.append("           holders A: " + ", ".join(s.holders_a[:6]))
+            if s.holders_b:
+                lines.append("           holders B: " + ", ".join(s.holders_b[:6]))
+            pin = s.pin_for_true()
+            if pin:
+                lines.append(f"           pin  {pin[0]}:{pin[1]}")
+    else:
+        lines.append("  (empty — nothing died)")
+
+    if any(o is not None for o in occupies):
+        lines.append("")
+        lines.append("occupy  (this stack held, plus who sat in it)")
+        for s, occ in zip(covering, occupies):
+            if occ is None:
+                continue
+            lines.append(f"  # {s.label}")
+            lines.append(f"    pin  {occ.pin}")
+            lines.extend(format_eras(occ, color=color))
+
+    if walks:
+        lines.append("")
+        lines.append("walk  (paste into a shell — tenure of the pin)")
+        for item in walks:
+            lines.append("  " + item["line"])
+
+    if unexplained:
+        lines.append("")
+        lines.append(
+            "unexplained  "
+            + ", ".join(unexplained[:6])
+            + (f"  (+{len(unexplained) - 6})" if len(unexplained) > 6 else "")
+        )
+    n_occ = sum(1 for o in occupies if o is not None)
+    lines.append(
+        f"wane={len(covering)}  occupy={n_occ}  walks={len(walks)}  "
+        f"delta={delta['added'] + delta['deleted'] + delta['changed']}"
+    )
+    return "\n".join(lines)
+
+
+def era_to_json(e: Era) -> dict:
+    def sample_dict(s: Sample) -> dict:
+        return {
+            "sha": s.sha,
+            "short": s.short,
+            "timestamp": s.timestamp,
+            "iso": s.iso,
+            "subject": s.subject,
+            "kind": s.kind,
+        }
+
+    return {
+        "value": e.value,
+        "count": e.count,
+        "split": e.split,
+        "kind": e.kind,
+        "start": sample_dict(e.start),
+        "end": sample_dict(e.end),
+        "holders": e.holders,
+        "added": e.added,
+        "dropped": e.dropped,
+        "echoes": e.echoes,
+    }
+
+
+def occupy_to_json(o: OccupyReport) -> dict:
+    return {
+        "predicate": o.predicate,
+        "pin": o.pin,
+        "end_rev": o.end_rev,
+        "first_parent": o.first_parent,
+        "holds_now": o.holds_now,
+        "ghost_now": o.ghost_now,
+        "true_commits": o.true_commits,
+        "commits_scanned": o.commits_scanned,
+        "probes": o.probes,
+        "boolean_eras": o.boolean_eras,
+        "grain": o.grain,
+        "split_holders": o.split_holders,
+        "eras": [era_to_json(e) for e in o.eras],
+        "hints": o.hints,
+        "pattern": "".join("T" if e.value else "F" for e in o.eras),
+        "kinds": [e.kind for e in o.eras],
+        "holder_seq": " | ".join(",".join(e.holders) for e in o.eras if e.value),
+    }
+
+
+def stack_to_json(s: Stack, occ: OccupyReport | None) -> dict:
+    pin = s.pin_for_true()
+    return {
+        "label": s.label,
+        "key": [[k, p] for k, p in s.key],
+        "true_on": s.true_on,
+        "role": s.role,
+        "depth": s.depth,
+        "quality": s.quality,
+        "holders_a": s.holders_a,
+        "holders_b": s.holders_b,
+        "paths_a": s.paths_a,
+        "paths_b": s.paths_b,
+        "covers": s.covers,
+        "pin": f"{pin[0]}:{pin[1]}" if pin else None,
+        "fn": s.fn,
+        "seeds": s.seeds,
+        "occupy": occupy_to_json(occ) if occ is not None else None,
+    }
+
+
+def format_oneline(stacks: Sequence[Stack]) -> str:
+    rows = []
+    for s in stacks:
+        ha = ",".join(s.holders_a)
+        hb = ",".join(s.holders_b)
+        rows.append(f"{s.role}\t{s.true_on}\t{s.depth}\t{s.label}\t{ha}\t{hb}")
+    return "\n".join(rows)
+
+
+def _side_json(s: Side) -> dict:
+    return {
+        "spec": s.spec,
+        "kind": s.kind,
+        "sha": s.sha,
+        "short": s.short,
+        "tree": s.tree,
+        "subject": s.subject,
+        "iso": s.iso,
+    }
+
+
+# --- cli --------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="wane",
+        description=(
+            "Two git trees in. Emit the exclusive-A path-condition "
+            "stacks that died (true on A, false on B), then occupy "
+            "those stacks through history. Not thatch's mixed A/B/AB "
+            "budget. Not sheaf's grep/exists. Invert A/B to ask what "
+            "was born."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  wane HEAD~1 HEAD
+  wane 14b1d6e HEAD
+  wane HEAD :worktree
+  wane --json --limit 6 -C sitbone 14b1d6e HEAD
+  wane --also-changed --limit 6 -C sitbone 14b1d6e HEAD
+  wane --walks -C sitbone 70ec7df^ 70ec7df
+""",
+    )
+    parser.add_argument("-C", "--repo", default=None, help="repository (default: cwd)")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--oneline", action="store_true")
+    parser.add_argument(
+        "--walks",
+        "--sh",
+        action="store_true",
+        help="print only ready-to-run tenure FILE:LINE command lines",
+    )
+    parser.add_argument(
+        "--no-walks",
+        action="store_true",
+        help="do not print tenure command lines in human output",
+    )
+    parser.add_argument(
+        "--no-occupy",
+        action="store_true",
+        help="covering set only; do not walk history",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="force full-history occupy (not only first-parent)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="max exclusive-A (dead) stacks to name (default: 8); never filled with exclusive-B or AB else",
+    )
+    parser.add_argument(
+        "--also-changed",
+        action="store_true",
+        help="also name exclusive-A stacks that died inside surviving files (default: deleted files only)",
+    )
+    parser.add_argument(
+        "--occupy-limit",
+        type=int,
+        default=None,
+        help="keep only the last N commits when occupying (default: 12 if adjacent, else all)",
+    )
+    parser.add_argument(
+        "--boolean",
+        action="store_true",
+        help="occupy compresses only on TRUE/FALSE (ancestor held)",
+    )
+    parser.add_argument(
+        "--grain",
+        choices=("files", "functions", "regions", "loci"),
+        default="functions",
+    )
+    parser.add_argument("--with-fn", action="store_true")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("--now", action="store_true", help="append the working tree as a final occupy sample")
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("a", nargs="?", help="tree-ish A")
+    parser.add_argument("b", nargs="?", help="tree-ish B")
+    parser.add_argument("paths", nargs="*", help="optional path limiter")
+    return parser.parse_args(list(argv))
+
+
+def selftest() -> int:
+    fails = 0
+
+    def check(name: str, cond: bool) -> None:
+        nonlocal fails
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            print(f"  FAIL {name}", file=sys.stderr)
+            fails += 1
+
+    src = (
+        "def process(x, ready=True, enabled=True):\n"
+        "    if not ready:\n"
+        "        return None\n"
+        "    if x > 0:\n"
+        "        flag = True\n"
+        "        return 'ok'\n"
+    )
+    idx = FileIndex(src, "src/app.py")
+    loc = idx.at(6)
+    loc.file = "src/app.py"
+    key = cond_key(loc.frames, with_fn=False)
+    check("return line has given+if, not fn", [k[0] for k in key] == ["given", "if"])
+    check("given is ready (negated not ready)", "ready" in key[0][1] and "not ready" not in key[0][1])
+    check("if is x > 0", "x > 0" in key[1][1] or "x>0" in key[1][1].replace(" ", ""))
+
+    hits = stacks_in_source(src, "src/app.py", grain="functions", with_fn=False)
+    check("discovered the ready|x>0 stack", key in hits)
+    check("functions grain is process", hits[key].holders == ["src/app.py:process"])
+
+    # Move covers both paths as one member; two exclusives are the concatenation.
+    move = Stack(
+        key=key,
+        holders_a=["src/git.py:parse"],
+        holders_b=["src/parse.py:parse"],
+        paths_a=["src/git.py"],
+        paths_b=["src/parse.py"],
+        pin_a=("src/git.py", 4),
+        pin_b=("src/parse.py", 4),
+    )
+    universe = {"src/git.py", "src/parse.py"}
+    move.covers = move.cover_paths(universe)
+    check("move role", move.role == "move")
+    check("move covers both paths", set(move.covers) == universe)
+    check("move quality is 0 (the joint)", move.quality == 0)
+
+    ex_a = Stack(
+        key=(("if", "gone"),),
+        holders_a=["src/git.py:parse"],
+        holders_b=[],
+        paths_a=["src/git.py"],
+        paths_b=[],
+        pin_a=("src/git.py", 1),
+        pin_b=None,
+    )
+    ex_a.covers = ex_a.cover_paths(universe)
+    ex_b = Stack(
+        key=(("if", "born"),),
+        holders_a=[],
+        holders_b=["src/parse.py:parse"],
+        paths_a=[],
+        paths_b=["src/parse.py"],
+        pin_a=None,
+        pin_b=("src/parse.py", 1),
+    )
+    ex_b.covers = ex_b.cover_paths(universe)
+    cover = shortest_cover([ex_a, ex_b, move], sorted(universe), limit=4)
+    check("shortest cover is the one move, not two exclusives", cover == [move])
+
+    shallow = Stack(
+        key=(("given", "ready"),),
+        holders_a=[],
+        holders_b=["src/git.py:parse"],
+        paths_a=[],
+        paths_b=["src/git.py"],
+        pin_a=None,
+        pin_b=("src/git.py", 3),
+    )
+    shallow.covers = ["src/git.py"]
+    deep = Stack(
+        key=(("given", "ready"), ("if", "x > 0")),
+        holders_a=[],
+        holders_b=["src/git.py:parse"],
+        paths_a=[],
+        paths_b=["src/git.py"],
+        pin_a=None,
+        pin_b=("src/git.py", 5),
+    )
+    deep.covers = ["src/git.py"]
+    body = shortest_cover([shallow, deep], ["src/git.py"], limit=2)
+    check("deeper body stack beats prefix given", body == [deep])
+
+    # Exclusive-A only: island stack survives a B-side flood without reservation.
+    river_key = (("if", "flow_score > 0.2"),)
+    river = Stack(
+        key=river_key,
+        holders_a=["src/river.py:bar"],
+        holders_b=[],
+        paths_a=["src/river.py"],
+        paths_b=[],
+        pin_a=("src/river.py", 2),
+        pin_b=None,
+    )
+    river.covers = ["src/river.py"]
+    flood: list[Stack] = []
+    only_b: list[str] = []
+    for i in range(8):
+        p = f"src/mod{i}.py"
+        only_b.append(p)
+        s = Stack(
+            key=(("if", f"unique_mod_{i} > 0"),),
+            holders_a=[],
+            holders_b=[f"{p}:fn"],
+            paths_a=[],
+            paths_b=[p],
+            pin_a=None,
+            pin_b=(p, 2),
+        )
+        s.covers = [p]
+        flood.append(s)
+    dead = dead_cover(
+        [river, *flood],
+        ["src/river.py"],
+        [],
+        limit=4,
+    )
+    check("dead cover keeps the island under --limit 4", any(s.key == river_key for s in dead))
+    check("dead cover ignores exclusive-B flood", all(s.true_on == "A" for s in dead))
+    check("dead cover size respects --limit", len(dead) <= 4)
+
+    else_spread = Stack(
+        key=(("else", ""),),
+        holders_a=["src/old.py:f"],
+        holders_b=["src/old.py:f", "src/mod0.py:fn"],
+        paths_a=["src/old.py"],
+        paths_b=["src/old.py", "src/mod0.py"],
+        pin_a=("src/old.py", 1),
+        pin_b=("src/mod0.py", 1),
+    )
+    check("bare else is junk", else_spread.junk)
+    check("bare else quality is last", else_spread.quality >= 5)
+    dead2 = dead_cover(
+        [river, else_spread, *flood, move],
+        ["src/river.py"],
+        ["src/old.py", "src/git.py", "src/parse.py"],
+        limit=4,
+    )
+    check(
+        "dead cover is exclusive-A only (no else, no B, no move)",
+        any(s.key == river_key for s in dead2)
+        and all(s.true_on == "A" for s in dead2)
+        and all(s.key != else_spread.key for s in dead2)
+        and all(s.role != "move" for s in dead2),
+    )
+
+    given_else = Stack(
+        key=(("given", "¬(app.flowScore>0.2)"), ("given", "¬(app.flowScore<-0.2)")),
+        holders_a=["src/river.py:dotColor"],
+        holders_b=[],
+        paths_a=["src/river.py"],
+        paths_b=[],
+        pin_a=("src/river.py", 8),
+        pin_b=None,
+    )
+    given_else.covers = ["src/river.py"]
+    if_arm = Stack(
+        key=(("if", "app.flowScore > 0.2"),),
+        holders_a=["src/river.py:barColor"],
+        holders_b=[],
+        paths_a=["src/river.py"],
+        paths_b=[],
+        pin_a=("src/river.py", 4),
+        pin_b=None,
+    )
+    if_arm.covers = ["src/river.py"]
+    window = Stack(
+        key=(("if", "w = window"),),
+        holders_a=["src/river.py:show"],
+        holders_b=[],
+        paths_a=["src/river.py"],
+        paths_b=[],
+        pin_a=("src/river.py", 12),
+        pin_b=None,
+    )
+    window.covers = ["src/river.py"]
+    prefix = Stack(
+        key=(("given", "¬(app.flowScore>0.2)"),),
+        holders_a=["src/river.py:dotColor"],
+        holders_b=[],
+        paths_a=["src/river.py"],
+        paths_b=[],
+        pin_a=("src/river.py", 7),
+        pin_b=None,
+    )
+    prefix.covers = ["src/river.py"]
+    dead3 = dead_cover(
+        [given_else, if_arm, window, prefix],
+        ["src/river.py"],
+        [],
+        limit=3,
+    )
+    check("dead cover prefers if-arm flowScore over given-negation else", dead3[0].key == if_arm.key)
+    check(
+        "dead cover suppresses prefix of a chosen deeper stack",
+        all(s.key != prefix.key for s in dead3),
+    )
+    check(
+        "dead cover extra stacks on the island stay name-like",
+        all(_pred_name_like(s) for s in dead3),
+    )
+
+    tick = Stack(
+        key=(("switch", "current"), ("case", ".flow"), ("if", "idle<thresholds.t1")),
+        holders_a=["src/core.py:tick"],
+        holders_b=[],
+        paths_a=["src/core.py"],
+        paths_b=[],
+        pin_a=("src/core.py", 40),
+        pin_b=None,
+    )
+    tick.covers = ["src/core.py"]
+    dead4 = dead_cover(
+        [if_arm, tick],
+        ["src/river.py"],
+        ["src/core.py"],
+        limit=6,
+    )
+    check("default leftover ignores surviving-file exclusive-A", all(s.key != tick.key for s in dead4))
+    check("default leftover still names the deleted file", any(s.key == if_arm.key for s in dead4))
+    dead5 = dead_cover(
+        [if_arm, tick],
+        ["src/river.py"],
+        ["src/core.py"],
+        limit=6,
+        also_changed=True,
+    )
+    check("--also-changed includes surviving-file exclusive-A", any(s.key == tick.key for s in dead5))
+
+    ghost = classify_era(
+        value=True,
+        split="holders",
+        holders=["tests/test_app.py:test_process"],
+        added=[],
+        dropped=["src/app.py:process"],
+    )
+    check("production→tests is ghost", ghost == "ghost")
+    deeper = (("given", "enabled"), ("given", "ready"), ("if", "x > 0"))
+    check("extra guard is deeper", relate_keys(deeper, key) == "deeper")
+
+    samples = [
+        Sample("a" * 40, 1, "2026-01-01", "t0", "commit"),
+        Sample("b" * 40, 2, "2026-01-02", "t1", "commit"),
+        Sample("c" * 40, 3, "2026-01-03", "t2", "commit"),
+    ]
+    values = [True, True, True]
+    wits = [
+        ["src/git.py:parse"],
+        ["src/git.py:parse"],
+        ["src/parse.py:parse"],
+    ]
+    eras = compress(samples, values, wits, split_holders=True)
+    check("holder move splits TRUE", len(eras) == 2 and all(e.value for e in eras))
+    check("second era is move", eras[1].kind == "move")
+    bool_eras = compress(samples, values, wits, split_holders=False)
+    check("--boolean hides the move", len(bool_eras) == 1)
+
+    if fails:
+        print(f"selftest FAIL={fails}", file=sys.stderr)
+        return 1
+    print("selftest ok")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.selftest:
+        return selftest()
+    try:
+        if not args.a or not args.b:
+            raise WaneError("usage: wane A B")
+        repo = resolve_repo(args.repo)
+        side_a = resolve_side(repo, args.a)
+        side_b = resolve_side(repo, args.b)
+        pathspecs = list(args.paths)
+        tree_a = load_tree(repo, side_a, pathspecs)
+        tree_b = load_tree(repo, side_b, pathspecs)
+
+        if tree_a.paths == tree_b.paths and all(
+            tree_a.paths[p] == tree_b.paths.get(p) for p in tree_a.paths
+        ):
+            if not args.quiet:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "repo": repo,
+                                "a": _side_json(side_a),
+                                "b": _side_json(side_b),
+                                "identical": True,
+                                "wane": [],
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    eprint(f"wane: {side_a.short} and {side_b.short} are identical")
+            return 1
+
+        only_a = sorted(p for p in tree_a.paths if p not in tree_b.paths)
+        only_b = sorted(p for p in tree_b.paths if p not in tree_a.paths)
+        changed = sorted(
+            p
+            for p in tree_a.paths
+            if p in tree_b.paths and tree_a.paths[p] != tree_b.paths[p]
+        )
+        same = len(tree_a.paths) - len(only_a) - len(changed)
+        delta = {
+            "deleted": len(only_a),
+            "added": len(only_b),
+            "changed": len(changed),
+            "same": same,
+        }
+        universe = {p for p in (only_a + only_b + changed) if is_source_path(p)}
+
+        grain = args.grain
+        with_fn = bool(args.with_fn)
+        stacks_a = discover_tree_stacks(tree_a, grain=grain, with_fn=with_fn)
+        stacks_b = discover_tree_stacks(tree_b, grain=grain, with_fn=with_fn)
+        distinguishing = merge_stacks(stacks_a, stacks_b, universe)
+        lim = args.limit if args.limit >= 0 else 8
+        covering = dead_cover(
+            distinguishing, only_a, changed, limit=lim, also_changed=args.also_changed
+        )
+        covered: set[str] = set()
+        for s in covering:
+            covered.update(s.covers)
+        # Unexplained deaths: exclusive-A files with no named dead stack.
+        # Born-only and AB leftovers are out of wane's universe on purpose.
+        unexplained = [p for p in sorted(only_a) if is_source_path(p) and p not in covered]
+        non_source = [
+            p
+            for p in only_a
+            if not is_source_path(p) and not skip_token_path(p)
+        ]
+
+        force_full: bool | None = True if args.full else None
+        walks: list[dict] = []
+        if not args.no_walks:
+            walks = build_walks(
+                repo,
+                side_a,
+                side_b,
+                covering,
+                force_full=force_full,
+            )
+
+        occupies: list[OccupyReport | None] = [None] * len(covering)
+        if not args.no_occupy and covering and (side_a.kind == "commit" or side_b.kind == "commit"):
+            tip = _walk_tip(side_a, side_b)
+            adjacent = _adjacent_commits(repo, side_a, side_b)
+            now = bool(args.now) or side_a.kind == "worktree" or side_b.kind == "worktree"
+            sample_cache: dict[tuple[bool, int | None], list[Sample]] = {}
+            for i, stack in enumerate(covering):
+                full = (
+                    True
+                    if force_full is True
+                    else (
+                        False
+                        if force_full is False
+                        else needs_full_walk(repo, side_a, side_b, stack)
+                    )
+                )
+                occ_limit = args.occupy_limit
+                if occ_limit is None and adjacent and not full:
+                    occ_limit = 12
+                cache_key = (not full, occ_limit)
+                if cache_key not in sample_cache:
+                    if tip is None:
+                        sample_cache[cache_key] = []
+                    else:
+                        sample_cache[cache_key] = list_samples(
+                            repo,
+                            end_rev=tip.sha,
+                            first_parent=not full,
+                            limit=occ_limit,
+                        )
+                samples = list(sample_cache[cache_key])
+                if now:
+                    samples = list(samples) + [worktree_sample(repo)]
+                if not samples:
+                    continue
+                occupies[i] = occupy_stack(
+                    repo,
+                    stack,
+                    samples=samples,
+                    grain=grain,
+                    with_fn=with_fn,
+                    split_holders=not args.boolean,
+                    end_rev=tip.sha if tip else "",
+                    first_parent=not full,
+                )
+
+        if not args.quiet:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "repo": repo,
+                            "a": _side_json(side_a),
+                            "b": _side_json(side_b),
+                            "identical": False,
+                            "delta": {
+                                **delta,
+                                "paths": {
+                                    "only_a": only_a,
+                                    "only_b": only_b,
+                                    "changed": changed,
+                                },
+                            },
+                            "wane": [
+                                stack_to_json(s, o) for s, o in zip(covering, occupies)
+                            ],
+                            "walks": walks,
+                            "unexplained": unexplained,
+                            "non_source": non_source,
+                            "discovered": len(distinguishing),
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            elif args.walks:
+                text = "\n".join(item["line"] for item in walks)
+                if text:
+                    print(text)
+            elif args.oneline:
+                text = format_oneline(covering)
+                if text:
+                    print(text)
+            else:
+                print(
+                    format_human(
+                        repo=repo,
+                        a=side_a,
+                        b=side_b,
+                        delta=delta,
+                        covering=covering,
+                        unexplained=unexplained + non_source[:8],
+                        walks=[] if args.no_walks else walks,
+                        occupies=occupies,
+                        color=color_enabled(args),
+                    )
+                )
+        return 0
+    except WaneError as exc:
+        eprint(f"wane: {exc}")
+        return exc.code
+    except KeyboardInterrupt:
+        eprint("wane: interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

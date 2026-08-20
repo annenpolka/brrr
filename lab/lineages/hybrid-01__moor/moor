@@ -1,0 +1,2318 @@
+#!/usr/bin/env python3
+"""moor — bind a log instance to a current locator and a source hole.
+
+A CI/compiler log is an *instance*: interpolated values plugged into a
+format template, observed at a file:line that may already be stale.
+slip relocates addresses. unfmt/sluice invert strings against templates.
+moor is the joint verb: re-bind the instance against two snapshots in
+one pass so the locator and the hole assignment corroborate.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "vendor",
+    ".idea",
+    ".next",
+    "coverage",
+    "Pods",
+    ".build",
+    "DerivedData",
+    "zig-out",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".turbo",
+    "out",
+    "bin",
+    ".cargo",
+}
+SKIP_SUFFIXES = {
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".lock",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".wasm",
+    ".so",
+    ".dylib",
+    ".a",
+    ".o",
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".jar",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".bin",
+    ".exe",
+    ".dll",
+    ".pdb",
+    ".svg",
+    ".rlib",
+    ".rmeta",
+    ".tar",
+}
+SOURCE_EXTS = {
+    ".rs": "rust",
+    ".ts": "js",
+    ".tsx": "js",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".py": "py",
+    ".pyi": "py",
+    ".go": "go",
+    ".swift": "swift",
+    ".c": "c",
+    ".h": "c",
+    ".hh": "c",
+    ".cc": "c",
+    ".cpp": "c",
+    ".cxx": "c",
+    ".hpp": "c",
+    ".java": "java",
+    ".kt": "kt",
+    ".kts": "kt",
+    ".rb": "rb",
+    ".cs": "cs",
+    ".zig": "zig",
+    ".sh": "sh",
+    ".bash": "sh",
+    ".zsh": "sh",
+}
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PY_TB_RE = re.compile(
+    r"""File\s+(?P<q>["'])(?P<path>.*?)(?P=q),\s+line\s+(?P<line>\d+)""",
+    re.IGNORECASE,
+)
+COLON_NUM_RE = re.compile(r":(\d+)(?::(\d+))?")
+EXC_RE = re.compile(
+    r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Panic|Failure)):\s+(.*)$"
+)
+ERROR_START_RE = re.compile(r"^(?:error|warning|note)(?:\[[^\]]+\])?:", re.I)
+PANIC_AT_RE = re.compile(
+    r"panicked at (?:(?P<q>['\"])(?P<p1>.*?)(?P=q) )?(?P<path>\S+):(?P<line>\d+)(?::(?P<col>\d+))?:?\s*$"
+)
+STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "class", "const", "crate",
+    "def", "else", "enum", "false", "fn", "for", "from", "func", "function",
+    "i", "if", "impl", "import", "in", "int", "let", "mod", "mut", "n",
+    "none", "not", "of", "or", "pub", "return", "self", "static", "str",
+    "struct", "t", "the", "this", "to", "true", "type", "use", "var",
+    "void", "where", "with",
+}
+TRIVIAL_NORMS = {
+    "", "{", "}", "};", "[", "]", "(", ")", "else", "else:", "pass",
+    "break", "continue", "end", "end;", "//", "#", "*/", "/*",
+}
+W_LINE = 0.44
+W_TOK = 0.22
+W_NEI = 0.20
+W_PATH = 0.14
+RESOLVE_THRESHOLD = 0.48
+CANDIDATE_CAP = 400
+MAX_FILE_BYTES = 1_000_000
+MAX_TEMPLATE_FILE_BYTES = 2_000_000
+MIN_STATIC_EXACT = 4
+MIN_STATIC_PREFIX = 10
+MIN_STATIC_INFIX = 16
+MIN_STATIC_HOLE = 6
+DEFAULT_MIN_SCORE = 0.34
+MAX_NOHOLE_CHARS = 280
+SWIFT_CONTINUATION_RE = re.compile(r"\\[ \t]*\n[ \t]*")
+TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|specs?|__tests__|__mocks__)(?:/|$)|"
+    r"\.(?:test|spec)\.|_test\.|_tests\.|Tests/",
+    re.I,
+)
+DATA_LITERAL_RE = re.compile(r"""^\s*[{\[]\s*(?:"|\{|\[|\d)""")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+PRINTF_RE = re.compile(
+    r"%(?:%|[-+0 #]*\d*(?:\.\d+)?(?:hh|h|ll|l|z|j|t|L)?[sdifugGxXeEpc@voOqTwWcS])"
+)
+SKIP_STDIN_RE = re.compile(
+    r"""(?x)
+    ^\s*$
+    |^(Compiling|Checking|Finished|Running|Downloading|Downloaded|
+       Installing|Updating|Fetching|Resolving|Auditing)\b
+    |^test\ result:
+    |^running\ \d+\ tests
+    |^\s*test\ .*\ \.\.\.\ (ok|ignored|FAILED)?
+    |^\[created\ [^\]]+\]\s*$
+    """
+)
+# Compiler diagnostics name an identifier; that name is a hole if it
+# lives on the (slipped or already-current) dest line.
+DIAG_HOLE_RES = [
+    (re.compile(r"no method named [`']?([A-Za-z_][A-Za-z0-9_]*)[`']?", re.I), "no method named {}"),
+    (re.compile(r"cannot find (?:value|type|function|method|`?[A-Za-z_]+`?) [`']?([A-Za-z_][A-Za-z0-9_]*)[`']? in this scope", re.I), "cannot find {} in this scope"),
+    (re.compile(r"use of undeclared (?:type|identifier) [`']?([A-Za-z_][A-Za-z0-9_]*)[`']?", re.I), "use of undeclared {}"),
+    (re.compile(r"unresolved import [`']([^`']+)[`']", re.I), "unresolved import {}"),
+    (re.compile(r"no value named [`']?([A-Za-z_][A-Za-z0-9_]*)[`']?", re.I), "no value named {}"),
+]
+
+
+LOG_PREFIX_RES = [
+    re.compile(r"^(?:\x1b\[[0-9;]*m)+"),
+    re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+"),
+    re.compile(r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*"),
+    re.compile(
+        r"^(?:INFO|WARN|WARNING|ERROR|DEBUG|TRACE|FATAL|Info|Error|Debug|Warning)"
+        r"(?:\s+\[[^\]]+\])?[:\s]+"
+    ),
+    re.compile(r"^[A-Za-z0-9_.-]+\[\d+\]:\s+"),
+    re.compile(r"^(?:error|warning|note|help|fail|failed):\s+", re.I),
+]
+
+
+@dataclass
+class Locator:
+    path: str
+    line: int
+    col: Optional[int] = None
+    ref: Optional[str] = None
+    span: Optional[tuple[int, int]] = None
+    form: str = "colon"
+    quote: str = '"'
+
+
+@dataclass
+class Resolution:
+    locator: Locator
+    status: str
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    score: float = 0.0
+    note: str = ""
+    dest_text: str = ""
+
+
+@dataclass(frozen=True)
+class Template:
+    path: str
+    line: int
+    col: int
+    lang: str
+    raw: str
+    parts: tuple[str, ...]
+    holes: tuple[str, ...]
+
+    @property
+    def n_holes(self) -> int:
+        return len(self.holes)
+
+    @property
+    def static_len(self) -> int:
+        return sum(len(p) for p in self.parts)
+
+    @property
+    def display(self) -> str:
+        out: list[str] = []
+        for i, p in enumerate(self.parts):
+            if i:
+                name = self.holes[i - 1] if i - 1 < len(self.holes) else ""
+                out.append("{}" if name.isdigit() else "{" + name + "}")
+            out.append(p.replace("\n", "\\n").replace("\t", "\\t"))
+        return "".join(out)
+
+
+@dataclass
+class THit:
+    template: Template
+    score: float
+    variant: str
+    prefix: str
+    suffix: str
+    values: tuple[str, ...]
+
+
+@dataclass
+class Binding:
+    status: str  # bound | relocated | matched | deleted | miss
+    from_path: Optional[str] = None
+    from_line: Optional[int] = None
+    dest_path: Optional[str] = None
+    dest_line: Optional[int] = None
+    dest_col: Optional[int] = None
+    slip_status: str = ""
+    slip_score: float = 0.0
+    tmpl: Optional[Template] = None
+    match_score: float = 0.0
+    joint_score: float = 0.0
+    via: str = ""
+    values: tuple[str, ...] = ()
+    message: str = ""
+    note: str = ""
+    resolutions: list[Resolution] = field(default_factory=list)
+
+
+@dataclass
+class LogRecord:
+    lines: list[str]
+    start: int
+    locators: list[Locator] = field(default_factory=list)
+    message: str = ""
+
+
+@dataclass
+class Snapshot:
+    label: str
+    files: dict[str, list[str]]
+    by_norm: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    by_token: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    token_df: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    paths: tuple[str, ...] = ()
+    templates: list[Template] = field(default_factory=list)
+    templates_by_path: dict[str, list[Template]] = field(default_factory=lambda: defaultdict(list))
+
+    def index(self) -> None:
+        self.by_norm.clear()
+        self.by_token.clear()
+        self.token_df.clear()
+        seen_token_file: dict[str, set[str]] = defaultdict(set)
+        for path, lines in self.files.items():
+            for i, raw in enumerate(lines, start=1):
+                n = normalize(raw)
+                if n not in TRIVIAL_NORMS:
+                    self.by_norm[n].append((path, i))
+                for tok in tokens(raw):
+                    self.by_token[tok].append((path, i))
+                    seen_token_file[tok].add(path)
+        for tok, files in seen_token_file.items():
+            self.token_df[tok] = len(files)
+        self.paths = tuple(sorted(self.files.keys(), key=lambda p: len(p), reverse=True))
+
+    def extract_templates(self) -> None:
+        self.templates = []
+        self.templates_by_path = defaultdict(list)
+        for path, lines in self.files.items():
+            lang = lang_for(path)
+            if not lang:
+                continue
+            text = "\n".join(lines)
+            if not text:
+                continue
+            found = extract_templates(text, lang, path)
+            if found:
+                self.templates.extend(found)
+                self.templates_by_path[path].extend(found)
+
+
+# ---------------------------------------------------------------------------
+# snapshot I/O
+# ---------------------------------------------------------------------------
+
+def git(root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def git_ok(root: Path, args: list[str]) -> Optional[str]:
+    try:
+        cp = git(root, args, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return cp.stdout.decode("utf-8", "surrogateescape")
+
+
+def discover_repo(start: Path) -> Optional[Path]:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return None
+
+
+def posix_rel(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def should_skip_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    if any(part in SKIP_DIRS for part in parts):
+        return True
+    lower = path.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def normalize(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def tokens(line: str) -> list[str]:
+    out = []
+    for m in IDENT_RE.findall(line):
+        if m.lower() in STOPWORDS or len(m) < 2:
+            continue
+        out.append(m)
+    return out
+
+
+def decode_bytes(data: bytes) -> Optional[str]:
+    if b"\x00" in data[:4096]:
+        return None
+    if len(data) > MAX_TEMPLATE_FILE_BYTES:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def split_lines(text: str) -> list[str]:
+    if text == "":
+        return []
+    return text.splitlines()
+
+
+def lang_for(path: str | Path, default: str | None = None) -> str | None:
+    suf = Path(str(path)).suffix.lower()
+    return SOURCE_EXTS.get(suf, default)
+
+
+def is_test_path(path: str) -> bool:
+    return bool(TEST_PATH_RE.search(path.replace("\\", "/")))
+
+
+def walk_dir_files(root: Path) -> Iterator[str]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if should_skip_path(rel):
+                continue
+            yield rel
+
+
+def read_dir_file(root: Path, path: str) -> Optional[list[str]]:
+    fp = root / path
+    try:
+        data = fp.read_bytes()
+    except OSError:
+        return None
+    text = decode_bytes(data)
+    if text is None:
+        return None
+    return split_lines(text)
+
+
+def load_git_archive(root: Path, ref: str) -> dict[str, list[str]]:
+    files: dict[str, list[str]] = {}
+    try:
+        cp = git(root, ["archive", "--format=tar", ref], check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return files
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(cp.stdout), mode="r:")
+    except tarfile.TarError:
+        return files
+    for m in tf.getmembers():
+        if not m.isfile():
+            continue
+        path = posix_rel(m.name)
+        if should_skip_path(path):
+            continue
+        f = tf.extractfile(m)
+        if f is None:
+            continue
+        data = f.read()
+        if m.size > MAX_TEMPLATE_FILE_BYTES:
+            continue
+        text = decode_bytes(data)
+        if text is None:
+            continue
+        files[path] = split_lines(text)
+    return files
+
+
+def load_worktree_files(root: Path, untracked: bool) -> dict[str, list[str]]:
+    files: dict[str, list[str]] = {}
+    raw = git_ok(root, ["ls-files", "-z"]) or ""
+    paths = [posix_rel(p) for p in raw.split("\0") if p and not should_skip_path(p)]
+    if untracked:
+        extra = git_ok(root, ["ls-files", "-o", "--exclude-standard", "-z"]) or ""
+        for p in extra.split("\0"):
+            if p and not should_skip_path(p):
+                paths.append(posix_rel(p))
+    for path in paths:
+        fp = root / path
+        try:
+            data = fp.read_bytes()
+        except OSError:
+            continue
+        text = decode_bytes(data)
+        if text is None:
+            continue
+        files[path] = split_lines(text)
+    return files
+
+
+def load_snapshot(
+    *,
+    git_root: Optional[Path],
+    ref: Optional[str],
+    directory: Optional[Path],
+    untracked: bool,
+    label: str,
+) -> Snapshot:
+    files: dict[str, list[str]] = {}
+    if directory is not None:
+        for path in walk_dir_files(directory):
+            lines = read_dir_file(directory, path)
+            if lines is not None:
+                files[path] = lines
+    elif git_root is None:
+        raise SystemExit("moor: not a git repository (use --repo or --from-dir/--to-dir)")
+    elif ref is None:
+        files = load_worktree_files(git_root, untracked=untracked)
+    else:
+        files = load_git_archive(git_root, ref)
+    snap = Snapshot(label=label, files=files)
+    snap.index()
+    snap.extract_templates()
+    return snap
+
+
+def rename_map(root: Path, src_ref: Optional[str], dst_ref: Optional[str]) -> dict[str, str]:
+    if src_ref is None or dst_ref is None:
+        return {}
+    raw = git_ok(root, ["diff", "-M", "-C", "--name-status", "--diff-filter=R", src_ref, dst_ref])
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0].startswith("R"):
+            out[posix_rel(parts[1])] = posix_rel(parts[2])
+    return out
+
+
+def resolve_ref(root: Path, ref: str) -> Optional[str]:
+    raw = git_ok(root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    if raw is None:
+        raw = git_ok(root, ["rev-parse", "--verify", "--quiet", ref])
+    if raw is None:
+        return None
+    return raw.strip()
+
+
+# ---------------------------------------------------------------------------
+# locators
+# ---------------------------------------------------------------------------
+
+def bind_path(raw: str, known: Iterable[str]) -> Optional[str]:
+    p = raw.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = posix_rel(p)
+    known_set = known if isinstance(known, set) else set(known)
+    if p in known_set:
+        return p
+    best = None
+    for kp in known_set:
+        if p.endswith("/" + kp):
+            if best is None or len(kp) > len(best):
+                best = kp
+    return best
+
+
+def _boundary_ok(text: str, start: int, end: int) -> bool:
+    if start > 0 and text[start - 1] not in "/\\\"'({[< \t,:":
+        if text[start - 1].isalnum() or text[start - 1] in "._-":
+            return False
+    if end < len(text) and (text[end].isalnum() or text[end] in "._-"):
+        return False
+    return True
+
+
+def find_stdin_locators(text: str, known: Iterable[str]) -> list[Locator]:
+    known_list = list(known)
+    occupied: list[tuple[int, int]] = []
+    found: list[Locator] = []
+
+    def take(span: tuple[int, int]) -> bool:
+        s, e = span
+        for os_, oe in occupied:
+            if not (e <= os_ or s >= oe):
+                return False
+        occupied.append(span)
+        return True
+
+    for m in PY_TB_RE.finditer(text):
+        bound = bind_path(m.group("path"), known_list)
+        if not bound:
+            continue
+        span = (m.start(), m.end())
+        if not take(span):
+            continue
+        found.append(
+            Locator(
+                path=bound,
+                line=int(m.group("line")),
+                span=span,
+                form="python",
+                quote=m.group("q"),
+            )
+        )
+
+    for path in known_list:
+        if not path:
+            continue
+        start = 0
+        while True:
+            i = text.find(path, start)
+            if i < 0:
+                break
+            j = i + len(path)
+            start = i + 1
+            if not _boundary_ok(text, i, j):
+                continue
+            m = COLON_NUM_RE.match(text, j)
+            if not m:
+                continue
+            span = (i, m.end())
+            if not take(span):
+                continue
+            col = int(m.group(2)) if m.group(2) else None
+            found.append(
+                Locator(path=path, line=int(m.group(1)), col=col, span=span, form="colon")
+            )
+
+    found.sort(key=lambda loc: loc.span[0] if loc.span else 0)
+    return found
+
+
+def parse_arg_locator(text: str, git_root: Optional[Path], known: Iterable[str]) -> Locator:
+    m = re.search(r":(\d+)(?::(\d+))?$", text)
+    if not m:
+        raise SystemExit(f"moor: not a location (expected path:line): {text}")
+    line = int(m.group(1))
+    col = int(m.group(2)) if m.group(2) else None
+    rest = text[: m.start()]
+    known_set = set(known or ())
+    bound = bind_path(rest, known_set) if known_set else None
+    path = bound or posix_rel(rest)
+    ref = None
+    if not bound and ":" in rest and git_root is not None:
+        best = None
+        for i, ch in enumerate(rest):
+            if ch != ":":
+                continue
+            left, right = rest[:i], rest[i + 1 :]
+            if not left or not right:
+                continue
+            if not resolve_ref(git_root, left):
+                continue
+            b = bind_path(right, known_set) if known_set else None
+            score = 2 if b else 1
+            cand = b or posix_rel(right)
+            if best is None or score >= best[0]:
+                best = (score, left, cand)
+        if best:
+            ref, path = best[1], best[2]
+    if not path:
+        raise SystemExit(f"moor: missing path in {text}")
+    return Locator(path=path, line=line, col=col, ref=ref)
+
+
+# ---------------------------------------------------------------------------
+# fingerprint relocate (slip kernel)
+# ---------------------------------------------------------------------------
+
+def path_score(src: str, dst: str) -> float:
+    if src == dst:
+        return 1.0
+    s_parts = src.split("/")
+    d_parts = dst.split("/")
+    s_base = s_parts[-1]
+    d_base = d_parts[-1]
+    score = 0.0
+    if s_base == d_base:
+        score += 0.55
+    s_stem, s_ext = os.path.splitext(src)
+    if dst.startswith(s_stem + "/") or f"/{os.path.basename(s_stem)}/" in f"/{dst}":
+        score += 0.35
+    if s_ext and s_ext == os.path.splitext(dst)[1]:
+        score += 0.05
+    s_set, d_set = set(s_parts[:-1]), set(d_parts[:-1])
+    if s_set and d_set:
+        score += 0.15 * len(s_set & d_set) / len(s_set | d_set)
+    return min(1.0, score)
+
+
+def neighbor_score(src_lines: list[str], src_i: int, dst_lines: list[str], dst_i: int, ctx: int) -> float:
+    if ctx <= 0:
+        return 0.0
+    hits = 0
+    total = 0
+    for delta in range(-ctx, ctx + 1):
+        if delta == 0:
+            continue
+        sj = src_i + delta
+        if sj < 1 or sj > len(src_lines):
+            continue
+        sn = normalize(src_lines[sj - 1])
+        if sn in TRIVIAL_NORMS:
+            continue
+        total += 1
+        lo = max(1, dst_i - ctx)
+        hi = min(len(dst_lines), dst_i + ctx)
+        window = {normalize(dst_lines[k - 1]) for k in range(lo, hi + 1) if k != dst_i}
+        if sn in window:
+            hits += 1
+    if total == 0:
+        return 0.0
+    return hits / total
+
+
+def line_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return 0.97
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def token_score(a: str, b: str) -> float:
+    ta, tb = set(tokens(a)), set(tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def score_pair(
+    src_path: str,
+    src_lines: list[str],
+    src_i: int,
+    dst_path: str,
+    dst_lines: list[str],
+    dst_i: int,
+    ctx: int,
+) -> float:
+    sraw = src_lines[src_i - 1]
+    draw = dst_lines[dst_i - 1]
+    ns = neighbor_score(src_lines, src_i, dst_lines, dst_i, ctx)
+    ps = path_score(src_path, dst_path)
+    if sraw == draw:
+        return min(1.0, 0.75 + 0.25 * ps + 0.05 * ns)
+    if normalize(sraw) == normalize(draw):
+        return min(1.0, 0.68 + 0.25 * ps + 0.07 * ns)
+    lr = line_ratio(sraw, draw)
+    ts = token_score(sraw, draw)
+    return W_LINE * lr + W_TOK * ts + W_NEI * ns + W_PATH * ps
+
+
+def candidates_for(
+    src_path: str, src_lines: list[str], src_i: int, dst: Snapshot, renamed_to: Optional[str]
+) -> list[tuple[str, int]]:
+    raw = src_lines[src_i - 1]
+    n = normalize(raw)
+    toks = tokens(raw)
+    found: dict[tuple[str, int], None] = {}
+
+    def add(path: str, line: int) -> None:
+        found[(path, line)] = None
+
+    if n not in TRIVIAL_NORMS:
+        for path, line in dst.by_norm.get(n, ()):
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    ranked = sorted(set(toks), key=lambda t: (dst.token_df.get(t, 10**9), -len(t)))
+    for tok in ranked[:4]:
+        locs = dst.by_token.get(tok, ())
+        if len(locs) > 800:
+            continue
+        for path, line in locs:
+            add(path, line)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    preferred_paths = []
+    if src_path in dst.files:
+        preferred_paths.append(src_path)
+    if renamed_to and renamed_to in dst.files:
+        preferred_paths.append(renamed_to)
+    stem = os.path.splitext(src_path)[0]
+    for p in dst.files:
+        if p.startswith(stem + "/") or p.endswith("/" + os.path.basename(src_path)):
+            preferred_paths.append(p)
+    for p in preferred_paths:
+        lines = dst.files.get(p) or []
+        for i, _ in enumerate(lines, start=1):
+            add(p, i)
+            if len(found) >= CANDIDATE_CAP:
+                return list(found)
+    return list(found)
+
+
+def classify(src_path: str, src_raw: str, dst_path: Optional[str], dst_raw: str, score: float) -> str:
+    if dst_path is None or score < RESOLVE_THRESHOLD:
+        return "deleted"
+    if src_path == dst_path and normalize(src_raw) == normalize(dst_raw):
+        return "same"
+    if normalize(src_raw) == normalize(dst_raw) or line_ratio(src_raw, dst_raw) >= 0.96:
+        return "moved" if src_path != dst_path else "same"
+    return "edited"
+
+
+def union_paths(src: Snapshot, dst: Snapshot) -> tuple[str, ...]:
+    return tuple(sorted(set(src.paths) | set(dst.paths), key=lambda p: len(p), reverse=True))
+
+
+def resolve_locator(
+    loc: Locator,
+    src: Snapshot,
+    dst: Snapshot,
+    ctx: int,
+    renames: dict[str, str],
+) -> Resolution:
+    src_lines = src.files.get(loc.path)
+    if src_lines is None:
+        hits = [p for p in src.files if p == loc.path or p.endswith("/" + loc.path)]
+        if len(hits) == 1:
+            loc.path = hits[0]
+            src_lines = src.files[loc.path]
+        elif hits:
+            return Resolution(locator=loc, status="unresolved", note="source path ambiguous")
+        else:
+            # Already-current dest path (mixed old/new logs against --from old).
+            dlines = dst.files.get(loc.path)
+            if dlines is None:
+                dhits = [p for p in dst.files if p == loc.path or p.endswith("/" + loc.path)]
+                if len(dhits) == 1:
+                    loc.path = dhits[0]
+                    dlines = dst.files[loc.path]
+            if dlines is not None and 1 <= loc.line <= len(dlines):
+                return Resolution(
+                    locator=loc,
+                    status="same",
+                    dest_path=loc.path,
+                    dest_line=loc.line,
+                    score=1.0,
+                    note="already in dest snapshot",
+                    dest_text=dlines[loc.line - 1],
+                )
+            return Resolution(locator=loc, status="unresolved", note="source path not in from-snapshot")
+    if loc.line < 1 or loc.line > len(src_lines):
+        return Resolution(
+            locator=loc,
+            status="unresolved",
+            note=f"line {loc.line} out of range (file has {len(src_lines)} lines)",
+        )
+    src_raw = src_lines[loc.line - 1]
+    if normalize(src_raw) in TRIVIAL_NORMS:
+        return Resolution(locator=loc, status="unresolved", note="line is too trivial to fingerprint")
+
+    renamed_to = renames.get(loc.path)
+    cands = candidates_for(loc.path, src_lines, loc.line, dst, renamed_to)
+    best: Optional[tuple[float, str, int, str]] = None
+    for dpath, dline in cands:
+        dlines = dst.files.get(dpath)
+        if not dlines or dline < 1 or dline > len(dlines):
+            continue
+        sc = score_pair(loc.path, src_lines, loc.line, dpath, dlines, dline, ctx)
+        if best is None or sc > best[0]:
+            best = (sc, dpath, dline, dlines[dline - 1])
+    if best is None:
+        return Resolution(locator=loc, status="deleted", score=0.0, note="no candidates")
+    sc, dpath, dline, draw = best
+    status = classify(loc.path, src_raw, dpath, draw, sc)
+    note = ""
+    if status == "edited":
+        note = "line text drifted"
+    elif status == "moved":
+        note = "path or surrounding file changed"
+    elif status == "deleted":
+        note = "best candidate below threshold"
+    return Resolution(
+        locator=loc,
+        status=status,
+        dest_path=dpath if status != "deleted" else None,
+        dest_line=dline if status != "deleted" else None,
+        score=sc,
+        note=note,
+        dest_text=draw,
+    )
+
+
+def replacement_text(res: Resolution) -> Optional[str]:
+    if res.status in {"deleted", "unresolved"}:
+        return None
+    if res.dest_path is None or res.dest_line is None:
+        return None
+    loc = res.locator
+    if loc.form == "python":
+        q = loc.quote or '"'
+        return f"File {q}{res.dest_path}{q}, line {res.dest_line}"
+    col = f":{loc.col}" if loc.col is not None else ""
+    return f"{res.dest_path}:{res.dest_line}{col}"
+
+
+def rewrite_line(text: str, resolutions: list[Resolution]) -> str:
+    items = [res for res in resolutions if res.locator.span is not None]
+    items.sort(key=lambda r: r.locator.span[0], reverse=True)
+    out = text
+    for res in items:
+        start, end = res.locator.span  # type: ignore[misc]
+        new = replacement_text(res)
+        if not new:
+            continue
+        out = out[:start] + new + out[end:]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# inverse printf (unfmt kernel) + hole binding
+# ---------------------------------------------------------------------------
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def normalize_query(s: str) -> str:
+    s = strip_ansi(s).replace("\r\n", "\n").replace("\r", "\n").strip()
+    changed = True
+    while changed and s:
+        changed = False
+        for rx in LOG_PREFIX_RES:
+            n = rx.sub("", s)
+            if n != s:
+                s = n.lstrip()
+                changed = True
+    return s
+
+
+def query_variants(q: str) -> list[tuple[str, float, str]]:
+    q = normalize_query(q)
+    if not q:
+        return []
+    out = [(q, 0.0, "full")]
+    parts = re.split(r": ", q)
+    if len(parts) > 1:
+        for i in range(1, len(parts)):
+            suf = ": ".join(parts[i:])
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.04 * i, f"suffix:{i}"))
+    for sep, name in ((" — ", "emdash"), (" - ", "dash")):
+        if sep in q:
+            suf = q.split(sep, 1)[1]
+            if len(suf) >= MIN_STATIC_HOLE:
+                out.append((suf, 0.05, name))
+    seen: set[str] = set()
+    uniq = []
+    for item in out:
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        uniq.append(item)
+    return uniq
+
+
+def unescape_basic(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'", "`": "`"}
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "(":
+                out.append("\\(")
+                i += 2
+                continue
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "x" and i + 3 < n:
+                try:
+                    out.append(chr(int(s[i + 2 : i + 4], 16)))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _matching_brace(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch in {'"', "'"}:
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _matching_paren(s: str, open_at: int) -> int | None:
+    depth = 0
+    i = open_at
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch in {'"', "'"}:
+            q = ch
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    break
+                i += 1
+        i += 1
+    return None
+
+
+def _is_format_hole(s: str, i: int) -> tuple[int, str] | None:
+    if i >= len(s) or s[i] != "{":
+        return None
+    n = len(s)
+    j = i + 1
+    if j < n and s[j] in '{"[ \n\t':
+        return None
+    if j < n and s[j] == "}":
+        return j + 1, ""
+    if j < n and s[j].isdigit():
+        while j < n and s[j].isdigit():
+            j += 1
+    elif j < n and (s[j].isalpha() or s[j] == "_"):
+        while j < n and (s[j].isalnum() or s[j] in "_."):
+            j += 1
+    name = s[i + 1 : j]
+    if j < n and s[j] == ":":
+        k = s.find("}", j)
+        if k < 0:
+            return None
+        return k + 1, name
+    if j < n and s[j] == "}":
+        return j + 1, name
+    return None
+
+
+def swift_hole_name(inner: str) -> str:
+    inner = inner.strip()
+    if "," in inner:
+        inner = inner.split(",", 1)[0].strip()
+    return inner or "expr"
+
+
+def swift_string_value(raw: str) -> str:
+    s = SWIFT_CONTINUATION_RE.sub("", raw)
+    if "\n" not in s:
+        return s
+    if s.startswith("\n"):
+        s = s[1:]
+    lines = s.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty:
+        cut = min(len(ln) - len(ln.lstrip(" \t")) for ln in nonempty)
+        lines = [ln[cut:] if len(ln) >= cut else ln for ln in lines]
+    return "\n".join(lines).strip()
+
+
+def looks_like_data_literal(body: str, holes: int) -> bool:
+    if holes:
+        return False
+    s = body.strip()
+    if len(s) >= MAX_NOHOLE_CHARS:
+        return True
+    if DATA_LITERAL_RE.match(s) and (":" in s or "," in s):
+        return True
+    return False
+
+
+def tokenize_template(s: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    buf: list[str] = []
+    parts: list[str] = []
+    holes: list[str] = []
+    unnamed = 0
+    i = 0
+    n = len(s)
+
+    def flush() -> None:
+        parts.append("".join(buf))
+        buf.clear()
+
+    def next_unnamed() -> str:
+        nonlocal unnamed
+        name = str(unnamed)
+        unnamed += 1
+        return name
+
+    while i < n:
+        if s.startswith("{{", i):
+            buf.append("{")
+            i += 2
+            continue
+        if s.startswith("}}", i):
+            buf.append("}")
+            i += 2
+            continue
+        if s.startswith("%%", i):
+            buf.append("%")
+            i += 2
+            continue
+        if s.startswith("${", i):
+            end = _matching_brace(s, i + 1)
+            if end is not None:
+                flush()
+                inner = s[i + 2 : end]
+                holes.append(inner.strip() or next_unnamed())
+                i = end + 1
+                continue
+        if s.startswith("\\(", i):
+            end = _matching_paren(s, i + 1)
+            if end is not None:
+                flush()
+                inner = s[i + 2 : end]
+                holes.append(swift_hole_name(inner))
+                i = end + 1
+                continue
+        if s[i] == "{":
+            got = _is_format_hole(s, i)
+            if got is not None:
+                end, name = got
+                flush()
+                holes.append(name if name else next_unnamed())
+                i = end
+                continue
+        m = PRINTF_RE.match(s, i)
+        if m:
+            if m.group(0) == "%%":
+                buf.append("%")
+                i = m.end()
+                continue
+            flush()
+            holes.append(next_unnamed())
+            i = m.end()
+            continue
+        buf.append(s[i])
+        i += 1
+    flush()
+    return tuple(parts), tuple(holes)
+
+
+def _line_starts(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _linecol(starts: list[int], index: int) -> tuple[int, int]:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= index:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    line_idx = hi
+    return line_idx + 1, index - starts[line_idx] + 1
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] != "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    n = len(text)
+    i += 2
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        i += 1
+    return min(n, i + 2)
+
+
+def _read_quoted(text: str, i: int, quote: str) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    start = i
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1, text[start:i]
+        if ch == "\n" and quote != "`":
+            return None
+        i += 1
+    return None
+
+
+def _read_raw_hash(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    start = i
+    close = '"' + ("#" * hashes)
+    while i < n:
+        if text.startswith(close, i):
+            return i + len(close), text[start:i]
+        i += 1
+    return None
+
+
+def _read_triple(text: str, i: int, quote: str) -> tuple[int, str] | None:
+    delim = quote * 3
+    if not text.startswith(delim, i):
+        return None
+    i += 3
+    start = i
+    n = len(text)
+    while i + 2 < n:
+        if text.startswith(delim, i):
+            return i + 3, text[start:i]
+        i += 1
+    return None
+
+
+def _read_js_template(text: str, i: int) -> tuple[int, str] | None:
+    n = len(text)
+    i += 1
+    chunks: list[str] = []
+    last = i
+    depth_expr = 0
+    in_expr = False
+    while i < n:
+        ch = text[i]
+        if not in_expr:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                chunks.append(text[last:i])
+                return i + 1, "".join(chunks)
+            if ch == "$" and i + 1 < n and text[i + 1] == "{":
+                chunks.append(text[last:i])
+                chunks.append("${")
+                i += 2
+                last = i
+                in_expr = True
+                depth_expr = 1
+                continue
+            i += 1
+            continue
+        if ch == "{":
+            depth_expr += 1
+        elif ch == "}":
+            depth_expr -= 1
+            if depth_expr == 0:
+                chunks.append(text[last:i])
+                chunks.append("}")
+                i += 1
+                last = i
+                in_expr = False
+                continue
+        elif ch in {'"', "'", "`"}:
+            q = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return None
+
+
+def extract_templates(text: str, lang: str, path: str) -> list[Template]:
+    starts = _line_starts(text)
+    n = len(text)
+    i = 0
+    out: list[Template] = []
+    any_lang = lang in {"any", ""}
+    rustish = lang == "rust" or any_lang
+    pyish = lang == "py" or any_lang
+    jsish = lang == "js" or any_lang
+    goish = lang == "go" or any_lang
+    hash_comment = lang in {"py", "sh", "rb"}
+
+    def emit(raw_inner: str, at: int, unesc: bool) -> None:
+        body = raw_inner
+        if lang == "swift" or (any_lang and ("\\(" in body or "\\\n" in body)):
+            body = swift_string_value(body)
+        if unesc:
+            body = unescape_basic(body)
+        if not body or body.isspace():
+            return
+        if body.endswith("\r\n"):
+            body = body[:-2]
+        elif body.endswith("\n"):
+            body = body[:-1]
+        if len(body.strip()) < MIN_STATIC_EXACT:
+            return
+        parts, holes = tokenize_template(body)
+        if looks_like_data_literal(body, len(holes)):
+            return
+        if not holes and sum(len(p) for p in parts) < MIN_STATIC_EXACT:
+            return
+        line, col = _linecol(starts, at)
+        out.append(
+            Template(
+                path=path,
+                line=line,
+                col=col,
+                lang=lang if lang and lang != "any" else (lang_for(path) or "any"),
+                raw=body,
+                parts=parts,
+                holes=holes,
+            )
+        )
+
+    while i < n:
+        ch = text[i]
+        if hash_comment and ch == "#":
+            i = _skip_line_comment(text, i)
+            continue
+        if lang != "py" and ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i = _skip_line_comment(text, i)
+                continue
+            if text[i + 1] == "*":
+                i = _skip_block_comment(text, i)
+                continue
+        if rustish and ch in {"r", "b", "c"}:
+            j = i
+            if text[j] in {"b", "c"}:
+                j += 1
+            if j < n and text[j] == "r":
+                j += 1
+                got = _read_raw_hash(text, j)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=False)
+                    i = end
+                    continue
+        if pyish and ch.isalpha():
+            j = i
+            while j < n and text[j] in "rRfFbBuU":
+                j += 1
+            if j > i and j < n and text[j] in {'"', "'"}:
+                is_raw = any(c in "rR" for c in text[i:j])
+                if text.startswith(text[j] * 3, j):
+                    got = _read_triple(text, j, text[j])
+                else:
+                    got = _read_quoted(text, j, text[j])
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=not is_raw)
+                    i = end
+                    continue
+        if (goish or jsish) and ch == "`":
+            if jsish or "${" in text[i : i + 400]:
+                got = _read_js_template(text, i)
+                if got:
+                    end, inner = got
+                    emit(inner, i, unesc=True)
+                    i = end
+                    continue
+            if goish:
+                j = text.find("`", i + 1)
+                if j >= 0:
+                    emit(text[i + 1 : j], i, unesc=False)
+                    i = j + 1
+                    continue
+        if ch in {'"', "'"} and text.startswith(ch * 3, i):
+            got = _read_triple(text, i, ch)
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        if ch == '"' or (ch == "'" and lang in {"js", "py", "sh", "rb", "go", "java", "kt", "c", "any", ""}):
+            got = _read_quoted(text, i, ch)
+            if got:
+                end, inner = got
+                emit(inner, i, unesc=True)
+                i = end
+                continue
+        i += 1
+    return out
+
+
+def match_template(tmpl: Template, query: str) -> tuple[float, str, str, tuple[str, ...]] | None:
+    parts = tmpl.parts
+    static = tmpl.static_len
+    n_holes = tmpl.n_holes
+    if n_holes == 0:
+        body = parts[0] if parts else ""
+        if body == query:
+            return 1.0, "", "", ()
+        if query.startswith(body) and static >= MIN_STATIC_PREFIX:
+            return min(0.93, 0.55 + static / max(len(query), 1) * 0.4), "", query[len(body) :], ()
+        idx = query.find(body)
+        if idx >= 0 and static >= MIN_STATIC_INFIX:
+            prefix = query[:idx]
+            suffix = query[idx + len(body) :]
+            coverage = static / max(len(query), 1)
+            if coverage < 0.25 and static < 24:
+                return None
+            return min(0.88, 0.4 + coverage * 0.5), prefix, suffix, ()
+        return None
+
+    min_static = MIN_STATIC_HOLE
+    if n_holes >= 2 and any(len(p) >= 4 for p in parts):
+        min_static = 5
+    if static < min_static:
+        return None
+
+    values: list[str] = []
+    prefix = ""
+    pos = 0
+    first_static = True
+    for i, part in enumerate(parts):
+        is_last = i == len(parts) - 1
+        if part == "":
+            if is_last:
+                values.append(query[pos:])
+                pos = len(query)
+            continue
+        idx = query.find(part, pos)
+        if idx < 0:
+            return None
+        if first_static:
+            prefix = query[:idx]
+            if len(part) < 4 and static < 16:
+                return None
+            first_static = False
+            if i > 0:
+                values.append(query[pos:idx])
+        else:
+            values.append(query[pos:idx])
+        pos = idx + len(part)
+    suffix = query[pos:] if pos <= len(query) else ""
+    if parts and parts[-1] and len(suffix) > max(24, static):
+        return None
+    if len(values) != n_holes:
+        if len(values) < n_holes and parts[-1] == "":
+            pass
+        elif len(values) != n_holes:
+            return None
+
+    coverage = static / max(len(query), 1)
+    explained = static / max(static + len(prefix) + (0 if parts[-1] == "" else len(suffix)), 1)
+    score = 0.42 * min(coverage, 1.0) + 0.38 * explained + 0.20 * min(static / 40.0, 1.0)
+    if parts[-1] == "":
+        score += 0.04
+    if len(prefix) > static * 2 and len(prefix) > 20:
+        score -= 0.12
+    return min(score, 0.99), prefix, suffix, tuple(values)
+
+
+def score_query(tmpl: Template, query: str) -> THit | None:
+    best: THit | None = None
+    for variant, penalty, tag in query_variants(query):
+        got = match_template(tmpl, variant)
+        if got is None:
+            continue
+        score, prefix, suffix, values = got
+        score = max(0.0, score - penalty)
+        if best is None or score > best.score:
+            best = THit(
+                template=tmpl,
+                score=score,
+                variant=tag,
+                prefix=prefix,
+                suffix=suffix,
+                values=values,
+            )
+    return best
+
+
+def search_templates(
+    templates: list[Template],
+    query: str,
+    min_score: float,
+    limit: int,
+) -> list[THit]:
+    q = normalize_query(query)
+    if not q:
+        return []
+    hits: list[THit] = []
+    for tmpl in templates:
+        hit = score_query(tmpl, q)
+        if hit is None or hit.score < min_score:
+            continue
+        hits.append(hit)
+    hits.sort(
+        key=lambda h: (
+            -h.score,
+            is_test_path(h.template.path),
+            -h.template.static_len,
+            h.template.path,
+            h.template.line,
+        )
+    )
+    return hits[:limit]
+
+
+# ---------------------------------------------------------------------------
+# records + joint bind
+# ---------------------------------------------------------------------------
+
+def payload_after_locators(text: str, locators: list[Locator]) -> str:
+    if not locators:
+        return normalize_query(text)
+    chars = list(text)
+    for loc in sorted([l for l in locators if l.span], key=lambda l: l.span[0], reverse=True):  # type: ignore[index]
+        s, e = loc.span  # type: ignore[misc]
+        chars[s:e] = []
+    leftover = "".join(chars)
+    leftover = re.sub(r"^[\s:.\->#]*", "", leftover)
+    leftover = re.sub(r"[\s:]+$", "", leftover)
+    return normalize_query(leftover)
+
+
+def parse_records(lines: list[str], known: Iterable[str], mode: str) -> list[LogRecord]:
+    if mode == "line":
+        recs = []
+        for i, line in enumerate(lines):
+            locs = find_stdin_locators(line, known)
+            recs.append(
+                LogRecord(
+                    lines=[line],
+                    start=i,
+                    locators=locs,
+                    message=payload_after_locators(line, locs),
+                )
+            )
+        return recs
+
+    recs: list[LogRecord] = []
+    i = 0
+    n = len(lines)
+    known_list = list(known)
+    while i < n:
+        line = lines[i]
+        pm = PANIC_AT_RE.search(strip_ansi(line))
+        if pm:
+            rec = LogRecord(lines=[line], start=i, locators=find_stdin_locators(line, known_list))
+            if i + 1 < n and lines[i + 1].strip() and not PANIC_AT_RE.search(strip_ansi(lines[i + 1])):
+                rec.lines.append(lines[i + 1])
+                rec.message = normalize_query(lines[i + 1])
+                i += 2
+            else:
+                rec.message = payload_after_locators(line, rec.locators)
+                i += 1
+            recs.append(rec)
+            continue
+        if PY_TB_RE.search(line):
+            rec = LogRecord(lines=[line], start=i, locators=find_stdin_locators(line, known_list))
+            j = i + 1
+            while j < n and (
+                lines[j].startswith(" ")
+                or lines[j].startswith("\t")
+                or PY_TB_RE.search(lines[j])
+            ):
+                rec.lines.append(lines[j])
+                rec.locators.extend(find_stdin_locators(lines[j], known_list))
+                j += 1
+            if j < n:
+                em = EXC_RE.match(strip_ansi(lines[j]).strip())
+                if em:
+                    rec.lines.append(lines[j])
+                    rec.message = normalize_query(em.group(2) or lines[j])
+                    j += 1
+            if not rec.message:
+                rec.message = payload_after_locators(" ".join(rec.lines), rec.locators)
+            recs.append(rec)
+            i = j
+            continue
+        stripped = strip_ansi(line).lstrip()
+        if ERROR_START_RE.match(stripped) or stripped.startswith("error["):
+            rec = LogRecord(lines=[line], start=i, locators=find_stdin_locators(line, known_list))
+            rec.message = payload_after_locators(line, rec.locators) or normalize_query(line)
+            j = i + 1
+            while j < n:
+                nxt = lines[j]
+                ns = strip_ansi(nxt)
+                if ns.strip() == "":
+                    break
+                if ERROR_START_RE.match(ns.lstrip()) or ns.lstrip().startswith("error["):
+                    break
+                lead = ns.lstrip()
+                if lead.startswith("-->") or lead.startswith("|") or lead.startswith("..."):
+                    rec.lines.append(nxt)
+                    rec.locators.extend(find_stdin_locators(nxt, known_list))
+                    j += 1
+                    continue
+                break
+            recs.append(rec)
+            i = j
+            continue
+        locs = find_stdin_locators(line, known_list)
+        recs.append(
+            LogRecord(
+                lines=[line],
+                start=i,
+                locators=locs,
+                message=payload_after_locators(line, locs),
+            )
+        )
+        i += 1
+    return recs
+
+
+def proximity(res: Resolution, tmpl: Template) -> float:
+    if res.status in {"deleted", "unresolved"} or not res.dest_path or res.dest_line is None:
+        return 0.0
+    if res.dest_path == tmpl.path:
+        d = abs(res.dest_line - tmpl.line)
+        if d == 0:
+            return 1.0
+        if d <= 2:
+            return 0.88
+        if d <= 8:
+            return 0.62
+        return 0.38
+    return 0.28 * path_score(res.dest_path, tmpl.path)
+
+
+def src_proximity(loc: Locator, tmpl: Template) -> float:
+    if loc.path != tmpl.path:
+        return 0.28 * path_score(loc.path, tmpl.path)
+    d = abs(loc.line - tmpl.line)
+    if d == 0:
+        return 1.0
+    if d <= 2:
+        return 0.88
+    if d <= 8:
+        return 0.62
+    return 0.38
+
+
+def dest_line_text(res: Optional[Resolution], dst: Snapshot) -> Optional[str]:
+    if res is None or not res.dest_path or res.dest_line is None:
+        return None
+    lines = dst.files.get(res.dest_path)
+    if not lines or res.dest_line < 1 or res.dest_line > len(lines):
+        return None
+    return lines[res.dest_line - 1]
+
+
+def ident_bind(
+    message: str,
+    res: Resolution,
+    dst: Snapshot,
+) -> Optional[tuple[Template, tuple[str, ...]]]:
+    """Bind a compiler-diagnostic name to the dest line it now lives on."""
+    if res.status in {"deleted", "unresolved"} or not res.dest_path or res.dest_line is None:
+        return None
+    line = dest_line_text(res, dst) or res.dest_text
+    if not line:
+        return None
+    line_toks = set(tokens(line))
+    q = normalize_query(message)
+    if not q:
+        return None
+    for rx, display in DIAG_HOLE_RES:
+        m = rx.search(q)
+        if not m:
+            continue
+        name = m.group(1)
+        if name not in line_toks and name not in line:
+            continue
+        parts, holes = tokenize_template(display)
+        tmpl = Template(
+            path=res.dest_path,
+            line=res.dest_line,
+            col=res.locator.col or 1,
+            lang="diag",
+            raw=display,
+            parts=parts,
+            holes=holes,
+        )
+        return tmpl, (name,)
+    # Rare shared identifier: message names a token that lives on the dest line.
+    msg_toks = [t for t in tokens(q) if len(t) >= 6]
+    shared = [t for t in msg_toks if t in line_toks]
+    if len(shared) != 1:
+        return None
+    name = shared[0]
+    tmpl = Template(
+        path=res.dest_path,
+        line=res.dest_line,
+        col=res.locator.col or 1,
+        lang="diag",
+        raw="{}",
+        parts=("", ""),
+        holes=("0",),
+    )
+    return tmpl, (name,)
+
+
+def format_holes(tmpl: Template, values: tuple[str, ...]) -> str:
+    bits = []
+    for i, name in enumerate(tmpl.holes):
+        val = values[i] if i < len(values) else ""
+        bits.append(f"{name}={val}")
+    return " ".join(bits)
+
+
+def joint_bind(
+    rec: LogRecord,
+    src: Snapshot,
+    dst: Snapshot,
+    ctx: int,
+    renames: dict[str, str],
+    min_score: float,
+    slip_cache: dict[tuple[str, int], Resolution],
+) -> Binding:
+    resolutions: list[Resolution] = []
+    for loc in rec.locators:
+        key = (loc.path, loc.line)
+        if key in slip_cache:
+            base = slip_cache[key]
+            resolutions.append(
+                Resolution(
+                    locator=loc,
+                    status=base.status,
+                    dest_path=base.dest_path,
+                    dest_line=base.dest_line,
+                    score=base.score,
+                    note=base.note,
+                    dest_text=base.dest_text,
+                )
+            )
+        else:
+            res = resolve_locator(loc, src, dst, ctx, renames)
+            slip_cache[key] = res
+            resolutions.append(res)
+
+    msg = rec.message
+    if not msg:
+        for line in rec.lines:
+            if SKIP_STDIN_RE.match(strip_ansi(line).rstrip()):
+                continue
+            p = payload_after_locators(line, find_stdin_locators(line, src.paths))
+            if p:
+                msg = p
+                break
+
+    dest_hits = search_templates(dst.templates, msg, min_score, limit=24) if msg else []
+    src_hits = search_templates(src.templates, msg, min_score, limit=16) if msg else []
+
+    best: Optional[tuple[float, THit, str, Optional[Resolution]]] = None
+
+    def consider(hit: THit, via: str, res: Optional[Resolution], extra: float) -> None:
+        nonlocal best
+        slip_s = res.score if res and res.status not in {"deleted", "unresolved"} else 0.0
+        prox = proximity(res, hit.template) if res else 0.0
+        test_pen = 0.06 if is_test_path(hit.template.path) else 0.0
+        joint = 0.50 * hit.score + 0.30 * prox + 0.20 * slip_s + extra - test_pen
+        # A locator that agrees with the template is the hybrid signal.
+        if prox >= 0.85:
+            joint += 0.12
+        if best is None or joint > best[0]:
+            best = (joint, hit, via, res)
+
+    for hit in dest_hits:
+        if resolutions:
+            for res in resolutions:
+                consider(hit, "joint", res, 0.0)
+        else:
+            consider(hit, "template", None, 0.0)
+
+    # Source templates near the original locator, then slip that berth.
+    for hit in src_hits:
+        for loc in rec.locators:
+            sp = src_proximity(loc, hit.template)
+            if sp < 0.5:
+                continue
+            key = (hit.template.path, hit.template.line)
+            if key in slip_cache:
+                res = slip_cache[key]
+            else:
+                tloc = Locator(path=hit.template.path, line=hit.template.line)
+                res = resolve_locator(tloc, src, dst, ctx, renames)
+                slip_cache[key] = res
+            consider(hit, "src-slip", res, 0.08 * sp)
+
+    loc_res = next(
+        (r for r in resolutions if r.status not in {"deleted", "unresolved"} and r.dest_path),
+        None,
+    )
+    del_res = next((r for r in resolutions if r.status == "deleted"), None)
+
+    if best is None:
+        if loc_res:
+            ident = ident_bind(msg, loc_res, dst)
+            if ident:
+                tmpl, values = ident
+                return Binding(
+                    status="bound",
+                    from_path=loc_res.locator.path,
+                    from_line=loc_res.locator.line,
+                    dest_path=loc_res.dest_path,
+                    dest_line=loc_res.dest_line,
+                    dest_col=loc_res.locator.col,
+                    slip_status=loc_res.status,
+                    slip_score=loc_res.score,
+                    tmpl=tmpl,
+                    match_score=0.8,
+                    joint_score=min(1.2, 0.55 + 0.45 * loc_res.score),
+                    via="ident",
+                    values=values,
+                    message=msg,
+                    note=loc_res.note,
+                    resolutions=resolutions,
+                )
+            return Binding(
+                status="relocated",
+                from_path=loc_res.locator.path,
+                from_line=loc_res.locator.line,
+                dest_path=loc_res.dest_path,
+                dest_line=loc_res.dest_line,
+                dest_col=loc_res.locator.col,
+                slip_status=loc_res.status,
+                slip_score=loc_res.score,
+                joint_score=loc_res.score,
+                via="locator",
+                message=msg,
+                note=loc_res.note,
+                resolutions=resolutions,
+            )
+        if del_res:
+            return Binding(
+                status="deleted",
+                from_path=del_res.locator.path,
+                from_line=del_res.locator.line,
+                slip_status="deleted",
+                slip_score=del_res.score,
+                via="locator",
+                message=msg,
+                note=del_res.note,
+                resolutions=resolutions,
+            )
+        return Binding(status="miss", message=msg, via="", resolutions=resolutions)
+
+    joint, hit, via, res = best
+    dest_path = hit.template.path
+    dest_line = hit.template.line
+    dest_col = hit.template.col
+    from_path = rec.locators[0].path if rec.locators else None
+    from_line = rec.locators[0].line if rec.locators else None
+    slip_st = ""
+    slip_sc = 0.0
+    if res and res.status not in {"deleted", "unresolved"}:
+        # Prefer the template's own current berth; keep slipped site if different.
+        if res.dest_path:
+            slip_st = res.status
+            slip_sc = res.score
+            if via == "src-slip" and res.dest_path:
+                dest_path = res.dest_path
+                dest_line = res.dest_line or dest_line
+        from_path = res.locator.path
+        from_line = res.locator.line
+    elif loc_res:
+        slip_st = loc_res.status
+        slip_sc = loc_res.score
+        from_path = loc_res.locator.path
+        from_line = loc_res.locator.line
+
+    status = "bound" if (via in {"joint", "src-slip"} or loc_res) else "matched"
+    if not rec.locators:
+        status = "matched"
+    if via == "joint" and loc_res:
+        status = "bound"
+
+    return Binding(
+        status=status,
+        from_path=from_path,
+        from_line=from_line,
+        dest_path=dest_path,
+        dest_line=dest_line,
+        dest_col=dest_col,
+        slip_status=slip_st,
+        slip_score=slip_sc,
+        tmpl=hit.template,
+        match_score=hit.score,
+        joint_score=joint,
+        via=via,
+        values=hit.values,
+        message=msg,
+        note=hit.variant if hit.variant != "full" else "",
+        resolutions=resolutions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def holes_text(b: Binding) -> str:
+    if not b.tmpl:
+        return ""
+    return format_holes(b.tmpl, b.values)
+
+
+def format_from(b: Binding) -> str:
+    if b.from_path is None or b.from_line is None:
+        return "-"
+    return f"{b.from_path}:{b.from_line}"
+
+
+def format_to(b: Binding) -> str:
+    if b.dest_path is None or b.dest_line is None:
+        return "-"
+    col = f":{b.dest_col}" if b.dest_col else ""
+    return f"{b.dest_path}:{b.dest_line}{col}"
+
+
+def print_human(b: Binding) -> None:
+    src = format_from(b)
+    dst = format_to(b)
+    arrow = "→"
+    extra = f"  {b.note}" if b.note else ""
+    print(f"{src:40} {arrow} {dst:40} {b.status:10} {b.joint_score:5.2f} via={b.via or '-'}{extra}")
+    if b.tmpl:
+        print(f"  tmpl:  {b.tmpl.display}")
+        ht = holes_text(b)
+        if ht:
+            print(f"  holes: {ht}")
+    if b.message:
+        print(f"  log:   {b.message}")
+
+
+def print_porcelain(b: Binding) -> None:
+    tmpl = b.tmpl.display if b.tmpl else ""
+    holes = holes_text(b).replace("\t", " ")
+    note = (b.note or "").replace("\t", " ").replace("\n", " ")
+    print(
+        f"{b.status}\t{format_from(b)}\t{format_to(b)}\t{tmpl}\t{holes}\t"
+        f"{b.joint_score:.3f}\t{b.via}\t{note}"
+    )
+
+
+def print_json(b: Binding) -> None:
+    obj = {
+        "status": b.status,
+        "from": None if b.from_path is None else {"path": b.from_path, "line": b.from_line},
+        "to": None if b.dest_path is None else {"path": b.dest_path, "line": b.dest_line, "col": b.dest_col},
+        "template": b.tmpl.display if b.tmpl else None,
+        "holes": (
+            {name: (b.values[i] if i < len(b.values) else "") for i, name in enumerate(b.tmpl.holes)}
+            if b.tmpl
+            else {}
+        ),
+        "match_score": round(b.match_score, 4),
+        "slip_score": round(b.slip_score, 4),
+        "joint_score": round(b.joint_score, 4),
+        "via": b.via,
+        "slip_status": b.slip_status,
+        "message": b.message,
+        "note": b.note,
+    }
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def annotate_trailer(b: Binding) -> str:
+    if not b.tmpl or b.dest_path is None:
+        return ""
+    holes = holes_text(b)
+    loc = format_to(b)
+    if holes:
+        return f"  ⟦{loc}  {b.tmpl.display}  {holes}⟧"
+    return f"  ⟦{loc}  {b.tmpl.display}⟧"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="moor",
+        description=(
+            "Bind a log instance to a current locator and a source hole. "
+            "Input is a log stream plus two snapshots; output rewrites "
+            "stale path:line and unpacks format-string holes in one pass."
+        ),
+    )
+    p.add_argument("inputs", nargs="*", help="log lines, path:line, or log files (omit to filter stdin)")
+    p.add_argument("--from", dest="from_ref", default=None, help="source git ref (default: worktree)")
+    p.add_argument("--to", dest="to_ref", default=None, help="destination git ref (default: worktree)")
+    p.add_argument("--from-dir", type=Path, default=None, help="source snapshot as a directory")
+    p.add_argument("--to-dir", type=Path, default=None, help="destination snapshot as a directory")
+    p.add_argument("--repo", type=Path, default=None, help="git repository (default: discover from cwd)")
+    p.add_argument("--json", action="store_true", help="NDJSON bindings")
+    p.add_argument("--porcelain", action="store_true", help="TSV bindings")
+    p.add_argument("--rewrite", action="store_true", help="emit rewritten log lines (stdin/files)")
+    p.add_argument(
+        "--annotate",
+        action="store_true",
+        default=None,
+        help="append ⟦locator tmpl holes⟧ to rewritten lines (default on with --rewrite)",
+    )
+    p.add_argument("--no-annotate", action="store_true", help="rewrite locators only")
+    p.add_argument("--map", action="store_true", help="print bindings even when rewriting")
+    p.add_argument("--records", choices=("auto", "line"), default="auto", help="group rustc/panic/traceback")
+    p.add_argument("--strict", action="store_true", help="exit 1 if any record is a miss/unresolved")
+    p.add_argument("--context", type=int, default=3, help="neighbor window for fingerprints")
+    p.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE, help="minimum template score")
+    p.add_argument("--cached-only", action="store_true", help="do not include untracked dest files")
+    p.add_argument("--selftest", action="store_true", help="run built-in tests")
+    p.add_argument("--version", action="version", version=f"moor {VERSION}")
+    return p
+
+
+def run_selftest() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    parts, holes = tokenize_template("git diff single file failed: {}")
+    expect(holes == ("0",) and parts == ("git diff single file failed: ", ""), f"rust {{}}: {parts} {holes}")
+
+    parts, holes = tokenize_template("user {uid} not found")
+    expect(holes == ("uid",) and parts == ("user ", " not found"), f"named: {parts} {holes}")
+
+    parts, holes = tokenize_template("Duplicate event ID: ${snapshot.id}")
+    expect(holes == ("snapshot.id",) and parts[0] == "Duplicate event ID: ", f"js: {parts} {holes}")
+
+    parts, holes = tokenize_template(
+        "session started profile=\\(self.activeProfile.name, privacy: .private)"
+    )
+    expect(
+        holes == ("self.activeProfile.name",) and parts[0] == "session started profile=",
+        f"swift: {parts} {holes}",
+    )
+
+    parts, holes = tokenize_template("open %s: %v")
+    expect(holes == ("0", "1") and parts == ("open ", ": ", ""), f"printf: {parts} {holes}")
+
+    parts, holes = tokenize_template('{"ok": true}')
+    expect(holes == (), f"json braces should not be holes: {parts} {holes}")
+
+    t = Template("a.rs", 1, 1, "rust", "git diff single file failed: {}", ("git diff single file failed: ", ""), ("0",))
+    hit = score_query(t, "git diff single file failed: fatal: not a git repository")
+    expect(hit is not None and hit.score >= 0.5 and hit.values == ("fatal: not a git repository",), f"bind filled: {hit}")
+
+    t2 = Template("u.py", 2, 1, "py", "user {uid} not found", ("user ", " not found"), ("uid",))
+    hit = score_query(t2, "user 42 not found")
+    expect(hit is not None and hit.values == ("42",), f"uid bind: {hit}")
+
+    t3 = Template("o.go", 1, 1, "go", "open %s: %v", ("open ", ": ", ""), ("0", "1"))
+    hit = score_query(t3, "open /tmp/x: permission denied")
+    expect(hit is not None and hit.values == ("/tmp/x", "permission denied"), f"printf bind: {hit}")
+
+    rust = 'return Err(anyhow!("git diff single file failed: {}", stderr.trim()));\n'
+    tmpls = extract_templates(rust, "rust", "diff.rs")
+    expect(any(t.display == "git diff single file failed: {}" for t in tmpls), f"extract rust: {[t.display for t in tmpls]}")
+
+    py = 'raise KeyError(f"user {uid} not found")\n'
+    tmpls = extract_templates(py, "py", "u.py")
+    expect(any(t.n_holes == 1 and t.parts[0] == "user " for t in tmpls), f"py f: {[t.raw for t in tmpls]}")
+
+    swift_src = (
+        'Logger.dataStore.error("""\n'
+        "            cumulative save failed path=\\(path) \\\n"
+        "            error=\\(err)\n"
+        '            """)\n'
+    )
+    tmpls = extract_templates(swift_src, "swift", "JSONSessionStore.swift")
+    expect(
+        any("cumulative save failed path=" in t.display and t.n_holes == 2 for t in tmpls),
+        f"swift flatten: {[t.display for t in tmpls]}",
+    )
+
+    # Joint scoring: an exact test literal must lose to a production template
+    # sitting on a slipped locator.
+    prod = Template("src/users/lookup.py", 8, 1, "py", "user {uid} not found", ("user ", " not found"), ("uid",))
+    decoy = Template("tests/test_auth.py", 3, 1, "py", "user 42 not found", ("user 42 not found",), ())
+    h_prod = score_query(prod, "user 42 not found")
+    h_decoy = score_query(decoy, "user 42 not found")
+    expect(h_decoy is not None and h_prod is not None, "both templates match")
+    expect(h_decoy.score > h_prod.score, f"decoy should be a better raw match: {h_decoy.score} vs {h_prod.score}")
+    res = Resolution(
+        locator=Locator(path="src/auth.py", line=5),
+        status="moved",
+        dest_path="src/users/lookup.py",
+        dest_line=8,
+        score=0.9,
+    )
+    prox_p = proximity(res, prod)
+    prox_d = proximity(res, decoy)
+    joint_p = 0.50 * h_prod.score + 0.30 * prox_p + 0.20 * 0.9 + 0.12
+    joint_d = 0.50 * h_decoy.score + 0.30 * prox_d + 0.20 * 0.9 - 0.06
+    expect(joint_p > joint_d, f"joint should prefer production: {joint_p:.3f} vs {joint_d:.3f}")
+
+    expect(path_score("src/app.rs", "src/app/layout.rs") >= 0.35, "stem-split affinity")
+
+    dest_res = Resolution(
+        locator=Locator(path="src/app/layout.rs", line=17),
+        status="same",
+        dest_path="src/app/layout.rs",
+        dest_line=17,
+        score=1.0,
+        dest_text="pub fn seen_hunk_fingerprint(",
+    )
+    fake_dst = Snapshot(label="t", files={"src/app/layout.rs": ["", "", "pub fn seen_hunk_fingerprint("]})
+    # line 17 is out of range in this stub; ident_bind falls back to dest_text
+    fake_dst.files["src/app/layout.rs"] = ["x"] * 16 + ["pub fn seen_hunk_fingerprint("]
+    got = ident_bind("error[E0599]: no method named seen_hunk_fingerprint", dest_res, fake_dst)
+    expect(got is not None and got[1] == ("seen_hunk_fingerprint",), f"ident bind rustc: {got}")
+    expect(got is not None and got[0].display == "no method named {}", f"ident tmpl: {got}")
+
+    if failures:
+        for f in failures:
+            print(f"selftest FAIL: {f}", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+def collect_input_lines(args: argparse.Namespace) -> tuple[list[str], bool]:
+    """Return (lines, from_files_or_stdin)."""
+    if args.inputs:
+        # If every arg is an existing file, read them as a log stream.
+        if all(Path(a).is_file() for a in args.inputs):
+            lines: list[str] = []
+            for a in args.inputs:
+                text = Path(a).read_text(encoding="utf-8", errors="replace")
+                lines.extend(text.splitlines())
+            return lines, True
+        return list(args.inputs), False
+    if sys.stdin.isatty():
+        return [], False
+    return sys.stdin.read().splitlines(), True
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.selftest:
+        return run_selftest()
+
+    cwd = Path.cwd()
+    git_root = None
+    if args.from_dir is None or args.to_dir is None:
+        start = args.repo if args.repo is not None else cwd
+        git_root = discover_repo(start)
+        if args.repo is not None:
+            git_root = args.repo.resolve()
+            if not (git_root / ".git").exists() and not (git_root / ".git").is_file():
+                print(f"moor: {git_root} is not a git repo", file=sys.stderr)
+                return 2
+
+    src = load_snapshot(
+        git_root=git_root,
+        ref=None if args.from_dir is not None else args.from_ref,
+        directory=args.from_dir,
+        untracked=not args.cached_only,
+        label=str(args.from_dir or args.from_ref or "worktree"),
+    )
+    dst = load_snapshot(
+        git_root=git_root,
+        ref=None if args.to_dir is not None else args.to_ref,
+        directory=args.to_dir,
+        untracked=not args.cached_only,
+        label=str(args.to_dir or args.to_ref or "worktree"),
+    )
+    renames: dict[str, str] = {}
+    if git_root is not None and args.from_dir is None and args.to_dir is None:
+        if args.from_ref and args.to_ref:
+            renames = rename_map(git_root, args.from_ref, args.to_ref)
+        elif args.from_ref:
+            renames = rename_map(git_root, args.from_ref, "HEAD")
+
+    lines, stream_mode = collect_input_lines(args)
+    if not lines:
+        if sys.stdin.isatty() and not args.inputs:
+            build_parser().print_help()
+            return 2
+        return 0
+
+    known = union_paths(src, dst)
+    recs = parse_records(lines, known, args.records)
+    slip_cache: dict[tuple[str, int], Resolution] = {}
+    bindings = [
+        joint_bind(rec, src, dst, args.context, renames, args.min_score, slip_cache) for rec in recs
+    ]
+
+    annotate = args.annotate
+    if annotate is None:
+        annotate = bool(args.rewrite) and not args.no_annotate
+    if args.no_annotate:
+        annotate = False
+
+    rewrite = args.rewrite or (stream_mode and not args.json and not args.porcelain and not args.map)
+
+    if rewrite:
+        # Rebuild the stream, record by record.
+        for rec, b in zip(recs, bindings):
+            rewritten_lines = []
+            for line in rec.lines:
+                locs = [r for r in b.resolutions if r.locator.span is not None]
+                # Only apply resolutions whose span belongs to this line: we stored
+                # spans against the line that produced them, so match by identity
+                # of the locator objects that came from this record.
+                line_locs = find_stdin_locators(line, known)
+                line_res: list[Resolution] = []
+                for loc in line_locs:
+                    match = next(
+                        (
+                            r
+                            for r in b.resolutions
+                            if r.locator.path == loc.path and r.locator.line == loc.line
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        continue
+                    line_res.append(
+                        Resolution(
+                            locator=loc,
+                            status=match.status,
+                            dest_path=match.dest_path,
+                            dest_line=match.dest_line,
+                            score=match.score,
+                            note=match.note,
+                            dest_text=match.dest_text,
+                        )
+                    )
+                rewritten_lines.append(rewrite_line(line, line_res))
+            if annotate:
+                trailer = annotate_trailer(b)
+                if trailer:
+                    rewritten_lines[-1] = rewritten_lines[-1] + trailer
+            for rl in rewritten_lines:
+                print(rl)
+        if args.map or args.json or args.porcelain:
+            for b in bindings:
+                if SKIP_STDIN_RE.match(b.message) and b.status == "miss":
+                    continue
+                if args.json:
+                    print_json(b)
+                elif args.porcelain:
+                    print_porcelain(b)
+                else:
+                    print_human(b)
+    else:
+        for rec, b in zip(recs, bindings):
+            raw = rec.lines[0] if rec.lines else ""
+            if SKIP_STDIN_RE.match(strip_ansi(raw).rstrip()) and b.status == "miss" and not b.resolutions:
+                continue
+            if args.json:
+                print_json(b)
+            elif args.porcelain:
+                print_porcelain(b)
+            else:
+                print_human(b)
+
+    if args.strict:
+        bad = any(b.status in {"miss"} or any(r.status == "unresolved" for r in b.resolutions) for b in bindings)
+        if bad:
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

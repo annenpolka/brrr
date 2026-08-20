@@ -1,0 +1,2791 @@
+#!/usr/bin/env python3
+"""unsay — unspeak ALOUD so a BLAST survivor rides again.
+
+aloud *names* the blast survivor that later restated the new default
+(ALOUD) versus the one that stayed omitted (MUTE). Naming is not a
+witness. unsay emits the unified diff that deletes the explicit
+new-default argument (ALOUD → TACIT) so the site rides again. Optionally
+`--pin` writes the new default at MUTE sites (MUTE → SHADOW).
+
+    ALOUD  --emit deletes the spoken new-default arg
+    MUTE   --pin inserts the inherited new-default arg
+    PRE    already spoke at the blast — not unsaid
+    LATE   never rode the blast — not unsaid
+    FOSSIL restates the *old* value — not unsaid
+
+The patch is the witness that the fate was real. A leftover-name search
+or `rg presentThreshold: 0.45` cannot tell ALOUD from PRE from LATE;
+unsay only rewrites ALOUD.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+VERSION = "0.2"
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "vendor",
+    ".build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "coverage",
+    ".next",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+}
+CODE_EXTS = {".swift", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs"}
+MAX_BYTES = 2_000_000
+
+SWIFT_MOD = (
+    r"(?:(?:public|private|internal|fileprivate|open|static|override|"
+    r"mutating|convenience|required|final|nonisolated|distributed)\s+)*"
+)
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+def role_of(path: str) -> str:
+    p = path.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    if (
+        "/test" in p
+        or "/spec" in p
+        or base.endswith("_test.py")
+        or base.endswith("_test.rs")
+        or ".test." in base
+        or base.endswith("tests.swift")
+        or base.endswith("tests.py")
+        or base.endswith("tests.rs")
+        or base.endswith("tests.ts")
+    ):
+        return "test"
+    if p.endswith(".md"):
+        return "docs"
+    return "prod"
+
+
+def relpath(path: str, root: str | None) -> str:
+    if root:
+        try:
+            return str(Path(path).resolve().relative_to(Path(root).resolve()))
+        except Exception:
+            pass
+    return path
+
+
+def is_literal(src: str) -> bool:
+    s = src.strip()
+    if not s:
+        return False
+    if s in {
+        "None",
+        "nil",
+        "true",
+        "false",
+        "True",
+        "False",
+        "null",
+        "undefined",
+        "()",
+        "[]",
+        "{}",
+        "[:] ",
+        "[:]",
+    }:
+        return True
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s):
+        return True
+    if re.fullmatch(r"\.[A-Za-z_][A-Za-z0-9_]*", s):
+        return True
+    if re.fullmatch(r'["\']([^"\'\\]|\\.)*["\']', s):
+        return True
+    # empty constructed default: Foo() / Foo{}
+    if re.fullmatch(rf"{IDENT}\s*\(\s*\)", s):
+        return True
+    if re.fullmatch(r"b['\"]([^\"'\\\\]|\\\\.)*['\"]", s):
+        return True
+    return False
+
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in {'"', "'"}:
+        return s[1:-1]
+    return s
+
+
+def values_equal(a: str, b: str) -> bool:
+    a = a.strip()
+    b = b.strip()
+    if a == b:
+        return True
+    if re.sub(r"\s+", "", a) == re.sub(r"\s+", "", b):
+        return True
+    try:
+        if float(a) == float(b):
+            return True
+    except ValueError:
+        pass
+    ua, ub = _unquote(a), _unquote(b)
+    if ua != a or ub != b:
+        if ua == ub:
+            return True
+        try:
+            if float(ua) == float(ub):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def ctor_name(default: str) -> str | None:
+    """If default looks like Foo() or Foo(...), return Foo."""
+    m = re.fullmatch(rf"({IDENT})\s*\(.*\)", default.strip(), re.S)
+    if m:
+        return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# mask comments/strings so searches don't fire in them
+# ---------------------------------------------------------------------------
+
+def mask(src: str, lang: str) -> str:
+    n = len(src)
+    out = [" "] * n
+    i = 0
+    py = lang == "py"
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if ch == "\n":
+            out[i] = "\n"
+            i += 1
+            continue
+        # line comments
+        if ch == "#" and py:
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "/" and not py:
+            i += 2
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*" and not py:
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                if src[i] == "\n":
+                    out[i] = "\n"
+                i += 1
+            i = min(n, i + 2)
+            continue
+        # python triple quotes
+        if py and src[i : i + 3] in ('"""', "'''"):
+            q = src[i : i + 3]
+            i += 3
+            while i + 2 < n and src[i : i + 3] != q:
+                if src[i] == "\n":
+                    out[i] = "\n"
+                i += 1
+            i = min(n, i + 3)
+            continue
+        # rust raw strings r#"..."#
+        if lang == "rs" and ch == "r" and nxt in ('#', '"'):
+            j = i + 1
+            hashes = 0
+            while j < n and src[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and src[j] == '"':
+                i = j + 1
+                close = '"' + ("#" * hashes)
+                while i < n and src[i : i + len(close)] != close:
+                    if src[i] == "\n":
+                        out[i] = "\n"
+                    i += 1
+                i = min(n, i + len(close))
+                continue
+        if ch in ('"', "'", "`"):
+            q = ch
+            i += 1
+            while i < n:
+                if src[i] == "\n":
+                    out[i] = "\n"
+                    # unclosed single-line (python/swift) — stop at newline
+                    if q != "`" and lang in {"py", "swift"}:
+                        i += 1
+                        break
+                    i += 1
+                    continue
+                if src[i] == "\\" and lang != "swift":
+                    i += 2
+                    continue
+                if lang == "swift" and src[i] == "\\" and i + 1 < n and src[i + 1] != "(":
+                    i += 2
+                    continue
+                if src[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out[i] = ch
+        i += 1
+    return "".join(out)
+
+
+def line_at(src: str, idx: int) -> int:
+    return src.count("\n", 0, idx) + 1
+
+
+def match_paren(src: str, open_idx: int) -> int | None:
+    """Return index of closing paren, or None. Respects strings."""
+    n = len(src)
+    if open_idx >= n or src[open_idx] not in "([{":
+        return None
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack = [src[open_idx]]
+    i = open_idx + 1
+    while i < n:
+        ch = src[i]
+        if ch in "\"'`":
+            q = ch
+            i += 1
+            while i < n and src[i] != q:
+                if src[i] == "\\" and q != "`":
+                    i += 2
+                    continue
+                if src[i] == "\n" and q != "`":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "#" and stack[-1] != '"':
+            # only treat as comment if we are in python; harmless elsewhere
+            # inside ( ) of swift it would be wrong for #available
+            pass
+        if ch in pairs:
+            stack.append(ch)
+        elif ch in pairs.values():
+            if not stack or pairs.get(stack[-1]) != ch:
+                return None
+            stack.pop()
+            if not stack:
+                return i
+        i += 1
+    return None
+
+
+def split_top(inner: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch in "\"'`":
+            q = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                buf.append(inner[i])
+                if inner[i] == "\\" and q != "`":
+                    i += 1
+                    if i < n:
+                        buf.append(inner[i])
+                    i += 1
+                    continue
+                if inner[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        elif ch == "/" and i + 1 < n and inner[i + 1] == "/" and depth == 0:
+            while i < n and inner[i] != "\n":
+                i += 1
+            continue
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip() and p.strip() != ","]
+
+
+def split_top_spans(inner: str) -> list[tuple[int, int]]:
+    """[start, end) of each top-level argument, excluding separating commas."""
+    parts: list[tuple[int, int]] = []
+    start = 0
+    depth = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch in "\"'`":
+            q = ch
+            i += 1
+            while i < n:
+                if inner[i] == "\\" and q != "`":
+                    i += 2
+                    continue
+                if inner[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append((start, i))
+            start = i + 1
+        elif ch == "/" and i + 1 < n and inner[i + 1] == "/" and depth == 0:
+            while i < n and inner[i] != "\n":
+                i += 1
+            continue
+        i += 1
+    parts.append((start, n))
+    return [(s, e) for s, e in parts if inner[s:e].strip() and inner[s:e].strip() != ","]
+
+
+def strip_line_comment(chunk: str) -> str:
+    out = []
+    i = 0
+    n = len(chunk)
+    depth = 0
+    while i < n:
+        ch = chunk[i]
+        if ch in "\"'`":
+            q = ch
+            out.append(ch)
+            i += 1
+            while i < n and chunk[i] != q:
+                out.append(chunk[i])
+                if chunk[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(chunk[i])
+                i += 1
+            if i < n:
+                out.append(chunk[i])
+                i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "/" and i + 1 < n and chunk[i + 1] == "/" and depth == 0:
+            break
+        if ch == "#" and depth == 0:
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out).strip().rstrip(",").strip()
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Param:
+    name: str
+    default: str | None
+    index: int
+
+
+@dataclass
+class Sig:
+    callee: str
+    params: list[Param]
+    path: str
+    line: int
+    lang: str
+    kind: str
+    open_idx: int = -1
+
+
+@dataclass
+class Call:
+    callee: str
+    # name -> raw source; omitted names are absent
+    passed: dict[str, str]
+    bound: set[str]
+    path: str
+    line: int
+    role: str
+    lang: str = ""
+    kind: str = "call"  # call | clap
+    open_idx: int = -1
+    close_idx: int = -1
+    # name -> (inner_start, inner_end, used_keyword)
+    arg_locs: dict = field(default_factory=dict)
+    flag_start: int = -1
+    flag_end: int = -1
+    style_keyword: bool = False
+
+
+@dataclass
+class Row:
+    verdict: str
+    role: str
+    callee: str
+    param: str
+    default: str
+    passed: str
+    path: str
+    line: int
+    why: str = ""  # fate: ALOUD/MUTE/FOSSIL/PRE/LATE/LOCK/BOUND/GONE
+    blast: str = ""  # verdict at the BLAST snapshot (NEW)
+    blast_line: int = 0
+    blast_passed: str = ""
+    others: tuple = ()  # sibling args, excluding this slot (join key)
+    lang: str = ""
+    kind: str = "call"
+    open_idx: int = -1
+    close_idx: int = -1
+    arg_start: int = -1
+    arg_end: int = -1
+    arg_keyword: bool = True
+    flag_start: int = -1
+    flag_end: int = -1
+    style_keyword: bool = False
+    new_val: str = ""
+
+
+# ---------------------------------------------------------------------------
+# signature extraction
+# ---------------------------------------------------------------------------
+
+def enclosing_type(prefix: str, lang: str) -> str | None:
+    if lang == "swift":
+        pat = rf"(?:struct|class|enum|actor|extension|protocol)\s+({IDENT})"
+    elif lang == "py":
+        pat = rf"class\s+({IDENT})"
+    elif lang == "rs":
+        pat = rf"(?:struct|enum|impl(?:\s*<[^>]*>)?)\s+({IDENT})"
+    else:
+        pat = rf"(?:class|interface|type|enum)\s+({IDENT})"
+    last = None
+    for m in re.finditer(pat, prefix):
+        last = m.group(1)
+    return last
+
+
+def enclosing_variant(prefix: str) -> str | None:
+    """Last Ident {{ before here — clap lives on enum variants, not the enum name."""
+    last = None
+    for m in re.finditer(rf"({IDENT})\s*\{{", prefix):
+        last = m.group(1)
+    if last in {
+        "enum",
+        "struct",
+        "impl",
+        "mod",
+        "match",
+        "if",
+        "else",
+        "for",
+        "while",
+        "unsafe",
+        "pub",
+    }:
+        return None
+    return last
+
+
+def parse_swift_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk)
+    if not chunk or chunk.startswith("@"):
+        # attributes like @escaping may prefix; keep going
+        chunk = re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s*)+", "", chunk).strip()
+    if not chunk:
+        return None
+    default = None
+    # split default at depth-0 '='
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    # name: Type   or  ext int: Type  or  _ int: Type
+    m = re.match(
+        rf"(?:({IDENT}|_)\s+)?({IDENT})\s*:",
+        chunk,
+    )
+    if not m:
+        return None
+    ext, name = m.group(1), m.group(2)
+    if ext and ext != "_" and name:
+        # external internal:  the *call* uses external label
+        call_name = ext
+    else:
+        call_name = name
+    if call_name == "_":
+        call_name = name
+    return Param(name=call_name, default=default, index=index)
+
+
+def parse_py_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk).strip()
+    if not chunk:
+        return None
+    if chunk.startswith("**") or chunk.startswith("*"):
+        return None
+    if chunk in {"self", "cls", "/", "*"}:
+        return None
+    if chunk.startswith("/") or chunk == "*":
+        return None
+    default = None
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    # drop annotation
+    if ":" in chunk:
+        name = chunk.split(":", 1)[0].strip()
+    else:
+        name = chunk.strip()
+    if not re.fullmatch(IDENT, name) or name in {"self", "cls"}:
+        return None
+    return Param(name=name, default=default, index=index)
+
+
+def parse_ts_param(chunk: str, index: int) -> Param | None:
+    chunk = strip_line_comment(chunk).strip()
+    if not chunk or chunk.startswith("..."):
+        return None
+    default = None
+    depth = 0
+    eq = None
+    for i, ch in enumerate(chunk):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq = i
+            break
+    if eq is not None:
+        default = chunk[eq + 1 :].strip()
+        chunk = chunk[:eq].strip()
+    chunk = re.sub(r"[?:].*$", "", chunk).strip()
+    chunk = chunk.lstrip("{").strip()
+    if not re.fullmatch(IDENT, chunk):
+        return None
+    return Param(name=chunk, default=default, index=index)
+
+
+def parse_params(inner: str, lang: str) -> list[Param]:
+    out: list[Param] = []
+    idx = 0
+    for chunk in split_top(inner):
+        if lang == "swift":
+            p = parse_swift_param(chunk, idx)
+        elif lang == "py":
+            p = parse_py_param(chunk, idx)
+        else:
+            p = parse_ts_param(chunk, idx)
+        if p:
+            out.append(p)
+            idx += 1
+    return out
+
+
+def extract_swift_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pat = re.compile(
+        rf"{SWIFT_MOD}(func|init)\s*(?:<[^>\n]*>)?\s*({IDENT})?\s*\(",
+        re.M,
+    )
+    for m in pat.finditer(masked):
+        kind, name = m.group(1), m.group(2)
+        open_idx = m.end() - 1
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = parse_params(inner, "swift")
+        if kind == "init":
+            callee = enclosing_type(masked[: m.start()], "swift")
+            if not callee:
+                continue
+            skind = "init"
+        else:
+            callee = name
+            if not callee:
+                continue
+            skind = "func"
+        if not any(p.default is not None for p in params):
+            continue
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=params,
+                path=path,
+                line=line_at(src, m.start()),
+                lang="swift",
+                kind=skind,
+                open_idx=open_idx,
+            )
+        )
+    return sigs
+
+
+def extract_py_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pat = re.compile(rf"(?:async\s+)?def\s+({IDENT})\s*\(", re.M)
+    for m in pat.finditer(masked):
+        name = m.group(1)
+        open_idx = m.end() - 1
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = parse_params(inner, "py")
+        kind = "func"
+        callee = name
+        if name == "__init__":
+            cls = enclosing_type(masked[: m.start()], "py")
+            if not cls:
+                continue
+            callee = cls
+            kind = "init"
+        if not any(p.default is not None for p in params):
+            continue
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=params,
+                path=path,
+                line=line_at(src, m.start()),
+                lang="py",
+                kind=kind,
+                open_idx=open_idx,
+            )
+        )
+    # dataclass fields
+    for m in re.finditer(
+        rf"@dataclass(?:\([^)]*\))?\s*\nclass\s+({IDENT})\s*(?:\([^)]*\))?\s*:",
+        masked,
+    ):
+        cls = m.group(1)
+        # body: until next class/def at column 0
+        rest = src[m.end() :]
+        params: list[Param] = []
+        idx = 0
+        for line in rest.splitlines():
+            if re.match(r"^(class|def|async def)\b", line):
+                break
+            fm = re.match(
+                rf"\s+({IDENT})\s*:\s*[^=\n]+?=\s*(.+?)\s*$",
+                line,
+            )
+            if not fm:
+                continue
+            default = strip_line_comment(fm.group(2))
+            params.append(Param(name=fm.group(1), default=default, index=idx))
+            idx += 1
+        if params:
+            sigs.append(
+                Sig(
+                    callee=cls,
+                    params=params,
+                    path=path,
+                    line=line_at(src, m.start()),
+                    lang="py",
+                    kind="class",
+                )
+            )
+    return sigs
+
+
+def extract_ts_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    sigs: list[Sig] = []
+    pats = [
+        re.compile(rf"(?:export\s+)?(?:async\s+)?function\s+({IDENT})\s*(?:<[^>]*>)?\s*\("),
+        re.compile(rf"(?:export\s+)?(?:const|let|var)\s+({IDENT})\s*=\s*(?:async\s+)?(?:<[^>]*>)?\("),
+        re.compile(
+            rf"(?:(?:public|private|protected|static|async|readonly)\s+)*(constructor)\s*\("
+        ),
+        # class/object methods with a default, but not every ident(
+        re.compile(
+            rf"(?:(?:public|private|protected|static|async|readonly)\s+)+({IDENT})\s*(?:<[^>]*>)?\s*\("
+        ),
+    ]
+    seen_opens: set[int] = set()
+    for pat in pats:
+        for m in pat.finditer(masked):
+            open_idx = m.end() - 1
+            if open_idx in seen_opens:
+                continue
+            # constructor / method: skip control keywords
+            name = m.group(1)
+            if name in {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "catch",
+                "function",
+                "return",
+                "await",
+                "new",
+            }:
+                continue
+            close = match_paren(src, open_idx)
+            if close is None:
+                continue
+            inner = src[open_idx + 1 : close]
+            params = parse_params(inner, "ts")
+            if not any(p.default is not None for p in params):
+                continue
+            seen_opens.add(open_idx)
+            callee = name
+            kind = "func"
+            if name == "constructor":
+                cls = enclosing_type(masked[: m.start()], "ts")
+                if not cls:
+                    continue
+                callee = cls
+                kind = "init"
+            sigs.append(
+                Sig(
+                    callee=callee,
+                    params=params,
+                    path=path,
+                    line=line_at(src, m.start()),
+                    lang="ts",
+                    kind=kind,
+                    open_idx=open_idx,
+                )
+            )
+    return sigs
+
+
+def extract_clap_sigs(src: str, masked: str, path: str) -> list[Sig]:
+    """Rust clap #[arg(default_value = ...)] field → a defaulted slot.
+
+    Structure is matched on the masked file (strings are spaces); the
+    default *value* is read from the original, because it lives in a string.
+    """
+    sigs: list[Sig] = []
+    pat = re.compile(
+        r"#\[arg\((.*?)\)\]\s*(?:pub\s+)?(" + IDENT + r")\s*:",
+        re.S,
+    )
+    for m in pat.finditer(masked):
+        orig = src[m.start() : m.end()]
+        field = m.group(2)
+        dm = re.search(
+            r'default_value(?:_t)?\s*=\s*("(?:\\.|[^"])*"|[A-Za-z0-9_.]+)',
+            orig,
+        )
+        if not dm:
+            continue
+        default = dm.group(1)
+        callee = enclosing_variant(masked[: m.start()]) or enclosing_type(
+            masked[: m.start()], "rs"
+        ) or field
+        sigs.append(
+            Sig(
+                callee=callee,
+                params=[Param(name=field, default=default, index=0)],
+                path=path,
+                line=line_at(src, m.start()),
+                lang="rs",
+                kind="clap",
+            )
+        )
+    return sigs
+
+
+def extract_sigs(src: str, path: str, lang: str) -> list[Sig]:
+    masked = mask(src, lang)
+    if lang == "swift":
+        return extract_swift_sigs(src, masked, path)
+    if lang == "py":
+        return extract_py_sigs(src, masked, path)
+    if lang == "rs":
+        return extract_clap_sigs(src, masked, path)
+    return extract_ts_sigs(src, masked, path)
+
+
+# ---------------------------------------------------------------------------
+# call extraction
+# ---------------------------------------------------------------------------
+
+def parse_call_args(
+    inner: str, lang: str, params: list[Param]
+) -> tuple[dict[str, str], set[str], dict[str, tuple[int, int, bool]]]:
+    """Return (passed, bound, locs). locs: name -> (inner_start, inner_end, keyword)."""
+    passed: dict[str, str] = {}
+    bound: set[str] = set()
+    locs: dict[str, tuple[int, int, bool]] = {}
+    positional_names = [p.name for p in params]
+    pos_i = 0
+    for start, end in split_top_spans(inner):
+        chunk = strip_line_comment(inner[start:end].strip())
+        if not chunk:
+            continue
+        kw = None
+        val = None
+        keyword = False
+        if lang == "swift":
+            m = re.match(rf"({IDENT})\s*:\s*(.*)$", chunk, re.S)
+            if m:
+                kw, val = m.group(1), m.group(2).strip()
+                keyword = True
+        else:
+            m = re.match(rf"({IDENT})\s*=\s*(.*)$", chunk, re.S)
+            if m:
+                kw, val = m.group(1), m.group(2).strip()
+                keyword = True
+        if kw is None:
+            if pos_i >= len(positional_names):
+                continue
+            # swift inits are labeled; a positional unlabeled arg is
+            # almost always a comment residue or type-cast, not a call.
+            if lang == "swift":
+                continue
+            kw = positional_names[pos_i]
+            val = chunk
+            pos_i += 1
+        else:
+            if kw in positional_names:
+                ni = positional_names.index(kw)
+                if ni >= pos_i:
+                    pos_i = ni + 1
+        passed[kw] = val
+        locs[kw] = (start, end, keyword)
+        if not is_literal(val):
+            bound.add(kw)
+    return passed, bound, locs
+
+
+def find_calls(
+    src: str,
+    path: str,
+    lang: str,
+    callees: set[str],
+    merged: dict[str, list[Param]],
+    sig_opens: set[int] | None = None,
+) -> list[Call]:
+    if not callees:
+        return []
+    masked = mask(src, lang)
+    names = sorted(callees, key=len, reverse=True)
+    # longest-first so PresenceArbiter wins over Arbiter if both exist
+    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\s*\(")
+    role = role_of(path)
+    calls: list[Call] = []
+    opens = sig_opens or set()
+    for m in pat.finditer(masked):
+        name = m.group(1)
+        open_idx = m.end() - 1
+        if open_idx in opens:
+            continue  # this paren belongs to the signature, not a call
+        close = match_paren(src, open_idx)
+        if close is None:
+            continue
+        inner = src[open_idx + 1 : close]
+        params = merged.get(name, [])
+        passed, bound, locs = parse_call_args(inner, lang, params)
+        # swift: require at least one labeled arg OR empty ()
+        # unlabeled-only was filtered; empty is a real call (Thresholds())
+        if lang == "swift" and inner.strip() and not passed:
+            continue
+        calls.append(
+            Call(
+                callee=name,
+                passed=passed,
+                bound=bound,
+                path=path,
+                line=line_at(src, m.start()),
+                role=role,
+                lang=lang,
+                kind="call",
+                open_idx=open_idx,
+                close_idx=close,
+                arg_locs=locs,
+                style_keyword=any(v[2] for v in locs.values()),
+            )
+        )
+    return calls
+
+
+def kebab(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "-", name).replace("_", "-").lower()
+
+
+def clap_bound_token(val: str) -> bool:
+    """Format/interpolation/path-expr tokens are BOUND, not OVERRIDE."""
+    if not val:
+        return True
+    if val[0] in "{$\\":
+        return True
+    if "{" in val or "}" in val or "$" in val:
+        return True
+    if val.endswith("\\n") or "\\n" in val:
+        return True
+    return False
+
+
+def pick_clap_callees(line: str, sigs: list[Sig]) -> list[Sig]:
+    """Bind --flag on a line to the subcommand named on that line."""
+    hits = []
+    for s in sigs:
+        kb = kebab(s.callee)
+        if kb and kb in line.lower():
+            hits.append(s)
+    if hits:
+        return hits
+    if len(sigs) == 1:
+        return sigs
+    return []  # ambiguous: two clap slots share the flag, line names neither
+
+
+def find_clap_uses(src: str, path: str, flags: dict[str, list[Sig]]) -> list[Call]:
+    """Find --flag value mentions for clap slots."""
+    if not flags:
+        return []
+    role = role_of(path)
+    calls: list[Call] = []
+    lines = src.splitlines()
+    for field, sigs in flags.items():
+        flag = field.replace("_", "-")
+        pat = re.compile(
+            rf"--{re.escape(flag)}(?:\s+|=)([^\s,;\"'`)\]}}]+)"
+        )
+        for m in pat.finditer(src):
+            val = m.group(1).rstrip("\"',")
+            if val.endswith("\\n") or val.endswith("\\t"):
+                val = val[:-2]
+            if not val or val.startswith(("'", '"')):
+                continue
+            line_no = line_at(src, m.start())
+            line_txt = lines[line_no - 1] if 0 < line_no <= len(lines) else ""
+            chosen = pick_clap_callees(line_txt, sigs)
+            if not chosen:
+                continue
+            bound: set[str] = set()
+            if clap_bound_token(val):
+                passed_val = val
+                bound.add(field)
+            else:
+                passed_val = val if val.startswith(("'", '"')) else f'"{val}"'
+            for sig in chosen:
+                calls.append(
+                    Call(
+                        callee=sig.callee,
+                        passed={field: passed_val},
+                        bound=set(bound),
+                        path=path,
+                        line=line_no,
+                        role=role,
+                        lang="rs",
+                        kind="clap",
+                        flag_start=m.start(),
+                        flag_end=m.end(),
+                    )
+                )
+        for sig in sigs:
+            kb = kebab(sig.callee)
+            tacit_pat = re.compile(
+                rf"\b{re.escape(kb)}\b(?![^\n]*--{re.escape(flag)}\b)"
+            )
+            for m in tacit_pat.finditer(src):
+                line = src.count("\n", 0, m.start())
+                line_txt = lines[line] if line < len(lines) else ""
+                # command-shaped only
+                if "command:" not in line_txt and "kizu " not in line_txt.lower() and "$ " not in line_txt:
+                    continue
+                calls.append(
+                    Call(
+                        callee=sig.callee,
+                        passed={},
+                        bound=set(),
+                        path=path,
+                        line=line + 1,
+                        role=role,
+                        lang="rs",
+                        kind="clap",
+                    )
+                )
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# walk / git
+# ---------------------------------------------------------------------------
+
+def lang_of(path: str) -> str | None:
+    ext = Path(path).suffix.lower()
+    return {
+        ".swift": "swift",
+        ".py": "py",
+        ".ts": "ts",
+        ".tsx": "ts",
+        ".js": "ts",
+        ".jsx": "ts",
+        ".rs": "rs",
+    }.get(ext)
+
+
+def iter_files(root: Path) -> Iterator[Path]:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            if p.suffix.lower() in CODE_EXTS:
+                yield p
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def git(repo: str, *args: str) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"git {' '.join(args)} failed")
+    return r.stdout
+
+
+def git_ok(repo: str, *args: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def tree_files(repo: str, rev: str) -> list[str]:
+    out = git(repo, "ls-tree", "-r", "--name-only", rev)
+    files = []
+    for line in out.splitlines():
+        if Path(line).suffix.lower() in CODE_EXTS:
+            files.append(line)
+    return files
+
+
+def tree_text(repo: str, rev: str, path: str) -> str | None:
+    r = subprocess.run(
+        ["git", "-C", repo, "show", f"{rev}:{path}"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return None
+    if len(r.stdout) > MAX_BYTES:
+        return None
+    return r.stdout.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# harvest a tree
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Harvest:
+    sigs: list[Sig] = field(default_factory=list)
+    calls: list[Call] = field(default_factory=list)
+    texts: dict[str, str] = field(default_factory=dict)
+
+    def merged_params(self) -> dict[str, list[Param]]:
+        """Union of params per callee. A name is defaultable if any overload
+        gives it a default; required-only names stay required."""
+        order: dict[str, list[str]] = {}
+        defs: dict[tuple[str, str], str | None] = {}
+        idx_of: dict[tuple[str, str], int] = {}
+        for s in self.sigs:
+            if s.callee not in order:
+                order[s.callee] = []
+            for p in s.params:
+                key = (s.callee, p.name)
+                if p.name not in order[s.callee]:
+                    order[s.callee].append(p.name)
+                    idx_of[key] = p.index
+                if key not in defs:
+                    defs[key] = p.default
+                elif defs[key] is None and p.default is not None:
+                    defs[key] = p.default
+        merged: dict[str, list[Param]] = {}
+        for callee, names in order.items():
+            merged[callee] = [
+                Param(name=n, default=defs[(callee, n)], index=i)
+                for i, n in enumerate(names)
+            ]
+        return merged
+
+
+def harvest_texts(items: list[tuple[str, str, str]]) -> Harvest:
+    """items: (path, src, lang)"""
+    h = Harvest()
+    for path, src, lang in items:
+        h.texts[path] = src
+        h.sigs.extend(extract_sigs(src, path, lang))
+    merged = h.merged_params()
+    callees = {s.callee for s in h.sigs if s.kind != "clap"}
+    clap_flags: dict[str, list[Sig]] = {}
+    sig_opens: dict[str, set[int]] = {}
+    for s in h.sigs:
+        if s.open_idx >= 0:
+            sig_opens.setdefault(s.path, set()).add(s.open_idx)
+        if s.kind == "clap" and s.params:
+            clap_flags.setdefault(s.params[0].name, []).append(s)
+    seen_call: set[tuple[str, str, int, tuple]] = set()
+    for path, src, lang in items:
+        if lang == "rs":
+            for c in find_clap_uses(src, path, clap_flags):
+                key = (c.callee, c.path, c.line, tuple(sorted(c.passed.items())))
+                if key in seen_call:
+                    continue
+                seen_call.add(key)
+                h.calls.append(c)
+            continue
+        for c in find_calls(
+            src, path, lang, callees, merged, sig_opens.get(path, set())
+        ):
+            key = (c.callee, c.path, c.line, tuple(sorted(c.passed.items())))
+            if key in seen_call:
+                continue
+            seen_call.add(key)
+            h.calls.append(c)
+    return h
+
+
+def harvest_root(root: Path) -> Harvest:
+    items: list[tuple[str, str, str]] = []
+    for p in iter_files(root):
+        lang = lang_of(str(p))
+        if not lang:
+            continue
+        src = read_text(p)
+        if src is None:
+            continue
+        items.append((str(p), src, lang))
+    return harvest_texts(items)
+
+
+def harvest_rev(repo: str, rev: str) -> Harvest:
+    items: list[tuple[str, str, str]] = []
+    for path in tree_files(repo, rev):
+        lang = lang_of(path)
+        if not lang:
+            continue
+        src = tree_text(repo, rev, path)
+        if src is None:
+            continue
+        items.append((path, src, lang))
+    return harvest_texts(items)
+
+
+# ---------------------------------------------------------------------------
+# classify
+# ---------------------------------------------------------------------------
+
+def _norm_val(v: str) -> str:
+    return re.sub(r"\s+", "", (v or "").strip())
+
+
+def sibling_args(call: Call, slot: str) -> tuple:
+    """Call identity excluding the slot that may later be spoken."""
+    return tuple(
+        sorted(
+            (k, _norm_val(v))
+            for k, v in call.passed.items()
+            if k != slot
+        )
+    )
+
+
+def classify_call(call: Call, params: list[Param]) -> list[Row]:
+    rows: list[Row] = []
+    defaultable = [p for p in params if p.default is not None]
+    for p in defaultable:
+        default = p.default or ""
+        if p.name not in call.passed:
+            verdict = "TACIT"
+            passed = "—"
+        elif p.name in call.bound:
+            verdict = "BOUND"
+            passed = call.passed[p.name]
+        elif values_equal(call.passed[p.name], default):
+            verdict = "SHADOW"
+            passed = call.passed[p.name]
+        else:
+            verdict = "OVERRIDE"
+            passed = call.passed[p.name]
+        loc = call.arg_locs.get(p.name)
+        rows.append(
+            Row(
+                verdict=verdict,
+                role=call.role,
+                callee=call.callee,
+                param=p.name,
+                default=default,
+                passed=passed,
+                path=call.path,
+                line=call.line,
+                others=sibling_args(call, p.name),
+                lang=call.lang,
+                kind=call.kind,
+                open_idx=call.open_idx,
+                close_idx=call.close_idx,
+                arg_start=loc[0] if loc else -1,
+                arg_end=loc[1] if loc else -1,
+                arg_keyword=loc[2] if loc else call.style_keyword,
+                flag_start=call.flag_start,
+                flag_end=call.flag_end,
+                style_keyword=call.style_keyword,
+            )
+        )
+    return rows
+
+
+def unfold_rows(rows: list[Row], merged: dict[str, list[Param]]) -> list[Row]:
+    """A TACIT slot whose default is Foo() also rides Foo's defaults."""
+    extra: list[Row] = []
+    for r in rows:
+        if r.verdict != "TACIT":
+            continue
+        ctor = ctor_name(r.default)
+        if not ctor or ctor not in merged:
+            continue
+        for p in merged[ctor]:
+            if p.default is None:
+                continue
+            extra.append(
+                Row(
+                    verdict="TACIT",
+                    role=r.role,
+                    callee=r.callee,
+                    param=f"{r.param}.{p.name}",
+                    default=p.default,
+                    passed="—",
+                    path=r.path,
+                    line=r.line,
+                    others=r.others,
+                )
+            )
+    return rows + extra
+
+
+def classify_harvest(h: Harvest, unfold: bool) -> list[Row]:
+    merged = h.merged_params()
+    rows: list[Row] = []
+    for c in h.calls:
+        params = merged.get(c.callee, [])
+        if not params:
+            continue
+        rows.extend(classify_call(c, params))
+    if unfold:
+        rows = unfold_rows(rows, merged)
+    return rows
+
+
+def pair_renames(old: list[Param], new: list[Param]) -> dict[str, str]:
+    """Map new-param-name → old-param-name when a defaulted slot kept its
+    position but changed identity (threshold → presentThreshold)."""
+    mapping: dict[str, str] = {}
+    old_by_i = {p.index: p for p in old}
+    new_names = {p.name for p in new}
+    old_names = {p.name for p in old}
+    for p in new:
+        if p.name in old_names:
+            mapping[p.name] = p.name
+            continue
+        cand = old_by_i.get(p.index)
+        if (
+            cand
+            and cand.name not in new_names
+            and cand.default is not None
+            and p.default is not None
+        ):
+            mapping[p.name] = cand.name
+    return mapping
+
+
+def diff_rows(
+    old_h: Harvest,
+    new_h: Harvest,
+    unfold: bool,
+) -> list[Row]:
+    old_m = old_h.merged_params()
+    new_m = new_h.merged_params()
+    rows = classify_harvest(new_h, unfold=unfold)
+    # defaults per (callee, param)
+    def defmap(m: dict[str, list[Param]]) -> dict[tuple[str, str], str | None]:
+        out: dict[tuple[str, str], str | None] = {}
+        for callee, params in m.items():
+            for p in params:
+                out[(callee, p.name)] = p.default
+        return out
+
+    old_d = defmap(old_m)
+    new_d = defmap(new_m)
+    rename: dict[tuple[str, str], str] = {}  # (callee, new_name) -> old_name
+    for callee, params in new_m.items():
+        if callee not in old_m:
+            continue
+        mapping = pair_renames(old_m[callee], params)
+        for new_n, old_n in mapping.items():
+            if new_n != old_n:
+                rename[(callee, new_n)] = old_n
+
+    tagged: list[Row] = []
+    for r in rows:
+        # unfold params: look at the leaf ctor? treat as nested; skip rename
+        key = (r.callee, r.param.split(".")[0] if "." in r.param else r.param)
+        # for unfolded, why follows the parent slot's default change only
+        # if the parent ctor default itself moved. Usually Thresholds() is stable.
+        param = r.param
+        leaf = param.split(".")[-1]
+        old_name = rename.get((r.callee, param), param)
+        if "." in param:
+            old_val = old_d.get((ctor_name(r.default) or "", leaf))
+            # unfolded: compare inner default across trees
+            parent = param.split(".")[0]
+            ctor = ctor_name(
+                next(
+                    (
+                        p.default
+                        for p in new_m.get(r.callee, [])
+                        if p.name == parent
+                    ),
+                    r.default,
+                )
+                or r.default
+            )
+            old_val = old_d.get((ctor or "", leaf)) if ctor else None
+            new_val = new_d.get((ctor or "", leaf)) if ctor else r.default
+        else:
+            old_val = old_d.get((r.callee, old_name))
+            if old_val is None and old_name != param:
+                old_val = old_d.get((r.callee, old_name))
+            new_val = new_d.get((r.callee, param))
+
+        changed = (old_val is not None and new_val is not None and not values_equal(str(old_val), str(new_val)))
+        born = old_val is None and new_val is not None
+        died = old_val is not None and new_val is None
+        if not (changed or born or died) and old_name == param:
+            continue  # stable slot: omit from diff view
+        why = ""
+        if r.verdict == "TACIT" and (changed or born):
+            why = "BLAST"
+        elif r.verdict in {"SHADOW", "OVERRIDE"} and old_val is not None and values_equal(r.passed, str(old_val)):
+            why = "FOSSIL"
+        elif r.verdict == "SHADOW" and (changed or born):
+            why = "PRE"
+        elif r.verdict == "OVERRIDE" and (changed or born):
+            why = "LOCK"
+        elif r.verdict == "BOUND" and (changed or born):
+            why = "BOUND"
+        elif died:
+            why = "DIED"
+        else:
+            why = "BLAST" if r.verdict == "TACIT" else r.verdict
+        rr = Row(**{**r.__dict__, "why": why})
+        if changed and old_val is not None:
+            rr.default = f"{old_val}→{new_val}"
+        tagged.append(rr)
+    return tagged
+
+
+@dataclass
+class Moved:
+    callee: str
+    param: str
+    old_name: str
+    old_val: str | None
+    new_val: str | None
+
+
+def relativize_harvest(h: Harvest, root: str | None) -> Harvest:
+    if not root:
+        return h
+    for s in h.sigs:
+        s.path = relpath(s.path, root).replace("\\", "/")
+    for c in h.calls:
+        c.path = relpath(c.path, root).replace("\\", "/")
+    texts: dict[str, str] = {}
+    for p, src in h.texts.items():
+        texts[_norm_path(relpath(p, root))] = src
+    h.texts = texts
+    return h
+
+
+def moved_slots(old_h: Harvest, new_h: Harvest) -> list[Moved]:
+    """Slots whose default moved, was born, or was renamed-and-moved.
+
+    Rename-only (same literal, new name) is not a blast of a *value*.
+    """
+    old_m = old_h.merged_params()
+    new_m = new_h.merged_params()
+
+    def defmap(m: dict[str, list[Param]]) -> dict[tuple[str, str], str | None]:
+        out: dict[tuple[str, str], str | None] = {}
+        for callee, params in m.items():
+            for p in params:
+                out[(callee, p.name)] = p.default
+        return out
+
+    old_d = defmap(old_m)
+    new_d = defmap(new_m)
+    rename: dict[tuple[str, str], str] = {}
+    for callee, params in new_m.items():
+        if callee not in old_m:
+            continue
+        mapping = pair_renames(old_m[callee], params)
+        for new_n, old_n in mapping.items():
+            if new_n != old_n:
+                rename[(callee, new_n)] = old_n
+
+    seen: set[tuple[str, str]] = set()
+    out: list[Moved] = []
+    for callee, params in new_m.items():
+        for p in params:
+            if p.default is None:
+                continue
+            old_name = rename.get((callee, p.name), p.name)
+            old_val = old_d.get((callee, old_name))
+            new_val = p.default
+            changed = (
+                old_val is not None
+                and new_val is not None
+                and not values_equal(str(old_val), str(new_val))
+            )
+            born = old_val is None and new_val is not None
+            if not (changed or born):
+                continue
+            key = (callee, p.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                Moved(
+                    callee=callee,
+                    param=p.name,
+                    old_name=old_name,
+                    old_val=None if old_val is None else str(old_val),
+                    new_val=str(new_val),
+                )
+            )
+    return out
+
+
+def _norm_path(p: str) -> str:
+    return p.replace("\\", "/").lstrip("./")
+
+
+def _prefix(r: Row) -> tuple:
+    return (_norm_path(r.path), r.callee, r.param, r.others)
+
+
+def _group_by_prefix(rows: list[Row]) -> dict[tuple, list[Row]]:
+    groups: dict[tuple, list[Row]] = {}
+    for r in rows:
+        groups.setdefault(_prefix(r), []).append(r)
+    for rs in groups.values():
+        rs.sort(key=lambda x: (x.line, x.passed, x.verdict))
+    return groups
+
+
+def _slot_rows(rows: list[Row], moved: list[Moved]) -> list[Row]:
+    want = {(m.callee, m.param) for m in moved}
+    # unfolded leaf: Thresholds.driftDelay may move even if parent is stable
+    out = []
+    for r in rows:
+        leaf = r.param.split(".")[-1]
+        if (r.callee, r.param) in want or (r.callee, leaf) in want:
+            out.append(r)
+            continue
+        # SessionProfile.thresholds.driftDelay — match inner ctor slot
+        if "." in r.param:
+            parent, child = r.param.split(".", 1)
+            if any(m.param == child or m.param == r.param for m in moved):
+                out.append(r)
+    return out
+
+
+def _default_label(m: Moved) -> str:
+    if m.old_val is None:
+        return f"∅→{m.new_val}"
+    return f"{m.old_val}→{m.new_val}"
+
+
+def _fate_of(blast: Row | None, later: Row | None, m: Moved) -> str:
+    """Name the third-snapshot object.
+
+    ALOUD is only a BLAST *survivor* (TACIT at NEW) that later restates
+    the new default. PRE already spoke at the blast. LATE never rode it.
+    FOSSIL restates the old value. MUTE stayed omitted.
+    """
+    new_val = m.new_val or ""
+    old_val = m.old_val
+
+    def is_new(r: Row) -> bool:
+        return r.verdict in {"SHADOW", "OVERRIDE"} and values_equal(r.passed, new_val)
+
+    def is_old(r: Row) -> bool:
+        return (
+            old_val is not None
+            and r.verdict in {"SHADOW", "OVERRIDE"}
+            and values_equal(r.passed, old_val)
+        )
+
+    if blast is None:
+        if later is None:
+            return "GONE"
+        if is_new(later):
+            return "LATE"
+        if is_old(later):
+            return "FOSSIL"
+        if later.verdict == "TACIT":
+            return "FRESH"
+        if later.verdict == "BOUND":
+            return "BOUND"
+        return "LOCK"
+
+    # blast exists
+    if blast.verdict == "TACIT":
+        if later is None:
+            return "GONE"
+        if later.verdict == "TACIT":
+            return "MUTE"
+        if is_new(later):
+            return "ALOUD"
+        if is_old(later):
+            return "FOSSIL"
+        if later.verdict == "BOUND":
+            return "BOUND"
+        return "LOCK"
+
+    if is_old(blast):
+        return "FOSSIL"
+    if is_new(blast):
+        return "PRE"
+    if blast.verdict == "BOUND":
+        return "BOUND"
+    # OVERRIDE of something else at blast
+    if later is None:
+        return "GONE"
+    if is_new(later) and blast.verdict == "TACIT":
+        return "ALOUD"
+    if is_old(later) or is_old(blast):
+        return "FOSSIL"
+    return "LOCK"
+
+
+def aloud_rows(
+    blast_h: Harvest,
+    later_h: Harvest,
+    moved: list[Moved],
+    unfold: bool,
+) -> list[Row]:
+    """Join BLAST-time sites to a later snapshot.
+
+    Identity: (path, callee, param, sibling-args-excluding-slot), then
+    zip by line order inside that group so speaking the slot (which adds
+    the name) does not change the key.
+    """
+    if not moved:
+        return []
+    blast_rows = _slot_rows(classify_harvest(blast_h, unfold=unfold), moved)
+    later_rows = _slot_rows(classify_harvest(later_h, unfold=unfold), moved)
+    by_slot = {(m.callee, m.param): m for m in moved}
+    # also index by param name alone for unfolded leaves
+    by_param = {}
+    for m in moved:
+        by_param.setdefault(m.param, m)
+
+    def moved_for(r: Row) -> Moved | None:
+        if (r.callee, r.param) in by_slot:
+            return by_slot[(r.callee, r.param)]
+        leaf = r.param.split(".")[-1]
+        if (r.callee, leaf) in by_slot:
+            return by_slot[(r.callee, leaf)]
+        return by_param.get(leaf) or by_param.get(r.param)
+
+    bg = _group_by_prefix(blast_rows)
+    lg = _group_by_prefix(later_rows)
+    keys = set(bg) | set(lg)
+    tagged: list[Row] = []
+    for key in sorted(keys):
+        bs = bg.get(key, [])
+        ls = lg.get(key, [])
+        n = max(len(bs), len(ls))
+        for i in range(n):
+            b = bs[i] if i < len(bs) else None
+            l = ls[i] if i < len(ls) else None
+            sample = l or b
+            if sample is None:
+                continue
+            m = moved_for(sample)
+            if m is None:
+                continue
+            fate = _fate_of(b, l, m)
+            src = l or b
+            hint = l if l is not None else b
+            rr = Row(
+                verdict=(l.verdict if l else (b.verdict if b else "")),
+                role=src.role,
+                callee=src.callee,
+                param=src.param,
+                default=_default_label(m),
+                passed=(l.passed if l else "—"),
+                path=src.path,
+                line=src.line,
+                why=fate,
+                blast=(b.verdict if b else "—"),
+                blast_line=(b.line if b else 0),
+                blast_passed=(b.passed if b else "—"),
+                others=src.others,
+                lang=hint.lang,
+                kind=hint.kind,
+                open_idx=hint.open_idx,
+                close_idx=hint.close_idx,
+                arg_start=hint.arg_start,
+                arg_end=hint.arg_end,
+                arg_keyword=hint.arg_keyword,
+                flag_start=hint.flag_start,
+                flag_end=hint.flag_end,
+                style_keyword=hint.style_keyword,
+                new_val=m.new_val or "",
+            )
+            tagged.append(rr)
+    return tagged
+
+
+# ---------------------------------------------------------------------------
+# rewrite: unspeak ALOUD / pin MUTE
+# ---------------------------------------------------------------------------
+
+def drop_inner_span(inner: str, start: int, end: int) -> str:
+    """Remove one argument from a call inner, taking one adjacent comma."""
+    n = len(inner)
+    start = max(0, min(start, n))
+    end = max(start, min(end, n))
+    after = end
+    while after < n and inner[after] in " \t":
+        after += 1
+    if after < n and inner[after] == ",":
+        after += 1
+        while after < n and inner[after] in " \t":
+            after += 1
+        out = inner[:start] + inner[after:]
+    else:
+        before = start
+        while before > 0 and inner[before - 1] in " \t":
+            before -= 1
+        if before > 0 and inner[before - 1] == ",":
+            before -= 1
+            out = inner[:before] + inner[end:]
+        else:
+            out = inner[:start] + inner[end:]
+    if inner.endswith("\n") and not out.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def pin_inner(inner: str, piece: str) -> str:
+    """Insert a keyword/positional arg before the closing paren."""
+    if not inner.strip():
+        return piece
+    if "\n" not in inner:
+        return inner.rstrip() + ", " + piece
+    stripped = inner.rstrip()
+    trail = inner[len(stripped) :]
+    last_line = stripped.split("\n")[-1]
+    indent = last_line[: len(last_line) - len(last_line.lstrip())]
+    if not stripped.endswith(","):
+        stripped += ","
+    return stripped + "\n" + indent + piece + trail
+
+
+def format_arg(name: str, value: str, lang: str, keyword: bool) -> str:
+    if lang == "swift":
+        return f"{name}: {value}"
+    if lang == "rs":
+        flag = name.replace("_", "-")
+        return f"--{flag} {_unquote(value)}"
+    if not keyword:
+        return value
+    if lang == "py":
+        return f"{name}={value}"
+    return f"{name} = {value}"
+
+
+def drop_clap_flag(src: str, start: int, end: int) -> str:
+    if start > 0 and src[start - 1] in " \t":
+        start -= 1
+    return src[:start] + src[end:]
+
+
+def pin_clap_line(src: str, line_no: int, piece: str) -> str:
+    lines = src.splitlines(keepends=True)
+    idx = line_no - 1
+    if idx < 0 or idx >= len(lines):
+        return src
+    line = lines[idx]
+    nl = ""
+    if line.endswith("\n"):
+        nl = "\n"
+        line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+            nl = "\r\n"
+    if line and not line.endswith((" ", "\t")):
+        line += " "
+    lines[idx] = line + piece + nl
+    return "".join(lines)
+
+
+def _emit_target(r: Row, pin: bool) -> bool:
+    """Only ALOUD can be unsaid; only MUTE can be pinned. Nested unfold skips."""
+    if "." in r.param:
+        return False
+    if r.why == "ALOUD":
+        return True
+    if pin and r.why == "MUTE":
+        return True
+    return False
+
+
+def _group_key(r: Row) -> tuple:
+    if r.kind == "clap":
+        if r.why == "ALOUD" and r.flag_start >= 0:
+            return (r.path, "clap-unspeak", r.flag_start, r.flag_end)
+        return (r.path, "clap-pin", r.line, 0)
+    return (r.path, "call", r.open_idx, r.close_idx)
+
+
+def rewrite_source(src: str, rows: list[Row], pin: bool) -> str:
+    """Apply all unspeak/pin edits for one file, high offset first."""
+    groups: dict[tuple, list[Row]] = {}
+    for r in rows:
+        if not _emit_target(r, pin):
+            continue
+        groups.setdefault(_group_key(r), []).append(r)
+    if not groups:
+        return src
+
+    def sort_key(k: tuple) -> int:
+        # path, kind, a, b  — use the start offset (or line* large for clap-pin)
+        kind = k[1]
+        if kind == "clap-pin":
+            return 10**12 + int(k[2])
+        return int(k[2])
+
+    for key in sorted(groups, key=sort_key, reverse=True):
+        grp = groups[key]
+        r0 = grp[0]
+        if r0.kind == "clap":
+            if r0.why == "ALOUD" and r0.flag_start >= 0:
+                src = drop_clap_flag(src, r0.flag_start, r0.flag_end)
+            elif pin and r0.why == "MUTE" and r0.new_val:
+                piece = format_arg(r0.param, r0.new_val, "rs", True)
+                src = pin_clap_line(src, r0.line, piece)
+            continue
+        if r0.open_idx < 0 or r0.close_idx <= r0.open_idx:
+            continue
+        inner = src[r0.open_idx + 1 : r0.close_idx]
+        drops = [r for r in grp if r.why == "ALOUD" and r.arg_start >= 0]
+        drops.sort(key=lambda r: r.arg_start, reverse=True)
+        for r in drops:
+            inner = drop_inner_span(inner, r.arg_start, r.arg_end)
+        if pin:
+            for r in grp:
+                if r.why != "MUTE" or not r.new_val:
+                    continue
+                keyword = True if r.lang in {"swift", "py"} else r.style_keyword
+                if r.lang == "ts" and not r.style_keyword:
+                    keyword = False
+                piece = format_arg(r.param, r.new_val, r.lang, keyword)
+                inner = pin_inner(inner, piece)
+        src = src[: r0.open_idx + 1] + inner + src[r0.close_idx :]
+    return src
+
+
+def rewrite_harvest(
+    later_h: Harvest, rows: list[Row], pin: bool
+) -> dict[str, tuple[str, str]]:
+    """path -> (old, new) for files that change."""
+    by_path: dict[str, list[Row]] = {}
+    for r in rows:
+        if _emit_target(r, pin):
+            by_path.setdefault(_norm_path(r.path), []).append(r)
+    out: dict[str, tuple[str, str]] = {}
+    for path, rs in by_path.items():
+        old = later_h.texts.get(path)
+        if old is None:
+            # try basename-insensitive lookup
+            for k, v in later_h.texts.items():
+                if _norm_path(k) == path:
+                    old = v
+                    break
+        if old is None:
+            continue
+        new = rewrite_source(old, rs, pin)
+        if new != old:
+            out[path] = (old, new)
+    return out
+
+
+def unified_file_diff(path: str, old: str, new: str) -> str:
+    # Body lines must already include newlines (keepends); difflib only
+    # appends lineterm to headers. splitlines() without keepends mashes
+    # the hunk and git apply cannot consume it.
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    return "".join(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+        )
+    )
+
+
+def emit_patch(later_h: Harvest, rows: list[Row], pin: bool) -> str:
+    chunks = []
+    changed = rewrite_harvest(later_h, rows, pin)
+    for path in sorted(changed):
+        old, new = changed[path]
+        chunk = unified_file_diff(path, old, new)
+        if chunk:
+            chunks.append(chunk)
+    return "".join(chunks)
+
+
+def skip_notes(rows: list[Row], pin: bool) -> list[str]:
+    """Stderr when --emit produced no hunks.
+
+    Empty emit of 27 MUTE (still ride) is the opposite of empty emit of
+    18 LATE (born speaking, never rode). v0.1 collapsed them.
+    """
+    from collections import Counter
+
+    c = Counter(r.why for r in rows)
+    notes = []
+    if c["ALOUD"] == 0:
+        reasons = []
+        if c["MUTE"]:
+            reasons.append(f"{c['MUTE']} MUTE still ride")
+        if c["LATE"]:
+            reasons.append(f"{c['LATE']} LATE born-speaking, never rode")
+        if c["PRE"]:
+            reasons.append(f"{c['PRE']} PRE already spoke at the blast")
+        if c["FOSSIL"]:
+            reasons.append(f"{c['FOSSIL']} FOSSIL restates the old value")
+        if reasons:
+            notes.append(
+                "0 ALOUD (" + "; ".join(reasons) + "); nothing to unspeak"
+            )
+        else:
+            notes.append("0 ALOUD; nothing to unspeak")
+    if pin and c["MUTE"] == 0:
+        if c["LATE"]:
+            notes.append(
+                f"0 MUTE ({c['LATE']} LATE is not MUTE); nothing to pin"
+            )
+        else:
+            notes.append("0 MUTE; nothing to pin")
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def _needle_is_path(n: str) -> bool:
+    if "/" in n or n.startswith("."):
+        return True
+    lower = n.lower()
+    return any(lower.endswith(ext) for ext in CODE_EXTS)
+
+
+def filter_rows(rows: list[Row], needles: list[str], kinds: set[str], why: set[str]) -> list[Row]:
+    out = []
+    for r in rows:
+        if kinds and r.verdict not in kinds:
+            continue
+        if why and r.why not in why:
+            continue
+        ok = True
+        for n in needles:
+            nl = n.lower()
+            if _needle_is_path(n):
+                if nl not in r.path.lower():
+                    ok = False
+                    break
+            else:
+                if nl not in r.callee.lower() and nl not in r.param.lower():
+                    ok = False
+                    break
+        if not ok:
+            continue
+        out.append(r)
+    return out
+
+
+FATE_ORDER = (
+    "ALOUD",
+    "MUTE",
+    "FOSSIL",
+    "PRE",
+    "LATE",
+    "FRESH",
+    "LOCK",
+    "BOUND",
+    "GONE",
+)
+DEFAULT_FATES = {"ALOUD", "MUTE", "FOSSIL", "PRE", "LATE"}
+
+
+def emit_tsv(rows: list[Row], header: bool) -> None:
+    cols = [
+        "fate",
+        "blast",
+        "later",
+        "role",
+        "callee",
+        "param",
+        "default",
+        "passed",
+        "file",
+        "line",
+    ]
+    if header:
+        print("\t".join(cols))
+    for r in rows:
+        print(
+            "\t".join(
+                [
+                    r.why or "",
+                    r.blast or "—",
+                    r.verdict,
+                    r.role,
+                    r.callee,
+                    r.param,
+                    r.default.replace("\t", " ").replace("\n", " "),
+                    r.passed.replace("\t", " ").replace("\n", " "),
+                    r.path,
+                    str(r.line),
+                ]
+            )
+        )
+
+
+def emit_json(rows: list[Row]) -> None:
+    payload = []
+    for r in rows:
+        payload.append(
+            {
+                "fate": r.why,
+                "blast": r.blast or None,
+                "later": r.verdict,
+                "role": r.role,
+                "callee": r.callee,
+                "param": r.param,
+                "default": r.default,
+                "passed": None if r.passed == "—" else r.passed,
+                "file": r.path,
+                "line": r.line,
+                "blast_line": r.blast_line or None,
+                "blast_passed": None if r.blast_passed in {"", "—"} else r.blast_passed,
+            }
+        )
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def emit_summary(rows: list[Row]) -> None:
+    from collections import Counter
+
+    c = Counter(r.why for r in rows)
+    print("fate\tcount")
+    for k in FATE_ORDER:
+        if c[k]:
+            print(f"{k}\t{c[k]}")
+    slot: dict[tuple[str, str], Counter] = {}
+    for r in rows:
+        slot.setdefault((r.callee, r.param), Counter())[r.why] += 1
+    if slot:
+        print("callee\tparam\tALOUD\tMUTE\tFOSSIL\tPRE\tLATE")
+        for (callee, param), cc in sorted(slot.items()):
+            print(
+                f"{callee}\t{param}\t{cc['ALOUD']}\t{cc['MUTE']}\t"
+                f"{cc['FOSSIL']}\t{cc['PRE']}\t{cc['LATE']}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+# Three snapshots of one slot. sensors labels are the join key.
+OLD_SWIFT = r"""
+public final class PresenceArbiter {
+    public init(sensors: [String], threshold: Double = 0.4, emaAlpha: Double = 0.3) {}
+}
+public func seed() {
+    let mute = PresenceArbiter(sensors: ["camera"])
+    let spoken = PresenceArbiter(sensors: ["mic"])
+    let fossil = PresenceArbiter(sensors: ["radar"], threshold: 0.4)
+    let pre = PresenceArbiter(sensors: ["lidar"], threshold: 0.45)
+}
+"""
+
+BLAST_SWIFT = r"""
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45, emaAlpha: Double = 0.3) {}
+}
+public func seed() {
+    let mute = PresenceArbiter(sensors: ["camera"])
+    let spoken = PresenceArbiter(sensors: ["mic"])
+    let fossil = PresenceArbiter(sensors: ["radar"], presentThreshold: 0.4)
+    let pre = PresenceArbiter(sensors: ["lidar"], presentThreshold: 0.45)
+}
+"""
+
+LATER_SWIFT = r"""
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45, emaAlpha: Double = 0.3) {}
+}
+public func seed() {
+    let mute = PresenceArbiter(sensors: ["camera"])
+    let spoken = PresenceArbiter(sensors: ["mic"], presentThreshold: 0.45)
+    let fossil = PresenceArbiter(sensors: ["radar"], presentThreshold: 0.4)
+    let pre = PresenceArbiter(sensors: ["lidar"], presentThreshold: 0.45)
+    let late = PresenceArbiter(sensors: ["new"], presentThreshold: 0.45)
+}
+"""
+
+PY_OLD = '''
+def greet(name, greeting="hi"):
+    return greeting
+def use():
+    greet("mute")
+    greet("spoken")
+    greet("fossil", greeting="hi")
+    greet("pre", greeting="yo")
+'''
+
+PY_BLAST = '''
+def greet(name, greeting="yo"):
+    return greeting
+def use():
+    greet("mute")
+    greet("spoken")
+    greet("fossil", greeting="hi")
+    greet("pre", greeting="yo")
+'''
+
+PY_LATER = '''
+def greet(name, greeting="yo"):
+    return greeting
+def use():
+    greet("mute")
+    greet("spoken", greeting="yo")
+    greet("fossil", greeting="hi")
+    greet("pre", greeting="yo")
+    greet("late", greeting="yo")
+'''
+
+TS_OLD = r'''
+export function retry(fn: Function, attempts: number = 3) {
+  return fn();
+}
+retry(() => 1);
+retry(() => 2);
+retry(() => 3, 3);
+retry(() => 4, 5);
+'''
+
+TS_BLAST = r'''
+export function retry(fn: Function, attempts: number = 5) {
+  return fn();
+}
+retry(() => 1);
+retry(() => 2);
+retry(() => 3, 3);
+retry(() => 4, 5);
+'''
+
+TS_LATER = r'''
+export function retry(fn: Function, attempts: number = 5) {
+  return fn();
+}
+retry(() => 1);
+retry(() => 2, 5);
+retry(() => 3, 3);
+retry(() => 4, 5);
+retry(() => 6, 5);
+'''
+
+
+def _fates(rows: list[Row], param: str | None = None) -> dict[str, list[Row]]:
+    out: dict[str, list[Row]] = {}
+    for r in rows:
+        if param and r.param != param:
+            continue
+        out.setdefault(r.why, []).append(r)
+    return out
+
+
+def _selftest() -> int:
+    fails: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if cond:
+            print(f"  ok  {name}")
+        else:
+            fails.append(name)
+            print(f"  FAIL {name} {detail}", file=sys.stderr)
+
+    old_h = harvest_texts([("a.swift", OLD_SWIFT, "swift")])
+    blast_h = harvest_texts([("a.swift", BLAST_SWIFT, "swift")])
+    later_h = harvest_texts([("a.swift", LATER_SWIFT, "swift")])
+    moved = moved_slots(old_h, blast_h)
+    check(
+        "rename+move is one presentThreshold slot",
+        any(m.param == "presentThreshold" and m.old_name == "threshold" for m in moved),
+        str([(m.old_name, m.param, m.old_val, m.new_val) for m in moved]),
+    )
+    rows = aloud_rows(blast_h, later_h, moved, unfold=False)
+    f = _fates(rows, "presentThreshold")
+    check(
+        "ALOUD is omitted-then-spoken of the NEW default",
+        len(f.get("ALOUD", [])) == 1
+        and f["ALOUD"][0].blast == "TACIT"
+        and f["ALOUD"][0].verdict == "SHADOW"
+        and values_equal(f["ALOUD"][0].passed, "0.45"),
+        str([(r.blast, r.verdict, r.passed, r.others) for r in f.get("ALOUD", [])]),
+    )
+    check(
+        "MUTE stayed tacit — not ALOUD",
+        len(f.get("MUTE", [])) == 1
+        and f["MUTE"][0].blast == "TACIT"
+        and f["MUTE"][0].verdict == "TACIT",
+        str([(r.blast, r.verdict, r.passed) for r in f.get("MUTE", [])]),
+    )
+    check(
+        "FOSSIL is SHADOW-of-old, not of new",
+        len(f.get("FOSSIL", [])) == 1
+        and values_equal(f["FOSSIL"][0].passed, "0.4"),
+        str([(r.why, r.passed, r.blast) for r in f.get("FOSSIL", [])]),
+    )
+    check(
+        "PRE already spoke new at the BLAST — not a survivor",
+        len(f.get("PRE", [])) == 1
+        and f["PRE"][0].blast == "SHADOW"
+        and values_equal(f["PRE"][0].passed, "0.45"),
+        str([(r.why, r.blast, r.passed) for r in f.get("PRE", [])]),
+    )
+    # LATE is filtered from default view; compute with all fates
+    check(
+        "ALOUD ≠ PRE ≠ MUTE ≠ FOSSIL ≠ LATE (five distinct sites)",
+        {r.why for r in rows if r.param == "presentThreshold" and r.why in DEFAULT_FATES}
+        == {"ALOUD", "MUTE", "FOSSIL", "PRE", "LATE"},
+        str(sorted({r.why for r in rows})),
+    )
+    later_all = aloud_rows(blast_h, later_h, moved, unfold=False)
+    late = [r for r in later_all if r.why == "LATE" and r.param == "presentThreshold"]
+    check(
+        "LATE born-after speaking new is not ALOUD",
+        len(late) == 1
+        and late[0].blast == "—"
+        and late[0].verdict == "SHADOW"
+        and values_equal(late[0].passed, "0.45"),
+        str([(r.why, r.blast, r.verdict, r.passed, r.others) for r in late]),
+    )
+    # until==blast: nobody has spoken yet
+    at_blast = aloud_rows(blast_h, blast_h, moved, unfold=False)
+    af = _fates(at_blast, "presentThreshold")
+    check(
+        "at BLAST there is no ALOUD yet",
+        not af.get("ALOUD")
+        and len(af.get("MUTE", [])) == 2
+        and len(af.get("FOSSIL", [])) == 1
+        and len(af.get("PRE", [])) == 1,
+        str({k: len(v) for k, v in af.items()}),
+    )
+
+    # speaking the slot must not break the join key (siblings exclude the slot)
+    spoken = f["ALOUD"][0]
+    mute = f["MUTE"][0]
+    check(
+        "join key ignores the spoken slot",
+        ("sensors", '["mic"]') in spoken.others
+        and not any(k == "presentThreshold" for k, _ in spoken.others)
+        and ("sensors", '["camera"]') in mute.others,
+        str(spoken.others),
+    )
+
+    # python
+    py_old = harvest_texts([("a.py", PY_OLD, "py")])
+    py_blast = harvest_texts([("a.py", PY_BLAST, "py")])
+    py_later = harvest_texts([("a.py", PY_LATER, "py")])
+    py_moved = moved_slots(py_old, py_blast)
+    py_rows = aloud_rows(py_blast, py_later, py_moved, unfold=False)
+    pf = _fates(py_rows, "greeting")
+    check("py ALOUD spoken yo", any(r.why == "ALOUD" and "yo" in r.passed for r in py_rows))
+    check("py MUTE stayed", len(pf.get("MUTE", [])) == 1)
+    check("py FOSSIL hi (old)", any(r.why == "FOSSIL" and "hi" in r.passed for r in py_rows))
+    check("py PRE yo at blast", len(pf.get("PRE", [])) == 1)
+
+    # ts positional
+    ts_old = harvest_texts([("a.ts", TS_OLD, "ts")])
+    ts_blast = harvest_texts([("a.ts", TS_BLAST, "ts")])
+    ts_later = harvest_texts([("a.ts", TS_LATER, "ts")])
+    ts_moved = moved_slots(ts_old, ts_blast)
+    ts_rows = aloud_rows(ts_blast, ts_later, ts_moved, unfold=False)
+    tf = _fates(ts_rows, "attempts")
+    check(
+        "ts ALOUD positional 5",
+        len(tf.get("ALOUD", [])) == 1 and tf["ALOUD"][0].blast == "TACIT",
+        str([(r.why, r.blast, r.passed, r.others) for r in ts_rows]),
+    )
+    check("ts MUTE positional", len(tf.get("MUTE", [])) == 1)
+    check("ts FOSSIL 3", any(r.why == "FOSSIL" and r.passed.strip() == "3" for r in ts_rows))
+    check("ts PRE 5 at blast", len(tf.get("PRE", [])) == 1)
+
+    # same-fingerprint ordinal: two camera calls, speak the second
+    twin_blast = r"""
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45) {}
+}
+public func seed() {
+    let a = PresenceArbiter(sensors: ["camera"])
+    let b = PresenceArbiter(sensors: ["camera"])
+}
+"""
+    twin_later = r"""
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45) {}
+}
+public func seed() {
+    let a = PresenceArbiter(sensors: ["camera"])
+    let b = PresenceArbiter(sensors: ["camera"], presentThreshold: 0.45)
+}
+"""
+    twin_old = twin_blast.replace("0.45", "0.4")
+    th = aloud_rows(
+        harvest_texts([("t.swift", twin_blast, "swift")]),
+        harvest_texts([("t.swift", twin_later, "swift")]),
+        moved_slots(
+            harvest_texts([("t.swift", twin_old, "swift")]),
+            harvest_texts([("t.swift", twin_blast, "swift")]),
+        ),
+        unfold=False,
+    )
+    tw = _fates(th, "presentThreshold")
+    check(
+        "ordinal zip: first MUTE, second ALOUD",
+        len(tw.get("MUTE", [])) == 1
+        and len(tw.get("ALOUD", [])) == 1
+        and tw["MUTE"][0].line < tw["ALOUD"][0].line,
+        str([(r.why, r.line, r.passed) for r in th]),
+    )
+
+    # harvest sanity: comment residue still ignored
+    noisy = BLAST_SWIFT + "\n// PresenceArbiter(SitboneCore)\n"
+    nh = harvest_texts([("n.swift", noisy, "swift")])
+    nrows = classify_harvest(nh, unfold=False)
+    check(
+        "comment residue is not a call",
+        not any("SitboneCore" in (r.passed or "") for r in nrows),
+    )
+
+    # born-after OVERRIDE of a non-default is LOCK, not LATE
+    later_lock = LATER_SWIFT.replace(
+        'let late = PresenceArbiter(sensors: ["new"], presentThreshold: 0.45)',
+        'let late = PresenceArbiter(sensors: ["new"], presentThreshold: 0.45)\n'
+        '    let lock = PresenceArbiter(sensors: ["lock"], presentThreshold: 0.99)',
+    )
+    lock_rows = aloud_rows(
+        blast_h,
+        harvest_texts([("a.swift", later_lock, "swift")]),
+        moved,
+        unfold=False,
+    )
+    check(
+        "born-after OVERRIDE is LOCK not LATE",
+        any(r.why == "LOCK" and "0.99" in r.passed for r in lock_rows)
+        and not any(r.why == "LATE" and "0.99" in r.passed for r in lock_rows),
+        str([(r.why, r.passed) for r in lock_rows if r.param == "presentThreshold"]),
+    )
+
+    # --emit: only ALOUD is unsaid (not PRE, LATE, FOSSIL)
+    later_h_emit = harvest_texts([("a.swift", LATER_SWIFT, "swift")])
+    changed = rewrite_harvest(later_h_emit, rows, pin=False)
+    check("emit rewrites the later file", "a.swift" in changed, str(list(changed)))
+    unsaid = changed.get("a.swift", ("", ""))[1]
+    check(
+        "ALOUD mic lost presentThreshold: 0.45",
+        'PresenceArbiter(sensors: ["mic"])' in unsaid
+        and 'PresenceArbiter(sensors: ["mic"], presentThreshold: 0.45)' not in unsaid,
+        unsaid,
+    )
+    check(
+        "PRE lidar still speaks 0.45 (not unsaid)",
+        'PresenceArbiter(sensors: ["lidar"], presentThreshold: 0.45)' in unsaid,
+        unsaid,
+    )
+    check(
+        "LATE new still speaks 0.45 (never rode)",
+        'PresenceArbiter(sensors: ["new"], presentThreshold: 0.45)' in unsaid,
+        unsaid,
+    )
+    check(
+        "FOSSIL radar still speaks 0.4",
+        'PresenceArbiter(sensors: ["radar"], presentThreshold: 0.4)' in unsaid,
+        unsaid,
+    )
+    naive = re.sub(r", presentThreshold: 0.45", "", LATER_SWIFT)
+    naive_hits = naive.count("presentThreshold")
+    unsay_hits = unsaid.count("presentThreshold")
+    check(
+        "naive comma-regex would also unspeak PRE+LATE; unsay does not",
+        naive_hits < unsay_hits
+        and '["lidar"]' in naive
+        and 'presentThreshold' not in naive.split("lidar")[1].split("\n")[0],
+        f"naive_pt={naive_hits} unsay_pt={unsay_hits}",
+    )
+    re_h = harvest_texts([("a.swift", unsaid, "swift")])
+    re_rows = aloud_rows(blast_h, re_h, moved, unfold=False)
+    rf = _fates(re_rows, "presentThreshold")
+    check(
+        "after --emit, ALOUD became MUTE (TACIT rider again)",
+        not rf.get("ALOUD") and len(rf.get("MUTE", [])) == 2,
+        str({k: len(v) for k, v in rf.items()}),
+    )
+    check(
+        "after --emit, PRE/LATE/FOSSIL fates unchanged",
+        len(rf.get("PRE", [])) == 1
+        and len(rf.get("LATE", [])) == 1
+        and len(rf.get("FOSSIL", [])) == 1,
+        str({k: len(v) for k, v in rf.items()}),
+    )
+    patch = emit_patch(later_h_emit, rows, pin=False)
+    check(
+        "unified diff deletes the spoken arg",
+        patch.startswith("--- a/a.swift")
+        and "+++ b/a.swift" in patch
+        and "-    let spoken = PresenceArbiter(sensors: [\"mic\"], presentThreshold: 0.45)"
+        in patch
+        and "+    let spoken = PresenceArbiter(sensors: [\"mic\"])" in patch,
+        patch,
+    )
+    changed_lines = [
+        ln
+        for ln in patch.splitlines()
+        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+    ]
+    check(
+        "unified diff only rewrites the ALOUD line (context may name neighbors)",
+        any(ln.startswith("-") and "mic" in ln and "0.45" in ln for ln in changed_lines)
+        and any(ln.startswith("+") and "mic" in ln and "0.45" not in ln for ln in changed_lines)
+        and not any(
+            ("lidar" in ln or '["new"]' in ln or "radar" in ln) and ln.startswith(("+", "-"))
+            for ln in changed_lines
+        ),
+        "\n".join(changed_lines),
+    )
+
+    # --pin MUTE
+    pinned_files = rewrite_harvest(later_h_emit, rows, pin=True)
+    pinned = pinned_files["a.swift"][1]
+    check(
+        "pin MUTE camera now speaks 0.45",
+        'PresenceArbiter(sensors: ["camera"], presentThreshold: 0.45)' in pinned,
+        pinned,
+    )
+    check(
+        "pin still unspeaks ALOUD mic",
+        'PresenceArbiter(sensors: ["mic"])' in pinned
+        and '["mic"], presentThreshold' not in pinned,
+        pinned,
+    )
+
+    # python emit
+    py_later_h = harvest_texts([("a.py", PY_LATER, "py")])
+    py_changed = rewrite_harvest(py_later_h, py_rows, pin=False)
+    py_new = py_changed["a.py"][1]
+    check(
+        "py emit unsays greeting=yo on spoken only",
+        'greet("spoken")' in py_new
+        and 'greet("spoken", greeting="yo")' not in py_new
+        and 'greet("pre", greeting="yo")' in py_new
+        and 'greet("late", greeting="yo")' in py_new
+        and 'greet("fossil", greeting="hi")' in py_new,
+        py_new,
+    )
+
+    # ts positional emit
+    ts_later_h = harvest_texts([("a.ts", TS_LATER, "ts")])
+    ts_changed = rewrite_harvest(ts_later_h, ts_rows, pin=False)
+    ts_new = ts_changed["a.ts"][1]
+    check(
+        "ts emit drops positional 5 on ALOUD only",
+        "retry(() => 2, 5)" not in ts_new
+        and "retry(() => 2)" in ts_new
+        and "retry(() => 4, 5)" in ts_new
+        and "retry(() => 6, 5)" in ts_new
+        and "retry(() => 3, 3)" in ts_new,
+        ts_new,
+    )
+
+    # multiline call
+    multi_blast = """
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45) {}
+}
+public func seed() {
+    let spoken = PresenceArbiter(sensors: ["mic"])
+    let mute = PresenceArbiter(sensors: ["camera"])
+}
+"""
+    multi_later = """
+public final class PresenceArbiter {
+    public init(sensors: [String], presentThreshold: Double = 0.45) {}
+}
+public func seed() {
+    let spoken = PresenceArbiter(
+        sensors: ["mic"],
+        presentThreshold: 0.45
+    )
+    let mute = PresenceArbiter(sensors: ["camera"])
+}
+"""
+    multi_old = multi_blast.replace("0.45", "0.4")
+    mh_old = harvest_texts([("m.swift", multi_old, "swift")])
+    mh_blast = harvest_texts([("m.swift", multi_blast, "swift")])
+    mh_later = harvest_texts([("m.swift", multi_later, "swift")])
+    mh_moved = moved_slots(mh_old, mh_blast)
+    mh_rows = aloud_rows(mh_blast, mh_later, mh_moved, unfold=False)
+    mh_new = rewrite_harvest(mh_later, mh_rows, pin=False)["m.swift"][1]
+    check(
+        "multiline ALOUD drops the presentThreshold line",
+        "presentThreshold" not in mh_new.split("mic")[1].split("mute")[0]
+        and 'sensors: ["mic"]' in mh_new,
+        mh_new,
+    )
+    mh_pin = rewrite_harvest(mh_later, mh_rows, pin=True)["m.swift"][1]
+    check(
+        "multiline pin adds trailing comma + presentThreshold",
+        'sensors: ["camera"],' in mh_pin
+        or '["camera"], presentThreshold: 0.45' in mh_pin,
+        mh_pin,
+    )
+
+    mute_notes = skip_notes([r for r in rows if r.why == "MUTE"], pin=False)
+    late_notes = skip_notes([r for r in rows if r.why == "LATE"], pin=False)
+    check(
+        "empty-emit MUTE names still-ride, not born-speaking",
+        any("MUTE still ride" in n and "LATE" not in n for n in mute_notes),
+        str(mute_notes),
+    )
+    check(
+        "empty-emit LATE names born-speaking, not still-ride",
+        any("LATE born-speaking, never rode" in n and "MUTE" not in n for n in late_notes),
+        str(late_notes),
+    )
+    pin_late = skip_notes([r for r in rows if r.why == "LATE"], pin=True)
+    check(
+        "--pin LATE is refused as not MUTE",
+        any("LATE is not MUTE" in n for n in pin_late),
+        str(pin_late),
+    )
+    mixed = skip_notes(at_blast, pin=False)
+    check(
+        "at-blast empty emit names MUTE+PRE+FOSSIL, not LATE",
+        any(
+            "MUTE still ride" in n
+            and "PRE already spoke" in n
+            and "FOSSIL restates" in n
+            and "LATE" not in n
+            for n in mixed
+        ),
+        str(mixed),
+    )
+
+    if fails:
+        print(f"selftest: {len(fails)} failed", file=sys.stderr)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """unsay — unspeak ALOUD so a BLAST survivor rides again.
+
+  unsay -C <tree> --blast REV --emit [filter...]
+  unsay -C <tree> --blast OLD NEW [--until LATER] --emit --pin
+  unsay --selftest
+
+aloud names ALOUD (omitted at BLAST, later SHADOW of the *new* default).
+unsay emits the unified diff that deletes that argument (ALOUD → TACIT).
+`--pin` also writes the new default at MUTE sites (MUTE → SHADOW).
+
+PRE already spoke at the blast. LATE never rode it. FOSSIL restates the
+old value. None of those are unsaid. `rg ': 0.45'` cannot tell them apart.
+
+  --blast REV        OLD=REV^, NEW=REV; --until defaults to the worktree
+  --blast OLD NEW    two-point BLAST interval
+  --until LATER      third snapshot (rev or omitted=worktree)
+  --emit             unified diff: unspeak ALOUD
+  --pin              with --emit, also pin MUTE as SHADOW
+  --summary          counts per slot (without --emit)
+  --only aloud,mute  restrict fates
+  --all              include FRESH/LOCK/BOUND/GONE
+  --check            exit 1 if ALOUD remains
+
+Exit: 0 ok, 1 --check found ALOUD, 2 error.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="unsay",
+        description="Unspeak ALOUD (explicit new-default) so the site rides again.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP,
+    )
+    p.add_argument("-C", "--directory", default=".", help="tree to scan")
+    p.add_argument(
+        "--blast",
+        nargs="+",
+        metavar="REV",
+        help="BLAST interval: REV (means REV^..REV) or OLD NEW",
+    )
+    p.add_argument(
+        "--until",
+        default=None,
+        metavar="REV",
+        help="later snapshot (default: worktree)",
+    )
+    p.add_argument("--summary", action="store_true", help="counts per slot")
+    p.add_argument("--json", action="store_true", help="JSON array")
+    p.add_argument("--header", action="store_true", help="TSV header")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="include FRESH, LOCK, BOUND, GONE",
+    )
+    p.add_argument(
+        "--only",
+        default="",
+        help="comma fates (aloud,mute,fossil,pre,late,fresh,lock,bound,gone)",
+    )
+    p.add_argument("--no-unfold", action="store_true", help="do not expand Foo() defaults")
+    p.add_argument("--check", action="store_true", help="exit 1 if ALOUD remains")
+    p.add_argument(
+        "--emit",
+        action="store_true",
+        help="unified diff that unsays ALOUD (delete the new-default arg)",
+    )
+    p.add_argument(
+        "--pin",
+        action="store_true",
+        help="with --emit, also pin MUTE as SHADOW of the new default",
+    )
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("filter", nargs="*", help="AND substrings against callee/param/path")
+    return p.parse_args(argv)
+
+
+def fates_from(ns: argparse.Namespace) -> set[str]:
+    if ns.only:
+        out = set()
+        for part in ns.only.split(","):
+            part = part.strip().upper()
+            if part:
+                out.add(part)
+        return out
+    if ns.all:
+        return set()
+    return set(DEFAULT_FATES)
+
+
+def resolve_blast(repo: str, spec: list[str]) -> tuple[str, str]:
+    if len(spec) == 1:
+        new_rev = spec[0]
+        old_rev = spec[0] + "^"
+    elif len(spec) >= 2:
+        old_rev, new_rev = spec[0], spec[1]
+    else:
+        raise RuntimeError("--blast needs REV or OLD NEW")
+    # prove they exist
+    git(repo, "rev-parse", "--verify", old_rev)
+    git(repo, "rev-parse", "--verify", new_rev)
+    return old_rev, new_rev
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in {"selftest", "--self-test"}:
+        argv = ["--selftest"]
+    ns = parse_args(argv)
+    if ns.version:
+        print(f"unsay {VERSION}")
+        return 0
+    if ns.selftest:
+        return _selftest()
+
+    if not ns.blast:
+        print("unsay: --blast REV  (or --blast OLD NEW) is required", file=sys.stderr)
+        return 2
+    if ns.pin and not ns.emit:
+        print("unsay: --pin requires --emit", file=sys.stderr)
+        return 2
+
+    root = str(Path(ns.directory).resolve())
+    unfold = not ns.no_unfold
+    try:
+        old_rev, new_rev = resolve_blast(root, ns.blast)
+        old_h = relativize_harvest(harvest_rev(root, old_rev), None)
+        blast_h = relativize_harvest(harvest_rev(root, new_rev), None)
+        if ns.until:
+            later_h = relativize_harvest(harvest_rev(root, ns.until), None)
+        else:
+            later_h = relativize_harvest(harvest_root(Path(root)), root)
+        moved = moved_slots(old_h, blast_h)
+        if not moved:
+            print(
+                f"unsay: no default moved between {old_rev} and {new_rev}",
+                file=sys.stderr,
+            )
+            return 0
+        rows = aloud_rows(blast_h, later_h, moved, unfold=unfold)
+    except RuntimeError as e:
+        print(f"unsay: {e}", file=sys.stderr)
+        return 2
+
+    for r in rows:
+        r.path = _norm_path(relpath(r.path, root))
+    later_h.texts = {_norm_path(k): v for k, v in later_h.texts.items()}
+
+    why = fates_from(ns)
+    # Path/callee filter first. --only hides fates from TSV *and* from
+    # --emit targets, but empty-emit diagnosis uses default fates so
+    # `--only late --emit` still names LATE vs MUTE.
+    scoped = filter_rows(rows, ns.filter, set(), set())
+    rows = filter_rows(scoped, [], set(), why)
+    rows.sort(key=lambda r: (r.why, r.callee, r.param, r.path, r.line))
+
+    if ns.emit:
+        # Never rewrite PRE/LATE/FOSSIL even if --only named them:
+        # emit_patch only unsays ALOUD (and pins MUTE).
+        patch = emit_patch(later_h, rows, pin=ns.pin)
+        if not patch:
+            diag = [r for r in scoped if r.why in DEFAULT_FATES]
+            for note in skip_notes(diag, ns.pin):
+                print(f"unsay: {note}", file=sys.stderr)
+        else:
+            sys.stdout.write(patch)
+            if not patch.endswith("\n"):
+                sys.stdout.write("\n")
+        if ns.check and any(r.why == "ALOUD" for r in rows):
+            return 1
+        return 0
+
+    if ns.json:
+        emit_json(rows)
+    elif ns.summary:
+        emit_summary(rows)
+    else:
+        emit_tsv(rows, ns.header)
+
+    if ns.check and any(r.why == "ALOUD" for r in rows):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+

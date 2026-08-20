@@ -1,0 +1,2451 @@
+#!/usr/bin/env python3
+"""quire — emit one tree-image covering for COMMUTE across files.
+
+hank --emit is the composed covering as one unified diff. Hole: two files that
+commute are DISJOINT + two PARALLEL singletons, and occupying each file then
+concatenating diffs is joining rows. Without -C, hank emits two strand fences.
+
+quire: cross-file disjoint edits COMMUTE. The emit is one tree-image
+(unanimous fate or labelled MIXED). JAM still refuses. STACK fold stays
+-beta +beta3 with file context. Locus slack is load-bearing. ECHO is a
+locus, not image-identity.
+
+Not occupying each strand and joining rows. Not a fourth cinch.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
+import unicodedata
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from itertools import combinations
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+EXIT_OK = 0       # composed, occupancy reported (or empty)
+EXIT_SPLIT = 1
+EXIT_JAM = 2
+EXIT_ERROR = 3
+
+SUGGEST_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.S)
+HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+PATH_HEADER_RE = re.compile(
+    r"^(?:#+\s*)?(?:file:\s*)?(\S+):(\d+)(?:-(\d+))?\s*$", re.I
+)
+MD_PATH_RE = re.compile(r"^(?:#+\s*|<!--\s*)(?:path|file)\s*[:\s]\s*(\S+)", re.I)
+
+CONNECTING = frozenset(
+    {"ECHO", "STACK", "SUBSUME", "SPLIT", "JAM", "COVER", "COMMUTE", "THREAD"}
+)
+QUIET_PAIRS = frozenset({"DISJOINT"})
+REFUSE = frozenset({"JAMMED", "SPLIT"})
+LOCUS_SLACK = 2
+
+
+class ParseError(Exception):
+    pass
+
+
+class InputError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# objects
+# ---------------------------------------------------------------------------
+
+
+def _strip_cr(s: str) -> str:
+    return s.replace("\r", "")
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s) if s else s
+
+
+def _as_int(v: Any) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(*vals: Any) -> Any:
+    for v in vals:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _as_lines(val: Any) -> Optional[list[str]]:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [_strip_cr(str(x)).rstrip("\n") for x in val]
+    if isinstance(val, str):
+        return _strip_cr(val).splitlines()
+    return None
+
+
+def _norm(lines: Optional[list[str]], ignore_space: bool) -> Optional[list[str]]:
+    if lines is None:
+        return None
+    if not ignore_space:
+        return list(lines)
+    return [re.sub(r"[ \t]+", " ", ln).strip() for ln in lines]
+
+
+@dataclass
+class Span:
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start > self.end:
+            self.start, self.end = self.end, self.start
+
+    def overlaps(self, other: Span) -> bool:
+        return self.start <= other.end and other.start <= self.end
+
+    def contains(self, other: Span) -> bool:
+        return self.start <= other.start and self.end >= other.end
+
+    def strictly_contains(self, other: Span) -> bool:
+        return self.contains(other) and (self.start, self.end) != (other.start, self.end)
+
+    def nlines(self) -> int:
+        return self.end - self.start + 1
+
+    def __str__(self) -> str:
+        if self.start == self.end:
+            return str(self.start)
+        return f"{self.start}-{self.end}"
+
+
+@dataclass
+class Strand:
+    id: str
+    path: str
+    span: Span
+    before: Optional[list[str]]
+    after: Optional[list[str]]
+    kind: str = "suggestion"
+    commit: Optional[str] = None
+    original_commit: Optional[str] = None
+    created_at: Optional[str] = None
+    author: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    recon: str = "explicit"
+    source: str = "json"
+    body: str = ""
+
+    @property
+    def coord_key(self) -> str:
+        return self.original_commit or self.commit or ""
+
+    def has_edit(self) -> bool:
+        return self.after is not None
+
+    def real_edit(self) -> bool:
+        return self.after is not None and self.after != (self.before or [])
+
+
+@dataclass
+class Pair:
+    a: str
+    b: str
+    path: str
+    verdict: str
+    reason: str
+    a_span: str
+    b_span: str
+    order: Optional[str] = None
+
+
+@dataclass
+class Occupancy:
+    fate: str
+    method: str
+    note: str = ""
+    before_hits: int = 0
+    after_hits: int = 0
+
+
+@dataclass
+class Composed:
+    path: str
+    strand_ids: list[str]
+    verdict: str
+    note: str
+    before: list[str]
+    after: list[str]
+    covering: bool
+    start: Optional[int]
+    end: Optional[int]
+    parts: list[dict[str, Any]] = field(default_factory=list)
+    occupancy: Optional[Occupancy] = None
+
+
+@dataclass
+class Component:
+    id: int
+    path: str
+    strand_ids: list[str]
+    verdict: str
+    pair_counts: dict[str, int]
+    note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# reconstruction (commented range, not sate-all-plus)
+# ---------------------------------------------------------------------------
+
+
+def parse_diff_hunk(diff_hunk: str) -> Optional[tuple[int, int, list[tuple[str, str]]]]:
+    text = _strip_cr(diff_hunk)
+    lines = text.splitlines()
+    if not lines:
+        return None
+    header_i = 0
+    while header_i < len(lines) and not lines[header_i].startswith("@@"):
+        header_i += 1
+    if header_i >= len(lines):
+        return None
+    m = HUNK_RE.match(lines[header_i])
+    if not m:
+        return None
+    old_start = int(m.group(1))
+    new_start = int(m.group(3))
+    tagged: list[tuple[str, str]] = []
+    for L in lines[header_i + 1 :]:
+        if L.startswith("\\"):
+            continue
+        if not L:
+            tagged.append((" ", ""))
+            continue
+        tag = L[0]
+        if tag in " +-":
+            tagged.append((tag, L[1:]))
+        else:
+            tagged.append((" ", L))
+    return old_start, new_start, tagged
+
+
+def _in_range(loc: int, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+    return lo <= loc <= hi
+
+
+def lines_in_range(
+    tagged: list[tuple[str, str]],
+    old_start: int,
+    new_start: int,
+    side: str,
+    start: int,
+    end: int,
+) -> list[str]:
+    old_ln, new_ln = old_start, new_start
+    out: list[str] = []
+    right = side in ("RIGHT", "NEW", "+")
+    for tag, text in tagged:
+        if tag == "+":
+            if right and _in_range(new_ln, start, end):
+                out.append(text)
+            new_ln += 1
+        elif tag == "-":
+            if not right and _in_range(old_ln, start, end):
+                out.append(text)
+            old_ln += 1
+        else:
+            loc = new_ln if right else old_ln
+            if _in_range(loc, start, end):
+                out.append(text)
+            old_ln += 1
+            new_ln += 1
+    return out
+
+
+def side_new_lines(tagged: list[tuple[str, str]], side: str) -> list[str]:
+    if side in ("LEFT", "OLD", "-"):
+        return [t for tag, t in tagged if tag in " -"]
+    return [t for tag, t in tagged if tag in " +"]
+
+
+def extract_suggestions(body: str) -> list[list[str]]:
+    if not body:
+        return []
+    body = _strip_cr(body)
+    out: list[list[str]] = []
+    for m in SUGGEST_RE.finditer(body):
+        raw = m.group(1)
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        out.append(raw.splitlines())
+    return out
+
+
+def reconstruct_before(
+    obj: dict,
+) -> tuple[Optional[list[str]], str, Optional[int], Optional[int]]:
+    end = _as_int(_first(obj.get("line"), obj.get("original_line"), obj.get("originalLine")))
+    start = _as_int(
+        _first(
+            obj.get("start_line"),
+            obj.get("original_start_line"),
+            obj.get("startLine"),
+            obj.get("originalStartLine"),
+            end,
+        )
+    )
+    if "before" in obj:
+        return _as_lines(obj.get("before")), "explicit", start, end
+    side = str(obj.get("side") or obj.get("start_side") or "RIGHT").upper()
+    diff_hunk = obj.get("diff_hunk") or obj.get("diffHunk") or ""
+    parsed = parse_diff_hunk(diff_hunk) if diff_hunk else None
+    if parsed and start is not None and end is not None:
+        old_start, new_start, tagged = parsed
+        got = lines_in_range(tagged, old_start, new_start, side, start, end)
+        if got:
+            return got, "range", start, end
+        n = max(1, abs(end - start) + 1)
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return side_lines[-n:], "hunk-tail", start, end
+    if parsed:
+        old_start, new_start, tagged = parsed
+        side_lines = side_new_lines(tagged, side)
+        if side_lines:
+            return [side_lines[-1]], "hunk-last", start, end
+    return None, "none", start, end
+
+
+def _author_of(obj: dict) -> Optional[str]:
+    user = obj.get("user") or obj.get("author")
+    if isinstance(user, dict):
+        return user.get("login") or user.get("name")
+    if isinstance(user, str):
+        return user
+    return None
+
+
+def obj_to_strands(obj: dict, source: str, remarks: bool) -> list[Strand]:
+    path = _nfc(str(obj.get("path") or obj.get("filename") or obj.get("file") or ""))
+    if not path:
+        return []
+    cid = str(_first(obj.get("id"), obj.get("html_url"), obj.get("url"), path) or path)
+    afters = _as_lines(obj.get("after")) if "after" in obj else None
+    body = obj.get("body") or obj.get("comment") or obj.get("suggestion") or ""
+    sug = extract_suggestions(body) if isinstance(body, str) else []
+    kind = "suggestion"
+    images: list[Optional[list[str]]]
+    if afters is not None:
+        images = [afters]
+    elif sug:
+        images = list(sug)
+    elif remarks:
+        images = [None]
+        kind = "remark"
+    else:
+        return []
+    before, recon, start, end = reconstruct_before(obj)
+    if start is None:
+        start = 1
+    if end is None:
+        if before:
+            end = start + max(0, len(before) - 1)
+        else:
+            end = start
+    commit = obj.get("commit_id") or obj.get("commitId")
+    orig = obj.get("original_commit_id") or obj.get("originalCommitId")
+    in_reply = obj.get("in_reply_to_id") or obj.get("in_reply_to")
+    created = obj.get("created_at") or obj.get("createdAt") or obj.get("submitted_at")
+    out: list[Strand] = []
+    for i, after in enumerate(images):
+        ident = cid if len(images) == 1 else f"{cid}#{i + 1}"
+        out.append(
+            Strand(
+                id=str(ident),
+                path=path,
+                span=Span(int(start), int(end)),
+                before=None if before is None else list(before),
+                after=None if after is None else list(after),
+                kind=kind if after is not None else "remark",
+                commit=str(commit) if commit else None,
+                original_commit=str(orig) if orig else None,
+                created_at=str(created) if created else None,
+                author=_author_of(obj),
+                in_reply_to=str(in_reply) if in_reply else None,
+                recon=recon,
+                source=source,
+                body=_strip_cr(body) if isinstance(body, str) else "",
+            )
+        )
+    return out
+
+
+def parse_markdown(text: str, source: str, remarks: bool) -> list[Strand]:
+    text = _strip_cr(text)
+    lines = text.splitlines()
+    path = ""
+    start = end = 1
+    pending_quote: Optional[list[str]] = None
+    strands: list[Strand] = []
+    n = 0
+
+    def flush_suggestion(after: list[str]) -> None:
+        nonlocal n
+        if not path:
+            return
+        n += 1
+        if pending_quote is None:
+            before: Optional[list[str]] = None
+            recon = "none"
+        else:
+            before = list(pending_quote)
+            recon = "markdown"
+        strands.append(
+            Strand(
+                id=f"{source}:{n}:{path}",
+                path=path,
+                span=Span(start, end),
+                before=before,
+                after=list(after),
+                kind="suggestion",
+                recon=recon,
+                source=source,
+            )
+        )
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        mh = PATH_HEADER_RE.match(stripped)
+        ph = MD_PATH_RE.match(stripped)
+        if mh:
+            path = _nfc(mh.group(1))
+            start = int(mh.group(2))
+            end = int(mh.group(3) or mh.group(2))
+            pending_quote = None
+            i += 1
+            continue
+        if ph:
+            path = _nfc(ph.group(1).rstrip("-->").strip())
+            pending_quote = None
+            i += 1
+            continue
+        if stripped.startswith("```suggestion"):
+            buf: list[str] = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            flush_suggestion(buf)
+            pending_quote = None
+            if i < len(lines):
+                i += 1
+            continue
+        if stripped.startswith("```"):
+            buf = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            pending_quote = buf
+            if i < len(lines):
+                i += 1
+            continue
+        i += 1
+    if remarks and path and not strands:
+        strands.append(
+            Strand(
+                id=f"{source}:remark:{path}",
+                path=path,
+                span=Span(start, end),
+                before=None if pending_quote is None else list(pending_quote),
+                after=None,
+                kind="remark",
+                recon="markdown" if pending_quote is not None else "none",
+                source=source,
+            )
+        )
+    return strands
+
+
+def docs_to_objects(docs: Iterable[Any]) -> list[dict]:
+    out: list[dict] = []
+    for doc in docs:
+        if doc is None:
+            continue
+        if isinstance(doc, list):
+            out.extend(x for x in doc if isinstance(x, dict))
+        elif isinstance(doc, dict):
+            if isinstance(doc.get("comments"), list):
+                out.extend(x for x in doc["comments"] if isinstance(x, dict))
+            elif isinstance(doc.get("review_comments"), list):
+                out.extend(x for x in doc["review_comments"] if isinstance(x, dict))
+            else:
+                out.append(doc)
+    return out
+
+
+def _iter_json_docs(text: str) -> Iterator[Any]:
+    stripped = text.strip()
+    if not stripped:
+        return
+    if stripped[0] in "[{":
+        try:
+            yield json.loads(stripped)
+            return
+        except json.JSONDecodeError:
+            pass
+        if stripped[0] == "[":
+            raise ParseError("malformed JSON array")
+    # JSONL: a junk line is an error, not EMPTY of the valid prefix.
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            yield json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ParseError(f"line {i}: not json ({e.msg})") from e
+
+
+def ingest(text: str, source: str, remarks: bool) -> list[Strand]:
+    stripped = text.lstrip()
+    if not stripped:
+        return []
+    if stripped[0] in "[{":
+        objs = docs_to_objects(_iter_json_docs(text))
+        strands: list[Strand] = []
+        for obj in objs:
+            strands.extend(obj_to_strands(obj, source, remarks))
+        return strands
+    return parse_markdown(text, source, remarks)
+
+
+def read_source(path: str) -> str:
+    if path == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            raise InputError(f"{path}: {e}") from e
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise InputError(f"binary or non-utf8 input: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# composition algebra (locus-aware ECHO; replacement not union)
+# ---------------------------------------------------------------------------
+
+
+def same_coord_frame(a: Strand, b: Strand) -> bool:
+    ka, kb = a.coord_key, b.coord_key
+    if not ka or not kb:
+        return ka == kb
+    return ka == kb
+
+
+def _contiguous_slice(inner: list[str], outer: list[str]) -> bool:
+    if not inner:
+        return False
+    n = len(inner)
+    if n > len(outer):
+        return False
+    for i in range(len(outer) - n + 1):
+        if outer[i : i + n] == inner:
+            return True
+    return False
+
+
+def _reply_linked(a: Strand, b: Strand) -> bool:
+    if a.in_reply_to and a.in_reply_to == b.id:
+        return True
+    if b.in_reply_to and b.in_reply_to == a.id:
+        return True
+    if a.in_reply_to and b.in_reply_to and a.in_reply_to == b.in_reply_to:
+        return True
+    return False
+
+
+def _stack_ab(
+    a: Strand,
+    b: Strand,
+    a_before: Optional[list[str]],
+    a_after: Optional[list[str]],
+    b_before: Optional[list[str]],
+) -> Optional[str]:
+    """Return a reason if B applies only after A."""
+    if not a.real_edit() or a_after is None:
+        return None
+    if b_before is not None and a_after == b_before and a_after != (a_before or []):
+        return "after(a)==before(b)"
+    # subset / insert-then-edit: B's before lives in A's after, not A's before
+    if (
+        b_before
+        and _contiguous_slice(b_before, a_after)
+        and not (a_before is not None and _contiguous_slice(b_before, a_before))
+    ):
+        return "b.before lives in a.after"
+    return None
+
+
+def pair_verdict(a: Strand, b: Strand, ignore_space: bool = False) -> Pair:
+    """Compose two strands. Spans outrank image-equality (ECHO is a locus)."""
+    if a.path != b.path:
+        if a.real_edit() and b.real_edit():
+            return Pair(
+                a.id,
+                b.id,
+                f"{a.path} × {b.path}",
+                "COMMUTE",
+                "disjoint files",
+                str(a.span),
+                str(b.span),
+            )
+        return Pair(a.id, b.id, a.path, "DISJOINT", "cross-file", str(a.span), str(b.span))
+
+    a_before = _norm(a.before, ignore_space)
+    b_before = _norm(b.before, ignore_space)
+    a_after = _norm(a.after, ignore_space)
+    b_after = _norm(b.after, ignore_space)
+    same_span = a.span.start == b.span.start and a.span.end == b.span.end
+    overlap = a.span.overlaps(b.span)
+
+    if a.kind == "remark" or b.kind == "remark":
+        reply = _reply_linked(a, b)
+        one_edit = (a.has_edit() and not b.has_edit()) or (b.has_edit() and not a.has_edit())
+        if one_edit and same_coord_frame(a, b) and overlap:
+            return Pair(
+                a.id, b.id, a.path, "COVER", "remark sits on a suggestion", str(a.span), str(b.span)
+            )
+        if (not a.has_edit()) and (not b.has_edit()):
+            if reply:
+                return Pair(a.id, b.id, a.path, "THREAD", "in_reply_to", str(a.span), str(b.span))
+            if same_coord_frame(a, b) and overlap:
+                return Pair(a.id, b.id, a.path, "THREAD", "same locus", str(a.span), str(b.span))
+        return Pair(a.id, b.id, a.path, "DISJOINT", "remark", str(a.span), str(b.span))
+
+    reason_ab = _stack_ab(a, b, a_before, a_after, b_before)
+    reason_ba = _stack_ab(b, a, b_before, b_after, a_before)
+    if reason_ab and reason_ba:
+        return Pair(a.id, b.id, a.path, "JAM", "stack cycle", str(a.span), str(b.span))
+    if reason_ab:
+        return Pair(
+            a.id, b.id, a.path, "STACK", reason_ab, str(a.span), str(b.span), order="a>b"
+        )
+    if reason_ba:
+        return Pair(
+            a.id, b.id, a.path, "STACK", reason_ba, str(a.span), str(b.span), order="b>a"
+        )
+
+    # ECHO is locus-identity: same after on overlapping / equal spans.
+    if a_after is not None and b_after is not None and a_after == b_after and overlap:
+        return Pair(a.id, b.id, a.path, "ECHO", "same locus, same after", str(a.span), str(b.span))
+
+    # Replacement, not union: two afters of one span are SPLIT.
+    if (
+        same_span
+        and a_after is not None
+        and b_after is not None
+        and a_after != b_after
+    ):
+        return Pair(
+            a.id, b.id, a.path, "SPLIT", "same span, two afters", str(a.span), str(b.span)
+        )
+
+    # Missing before is not a before. [] == [] only if both images are present.
+    if (
+        a_before is not None
+        and b_before is not None
+        and a_before == b_before
+        and a_after is not None
+        and b_after is not None
+        and a_after != b_after
+        and overlap
+    ):
+        return Pair(
+            a.id, b.id, a.path, "SPLIT", "same before, two afters", str(a.span), str(b.span)
+        )
+
+    same = same_coord_frame(a, b)
+    if not same:
+        return Pair(
+            a.id,
+            b.id,
+            a.path,
+            "COMMUTE",
+            "distinct commits; images independent",
+            str(a.span),
+            str(b.span),
+        )
+
+    if a.span.strictly_contains(b.span) and a_after is not None and b_after is not None:
+        if _contiguous_slice(b_after, a_after):
+            return Pair(
+                a.id,
+                b.id,
+                a.path,
+                "SUBSUME",
+                "a contains b; b.after ⊂ a.after",
+                str(a.span),
+                str(b.span),
+                order="a>b",
+            )
+        return Pair(
+            a.id, b.id, a.path, "JAM", "a contains b; afters disagree", str(a.span), str(b.span)
+        )
+    if b.span.strictly_contains(a.span) and a_after is not None and b_after is not None:
+        if _contiguous_slice(a_after, b_after):
+            return Pair(
+                a.id,
+                b.id,
+                a.path,
+                "SUBSUME",
+                "b contains a; a.after ⊂ b.after",
+                str(a.span),
+                str(b.span),
+                order="b>a",
+            )
+        return Pair(
+            a.id, b.id, a.path, "JAM", "b contains a; afters disagree", str(a.span), str(b.span)
+        )
+
+    if overlap:
+        # Shared-line agreement is not a hunk-union. Different ranges JAM.
+        return Pair(
+            a.id, b.id, a.path, "JAM", "overlapping spans, incompatible", str(a.span), str(b.span)
+        )
+
+    return Pair(a.id, b.id, a.path, "COMMUTE", "disjoint spans", str(a.span), str(b.span))
+
+
+def all_pairs(strands: list[Strand], ignore_space: bool) -> list[Pair]:
+    pairs: list[Pair] = []
+    for a, b in combinations(strands, 2):
+        pairs.append(pair_verdict(a, b, ignore_space))
+    pairs.sort(key=lambda p: (p.path, p.verdict, p.a, p.b))
+    return pairs
+
+
+class UnionFind:
+    def __init__(self, ids: Iterable[str]) -> None:
+        self.p = {i: i for i in ids}
+
+    def find(self, x: str) -> str:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def connected_groups(strands: list[Strand], pairs: list[Pair]) -> list[list[Strand]]:
+    by_id = {s.id: s for s in strands}
+    uf = UnionFind(by_id)
+    for p in pairs:
+        if p.verdict in CONNECTING and p.a in by_id and p.b in by_id:
+            # Cross-file COMMUTE is a tree-image pair, not a mixed-path
+            # compose_group (spans are not comparable across files).
+            if by_id[p.a].path == by_id[p.b].path:
+                uf.union(p.a, p.b)
+    groups: dict[str, list[Strand]] = defaultdict(list)
+    for s in strands:
+        groups[uf.find(s.id)].append(s)
+    out = list(groups.values())
+    out.sort(key=lambda g: (g[0].path, min(x.id for x in g)))
+    return out
+
+
+def _has_cycle(succ: dict[str, set[str]]) -> bool:
+    seen: set[str] = set()
+    stack: set[str] = set()
+
+    def dfs(n: str) -> bool:
+        if n in stack:
+            return True
+        if n in seen:
+            return False
+        stack.add(n)
+        for m in succ.get(n, ()):
+            if dfs(m):
+                return True
+        stack.remove(n)
+        seen.add(n)
+        return False
+
+    return any(dfs(n) for n in list(succ))
+
+
+def component_verdict(group: list[Strand], pairs: list[Pair]) -> tuple[str, dict[str, int], str]:
+    ids = {s.id for s in group}
+    rel = [p for p in pairs if p.a in ids and p.b in ids]
+    counts: dict[str, int] = defaultdict(int)
+    for p in rel:
+        counts[p.verdict] += 1
+    if any(p.verdict == "JAM" for p in rel):
+        return "JAMMED", dict(counts), "incompatible overlap"
+    if any(p.verdict == "SPLIT" for p in rel):
+        return "SPLIT", dict(counts), "reviewers disagree"
+    stacks = [p for p in rel if p.verdict == "STACK"]
+    if stacks:
+        succ: dict[str, set[str]] = defaultdict(set)
+        for p in stacks:
+            if p.order == "a>b":
+                succ[p.a].add(p.b)
+            elif p.order == "b>a":
+                succ[p.b].add(p.a)
+        if _has_cycle(succ):
+            return "JAMMED", dict(counts), "stack cycle"
+        return "SERIES", dict(counts), "unique apply order"
+    if any(p.verdict == "SUBSUME" for p in rel):
+        return "SUBSUME", dict(counts), "outer consumes inner"
+    if any(p.verdict == "ECHO" for p in rel) and len(group) > 1:
+        return "ECHO", dict(counts), "duplicate strands"
+    if any(p.verdict == "COVER" for p in rel):
+        return "COVER", dict(counts), "remark sits on a suggestion"
+    if any(p.verdict == "THREAD" for p in rel):
+        return "THREAD", dict(counts), "reply chain"
+    n_edits = sum(1 for s in group if s.has_edit())
+    if n_edits > 1:
+        return "PARALLEL", dict(counts), "independent; compose in any order"
+    return "PARALLEL", dict(counts), "independent"
+
+
+def topo_order(group: list[Strand], pairs: list[Pair]) -> Optional[list[Strand]]:
+    ids = {s.id for s in group}
+    succ: dict[str, set[str]] = defaultdict(set)
+    indeg: dict[str, int] = {s.id: 0 for s in group}
+    for p in pairs:
+        if p.a not in ids or p.b not in ids:
+            continue
+        src = dst = None
+        if p.verdict == "STACK":
+            if p.order == "a>b":
+                src, dst = p.a, p.b
+            elif p.order == "b>a":
+                src, dst = p.b, p.a
+        elif p.verdict == "SUBSUME":
+            if p.order == "a>b":
+                src, dst = p.a, p.b
+            elif p.order == "b>a":
+                src, dst = p.b, p.a
+        if src and dst and dst not in succ[src]:
+            succ[src].add(dst)
+            indeg[dst] += 1
+    by_id = {s.id: s for s in group}
+    ready = sorted([i for i, d in indeg.items() if d == 0], key=lambda i: (by_id[i].span.start, i))
+    out: list[Strand] = []
+    while ready:
+        n = ready.pop(0)
+        out.append(by_id[n])
+        for m in sorted(succ.get(n, ()), key=lambda i: (by_id[i].span.start, i)):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+                ready.sort(key=lambda i: (by_id[i].span.start, i))
+    if len(out) != len(group):
+        return None
+    return out
+
+
+def collapse_echo(group: list[Strand], pairs: list[Pair]) -> list[Strand]:
+    ids = {s.id for s in group}
+    uf = UnionFind(ids)
+    drop: set[str] = set()
+    for p in pairs:
+        if p.a not in ids or p.b not in ids:
+            continue
+        if p.verdict == "ECHO":
+            uf.union(p.a, p.b)
+        elif p.verdict == "SUBSUME":
+            if p.order == "a>b":
+                drop.add(p.b)
+            elif p.order == "b>a":
+                drop.add(p.a)
+    kept: dict[str, Strand] = {}
+    for s in group:
+        if s.id in drop:
+            continue
+        root = uf.find(s.id)
+        if root not in kept or s.id < kept[root].id:
+            kept[root] = s
+    return [kept[k] for k in sorted(kept)]
+
+
+# ---------------------------------------------------------------------------
+# fold: one composed after-image per component
+# ---------------------------------------------------------------------------
+
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    n = len(needle)
+    hits: list[int] = []
+    for i in range(0, len(hay) - n + 1):
+        if hay[i : i + n] == needle:
+            hits.append(i)
+    return hits
+
+
+def overlaps_locus(
+    hit: int,
+    n: int,
+    start: Optional[int],
+    end: Optional[int],
+    slack: int = LOCUS_SLACK,
+) -> bool:
+    if start is None and end is None:
+        return True
+    a = start if start is not None else end
+    b = end if end is not None else start
+    if a is None:
+        return True
+    file_lo = min(a, b) - 1 - slack
+    file_hi = max(a, b) + slack
+    return hit < file_hi and (hit + n) > file_lo
+
+
+def find_at_locus(
+    hay: list[str],
+    needle: list[str],
+    start: Optional[int],
+    end: Optional[int],
+) -> list[int]:
+    hits = find_all(hay, needle)
+    return [h for h in hits if overlaps_locus(h, len(needle), start, end)]
+
+
+def apply_at(lines: list[str], start: int, end: int, after: list[str]) -> Optional[list[str]]:
+    if start < 1 or end < start:
+        return None
+    if end > len(lines):
+        return None
+    return lines[: start - 1] + list(after) + lines[end:]
+
+
+def apply_one(
+    lines: list[str], s: Strand, require_before: bool
+) -> tuple[Optional[list[str]], str]:
+    if s.after is None:
+        return lines, "remark"
+    if 1 <= s.span.start <= s.span.end <= len(lines):
+        window = lines[s.span.start - 1 : s.span.end]
+        if not require_before or window == (s.before or []) or s.before is None:
+            out = apply_at(lines, s.span.start, s.span.end, s.after)
+            return out, "span"
+        if window == s.after:
+            return lines, "already"
+    if s.before:
+        hits = find_all(lines, s.before)
+        if len(hits) == 1:
+            i = hits[0]
+            return lines[:i] + list(s.after) + lines[i + len(s.before) :], "image"
+        if len(hits) > 1:
+            return None, f"ambiguous-before x{len(hits)}"
+    if s.after and find_all(lines, s.after) and (not s.before or not find_all(lines, s.before)):
+        return lines, "already"
+    return None, "no-before"
+
+
+def shift_span(span: Span, applied: Span, new_len: int) -> Optional[Span]:
+    delta = new_len - applied.nlines()
+    if span.end < applied.start:
+        return span
+    if span.start > applied.end:
+        return Span(span.start + delta, span.end + delta)
+    return None
+
+
+def apply_sequence(
+    base: list[str],
+    seq: list[Strand],
+    shift_coords: bool,
+    require_before: bool,
+) -> tuple[Optional[list[str]], str, list[str]]:
+    lines = list(base)
+    used: list[str] = []
+    live: dict[str, Span] = {s.id: Span(s.span.start, s.span.end) for s in seq}
+    for s in seq:
+        cur = Strand(**{**asdict(s), "span": live[s.id]})
+        if isinstance(cur.span, dict):
+            cur.span = Span(cur.span["start"], cur.span["end"])
+        nxt, how = apply_one(lines, cur, require_before=require_before)
+        if nxt is None:
+            return None, f"{s.id}:{how}", used
+        if how not in ("already", "remark") and shift_coords:
+            new_len = len(cur.after or [])
+            applied = live[s.id]
+            for oid in list(live):
+                if oid == s.id:
+                    continue
+                shifted = shift_span(live[oid], applied, new_len)
+                if shifted is None:
+                    continue
+                live[oid] = shifted
+        lines = nxt
+        used.append(f"{s.id}:{how}")
+    return lines, "ok", used
+
+
+def _rel_strand(s: Strand, lo: int) -> Strand:
+    rel = Span(s.span.start - lo + 1, s.span.end - lo + 1)
+    return Strand(
+        id=s.id,
+        path=s.path,
+        span=rel,
+        before=s.before,
+        after=s.after,
+        kind=s.kind,
+        commit=s.commit,
+        original_commit=s.original_commit,
+        created_at=s.created_at,
+        author=s.author,
+        in_reply_to=s.in_reply_to,
+        recon=s.recon,
+        source=s.source,
+        body=s.body,
+    )
+
+
+def fold_series(seq: list[Strand]) -> tuple[list[str], list[str]]:
+    """Origin before → final after. Occupancy of the fold, not of each round."""
+    first = seq[0]
+    origin = list(first.before or [])
+    cur = list(first.after if first.after is not None else origin)
+    for s in seq[1:]:
+        if s.after is None:
+            continue
+        b = s.before or []
+        if b and cur:
+            hits = find_all(cur, b)
+            if hits:
+                i = hits[0]
+                cur = cur[:i] + list(s.after) + cur[i + len(b) :]
+                continue
+        if b == cur or (first.span.start == s.span.start and first.span.end == s.span.end):
+            cur = list(s.after)
+            continue
+        cur = list(s.after)
+    return origin, cur
+
+
+def paint_covering(
+    group: list[Strand],
+    tree_lines: Optional[list[str]] = None,
+) -> Optional[tuple[list[str], int, int]]:
+    """Covering block of the composed claim.
+
+    Claimed lines come from strand befores (the original snapshot). Unclaimed
+    gaps fill from the tree when present, so a COMMUTE with a hole occupies the
+    file region (alpha, beta, gamma → ALPHA, beta, GAMMA) rather than a
+    concatenation of nits.
+    """
+    if not group:
+        return None
+    lo = min(s.span.start for s in group)
+    hi = max(s.span.end for s in group)
+    for s in group:
+        if s.before:
+            hi = max(hi, s.span.start + len(s.before) - 1)
+    orig: list[Optional[str]] = [None] * (hi - lo + 1)
+    for s in group:
+        if s.before is None:
+            continue
+        for j, line in enumerate(s.before):
+            idx = s.span.start + j - lo
+            if idx < 0 or idx >= len(orig):
+                return None
+            if orig[idx] is None:
+                orig[idx] = line
+            elif orig[idx] != line:
+                return None
+    if tree_lines is not None:
+        for i, v in enumerate(orig):
+            if v is None:
+                fi = lo + i - 1
+                if 0 <= fi < len(tree_lines):
+                    orig[i] = tree_lines[fi]
+    if any(x is None for x in orig):
+        return None
+    return list(orig), lo, hi
+
+
+def _part_of(s: Strand) -> dict[str, Any]:
+    return {
+        "id": s.id,
+        "before": list(s.before or []),
+        "after": list(s.after or []),
+        "start": s.span.start,
+        "end": s.span.end,
+    }
+
+
+def compose_group(
+    group: list[Strand],
+    pairs: list[Pair],
+    verdict: str,
+    note: str,
+    tree_lines: Optional[list[str]] = None,
+) -> Composed:
+    edits = [s for s in group if s.has_edit()]
+    collapsed = collapse_echo(edits, pairs) if edits else []
+    ids = [s.id for s in sorted(group, key=lambda x: (x.span.start, x.id))]
+    path = group[0].path
+    if not collapsed:
+        return Composed(
+            path=path,
+            strand_ids=ids,
+            verdict=verdict,
+            note=note,
+            before=[],
+            after=[],
+            covering=False,
+            start=None,
+            end=None,
+            parts=[],
+        )
+
+    if verdict == "SERIES":
+        seq = topo_order(collapsed, pairs) or list(collapsed)
+        before, after = fold_series(seq)
+        start = seq[0].span.start
+        end = seq[0].span.end
+        return Composed(
+            path=path,
+            strand_ids=ids,
+            verdict=verdict,
+            note=note,
+            before=before,
+            after=after,
+            covering=True,
+            start=start,
+            end=end,
+            parts=[
+                {
+                    "id": ",".join(s.id for s in seq),
+                    "before": before,
+                    "after": after,
+                    "start": start,
+                    "end": end,
+                }
+            ],
+        )
+
+    painted = paint_covering(collapsed, tree_lines)
+    parts = [_part_of(s) for s in sorted(collapsed, key=lambda s: (s.span.start, s.id))]
+    if painted:
+        orig, lo, hi = painted
+        rel = [_rel_strand(s, lo) for s in collapsed]
+        bottom = sorted(rel, key=lambda s: (-s.span.start, -s.span.end, s.id))
+        nxt, err, _used = apply_sequence(orig, bottom, shift_coords=False, require_before=True)
+        if nxt is None:
+            nxt, err, _used = apply_sequence(orig, rel, shift_coords=True, require_before=True)
+        if nxt is not None:
+            return Composed(
+                path=path,
+                strand_ids=ids,
+                verdict=verdict,
+                note=note,
+                before=orig,
+                after=nxt,
+                covering=True,
+                start=lo,
+                end=hi,
+                parts=parts,
+            )
+    befores = [ln for s in collapsed for ln in (s.before or [])]
+    afters = [ln for s in collapsed for ln in (s.after or [])]
+    lo = min(s.span.start for s in collapsed)
+    hi = max(s.span.end for s in collapsed)
+    return Composed(
+        path=path,
+        strand_ids=ids,
+        verdict=verdict,
+        note=note,
+        before=befores,
+        after=afters,
+        covering=False,
+        start=lo,
+        end=hi,
+        parts=parts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# occupancy of the composed claim (one fate; partial apply is SUPERSEDED)
+# ---------------------------------------------------------------------------
+
+
+def load_tree_file(
+    root: Optional[str], path: str, against: Optional[str], worktree: bool
+) -> Optional[list[str]]:
+    if not root:
+        return None
+    if worktree or not against:
+        fp = os.path.join(root, path)
+        if not os.path.isfile(fp):
+            return None
+        try:
+            data = Path(fp).read_bytes()
+        except OSError:
+            return None
+        try:
+            return _strip_cr(data.decode("utf-8")).splitlines()
+        except UnicodeDecodeError as e:
+            raise InputError(f"binary tree file {path}: {e}") from e
+    import subprocess
+
+    r = subprocess.run(
+        ["git", "-C", root, "show", f"{against}:{path}"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        return _strip_cr(r.stdout.decode("utf-8")).splitlines()
+    except UnicodeDecodeError as e:
+        raise InputError(f"binary git path {against}:{path}: {e}") from e
+
+
+def _part_flags(
+    hay: list[str], before: list[str], after: list[str], start: Optional[int], end: Optional[int]
+) -> Optional[tuple[bool, bool]]:
+    """(before_leftover, after_present) for one folded part. Skip noops."""
+    if before == after:
+        return None
+    bh = bool(find_at_locus(hay, before, start, end)) if before else False
+    ah = bool(find_at_locus(hay, after, start, end)) if after else False
+    minus = [ln for ln in before if ln not in after]
+    plus = [ln for ln in after if ln not in before]
+    if plus and not minus:
+        return (False if ah else bh, ah)
+    if minus and not plus:
+        return (bh, not bh)
+    if not before and after:
+        return (False, ah)
+    if before and not after:
+        return (bh, not bh)
+    return (bh, ah)
+
+
+def occupy_union(hay: Optional[list[str]], composed: Composed) -> Occupancy:
+    if hay is None:
+        return Occupancy("SUPERSEDED", "missing-file")
+
+    if composed.covering and composed.before and composed.after:
+        before = composed.before
+        after = composed.after
+        if before == after:
+            return Occupancy("SKIP", "noop")
+        bh = find_at_locus(hay, before, composed.start, composed.end)
+        ah = find_at_locus(hay, after, composed.start, composed.end)
+        minus = [ln for ln in before if ln not in after]
+        plus = [ln for ln in after if ln not in before]
+        if plus and not minus:
+            if ah:
+                return Occupancy("APPLIED", "exact-after", before_hits=len(bh), after_hits=len(ah))
+            if bh:
+                return Occupancy("PENDING", "exact-before", before_hits=len(bh), after_hits=len(ah))
+        elif minus and not plus:
+            if bh:
+                return Occupancy("PENDING", "exact-before", before_hits=len(bh), after_hits=len(ah))
+            if ah or not bh:
+                return Occupancy("APPLIED", "exact-after", before_hits=len(bh), after_hits=len(ah))
+        else:
+            if ah and not bh:
+                return Occupancy("APPLIED", "exact-after", before_hits=len(bh), after_hits=len(ah))
+            if bh and not ah:
+                return Occupancy("PENDING", "exact-before", before_hits=len(bh), after_hits=len(ah))
+            if ah and bh:
+                return Occupancy("DUPLEX", "exact-both", before_hits=len(bh), after_hits=len(ah))
+        # covering present but drifted: still one fate of the fold
+        if not ah and not bh:
+            return Occupancy("SUPERSEDED", "covering-neither", before_hits=0, after_hits=0)
+
+    # Conjunction of parts: the union after-image. Partial apply is SUPERSEDED
+    # of the composed claim, not APPLIED+PENDING of each strand.
+    if not composed.parts:
+        return Occupancy("SUPERSEDED", "empty-claim")
+    flags: list[tuple[bool, bool]] = []
+    for part in composed.parts:
+        f = _part_flags(
+            hay,
+            list(part.get("before") or []),
+            list(part.get("after") or []),
+            part.get("start"),
+            part.get("end"),
+        )
+        if f is not None:
+            flags.append(f)
+    if not flags:
+        return Occupancy("SKIP", "noop-parts")
+    leftover_b = [b for b, _a in flags]
+    present_a = [_a for _b, _a in flags]
+    all_a = all(present_a)
+    all_b = all(leftover_b)
+    any_a = any(present_a)
+    any_b = any(leftover_b)
+    n_b = sum(1 for x in leftover_b if x)
+    n_a = sum(1 for x in present_a if x)
+    has_before = any(part.get("before") for part in composed.parts)
+    if all_a and not any_b:
+        return Occupancy("APPLIED", "union-after", before_hits=n_b, after_hits=n_a)
+    if not any_a and (all_b or not has_before):
+        # Afters missing: PENDING of the composed after-image. Empty befores
+        # (markdown recon=none) are not SUPERSEDED just because leftover-before
+        # flags are all false.
+        return Occupancy("PENDING", "union-before", before_hits=n_b, after_hits=n_a)
+    if all_a and all_b:
+        return Occupancy("DUPLEX", "union-both", before_hits=n_b, after_hits=n_a)
+    return Occupancy(
+        "SUPERSEDED",
+        "union-neither",
+        note="partial apply of the composed image",
+        before_hits=n_b,
+        after_hits=n_a,
+    )
+
+
+def occupy_composed(
+    composed: Composed, root: Optional[str], against: Optional[str], worktree: bool
+) -> Occupancy:
+    hay = load_tree_file(root, composed.path, against, worktree)
+    return occupy_union(hay, composed)
+
+
+def build_components(strands: list[Strand], pairs: list[Pair]) -> list[Component]:
+    comps: list[Component] = []
+    for i, group in enumerate(connected_groups(strands, pairs), 1):
+        verdict, counts, note = component_verdict(group, pairs)
+        comps.append(
+            Component(
+                id=i,
+                path=group[0].path,
+                strand_ids=[s.id for s in sorted(group, key=lambda x: (x.span.start, x.id))],
+                verdict=verdict,
+                pair_counts=counts,
+                note=note,
+            )
+        )
+    return comps
+
+
+def compose_all(
+    strands: list[Strand],
+    pairs: list[Pair],
+    comps: list[Component],
+    root: Optional[str],
+    against: Optional[str],
+    worktree: bool,
+) -> list[Composed]:
+    by_id = {s.id: s for s in strands}
+    out: list[Composed] = []
+    for c in comps:
+        group = [by_id[i] for i in c.strand_ids if i in by_id]
+        if not any(s.has_edit() for s in group):
+            continue
+        hay = load_tree_file(root, group[0].path, against, worktree)
+        composed = compose_group(group, pairs, c.verdict, c.note, tree_lines=hay)
+        composed.occupancy = occupy_union(hay, composed)
+        out.append(composed)
+    return out
+
+
+def compose_label(comps: list[Component]) -> str:
+    if not comps:
+        return "EMPTY"
+    vs = {c.verdict for c in comps}
+    if "JAMMED" in vs:
+        return "JAMMED"
+    if "SPLIT" in vs:
+        return "SPLIT"
+    if len(vs) == 1:
+        return next(iter(vs))
+    return "MIXED"
+
+
+def occupy_label(composed: list[Composed]) -> Optional[str]:
+    fates = [c.occupancy.fate for c in composed if c.occupancy]
+    fates = [f for f in fates if f != "SKIP"]
+    if not fates:
+        return None
+    if len(set(fates)) == 1:
+        return fates[0]
+    return "MIXED"
+
+
+def image_kind(composed: list[Composed]) -> str:
+    paths = {c.path for c in composed if c.before != c.after}
+    if len(paths) > 1:
+        return "tree"
+    return "file"
+
+
+def image_payload(
+    comps: list[Component], composed: list[Composed], occupied: bool
+) -> dict[str, Any]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    fates: dict[str, Optional[str]] = {}
+    for c in composed:
+        if c.path not in seen:
+            seen.add(c.path)
+            paths.append(c.path)
+        fates[c.path] = c.occupancy.fate if c.occupancy else None
+    return {
+        "kind": image_kind(composed),
+        "paths": paths,
+        "compose": compose_label(comps),
+        "occupy": occupy_label(composed) if occupied else None,
+        "covering": bool(composed) and all(c.covering for c in composed),
+        "fates": fates,
+    }
+
+
+def worst_exit(comps: list[Component]) -> int:
+    if any(c.verdict == "JAMMED" for c in comps):
+        return EXIT_JAM
+    if any(c.verdict == "SPLIT" for c in comps):
+        return EXIT_SPLIT
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# emit the covering (one unified diff of the fold, not N fences)
+# ---------------------------------------------------------------------------
+
+
+def format_hunk_wholesale(start: int, before: list[str], after: list[str]) -> list[str]:
+    """One covering hunk: minus the fold-before, plus the fold-after."""
+    old_n = len(before)
+    new_n = len(after)
+    old_start = start if old_n else max(start - 1, 0)
+    new_start = start if new_n else max(start - 1, 0)
+    lines = [f"@@ -{old_start},{old_n} +{new_start},{new_n} @@"]
+    for t in before:
+        lines.append("-" + t)
+    for t in after:
+        lines.append("+" + t)
+    return lines
+
+
+def format_hunk_mixed(start: int, before: list[str], after: list[str]) -> list[str]:
+    """Same covering coordinates, mixed -/+ /context inside one hunk."""
+    sm = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+    body: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for ln in before[i1:i2]:
+                body.append(" " + ln)
+        elif tag == "delete":
+            for ln in before[i1:i2]:
+                body.append("-" + ln)
+        elif tag == "insert":
+            for ln in after[j1:j2]:
+                body.append("+" + ln)
+        else:
+            for ln in before[i1:i2]:
+                body.append("-" + ln)
+            for ln in after[j1:j2]:
+                body.append("+" + ln)
+    old_n, new_n = len(before), len(after)
+    old_start = start if old_n else max(start - 1, 0)
+    new_start = start if new_n else max(start - 1, 0)
+    return [f"@@ -{old_start},{old_n} +{new_start},{new_n} @@"] + body
+
+
+def covering_has_context(before: list[str], after: list[str]) -> bool:
+    sm = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+    return any(tag == "equal" and i2 > i1 for tag, i1, i2, _j1, _j2 in sm.get_opcodes())
+
+
+def pad_from_tree(
+    start: int,
+    before: list[str],
+    after: list[str],
+    hay: list[str],
+    n: int = 3,
+) -> tuple[int, list[str], list[str]]:
+    """Wrap a zero-context fold in neighbor lines so vanilla git apply works.
+
+    Occupancy stays on the unpadded fold. Pad is emit-only.
+    """
+    if covering_has_context(before, after) or not hay or not before:
+        return start, before, after
+    lo = start - 1
+    hi = lo + len(before)
+    if not (0 <= lo <= hi <= len(hay) and hay[lo:hi] == before):
+        hits = find_all(hay, before)
+        if len(hits) != 1:
+            return start, before, after
+        lo = hits[0]
+        hi = lo + len(before)
+    pre_n = min(n, lo)
+    post_n = min(n, max(0, len(hay) - hi))
+    pre = hay[lo - pre_n : lo]
+    post = hay[hi : hi + post_n]
+    if not pre and not post:
+        return start, before, after
+    return lo - pre_n + 1, pre + list(before) + post, pre + list(after) + post
+
+
+def splice_covering(
+    hay: list[str], start: int, before: list[str], after: list[str]
+) -> Optional[list[str]]:
+    """Paint the covering after-image onto the tree. None if the origin is gone."""
+    lo = start - 1
+    hi = lo + len(before)
+    if 0 <= lo <= hi <= len(hay) and hay[lo:hi] == before:
+        return hay[:lo] + list(after) + hay[hi:]
+    hits = find_at_locus(hay, before, start, start + max(0, len(before) - 1))
+    if len(hits) == 1:
+        i = hits[0]
+        return hay[:i] + list(after) + hay[i + len(before) :]
+    return None
+
+
+def emit_file_diff(path: str, old: list[str], new: list[str]) -> str:
+    """git-style mixed unified diff of the file after-image of the fold."""
+    if old == new:
+        return ""
+    ud = list(
+        difflib.unified_diff(
+            old,
+            new,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+            n=3,
+        )
+    )
+    if not ud:
+        return ""
+    return f"diff --git a/{path} b/{path}\n" + "\n".join(ud) + "\n"
+
+
+def emit_composed(
+    composed: list[Composed],
+    mixed: bool = True,
+    trees: Optional[dict[str, list[str]]] = None,
+) -> tuple[str, list[str]]:
+    """Stdout object: unified diff of the tree after-image of the fold.
+
+    Multi-file COMMUTE is one patch (every claimed path), not N strand fences
+    and not occupying each file then joining rows as emit. If any claimed
+    path cannot cover, emit nothing — a partial tree is not the image.
+    """
+    hunk_fn = format_hunk_mixed if mixed else format_hunk_wholesale
+    trees = trees or {}
+    claimed = [c for c in composed if c.before != c.after]
+    multi = len({c.path for c in claimed}) > 1
+    errors: list[str] = []
+    ready: list[Composed] = []
+    for c in claimed:
+        if not c.covering:
+            errors.append(f"{c.path}: no covering (need -C to fill COMMUTE gaps)")
+            continue
+        if c.start is None:
+            errors.append(f"{c.path}: covering has no locus")
+            continue
+        if multi and c.path not in trees:
+            errors.append(
+                f"{c.path}: no tree-image (need -C to cover COMMUTE across files)"
+            )
+            continue
+        ready.append(c)
+    if errors:
+        return "", errors
+
+    chunks: list[str] = []
+    for c in ready:
+        start = int(c.start or 1)
+        before = list(c.before)
+        after = list(c.after)
+        hay = trees.get(c.path)
+        if mixed and hay is not None:
+            spliced = splice_covering(hay, start, before, after)
+            if spliced is not None:
+                chunk = emit_file_diff(c.path, hay, spliced)
+                if chunk:
+                    chunks.append(chunk)
+                continue
+            start, before, after = pad_from_tree(start, before, after, hay)
+        hunk = hunk_fn(start, before, after)
+        block = [
+            f"diff --git a/{c.path} b/{c.path}",
+            f"--- a/{c.path}",
+            f"+++ b/{c.path}",
+            *hunk,
+        ]
+        chunks.append("\n".join(block) + "\n")
+    return "".join(chunks), []
+
+
+def n_hunks(patch: str) -> int:
+    return sum(1 for ln in patch.splitlines() if ln.startswith("@@"))
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+
+def format_pretty(
+    strands: list[Strand],
+    pairs: list[Pair],
+    comps: list[Component],
+    composed: list[Composed],
+    occupied: bool,
+) -> str:
+    n = len(strands)
+    files = len({s.path for s in strands})
+    label = compose_label(comps)
+    head = f"quire  n={n}  files={files}  compose={label}"
+    if occupied:
+        occ = occupy_label(composed)
+        if occ:
+            head += f"  occupy={occ}"
+        if composed:
+            head += f"  image={image_kind(composed)}"
+    else:
+        head += "  occupy=—"
+    lines = [head, ""]
+
+    shown = [p for p in pairs if p.verdict not in QUIET_PAIRS]
+    hidden = len(pairs) - len(shown)
+    if shown and len(shown) <= 24:
+        lines.append("pairs")
+        for p in shown:
+            extra = f"  {p.reason}"
+            if p.order:
+                extra += f"  {p.order}"
+            lines.append(
+                f"  {p.verdict:<8} {p.path}  #{p.a}@{p.a_span}  #{p.b}@{p.b_span}{extra}"
+            )
+        if hidden:
+            lines.append(f"  ({hidden} DISJOINT hidden)")
+        lines.append("")
+    elif shown:
+        cc: dict[str, int] = defaultdict(int)
+        for p in shown:
+            cc[p.verdict] += 1
+        bits = " ".join(f"{k}={v}" for k, v in sorted(cc.items()))
+        lines.append(f"pairs  n={len(shown)}  {bits}")
+        if hidden:
+            lines.append(f"  ({hidden} DISJOINT hidden)")
+        lines.append("")
+
+    if comps:
+        lines.append("plaits")
+        paths = [c.path for c in comps]
+        tree = len(set(paths)) > 1 and label not in REFUSE and label != "EMPTY"
+        if tree:
+            ids = [i for c in comps for i in c.strand_ids]
+            note = (
+                "tree-image; compose in any order"
+                if label == "PARALLEL"
+                else "labelled MIXED"
+            )
+            lines.append(
+                f"  {label:<8} {','.join(paths)}  {','.join('#' + i for i in ids)}  {note}"
+            )
+        else:
+            for c in comps:
+                ids = ",".join(f"#{i}" for i in c.strand_ids)
+                lines.append(f"  {c.verdict:<8} {c.path}  {ids}  {c.note}")
+        lines.append("")
+
+    if occupied and composed:
+        lines.append("composed")
+        for c in composed:
+            ids = ",".join(f"#{i}" for i in c.strand_ids)
+            span = f"@{c.start}" if c.start == c.end else f"@{c.start}-{c.end}"
+            cov = "covering" if c.covering else "union"
+            lines.append(f"  {c.verdict:<8} {c.path}  {ids}  {span}  {cov}")
+            b = " | ".join(c.before) if c.before else "∅"
+            a = " | ".join(c.after) if c.after else "∅"
+            if len(b) > 80:
+                b = b[:77] + "..."
+            if len(a) > 80:
+                a = a[:77] + "..."
+            lines.append(f"           {b}  →  {a}")
+        lines.append("")
+        lines.append("occupy")
+        for c in composed:
+            occ = c.occupancy
+            if not occ:
+                continue
+            extra = f"  {occ.note}" if occ.note else ""
+            lines.append(
+                f"  {occ.fate:<10} {c.path}  {occ.method}  "
+                f"before_hits={occ.before_hits} after_hits={occ.after_hits}{extra}"
+            )
+    elif not occupied and comps:
+        lines.append("(refused occupy: composition is JAM or SPLIT)")
+
+    if not pairs and not comps:
+        lines.append("(no strands)")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def to_json(
+    strands: list[Strand],
+    pairs: list[Pair],
+    comps: list[Component],
+    composed: list[Composed],
+    occupied: bool,
+) -> dict[str, Any]:
+    cc: dict[str, int] = defaultdict(int)
+    for c in comps:
+        cc[c.verdict] += 1
+    pc: dict[str, int] = defaultdict(int)
+    for p in pairs:
+        pc[p.verdict] += 1
+    occ = occupy_label(composed) if occupied else None
+    return {
+        "n": len(strands),
+        "files": len({s.path for s in strands}),
+        "compose": compose_label(comps),
+        "occupy": occ,
+        "occupied": occupied,
+        "method": (
+            composed[0].occupancy.method
+            if occupied and len(composed) == 1 and composed[0].occupancy
+            else None
+        ),
+        "strands": [
+            {
+                "id": s.id,
+                "path": s.path,
+                "span": str(s.span),
+                "start": s.span.start,
+                "end": s.span.end,
+                "kind": s.kind,
+                "before": s.before,
+                "after": s.after,
+                "commit": s.commit,
+                "original_commit": s.original_commit,
+                "recon": s.recon,
+            }
+            for s in strands
+        ],
+        "pairs": [asdict(p) for p in pairs if p.verdict not in QUIET_PAIRS],
+        "components": [
+            {
+                "id": c.id,
+                "path": c.path,
+                "strands": c.strand_ids,
+                "verdict": c.verdict,
+                "pair_counts": c.pair_counts,
+                "note": c.note,
+            }
+            for c in comps
+        ],
+        "composed": [
+            {
+                "path": c.path,
+                "strands": c.strand_ids,
+                "verdict": c.verdict,
+                "before": c.before,
+                "after": c.after,
+                "covering": c.covering,
+                "start": c.start,
+                "end": c.end,
+                "parts": c.parts,
+                "fate": c.occupancy.fate if c.occupancy else None,
+                "method": c.occupancy.method if c.occupancy else None,
+                "note": c.occupancy.note if c.occupancy else "",
+            }
+            for c in composed
+        ],
+        "component_counts": dict(cc),
+        "pair_counts": dict(pc),
+        "image": image_payload(comps, composed, occupied),
+        "version": VERSION,
+    }
+
+
+def format_tsv(comps: list[Component], composed: list[Composed], occupied: bool) -> str:
+    rows = ["kind\tverdict\tpath\tids\tmethod"]
+    for c in comps:
+        rows.append(f"plait\t{c.verdict}\t{c.path}\t{','.join(c.strand_ids)}\t")
+    if occupied:
+        for c in composed:
+            fate = c.occupancy.fate if c.occupancy else ""
+            method = c.occupancy.method if c.occupancy else ""
+            rows.append(f"occupy\t{fate}\t{c.path}\t{','.join(c.strand_ids)}\t{method}")
+    return "\n".join(rows) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+class Fail(Exception):
+    pass
+
+
+def _strand(
+    i: str,
+    path: str,
+    start: int,
+    end: int,
+    before: Optional[list[str]],
+    after: Optional[list[str]],
+    **kw: Any,
+) -> Strand:
+    return Strand(id=i, path=path, span=Span(start, end), before=before, after=after, **kw)
+
+
+def run_selftest() -> int:
+    n = 0
+    failed = 0
+
+    def t(name: str, fn) -> None:
+        nonlocal n, failed
+        try:
+            fn()
+            print(f"  PASS  {name}")
+            n += 1
+        except Exception as e:
+            print(f"  FAIL  {name}: {e}", file=sys.stderr)
+            failed += 1
+
+    def commute_disjoint():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["x2"])
+        b = _strand("b", "f.py", 3, 3, ["z"], ["z2"])
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE":
+            raise Fail(p)
+
+    def commute_cross_file():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "util.py", 1, 1, ["gamma"], ["GAMMA"])
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE" or p.reason != "disjoint files":
+            raise Fail(("cross-file edits COMMUTE, not DISJOINT", p))
+        remark = _strand("n", "notes.md", 1, 1, None, None)
+        remark.kind = "remark"
+        d = pair_verdict(a, remark)
+        if d.verdict != "DISJOINT":
+            raise Fail(("remark×edit cross-file stays DISJOINT", d))
+
+    def echo_same_locus():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("b", "f.py", 1, 1, ["x"], ["y"])
+        p = pair_verdict(a, b)
+        if p.verdict != "ECHO":
+            raise Fail(p)
+
+    def echo_is_locus_not_image():
+        a = _strand("site1", "f.py", 1, 1, ["return 0"], ["return 1"])
+        b = _strand("site2", "f.py", 10, 10, ["return 0"], ["return 1"])
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE":
+            raise Fail(("expected COMMUTE of two loci, got", p))
+
+    def split_same_span():
+        a = _strand("a", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("b", "f.py", 1, 1, ["x"], ["z"])
+        p = pair_verdict(a, b)
+        if p.verdict != "SPLIT":
+            raise Fail(p)
+
+    def replacement_not_union_words():
+        a = _strand("a", "f.py", 1, 1, ["hello world"], ["HELLO world"])
+        b = _strand("b", "f.py", 1, 1, ["hello world"], ["hello WORLD"])
+        p = pair_verdict(a, b)
+        if p.verdict != "SPLIT":
+            raise Fail(p)
+
+    def jam_overlap():
+        a = _strand("a", "f.py", 1, 3, ["a", "b", "c"], ["A", "B", "C"])
+        b = _strand("b", "f.py", 3, 5, ["c", "d", "e"], ["C", "D", "E"])
+        p = pair_verdict(a, b)
+        if p.verdict != "JAM":
+            raise Fail(p)
+
+    def jam_overlap_same_join():
+        # different ranges, join line agrees: still JAM (replacement, not union)
+        w = _strand("wide", "f.py", 1, 2, ["a", "shared"], ["A", "SHARED"])
+        t = _strand("tail", "f.py", 2, 3, ["shared", "c"], ["SHARED", "C"])
+        p = pair_verdict(w, t)
+        if p.verdict != "JAM":
+            raise Fail(p)
+
+    def stack_images():
+        a = _strand("a", "f.py", 2, 2, ["beta"], ["beta2"], original_commit="c1")
+        b = _strand("b", "f.py", 2, 2, ["beta2"], ["beta3"], original_commit="c2")
+        p = pair_verdict(a, b)
+        if p.verdict != "STACK" or p.order != "a>b":
+            raise Fail(p)
+
+    def stack_cycle_is_jam():
+        a = _strand("a", "f.py", 1, 1, ["A"], ["B"], original_commit="c1")
+        b = _strand("b", "f.py", 1, 1, ["B"], ["A"], original_commit="c2")
+        p = pair_verdict(a, b)
+        if p.verdict != "JAM":
+            raise Fail(p)
+
+    def stack_subset():
+        a = _strand(
+            "ins",
+            "f.py",
+            1,
+            1,
+            ["pass"],
+            ["def f():", "    return 1", ""],
+            original_commit="c1",
+        )
+        b = _strand("ed", "f.py", 2, 2, ["    return 1"], ["    return 2"], original_commit="c2")
+        p = pair_verdict(a, b)
+        if p.verdict != "STACK":
+            raise Fail(p)
+
+    def empty_before_not_split():
+        a = _strand("a", "f.py", 1, 1, None, ["ALPHA"])
+        b = _strand("b", "f.py", 3, 3, None, ["GAMMA"])
+        p = pair_verdict(a, b)
+        if p.verdict != "COMMUTE":
+            raise Fail(("empty before must not SPLIT disjoint afters", p))
+
+    def subsume_ok():
+        a = _strand("a", "f.py", 1, 5, list("abcde"), list("abXde"))
+        b = _strand("b", "f.py", 3, 3, ["c"], ["X"])
+        p = pair_verdict(a, b)
+        if p.verdict != "SUBSUME":
+            raise Fail(p)
+
+    def recon_github_range():
+        obj = {
+            "id": 333030758,
+            "path": "command/pr.go",
+            "original_line": 347,
+            "line": None,
+            "diff_hunk": (
+                "@@ -339,7 +342,11 @@ func show(number ...string) error {\n"
+                " func pullRequestForCurrentBranch() (*github.PullRequest, error) {\n"
+                " \tproject := project()\n"
+                " \tclient := github.NewClient(project.Host)\n"
+                "-\theadWithOwner := fmt.Sprintf(\"%s:%s\", project.Owner, currentBranch())\n"
+                "+\tcurrentBranch, err := context.CurrentBranch()\n"
+                "+\tif err != nil {\n"
+                "+\t\treturn &github.PullRequest{}, err"
+            ),
+            "body": (
+                "It's fine to return nil in place of pointers when an error occurs:\n"
+                "```suggestion\n"
+                "\t\treturn nil, err\n"
+                "```"
+            ),
+        }
+        ss = obj_to_strands(obj, "t", remarks=False)
+        if len(ss) != 1:
+            raise Fail(ss)
+        if ss[0].after != ["\t\treturn nil, err"]:
+            raise Fail(ss[0].after)
+        if ss[0].before != ["\t\treturn &github.PullRequest{}, err"]:
+            raise Fail(("before", ss[0].before))
+
+    def occupy_commute_union():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "app.py", 3, 3, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        if v != "PARALLEL":
+            raise Fail(v)
+        c = compose_group([a, b], pairs, v, note)
+        pending = occupy_union(["alpha", "beta", "gamma"], c)
+        if pending.fate != "PENDING":
+            raise Fail(("pending", pending))
+        applied = occupy_union(["ALPHA", "beta", "GAMMA"], c)
+        if applied.fate != "APPLIED":
+            raise Fail(("applied", applied))
+        # A already applied: SUPERSEDED of the composed image, not APPLIED+PENDING
+        partial = occupy_union(["ALPHA", "beta", "gamma"], c)
+        if partial.fate != "SUPERSEDED":
+            raise Fail(("partial must be SUPERSEDED of the union", partial))
+
+    def occupy_stack_fold():
+        a = _strand("r1", "app.py", 2, 2, ["beta"], ["beta2"], original_commit="c1")
+        b = _strand("r2", "app.py", 2, 2, ["beta2"], ["beta3"], original_commit="c2")
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        if v != "SERIES":
+            raise Fail(v)
+        c = compose_group([a, b], pairs, v, note)
+        if c.before != ["beta"] or c.after != ["beta3"]:
+            raise Fail(("fold", c.before, c.after))
+        if occupy_union(["alpha", "beta", "gamma"], c).fate != "PENDING":
+            raise Fail("pending origin")
+        if occupy_union(["alpha", "beta3", "gamma"], c).fate != "APPLIED":
+            raise Fail("applied fold")
+        mid = occupy_union(["alpha", "beta2", "gamma"], c)
+        if mid.fate != "SUPERSEDED":
+            raise Fail(("mid must be SUPERSEDED of the fold, not APPLIED of r1", mid))
+        both = occupy_union(["alpha", "beta", "beta2", "gamma"], c)
+        if both.fate == "APPLIED":
+            raise Fail("both-images must not occupy the series after-image")
+
+    def occupy_echo_once():
+        a = _strand("alice", "f.py", 1, 1, ["x"], ["y"])
+        b = _strand("cara", "f.py", 1, 1, ["x"], ["y"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        c = compose_group([a, b], pairs, v, note)
+        if len(c.parts) != 1:
+            raise Fail(("echo must collapse to one part", c.parts))
+        if occupy_union(["x"], c).fate != "PENDING":
+            raise Fail("echo pending")
+        if occupy_union(["y"], c).fate != "APPLIED":
+            raise Fail("echo applied")
+
+    def occupy_dup_sites_union():
+        a = _strand("site1", "app.py", 1, 1, ["return 0"], ["return 1"])
+        b = _strand("site2", "app.py", 10, 10, ["return 0"], ["return 1"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        if v != "PARALLEL":
+            raise Fail(v)
+        c = compose_group([a, b], pairs, v, note)
+        if len(c.parts) != 2:
+            raise Fail(("two loci, two parts", c.parts))
+        tree = ["return 0"] + ["keep"] * 8 + ["return 0"]
+        if occupy_union(tree, c).fate != "PENDING":
+            raise Fail("dup pending")
+        one = ["return 1"] + ["keep"] * 8 + ["return 0"]
+        if occupy_union(one, c).fate != "SUPERSEDED":
+            raise Fail("one site applied is SUPERSEDED of the two-site image")
+        both = ["return 1"] + ["keep"] * 8 + ["return 1"]
+        if occupy_union(both, c).fate != "APPLIED":
+            raise Fail("both sites")
+
+    def occupy_subset_fold():
+        a = _strand(
+            "ins",
+            "app.py",
+            1,
+            1,
+            ["pass"],
+            ["def f():", "    return 1", ""],
+            original_commit="c1",
+        )
+        b = _strand("ed", "app.py", 2, 2, ["    return 1"], ["    return 2"], original_commit="c2")
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        if v != "SERIES":
+            raise Fail(v)
+        c = compose_group([a, b], pairs, v, note)
+        if c.after != ["def f():", "    return 2", ""]:
+            raise Fail(("subset fold", c.after))
+        if occupy_union(["pass"], c).fate != "PENDING":
+            raise Fail("subset pending")
+        inserted = ["def f():", "    return 1", ""]
+        mid = occupy_union(inserted, c)
+        if mid.fate != "SUPERSEDED":
+            raise Fail(("insert-only is SUPERSEDED of the series", mid))
+
+    def md_noquote_commute():
+        text = "app.py:1-1\n```suggestion\nALPHA\n```\n\napp.py:3-3\n```suggestion\nGAMMA\n```\n"
+        ss = ingest(text, "m", remarks=False)
+        if len(ss) != 2:
+            raise Fail(ss)
+        if ss[0].before is not None or ss[1].before is not None:
+            raise Fail(("missing quote is recon=none, not []", ss[0].before, ss[0].recon))
+        p = pair_verdict(ss[0], ss[1])
+        if p.verdict != "COMMUTE":
+            raise Fail(p)
+
+    def jsonl_junk_is_error():
+        text = '{"id":"a","path":"app.py","line":1,"before":["alpha"],"after":["ALPHA"]}\nthis is not json\n'
+        try:
+            ingest(text, "j", remarks=False)
+        except ParseError:
+            return
+        raise Fail("junk jsonl must not go EMPTY")
+
+    def empty_is_empty():
+        ss = ingest("", "e", remarks=False)
+        if ss:
+            raise Fail(ss)
+        ss = ingest("[]", "e", remarks=False)
+        if ss:
+            raise Fail(ss)
+
+    def refuse_jam_no_occupy():
+        a = _strand("wide", "app.py", 1, 3, ["a", "b", "c"], ["A", "B", "C"])
+        b = _strand("tail", "app.py", 3, 4, ["c", "d"], ["C", "D"])
+        pairs = [pair_verdict(a, b)]
+        comps = build_components([a, b], pairs)
+        if worst_exit(comps) != EXIT_JAM:
+            raise Fail(comps)
+        if compose_label(comps) != "JAMMED":
+            raise Fail(compose_label(comps))
+
+    def covering_fills_gap_from_tree():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "app.py", 3, 3, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        tree = ["alpha", "beta", "gamma"]
+        c = compose_group([a, b], pairs, v, note, tree_lines=tree)
+        if not c.covering:
+            raise Fail("expected covering")
+        if c.before != tree:
+            raise Fail(("before", c.before))
+        if c.after != ["ALPHA", "beta", "GAMMA"]:
+            raise Fail(("after", c.after))
+        if occupy_union(tree, c).fate != "PENDING":
+            raise Fail("covering pending")
+        if occupy_union(["ALPHA", "beta", "GAMMA"], c).fate != "APPLIED":
+            raise Fail("covering applied")
+        if occupy_union(["ALPHA", "beta", "gamma"], c).fate != "SUPERSEDED":
+            raise Fail("a-only still SUPERSEDED of the file region")
+
+    def md_noquote_occupy_pending():
+        text = "app.py:1-1\n```suggestion\nALPHA\n```\n\napp.py:3-3\n```suggestion\nGAMMA\n```\n"
+        ss = ingest(text, "m", remarks=False)
+        pairs = all_pairs(ss, False)
+        v, _, note = component_verdict(ss, pairs)
+        tree = ["alpha", "beta", "gamma"]
+        c = compose_group(ss, pairs, v, note, tree_lines=tree)
+        if c.after != ["ALPHA", "beta", "GAMMA"]:
+            raise Fail(("md covering after", c.after, c.covering))
+        occ = occupy_union(tree, c)
+        if occ.fate != "PENDING":
+            raise Fail(("md-noquote against origin must be PENDING of the after-image", occ))
+
+    def nfc_path():
+        obj = {"id": "a", "path": "cafe\u0301.py", "line": 1, "before": ["x"], "after": ["y"]}
+        ss = obj_to_strands(obj, "t", False)
+        if ss[0].path != unicodedata.normalize("NFC", "cafe\u0301.py"):
+            raise Fail(ss[0].path)
+
+    def emit_commute_one_covering_not_two_fences():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "app.py", 3, 3, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        c = compose_group([a, b], pairs, v, note, tree_lines=["alpha", "beta", "gamma"])
+        patch, errs = emit_composed([c], mixed=True)
+        if errs:
+            raise Fail(errs)
+        if n_hunks(patch) != 1:
+            raise Fail(("fold is one hunk, not N fences", n_hunks(patch), patch))
+        if "-alpha" not in patch or "+ALPHA" not in patch:
+            raise Fail(patch)
+        if "-gamma" not in patch or "+GAMMA" not in patch:
+            raise Fail(patch)
+        if "\n beta\n" not in patch:
+            raise Fail(("mixed covering keeps the unclaimed gap as context", patch))
+        if "diff --git a/app.py b/app.py" not in patch:
+            raise Fail(patch)
+
+    def emit_stack_is_fold_not_rounds():
+        a = _strand("r1", "app.py", 2, 2, ["beta"], ["beta2"], original_commit="c1")
+        b = _strand("r2", "app.py", 2, 2, ["beta2"], ["beta3"], original_commit="c2")
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        c = compose_group([a, b], pairs, v, note)
+        tree = ["alpha", "beta", "gamma"]
+        patch, errs = emit_composed([c], mixed=True, trees={"app.py": tree})
+        if errs:
+            raise Fail(errs)
+        if "beta2" in patch:
+            raise Fail(("fold must not mention the intermediate round", patch))
+        if "-beta" not in patch or "+beta3" not in patch:
+            raise Fail(patch)
+        if "\n alpha\n" not in patch or "\n gamma\n" not in patch:
+            raise Fail(("zero-context fold pads neighbors so git apply has context", patch))
+        if n_hunks(patch) != 1:
+            raise Fail(patch)
+
+    def emit_refuses_non_covering():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "app.py", 3, 3, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        v, _, note = component_verdict([a, b], pairs)
+        c = compose_group([a, b], pairs, v, note, tree_lines=None)
+        if c.covering:
+            raise Fail("gap without a tree is not a covering")
+        patch, errs = emit_composed([c], mixed=True)
+        if patch:
+            raise Fail(("must not emit concatenation as if it were the fold", patch))
+        if not errs:
+            raise Fail("need an error for the missing covering")
+
+    def emit_two_file_one_tree_image():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "util.py", 1, 1, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        if pairs[0].verdict != "COMMUTE":
+            raise Fail(pairs[0])
+        comps = build_components([a, b], pairs)
+        if compose_label(comps) != "PARALLEL":
+            raise Fail(compose_label(comps))
+        ca = compose_group([a], pairs, "PARALLEL", "independent", tree_lines=["alpha", "beta"])
+        cb = compose_group([b], pairs, "PARALLEL", "independent", tree_lines=["gamma", "delta"])
+        trees = {"app.py": ["alpha", "beta"], "util.py": ["gamma", "delta"]}
+        patch, errs = emit_composed([ca, cb], mixed=True, trees=trees)
+        if errs:
+            raise Fail(errs)
+        if patch.count("diff --git") != 2:
+            raise Fail(("tree-image is one patch of both files", patch))
+        if "diff --git a/app.py b/app.py" not in patch:
+            raise Fail(patch)
+        if "diff --git a/util.py b/util.py" not in patch:
+            raise Fail(patch)
+        if "-alpha" not in patch or "+ALPHA" not in patch:
+            raise Fail(patch)
+        if "-gamma" not in patch or "+GAMMA" not in patch:
+            raise Fail(patch)
+        img = image_payload(comps, [ca, cb], True)
+        if img["kind"] != "tree":
+            raise Fail(img)
+        ca.occupancy = occupy_union(trees["app.py"], ca)
+        cb.occupancy = occupy_union(trees["util.py"], cb)
+        if occupy_label([ca, cb]) != "PENDING":
+            raise Fail("unanimous PENDING of the tree")
+        ca.occupancy = occupy_union(["ALPHA", "beta"], ca)
+        if occupy_label([ca, cb]) != "MIXED":
+            raise Fail("partial tree is labelled MIXED, not two occupy rows joined")
+
+    def emit_two_file_without_tree_refuses():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "util.py", 1, 1, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        ca = compose_group([a], pairs, "PARALLEL", "independent")
+        cb = compose_group([b], pairs, "PARALLEL", "independent")
+        if not ca.covering or not cb.covering:
+            raise Fail("no-gap strand covering is not the hole")
+        patch, errs = emit_composed([ca, cb], mixed=True, trees={})
+        if patch:
+            raise Fail(("must not emit two strand fences as a tree-image", patch))
+        if not any("across files" in e for e in errs):
+            raise Fail(errs)
+
+    def emit_two_file_missing_path_refuses():
+        a = _strand("alice", "app.py", 1, 1, ["alpha"], ["ALPHA"])
+        b = _strand("bob", "util.py", 1, 1, ["gamma"], ["GAMMA"])
+        pairs = [pair_verdict(a, b)]
+        ca = compose_group([a], pairs, "PARALLEL", "independent", tree_lines=["alpha", "beta"])
+        cb = compose_group([b], pairs, "PARALLEL", "independent", tree_lines=["gamma", "delta"])
+        patch, errs = emit_composed(
+            [ca, cb], mixed=True, trees={"app.py": ["alpha", "beta"]}
+        )
+        if patch:
+            raise Fail(("partial tree is not a tree-image; do not join the file that worked", patch))
+        if not any(e.startswith("util.py:") for e in errs):
+            raise Fail(errs)
+
+    def jam_one_file_refuses_tree():
+        w = _strand("wide", "app.py", 1, 2, ["alpha", "beta"], ["A", "B"])
+        t = _strand("tail", "app.py", 2, 2, ["beta"], ["BETA"])
+        b = _strand("bob", "util.py", 1, 1, ["gamma"], ["GAMMA"])
+        ss = [w, t, b]
+        pairs = all_pairs(ss, False)
+        comps = build_components(ss, pairs)
+        if compose_label(comps) != "JAMMED":
+            raise Fail(compose_label(comps))
+        if worst_exit(comps) != EXIT_JAM:
+            raise Fail("JAM anywhere refuses the tree-image")
+
+    t("commute-disjoint", commute_disjoint)
+    t("commute-cross-file", commute_cross_file)
+    t("echo-same-locus", echo_same_locus)
+    t("echo-is-locus-not-image", echo_is_locus_not_image)
+    t("split-same-span", split_same_span)
+    t("replacement-not-union", replacement_not_union_words)
+    t("jam-overlap", jam_overlap)
+    t("jam-overlap-same-join", jam_overlap_same_join)
+    t("stack-images", stack_images)
+    t("stack-cycle-is-jam", stack_cycle_is_jam)
+    t("stack-subset", stack_subset)
+    t("empty-before-not-split", empty_before_not_split)
+    t("subsume", subsume_ok)
+    t("recon-github-range", recon_github_range)
+    t("occupy-commute-union", occupy_commute_union)
+    t("occupy-stack-fold", occupy_stack_fold)
+    t("occupy-echo-once", occupy_echo_once)
+    t("occupy-dup-sites-union", occupy_dup_sites_union)
+    t("occupy-subset-fold", occupy_subset_fold)
+    t("md-noquote-commute", md_noquote_commute)
+    t("jsonl-junk-is-error", jsonl_junk_is_error)
+    t("empty-is-empty", empty_is_empty)
+    t("refuse-jam-no-occupy", refuse_jam_no_occupy)
+    t("covering-fills-gap-from-tree", covering_fills_gap_from_tree)
+    t("md-noquote-occupy-pending", md_noquote_occupy_pending)
+    t("nfc-path", nfc_path)
+    t("emit-commute-one-covering", emit_commute_one_covering_not_two_fences)
+    t("emit-stack-fold-not-rounds", emit_stack_is_fold_not_rounds)
+    t("emit-refuses-non-covering", emit_refuses_non_covering)
+    t("emit-two-file-tree-image", emit_two_file_one_tree_image)
+    t("emit-two-file-without-tree", emit_two_file_without_tree_refuses)
+    t("emit-two-file-missing-path", emit_two_file_missing_path_refuses)
+    t("jam-one-file-refuses-tree", jam_one_file_refuses_tree)
+    print(f"selftest {n}/{n + failed} passed")
+    return 0 if failed == 0 else EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="quire",
+        description=(
+            "Compose review-suggestion strands, occupy the fold, and --emit "
+            "one tree-image covering (COMMUTE across files is one patch). "
+            "JAM/SPLIT refuse occupancy and emit."
+        ),
+        epilog=(
+            "quire --emit -C TREE stream.jsonl | git apply   "
+            "applies the tree-image of the fold, not N GitHub suggestion fences."
+        ),
+    )
+    p.add_argument("inputs", nargs="*", help="JSON / JSONL / markdown review streams; - for stdin")
+    p.add_argument("-C", "--root", dest="root", default=None, help="tree to occupy / paint covering against")
+    p.add_argument("--against", default=None, help="git ref (default: worktree files)")
+    p.add_argument("--worktree", action="store_true", help="force reading worktree files")
+    p.add_argument("--remarks", action="store_true", help="include non-suggestion comments")
+    p.add_argument("--ignore-space", action="store_true")
+    p.add_argument(
+        "--emit",
+        action="store_true",
+        help="print the composed covering as a unified diff (stdout); occupancy stays on stderr",
+    )
+    p.add_argument(
+        "--wholesale",
+        action="store_true",
+        help="with --emit, minus-then-plus the covering (v0.1; needs git apply --unidiff-zero)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--tsv", action="store_true")
+    p.add_argument("--report-only", action="store_true", help="always exit 0 on success")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.version:
+        print(f"quire {VERSION}")
+        return 0
+    if args.selftest:
+        try:
+            return run_selftest()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            return EXIT_ERROR
+    inputs = list(args.inputs)
+    if not inputs:
+        if sys.stdin.isatty():
+            print("quire: pass a review stream or '-' for stdin", file=sys.stderr)
+            return EXIT_ERROR
+        inputs = ["-"]
+    try:
+        strands: list[Strand] = []
+        for src in inputs:
+            label = "stdin" if src == "-" else src
+            text = read_source(src)
+            strands.extend(ingest(text, label, remarks=args.remarks))
+        seen: dict[str, int] = {}
+        for s in strands:
+            n = seen.get(s.id, 0) + 1
+            seen[s.id] = n
+            if n > 1:
+                s.id = f"{s.id}~{n}"
+        pairs = all_pairs(strands, args.ignore_space)
+        comps = build_components(strands, pairs)
+        label = compose_label(comps)
+        occupied = label not in REFUSE and label != "EMPTY"
+        worktree = args.worktree or (args.against is None)
+        root = args.root
+        composed: list[Composed] = []
+        if occupied:
+            composed = compose_all(strands, pairs, comps, root, args.against, worktree)
+        payload = to_json(strands, pairs, comps, composed, occupied)
+        if args.emit:
+            if not occupied:
+                if label in REFUSE:
+                    print(f"quire: {label}; not emitting", file=sys.stderr)
+                    return 0 if args.report_only else worst_exit(comps)
+                print("quire: nothing to emit", file=sys.stderr)
+                return 0
+            trees: dict[str, list[str]] = {}
+            if root:
+                for c in composed:
+                    hay = load_tree_file(root, c.path, args.against, worktree)
+                    if hay is not None:
+                        trees[c.path] = hay
+            patch, errs = emit_composed(
+                composed, mixed=not args.wholesale, trees=trees
+            )
+            for e in errs:
+                print(f"quire: {e}", file=sys.stderr)
+            if not patch:
+                if errs:
+                    return EXIT_ERROR
+                print("quire: covering is a noop", file=sys.stderr)
+                return 0
+            sys.stdout.write(patch)
+            occ = occupy_label(composed) or "—"
+            print(
+                f"quire  compose={label}  occupy={occ}  emit={n_hunks(patch)}  "
+                f"files={len({c.path for c in composed})}  "
+                f"image={image_kind(composed)}",
+                file=sys.stderr,
+            )
+            if args.report_only:
+                return 0
+            return worst_exit(comps)
+        if args.json:
+            json.dump(payload, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        elif args.tsv:
+            sys.stdout.write(format_tsv(comps, composed, occupied))
+        else:
+            sys.stdout.write(format_pretty(strands, pairs, comps, composed, occupied))
+        if args.report_only:
+            return 0
+        return worst_exit(comps)
+    except (ParseError, InputError) as e:
+        print(f"quire: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except BrokenPipeError:
+        return 0
+    except Exception as e:
+        print(f"quire: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

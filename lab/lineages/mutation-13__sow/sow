@@ -1,0 +1,2805 @@
+#!/usr/bin/env python3
+"""sow — emit the argument worlds production inhabits, as test-generator input.
+
+A function is the set of specializations its *production* callers exercise.
+Tests are a subtract filter, not a peer: sow does not report test/prod tilts.
+It prints the fixture records a generator can turn into tests — production
+worlds (and collection members) the existing tests do not already inhabit.
+
+Exit codes:
+  0  ok (or --check with no due fixtures)
+  1  --check found one or more due fixtures
+  2  usage / tool error
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+VERSION = "0.2.0"
+
+EXTS = {".py", ".rs", ".js", ".ts", ".tsx", ".jsx", ".go", ".swift"}
+SKIP_DIR = {
+    "node_modules",
+    "target",
+    "dist",
+    ".git",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    ".build",
+    "DerivedData",
+    "coverage",
+    ".next",
+    ".tox",
+    "Pods",
+    "Carthage",
+    ".grok",
+    "lab",
+}
+MAX_FILE_BYTES = 1_000_000
+
+DEF_KW = {"fn", "func", "function", "def"}
+NOT_CALL = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "func",
+    "fn",
+    "function",
+    "def",
+    "select",
+    "elif",
+    "elseif",
+    "case",
+    "when",
+    "match",
+    "with",
+    "new",
+    "typeof",
+    "sizeof",
+    "await",
+    "yield",
+    "throw",
+    "guard",
+    "defer",
+    "repeat",
+    "import",
+    "export",
+    "from",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "impl",
+    "protocol",
+    "extension",
+    "mod",
+    "package",
+    "go",
+    "defer",
+    "range",
+    "in",
+    "as",
+    "is",
+    "where",
+    "let",
+    "var",
+    "const",
+    "static",
+    "pub",
+    "async",
+    "unsafe",
+    "mut",
+    "self",
+    "super",
+    "this",
+    "type",
+    "interface",
+    "namespace",
+    "module",
+    "using",
+    "try",
+    "else",
+    "finally",
+    "do",
+    "loop",
+    "break",
+    "continue",
+    "fallthrough",
+    "default",
+    "macro_rules",
+}
+SKIP_SUBJECT = {
+    "print",
+    "println",
+    "eprintln",
+    "dbg",
+    "panic",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "format",
+    "vec",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "assertEquals",
+    "assertEqual",
+    "assertTrue",
+    "assertFalse",
+    "assertIn",
+    "assertIs",
+    "assertIsNone",
+    "assertIsNotNone",
+    "assertRaises",
+    "XCTAssert",
+    "XCTAssertTrue",
+    "XCTAssertFalse",
+    "XCTAssertEqual",
+    "XCTAssertNil",
+    "XCTAssertNotNil",
+    "expect",
+    "describe",
+    "it",
+    "beforeEach",
+    "afterEach",
+    "beforeAll",
+    "afterAll",
+    "console",
+    "log",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "require",
+    "include",
+    "len",
+    "length",
+    "str",
+    "int",
+    "bool",
+    "float",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "Ok",
+    "Err",
+    "Some",
+    "None",
+    "Some",
+    "Box",
+    "Rc",
+    "Arc",
+    "Vec",
+    "String",
+    "Option",
+    "Result",
+    "unwrap",
+    "expect",
+    "clone",
+    "into",
+    "from",
+    "default",
+    "to_string",
+    "toString",
+    "to_owned",
+    "as_str",
+    "as_ref",
+    "iter",
+    "map",
+    "filter",
+    "collect",
+    "push",
+    "pop",
+    "insert",
+    "get",
+    "set",
+    "update",
+    "getOwnPropertyDescriptor",
+    "defineProperty",
+    "hasOwnProperty",
+    "prototype",
+    "encode",
+    "decode",
+    "encodeTo",
+    "init",
+    "hash",
+    "description",
+    "array",
+    "object",
+    "string",
+    "number",
+    "boolean",
+    "Promise",
+    "then",
+    "catch",
+    "finally",
+    "apply",
+    "call",
+    "bind",
+    "copy",
+    "move",
+    "assign",
+    "replace",
+    "split",
+    "join",
+    "slice",
+    "splice",
+    "concat",
+    "trim",
+    "append",
+    "remove",
+    "contains",
+    "includes",
+    "indexOf",
+    "find",
+    "sort",
+    "reduce",
+    "forEach",
+    "add",
+    "delete",
+    "clear",
+    "count",
+    "first",
+    "last",
+    "next",
+    "prev",
+    "start",
+    "stop",
+    "reset",
+    "load",
+    "save",
+    "write",
+    "read",
+    "open",
+    "close",
+    "create",
+    "make",
+    "build",
+    "parse",
+    "stringify",
+    "toJSON",
+    "fromJSON",
+    "copyWithZone",
+    "isEqual",
+    "hashValue",
+    "keys",
+    "values",
+    "items",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "ok",
+    "err",
+    "super",
+    "self",
+    "this",
+    "typeof",
+    "sizeof",
+    "instanceof",
+    "Array",
+    "Object",
+    "Promise",
+    "JSON",
+    "Math",
+    "Date",
+    "Number",
+    "Boolean",
+    "RegExp",
+    "Error",
+    "RangeError",
+    "TypeError",
+    "deepFreeze",
+    "structuredClone",
+    "Object",
+    "freeze",
+    "isArray",
+    "hasOwn",
+    "keys",
+    "sprintf",
+    "printf",
+    "puts",
+    "fail",
+    "XCTFail",
+    "fatalError",
+    "precondition",
+    "preconditionFailure",
+    "assertionFailure",
+}
+
+LANG_BY_EXT = {
+    ".py": "py",
+    ".rs": "rs",
+    ".js": "js",
+    ".ts": "js",
+    ".tsx": "js",
+    ".jsx": "js",
+    ".go": "go",
+    ".swift": "swift",
+}
+
+TEST_PATH_RE = re.compile(
+    r"""(?ix)
+    (?:^|/)(?:tests|test|__tests__|spec|specs|benches|testdata)(?:/|$)
+    |(?:^|/)test_[^/]+\.py$
+    |_test\.(?:go|rs|py)$
+    |\.(?:test|spec)\.(?:js|ts|tsx|jsx)$
+    |tests?\.swift$
+    |(?:^|/)(?:tests|test)\.(?:rs|py|go|js|ts)$
+    |(?:^|/)test_support\.(?:rs|py|go|js|ts)$
+    |conftest\.py$
+    """,
+)
+
+
+# ---------------------------------------------------------------------------
+# small utils
+# ---------------------------------------------------------------------------
+
+def eprint(*a: object) -> None:
+    print(*a, file=sys.stderr)
+
+
+def is_test_path(path: str) -> bool:
+    p = path.replace("\\", "/")
+    if TEST_PATH_RE.search(p):
+        return True
+    stem = Path(p).stem.lower()
+    if stem in {"test_support", "conftest", "tests", "test"} or stem.startswith("test_") or stem.endswith("_test") or stem.endswith("_tests") or stem.endswith("tests"):
+        return True
+    return False
+
+
+def fmt_vals(vals: Iterable[str], limit: int = 12) -> str:
+    s = sorted({v for v in vals if v is not None})
+    if not s:
+        return "[]"
+    if len(s) <= limit:
+        return "[" + ",".join(s) + "]"
+    return "[" + ",".join(s[:limit]) + f"+{len(s) - limit}]"
+
+
+STRING_LIT_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def extract_collections(src: str) -> dict[str, list[str]]:
+    """Literal arrays/sets bound to a name: browsers = ["Chrome", ...]."""
+    out: dict[str, list[str]] = {}
+    for m in re.finditer(
+        r"\b(?:let|var|const)\s+(\w+)\s*(?::[^=]{0,120})?=\s*\[(.*?)\]",
+        src,
+        re.S,
+    ):
+        name, body = m.group(1), m.group(2)
+        lits = [canon_lit(s) for s in STRING_LIT_RE.findall(body)]
+        if len(lits) >= 2:
+            out[name] = lits
+    for m in re.finditer(
+        r"^([A-Z][A-Z0-9_]*)\s*=\s*\[(.*?)\]",
+        src,
+        re.S | re.M,
+    ):
+        lits = [canon_lit(s) for s in STRING_LIT_RE.findall(m.group(2))]
+        if len(lits) >= 2:
+            out[m.group(1)] = lits
+    return out
+
+
+def membership_hits(body: str, params: list[str], collections: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """(param, collection_name) pairs where the body asks if param is in the collection."""
+    if not body or not collections:
+        return []
+    hits: list[tuple[str, str]] = []
+    for cname in collections:
+        for pname in params:
+            pats = [
+                rf"\b{re.escape(cname)}\.contains\(\s*{re.escape(pname)}\s*\)",
+                rf"\b{re.escape(cname)}\.includes\(\s*{re.escape(pname)}\s*\)",
+                rf"\b{re.escape(pname)}\s+in\s+{re.escape(cname)}\b",
+                rf"\b{re.escape(cname)}\.has\(\s*{re.escape(pname)}\s*\)",
+                rf"\b{re.escape(cname)}\.contains\(\s*\.?\s*{re.escape(pname)}\s*\)",
+            ]
+            if any(re.search(p, body) for p in pats):
+                hits.append((pname, cname))
+    return hits
+
+
+def ident_ok(s: str) -> bool:
+    return bool(s) and (s[0].isalpha() or s[0] == "_" or ord(s[0]) > 127)
+
+
+def canon_lit(raw: str) -> str:
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'`":
+        inner = s[1:-1]
+        inner = inner.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"').replace("\\'", "'")
+        if len(inner) > 48:
+            inner = inner[:45] + "..."
+        return '"' + inner.replace("\n", "\\n") + '"'
+    low = s.lower()
+    if low in ("true", "false"):
+        return low
+    if low in ("none", "null", "nil", "undefined"):
+        return "null"
+    if re.fullmatch(r"[-+]?\d+_?\d*", s.replace("_", "")) or re.fullmatch(r"[-+]?\d+", s.replace("_", "")):
+        try:
+            return str(int(s.replace("_", "")))
+        except ValueError:
+            pass
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s.replace("_", "")):
+        try:
+            f = float(s.replace("_", ""))
+            if f.is_integer() and abs(f) < 1e15:
+                return str(int(f))
+            return repr(f)
+        except ValueError:
+            pass
+    if s.startswith(".") and ident_ok(s[1:]):
+        return s
+    if re.fullmatch(r"(?:[\w$]+::)*[\w$]+", s) and ("::" in s or (s[:1].isupper() and "_" not in s[:1])):
+        return s
+    if len(s) > 48:
+        return s[:45] + "..."
+    return s
+
+
+def looks_const_name(name: str) -> bool:
+    if not name:
+        return False
+    if name.isupper() and any(c.isalpha() for c in name):
+        return True
+    if name[0].isupper() and "_" not in name and name not in ("True", "False", "None", "Ok", "Err", "Some"):
+        # PascalCase enum-ish — only treat as const if whole token is a ref, not a ctor call
+        return True
+    return name.isupper()
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Param:
+    name: str
+    default: Optional[str] = None  # canonical literal or None
+    label: Optional[str] = None  # swift external label; "_" = positional
+
+
+@dataclass
+class FuncDef:
+    name: str
+    qualname: str
+    params: list[Param]
+    path: str
+    line: int
+    lang: str
+    is_test: bool
+    start: int
+    end: int
+    body: str
+    recv: Optional[str] = None  # impl/type name
+
+
+@dataclass
+class Arg:
+    index: int
+    name: Optional[str]
+    kind: str  # lit, dyn, default
+    value: Optional[str]
+
+
+@dataclass
+class Call:
+    name: str
+    recv: Optional[str]
+    args: list[Arg]
+    bags: dict[str, Arg]  # expanded object-literal keys at a positional slot
+    path: str
+    line: int
+    is_test: bool
+    caller: Optional[str]
+    raw: str
+
+
+@dataclass
+class World:
+    key: tuple
+    label: str
+    test_calls: list[Call] = field(default_factory=list)
+    prod_calls: list[Call] = field(default_factory=list)
+
+    @property
+    def n_test(self) -> int:
+        return len(self.test_calls)
+
+    @property
+    def n_prod(self) -> int:
+        return len(self.prod_calls)
+
+
+@dataclass
+class Arm:
+    pred: str
+    test: bool
+    prod: bool
+
+
+@dataclass
+class Fixture:
+    """One test-generator input record: a production argument world tests lack."""
+
+    kind: str  # world | member | dyn
+    status: str  # due | have
+    args: dict  # name -> {kind, value}
+    label: str
+    sites: list[str]
+    suggest: str
+    generable: bool = True
+    collection: Optional[str] = None
+    param: Optional[str] = None
+
+
+@dataclass
+class MemberGap:
+    param: str
+    collection: str
+    members: list[str]
+    witnessed: list[str]
+    missing: list[str]
+
+
+@dataclass
+class Report:
+    fn: FuncDef
+    calls: list[Call]
+    worlds: list[World]
+    arms: list[Arm]
+    fixtures: list[Fixture]
+    members: list[MemberGap] = field(default_factory=list)
+
+    @property
+    def due(self) -> list[Fixture]:
+        return [f for f in self.fixtures if f.status == "due"]
+
+
+# ---------------------------------------------------------------------------
+# files
+# ---------------------------------------------------------------------------
+
+def list_source_files(root: Path, extra_exclude: list[str] | None = None) -> list[Path]:
+    extra = extra_exclude or []
+    files: list[Path] = []
+    git_dir = root / ".git"
+    listed: list[str] | None = None
+    if git_dir.exists() or (root / ".git").is_file():
+        r = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout:
+            listed = [p.decode("utf-8", "surrogateescape") for p in r.stdout.split(b"\0") if p]
+    if listed is not None:
+        for rel in listed:
+            p = root / rel
+            if p.suffix.lower() not in EXTS:
+                continue
+            parts = Path(rel).parts
+            if any(part in SKIP_DIR for part in parts):
+                continue
+            if any(ex in rel.replace("\\", "/") for ex in extra):
+                continue
+            if p.is_file():
+                files.append(p)
+        return files
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR and not d.startswith(".")]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.suffix.lower() not in EXTS:
+                continue
+            rel = str(p.relative_to(root))
+            if any(ex in rel.replace("\\", "/") for ex in extra):
+                continue
+            files.append(p)
+    return files
+
+
+def read_text(path: Path) -> Optional[str]:
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# tokenizer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Tok:
+    k: str  # id num str op attr
+    v: str
+    line: int
+    i: int
+
+
+def tokenize(src: str, lang: str) -> list[Tok]:
+    out: list[Tok] = []
+    i, n, line = 0, len(src), 1
+    isalnum = str.isalnum
+
+    def peek(k: int = 0) -> str:
+        j = i + k
+        return src[j] if j < n else ""
+
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c.isspace():
+            i += 1
+            continue
+        # comments
+        if lang == "py" and c == "#":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if lang != "py" and c == "/" and peek(1) == "/":
+            i += 2
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and peek(1) == "*":
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                if src[i] == "\n":
+                    line += 1
+                i += 1
+            i = min(n, i + 2)
+            continue
+        # Rust lifetimes / char lits MUST be handled before the string
+        # scanner. `'a` in `&'a str` is a lifetime; treating `'` as a quote
+        # swallows the signature through the next apostrophe and the rest
+        # of the file is parsed as one function (kizu SelectState::new).
+        if c == "'" and lang == "rs":
+            if peek(1) == "\\" or (peek(1) and peek(2) == "'"):
+                sl, sln, _ = _scan_string(src, i, lang)
+                line += src[i : i + sln].count("\n")
+                out.append(Tok("str", sl, line, i))
+                i += sln
+                continue
+            j = i + 1
+            if j < n and src[j] == "_":
+                j += 1
+            while j < n and (src[j].isalnum() or src[j] == "_"):
+                j += 1
+            if j > i + 1:
+                out.append(Tok("id", src[i:j], line, i))
+                i = j
+                continue
+            out.append(Tok("op", "'", line, i))
+            i += 1
+            continue
+        # rust/swift attributes kept as attr tokens
+        if c == "#" and lang in ("rs", "swift") and peek(1) in "![":
+            j = i
+            i += 1
+            if peek() == "!":
+                i += 1
+            if peek() == "[":
+                depth = 0
+                while i < n:
+                    if src[i] == "[":
+                        depth += 1
+                    elif src[i] == "]":
+                        depth -= 1
+                        i += 1
+                        if depth == 0:
+                            break
+                        continue
+                    elif src[i] == "\n":
+                        line += 1
+                    i += 1
+            out.append(Tok("attr", src[j:i], line, j))
+            continue
+        # strings — rust `'` is a lifetime/char, already consumed above
+        if c in ("\"", "`") or (c == "'" and lang != "rs") or (
+            c == "r" and peek(1) in "\"'" and lang in ("py", "rs")
+        ) or (
+            lang == "py" and c in "fFbBuU" and peek(1) in "\"'"
+        ):
+            j = i
+            sl, sln, st = _scan_string(src, i, lang)
+            if sln:
+                # count newlines inside
+                line += src[i:i + sln].count("\n")
+                out.append(Tok("str", sl, line, j))
+                i += sln
+                continue
+        # numbers
+        if c.isdigit() or (c == "." and peek(1).isdigit()):
+            j = i
+            if c == "0" and peek(1) in "xXoObB":
+                j += 2
+                while j < n and src[j] in "0123456789abcdefABCDEFoOlLuU_":
+                    j += 1
+            else:
+                j = i
+                while j < n and (src[j].isdigit() or src[j] in "._eE+-"):
+                    # stop on identifier-like after number
+                    if src[j] in "+-" and src[j - 1] not in "eE":
+                        break
+                    j += 1
+            out.append(Tok("num", src[i:j], line, i))
+            i = j
+            continue
+        # ident
+        if c.isalpha() or c == "_" or ord(c) > 127:
+            j = i + 1
+            while j < n and (src[j].isalnum() or src[j] in "_$" or ord(src[j]) > 127):
+                j += 1
+            # rust/js macro foo!
+            v = src[i:j]
+            if j < n and src[j] == "!" and lang == "rs":
+                v += "!"
+                j += 1
+            out.append(Tok("id", v, line, i))
+            i = j
+            continue
+        three = src[i : i + 3]
+        if three in ("===", "!==", ">>>", "...", "<<="):
+            out.append(Tok("op", three, line, i))
+            i += 3
+            continue
+        two = src[i : i + 2]
+        if two in ("::", "=>", "->", "==", "!=", "<=", ">=", "&&", "||", "??", "?.", ".."):
+            out.append(Tok("op", two, line, i))
+            i += 2
+            continue
+        out.append(Tok("op", c, line, i))
+        i += 1
+    return out
+
+
+def _scan_string(src: str, i: int, lang: str) -> tuple[str, int, int]:
+    """Return (token_text, length, end_line_delta). length 0 = not a string."""
+    n = len(src)
+    start = i
+    # prefixes
+    while i < n and src[i] in "rRfFbBuU":
+        i += 1
+    if i >= n or src[i] not in "\"'`":
+        return "", 0, 0
+    quote = src[i]
+    triple = src[i:i + 3] == quote * 3
+    i += 3 if triple else 1
+    raw = lang == "rs" and src[start] == "r"
+    hashn = 0
+    if raw and quote == "#" or (lang == "rs" and src[start] == "r" and "#" in src[start:start + 8]):
+        pass
+    # rust raw r#"..."#
+    if lang == "rs" and src[start] == "r":
+        k = start + 1
+        while k < n and src[k] == "#":
+            hashn += 1
+            k += 1
+        if k < n and src[k] in "\"'":
+            quote = src[k]
+            i = k + 1
+            close = quote + ("#" * hashn)
+            j = i
+            while j < n:
+                if src[j:j + len(close)] == close:
+                    j += len(close)
+                    return src[start:j], j - start, 0
+                j += 1
+            return src[start:], n - start, 0
+    while i < n:
+        c = src[i]
+        if triple:
+            if src[i:i + 3] == quote * 3:
+                i += 3
+                return src[start:i], i - start, 0
+            i += 1
+            continue
+        if c == "\\" and not raw:
+            i += 2
+            continue
+        if c == quote:
+            i += 1
+            return src[start:i], i - start, 0
+        if c == "\n" and quote != "`" and not triple and lang != "py":
+            # unclosed
+            return src[start:i], i - start, 0
+        i += 1
+    return src[start:], n - start, 0
+
+
+# ---------------------------------------------------------------------------
+# param / arg parsing from token slices
+# ---------------------------------------------------------------------------
+
+def split_top(tokens: list[Tok], sep: str = ",") -> list[list[Tok]]:
+    parts: list[list[Tok]] = []
+    cur: list[Tok] = []
+    dpar = dbrc = dbrk = 0
+    for t in tokens:
+        if t.k == "op":
+            if t.v == "(":
+                dpar += 1
+            elif t.v == ")":
+                dpar -= 1
+            elif t.v == "{":
+                dbrc += 1
+            elif t.v == "}":
+                dbrc -= 1
+            elif t.v == "[":
+                dbrk += 1
+            elif t.v == "]":
+                dbrk -= 1
+            elif t.v == sep and dpar == 0 and dbrc == 0 and dbrk == 0:
+                if cur:
+                    parts.append(cur)
+                cur = []
+                continue
+        cur.append(t)
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def tokens_src(toks: list[Tok]) -> str:
+    if not toks:
+        return ""
+    return " ".join(t.v for t in toks)
+
+
+def parse_params(lang: str, inner: list[Tok]) -> list[Param]:
+    chunks = split_top(inner)
+    params: list[Param] = []
+    pending_names: list[str] = []
+    for ch in chunks:
+        ch = [t for t in ch if not (t.k == "op" and t.v == "\n")]
+        if not ch:
+            continue
+        text = tokens_src(ch)
+        if text in ("...", "*args", "**kwargs") or text.startswith("*") or text.startswith("..."):
+            continue
+        if lang == "rs":
+            joined = "".join(t.v for t in ch)
+            if re.fullmatch(r"&?(mut)?self", joined.replace(" ", "")):
+                continue
+            name = None
+            for t in ch:
+                if t.k == "id" and t.v not in ("mut", "pub", "ref", "const"):
+                    name = t.v
+                    break
+            if name:
+                params.append(Param(name))
+            continue
+        if lang == "swift":
+            ids = [t for t in ch if t.k == "id"]
+            # first id that's not a type-ish keyword may be label
+            # patterns: `_ name: T`  `label name: T`  `name: T`  `name T` no
+            colon = next((i for i, t in enumerate(ch) if t.k == "op" and t.v == ":"), None)
+            if colon is None:
+                if ids:
+                    params.append(Param(ids[0].v, label=ids[0].v))
+                continue
+            before = [t for t in ch[:colon] if t.k == "id" or (t.k == "op" and t.v == "_")]
+            default = None
+            eq = next((i for i, t in enumerate(ch) if t.k == "op" and t.v == "="), None)
+            if eq is not None:
+                default = _literal_from_tokens(ch[eq + 1 :])
+            if len(before) >= 2:
+                label = before[0].v
+                name = before[1].v
+                params.append(Param(name, default, label=label))
+            elif before:
+                params.append(Param(before[0].v, default, label=before[0].v))
+            continue
+        if lang == "go":
+            ids = [t.v for t in ch if t.k == "id"]
+            # `x, y int` was split — this chunk is either `x` or `y int`
+            if len(ids) == 1:
+                pending_names.append(ids[0])
+                # if this chunk has a type (more tokens), flush
+                if len(ch) > 1:
+                    for nm in pending_names:
+                        if nm not in ("int", "string", "bool", "error", "byte", "rune", "float64", "float32", "any"):
+                            params.append(Param(nm))
+                    pending_names = []
+            else:
+                # x int  or  x y — last may be type
+                names, maybe_type = ids[:-1], ids[-1] if ids else None
+                for nm in pending_names + names:
+                    params.append(Param(nm))
+                pending_names = []
+                if maybe_type and maybe_type[0].islower() and maybe_type not in (
+                    "int",
+                    "string",
+                    "bool",
+                    "error",
+                    "byte",
+                    "rune",
+                    "any",
+                    "float64",
+                    "float32",
+                    "int64",
+                    "int32",
+                    "uint",
+                ):
+                    params.append(Param(maybe_type))
+            continue
+        # js / default
+        if ch[0].k == "op" and ch[0].v in "{[":
+            params.append(Param(f"${len(params)}"))
+            continue
+        eq = next((i for i, t in enumerate(ch) if t.k == "op" and t.v == "="), None)
+        name = next((t.v for t in ch if t.k == "id"), None)
+        if not name:
+            continue
+        default = _literal_from_tokens(ch[eq + 1 :]) if eq is not None else None
+        params.append(Param(name, default))
+    for nm in pending_names:
+        params.append(Param(nm))
+    return params
+
+
+def _is_enum_tag(recv: str, attr: str, op: str) -> bool:
+    if op == "::":
+        return True
+    if op == "." and (looks_const_name(attr) or (recv[:1].isupper() and attr[:1].isupper())):
+        return True
+    return False
+
+
+def _literal_from_tokens(toks: list[Tok]) -> Optional[str]:
+    toks = [t for t in toks if t.k != "attr" and not (t.k == "op" and t.v in (";", ",", ")"))]
+    if not toks:
+        return None
+    if len(toks) == 1:
+        t = toks[0]
+        if t.k == "num":
+            return canon_lit(t.v)
+        if t.k == "str":
+            if "${" in t.v or r"\(" in t.v:
+                return None
+            return canon_lit(t.v)
+        if t.k == "id" and t.v.lower() in ("true", "false", "none", "null", "nil", "undefined"):
+            return canon_lit(t.v)
+        return None
+    # unary minus
+    if toks[0].k == "op" and toks[0].v in "+-" and len(toks) == 2 and toks[1].k == "num":
+        return canon_lit(toks[0].v + toks[1].v)
+    # enum / case tag, not field access like cfg.host
+    if (
+        len(toks) == 3
+        and toks[0].k == "id"
+        and toks[1].k == "op"
+        and toks[1].v in (".", "::")
+        and toks[2].k == "id"
+        and _is_enum_tag(toks[0].v, toks[2].v, toks[1].v)
+    ):
+        return toks[0].v + toks[1].v + toks[2].v
+    if len(toks) == 2 and toks[0].k == "op" and toks[0].v == "." and toks[1].k == "id":
+        return "." + toks[1].v
+    return None
+
+
+def parse_object_bag(toks: list[Tok], consts: dict[str, str]) -> Optional[dict[str, Arg]]:
+    if not toks or not (toks[0].k == "op" and toks[0].v == "{"):
+        return None
+    # drop outer braces
+    inner = toks[1:]
+    if inner and inner[-1].k == "op" and inner[-1].v == "}":
+        inner = inner[:-1]
+    if not inner:
+        return {}
+    bag: dict[str, Arg] = {}
+    for i, ch in enumerate(split_top(inner)):
+        if not ch:
+            continue
+        # shorthand { catalog } or { catalog: expr } or { catalog, }
+        if ch[0].k != "id":
+            continue
+        key = ch[0].v
+        colon = next((j for j, t in enumerate(ch) if t.k == "op" and t.v == ":"), None)
+        if colon is None:
+            # shorthand
+            bag[key] = _arg_from_tokens(0, key, [ch[0]], consts)
+        else:
+            bag[key] = _arg_from_tokens(0, key, ch[colon + 1 :], consts)
+    return bag if bag else {}
+
+
+def _arg_from_tokens(index: int, name: Optional[str], toks: list[Tok], consts: dict[str, str]) -> Arg:
+    lit = _literal_from_tokens(toks)
+    if lit is not None:
+        return Arg(index, name, "lit", lit)
+    if len(toks) == 1 and toks[0].k == "id":
+        idv = toks[0].v
+        if idv in consts:
+            return Arg(index, name, "lit", consts[idv])
+        return Arg(index, name, "dyn", None)
+    if (
+        len(toks) == 3
+        and toks[0].k == "id"
+        and toks[1].k == "op"
+        and toks[1].v in (".", "::")
+        and toks[2].k == "id"
+        and (looks_const_name(toks[2].v) or toks[1].v == "::")
+    ):
+        # Foo::BAR or Mode.Fast — treat as literal tag
+        if not (len(toks) > 3 and toks[3].k == "op" and toks[3].v == "("):
+            return Arg(index, name, "lit", toks[0].v + toks[1].v + toks[2].v)
+    return Arg(index, name, "dyn", None)
+
+
+def parse_args(lang: str, inner: list[Tok], consts: dict[str, str], params: list[Param] | None) -> tuple[list[Arg], dict[str, Arg]]:
+    chunks = split_top(inner)
+    args: list[Arg] = []
+    bags: dict[str, Arg] = {}
+    used_kw = False
+    for i, ch in enumerate(chunks):
+        if not ch:
+            continue
+        # keyword a=b (py) or a: b (swift/js object is different)
+        name = None
+        value_toks = ch
+        if lang == "py":
+            eq = next((j for j, t in enumerate(ch) if t.k == "op" and t.v == "="), None)
+            if eq is not None and ch[0].k == "id":
+                name = ch[0].v
+                value_toks = ch[eq + 1 :]
+                used_kw = True
+        elif lang == "swift":
+            colon = next((j for j, t in enumerate(ch) if t.k == "op" and t.v == ":"), None)
+            if colon is not None and ch[0].k == "id" and colon == 1:
+                name = ch[0].v
+                value_toks = ch[colon + 1 :]
+                used_kw = True
+        # js object bag as first-class arg
+        bag = parse_object_bag(ch, consts) if ch[0].k == "op" and ch[0].v == "{" else None
+        if bag is not None and lang in ("js", "py", "ts"):
+            # positional bag — expand
+            for k, a in bag.items():
+                bags[k] = a
+            args.append(Arg(i, name or (params[i].name if params and i < len(params) else f"${i}"), "dyn", "{...}"))
+            continue
+        if name is None and params and i < len(params) and not used_kw:
+            name = params[i].name
+        args.append(_arg_from_tokens(i, name, value_toks, consts))
+    return args, bags
+
+
+# ---------------------------------------------------------------------------
+# file parsers
+# ---------------------------------------------------------------------------
+
+def parse_python(path: str, src: str) -> tuple[list[FuncDef], list[Call], dict[str, str]]:
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return [], [], {}
+    consts: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            lit = _ast_literal(node.value)
+            if lit is not None:
+                consts[node.targets[0].id] = lit
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            lit = _ast_literal(node.value)
+            if lit is not None:
+                consts[node.target.id] = lit
+    defs: list[FuncDef] = []
+    file_test = is_test_path(path)
+
+    class DefVis(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+            self.test_stack: list[bool] = []
+
+        def _visit_fn(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            params: list[Param] = []
+            args = node.args
+            npos = len(args.posonlyargs) + len(args.args)
+            defaults = args.defaults
+            pad = npos - len(defaults)
+            all_pos = list(args.posonlyargs) + list(args.args)
+            for i, a in enumerate(all_pos):
+                if a.arg in ("self", "cls"):
+                    continue
+                default = None
+                if i >= pad:
+                    default = _ast_literal(defaults[i - pad])
+                    if default is None and isinstance(defaults[i - pad], ast.Name) and defaults[i - pad].id in consts:
+                        default = consts[defaults[i - pad].id]
+                params.append(Param(a.arg, default))
+            for a, d in zip(args.kwonlyargs, args.kw_defaults):
+                default = _ast_literal(d) if d is not None else None
+                params.append(Param(a.arg, default))
+            is_test = file_test or node.name.startswith("test") or any(
+                isinstance(d, ast.Name) and d.id == "pytest" for d in node.decorator_list
+            ) or self.test_stack[-1] if self.test_stack else False
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            start_off = _offset_at_line(src, node.lineno)
+            end_off = _offset_at_line(src, end + 1) if end < src.count("\n") + 1 else len(src)
+            body = ast.get_source_segment(src, node) or ""
+            defs.append(
+                FuncDef(
+                    name=node.name,
+                    qualname=".".join(self.stack + [node.name]),
+                    params=params,
+                    path=path,
+                    line=node.lineno,
+                    lang="py",
+                    is_test=bool(is_test),
+                    start=start_off,
+                    end=end_off,
+                    body=body,
+                )
+            )
+            self.stack.append(node.name)
+            self.test_stack.append(bool(is_test))
+            self.generic_visit(node)
+            self.stack.pop()
+            self.test_stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_fn(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_fn(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+    DefVis().visit(tree)
+
+    calls: list[Call] = []
+
+    class CallVis(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.fn_stack: list[FuncDef] = []
+            self._by_pos = {(d.start, d.name): d for d in defs}
+
+        def _current(self) -> Optional[FuncDef]:
+            return self.fn_stack[-1] if self.fn_stack else None
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._enter(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._enter(node)
+
+        def _enter(self, node: ast.AST) -> None:
+            start_off = _offset_at_line(src, getattr(node, "lineno", 1))
+            match = None
+            name = getattr(node, "name", "")
+            for d in defs:
+                if d.name == name and abs(d.start - start_off) < 4:
+                    match = d
+                    break
+            if match:
+                self.fn_stack.append(match)
+            self.generic_visit(node)
+            if match:
+                self.fn_stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name, recv = _ast_callee(node.func)
+            if not name:
+                self.generic_visit(node)
+                return
+            cur = self._current()
+            is_test = file_test or (cur.is_test if cur else False)
+            params = None
+            args: list[Arg] = []
+            bags: dict[str, Arg] = {}
+            for i, a in enumerate(node.args):
+                if isinstance(a, ast.Dict):
+                    for k, v in zip(a.keys, a.values):
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                            bags[k.value] = _ast_arg(0, k.value, v, consts)
+                    args.append(Arg(i, None, "dyn", "{...}"))
+                    continue
+                args.append(_ast_arg(i, None, a, consts))
+            for kw in node.keywords:
+                if kw.arg is None:
+                    continue
+                if isinstance(kw.value, ast.Dict):
+                    for k, v in zip(kw.value.keys, kw.value.values):
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                            bags[k.value] = _ast_arg(0, k.value, v, consts)
+                args.append(_ast_arg(len(args), kw.arg, kw.value, consts))
+            raw = ast.get_source_segment(src, node) or name
+            calls.append(
+                Call(
+                    name=name,
+                    recv=recv,
+                    args=args,
+                    bags=bags,
+                    path=path,
+                    line=node.lineno,
+                    is_test=is_test,
+                    caller=cur.qualname if cur else None,
+                    raw=raw[:120],
+                )
+            )
+            self.generic_visit(node)
+
+    CallVis().visit(tree)
+    return defs, calls, consts
+
+
+def _offset_at_line(src: str, lineno: int) -> int:
+    if lineno <= 1:
+        return 0
+    n = 1
+    for i, c in enumerate(src):
+        if c == "\n":
+            n += 1
+            if n == lineno:
+                return i + 1
+    return len(src)
+
+
+def _ast_literal(node: ast.AST | None) -> Optional[str]:
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return canon_lit(repr(v))
+        if isinstance(v, str):
+            if "${" in v or "\\(" in v:
+                return None
+            return canon_lit(json.dumps(v))
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        inner = _ast_literal(node.operand)
+        if inner is not None and isinstance(node.op, ast.USub) and inner != "null":
+            if inner.startswith("-"):
+                return inner[1:]
+            return "-" + inner
+        return inner
+    return None
+
+
+def _ast_callee(node: ast.AST) -> tuple[Optional[str], Optional[str]]:
+    if isinstance(node, ast.Name):
+        return node.id, None
+    if isinstance(node, ast.Attribute):
+        recv = None
+        if isinstance(node.value, ast.Name):
+            recv = node.value.id
+        elif isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name):
+            recv = node.value.attr
+        return node.attr, recv
+    return None, None
+
+
+def _ast_arg(index: int, name: Optional[str], node: ast.AST, consts: dict[str, str]) -> Arg:
+    lit = _ast_literal(node)
+    if lit is not None:
+        return Arg(index, name, "lit", lit)
+    if isinstance(node, ast.Name):
+        if node.id in consts:
+            return Arg(index, name, "lit", consts[node.id])
+        return Arg(index, name, "dyn", None)
+    if isinstance(node, ast.Attribute):
+        # Mode.FAST or obj.x — if attr is const-like, literal tag
+        if looks_const_name(node.attr) or (isinstance(node.value, ast.Name) and looks_const_name(node.value.id)):
+            recv = node.value.id if isinstance(node.value, ast.Name) else "?"
+            return Arg(index, name, "lit", f"{recv}.{node.attr}")
+        return Arg(index, name, "dyn", None)
+    return Arg(index, name, "dyn", None)
+
+
+def parse_generic(path: str, src: str, lang: str) -> tuple[list[FuncDef], list[Call], dict[str, str]]:
+    toks = tokenize(src, lang)
+    consts: dict[str, str] = _file_consts(toks, lang)
+    defs: list[FuncDef] = []
+    file_test = is_test_path(path)
+
+    # walk for defs + context
+    type_stack: list[tuple[str, int]] = []  # (name, brace_depth_inside)
+    brace = 0
+    test_mod_depth = -1
+    pending_test_attr = False
+    pending_cfg_test = False
+    i = 0
+    n = len(toks)
+
+    def skip_generics(j: int) -> int:
+        if j < n and toks[j].k == "op" and toks[j].v == "<":
+            depth = 1
+            j += 1
+            while j < n and depth:
+                if toks[j].k == "op" and toks[j].v == "<":
+                    depth += 1
+                elif toks[j].k == "op" and toks[j].v == ">":
+                    depth -= 1
+                j += 1
+        return j
+
+    while i < n:
+        t = toks[i]
+        if t.k == "attr":
+            if "test" in t.v and "cfg" not in t.v:
+                pending_test_attr = True
+            if "cfg(test)" in t.v.replace(" ", "") or "cfg( test )" in t.v:
+                pending_cfg_test = True
+            i += 1
+            continue
+        if t.k == "op" and t.v == "{":
+            brace += 1
+            if pending_cfg_test:
+                test_mod_depth = brace
+                pending_cfg_test = False
+            i += 1
+            continue
+        if t.k == "op" and t.v == "}":
+            if test_mod_depth == brace:
+                test_mod_depth = -1
+            brace -= 1
+            while type_stack and type_stack[-1][1] > brace:
+                type_stack.pop()
+            i += 1
+            continue
+        if t.k == "id" and t.v in ("impl", "struct", "enum", "class", "trait", "extension", "protocol", "interface", "mod", "actor"):
+            kind = t.v
+            j = i + 1
+            # rust impl Trait for Type / impl Type
+            # swift/js class SiteObserver: @unchecked Sendable  → first ident, not the protocol
+            mods = {
+                "for",
+                "pub",
+                "where",
+                "unsafe",
+                "crate",
+                "self",
+                "open",
+                "final",
+                "public",
+                "private",
+                "internal",
+                "fileprivate",
+                "static",
+                "override",
+                "mutating",
+                "indirect",
+                "unowned",
+                "weak",
+                "lazy",
+                "required",
+                "convenience",
+                "nonisolated",
+                "unchecked",
+                "optional",
+                "package",
+            }
+            first = last = None
+            saw_for = False
+            while j < n and not (toks[j].k == "op" and toks[j].v in "{;"):
+                if toks[j].k == "op" and toks[j].v == "<":
+                    j = skip_generics(j)
+                    continue
+                if toks[j].k == "op" and toks[j].v == "@":
+                    j += 2
+                    continue
+                if toks[j].k == "id" and toks[j].v == "for":
+                    saw_for = True
+                    first = None
+                    last = None
+                    j += 1
+                    continue
+                if toks[j].k == "id" and toks[j].v not in mods and not toks[j].v.startswith("'"):
+                    if first is None:
+                        first = toks[j].v
+                    last = toks[j].v
+                j += 1
+            if kind == "impl":
+                name = last or first
+            else:
+                name = first
+            if kind == "mod" and pending_cfg_test:
+                pass
+            if name and kind != "mod":
+                type_stack.append((name, brace + 1))
+            i += 1
+            continue
+
+        is_fn_kw = t.k == "id" and t.v in DEF_KW
+        # js: ident = (  or ident = async (  or ident = function
+        js_assign = False
+        if lang == "js" and t.k == "id" and t.v not in NOT_CALL:
+            j = i + 1
+            if j < n and toks[j].k == "op" and toks[j].v == "=":
+                k = j + 1
+                if k < n and toks[k].k == "id" and toks[k].v in ("async", "function"):
+                    if toks[k].v == "function":
+                        js_assign = True
+                    else:
+                        k += 1
+                        if k < n and toks[k].k == "id" and toks[k].v == "function":
+                            js_assign = True
+                        elif k < n and toks[k].k == "op" and toks[k].v == "(":
+                            js_assign = True
+                elif k < n and toks[k].k == "op" and toks[k].v == "(":
+                    js_assign = True
+
+        if is_fn_kw or js_assign:
+            recv = type_stack[-1][0] if type_stack else None
+            if is_fn_kw:
+                j = i + 1
+                # go receiver func (s *T) Name
+                if lang == "go" and j < n and toks[j].k == "op" and toks[j].v == "(":
+                    j = _skip_balanced(toks, j) + 1
+                    recv_ids = [x.v for x in toks[i + 2 : j] if x.k == "id"]
+                    if recv_ids:
+                        recv = recv_ids[-1].lstrip("*")
+                j = skip_generics(j)
+                if j >= n or toks[j].k != "id":
+                    i += 1
+                    continue
+                name = toks[j].v
+                j += 1
+                j = skip_generics(j)
+            else:
+                name = t.v
+                j = i + 1
+                while j < n and not (toks[j].k == "op" and toks[j].v == "("):
+                    j += 1
+            if j >= n or not (toks[j].k == "op" and toks[j].v == "("):
+                i += 1
+                continue
+            close = _skip_balanced(toks, j)
+            inner = toks[j + 1 : close]
+            params = parse_params(lang, inner)
+            # find body
+            k = close + 1
+            while k < n and not (toks[k].k == "op" and toks[k].v in "{;=") and not (
+                lang == "js" and toks[k].k == "op" and toks[k].v == "=>"
+            ):
+                k += 1
+            body_start = toks[j].i
+            body_end = toks[k].i if k < n else toks[close].i
+            if k < n and toks[k].k == "op" and toks[k].v == "=>":
+                k += 1
+            if k < n and toks[k].k == "op" and toks[k].v == "{":
+                endtok = _skip_balanced(toks, k)
+                body_start = toks[k].i
+                body_end = toks[endtok].i + 1 if endtok < n else len(src)
+            else:
+                # no brace body
+                endtok = k
+                body_end = toks[min(k, n - 1)].i if n else len(src)
+            is_test = (
+                file_test
+                or pending_test_attr
+                or (test_mod_depth >= 0)
+                or name.startswith("test")
+                or name.startswith("Test")
+                or name.startswith("it")
+            )
+            pending_test_attr = False
+            q = f"{recv}.{name}" if recv else name
+            defs.append(
+                FuncDef(
+                    name=name,
+                    qualname=q,
+                    params=params,
+                    path=path,
+                    line=t.line,
+                    lang=lang,
+                    is_test=is_test,
+                    start=t.i,
+                    end=body_end,
+                    body=src[body_start:body_end],
+                    recv=recv,
+                )
+            )
+            i = close + 1
+            continue
+        i += 1
+
+    # calls
+    calls: list[Call] = []
+    i = 0
+    while i < n:
+        t = toks[i]
+        if t.k != "id" or t.v in NOT_CALL or t.v.endswith("!"):
+            i += 1
+            continue
+        recv = None
+        # recv.ident or recv::ident
+        if i >= 2 and toks[i - 1].k == "op" and toks[i - 1].v in (".", "::") and toks[i - 2].k == "id":
+            recv = toks[i - 2].v
+        j = i + 1
+        j = skip_generics(j) if lang in ("rs", "go", "swift", "js") else j
+        # skip type args in ts ident<T>(
+        if j < n and toks[j].k == "op" and toks[j].v == "<":
+            j = skip_generics(j)
+        if j >= n or not (toks[j].k == "op" and toks[j].v == "("):
+            i += 1
+            continue
+        # if previous token is def keyword, this is a def name not a call
+        if i >= 1 and toks[i - 1].k == "id" and toks[i - 1].v in DEF_KW:
+            i += 1
+            continue
+        close = _skip_balanced(toks, j)
+        inner = toks[j + 1 : close]
+        # containing def
+        pos = t.i
+        container = _innermost_def(defs, path, pos)
+        is_test = file_test or (container.is_test if container else False) or (
+            container is not None and is_test_path(container.path)
+        )
+        params = container.params if container and container.name == t.v else None
+        args, bags = parse_args(lang, inner, consts, params)
+        raw = src[t.i : (toks[close].i + 1 if close < n else t.i + len(t.v))]
+        calls.append(
+            Call(
+                name=t.v,
+                recv=recv,
+                args=args,
+                bags=bags,
+                path=path,
+                line=t.line,
+                is_test=is_test,
+                caller=container.qualname if container else None,
+                raw=raw[:120],
+            )
+        )
+        # Walk into the argument list so nested calls are not swallowed
+        # (test("x", () => { listen(8080) }) must still see listen).
+        i = j + 1
+    return defs, calls, consts
+
+
+def _skip_balanced(toks: list[Tok], open_i: int) -> int:
+    if open_i >= len(toks):
+        return open_i
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    op = toks[open_i].v
+    cl = pairs.get(op)
+    if not cl:
+        return open_i
+    depth = 0
+    for j in range(open_i, len(toks)):
+        t = toks[j]
+        if t.k != "op":
+            continue
+        if t.v == op:
+            depth += 1
+        elif t.v == cl:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(toks) - 1
+
+
+def _innermost_def(defs: list[FuncDef], path: str, pos: int) -> Optional[FuncDef]:
+    best = None
+    best_span = 10**18
+    for d in defs:
+        if d.path != path:
+            continue
+        if d.start <= pos < d.end:
+            span = d.end - d.start
+            if span < best_span:
+                best = d
+                best_span = span
+    return best
+
+
+def _file_consts(toks: list[Tok], lang: str) -> dict[str, str]:
+    consts: dict[str, str] = {}
+    i = 0
+    n = len(toks)
+    while i < n:
+        t = toks[i]
+        if t.k == "id" and (t.v.isupper() or (lang == "js" and i > 0 and toks[i - 1].k == "id" and toks[i - 1].v in ("const", "let"))):
+            name = t.v
+            j = i + 1
+            # skip type anno
+            if j < n and toks[j].k == "op" and toks[j].v == ":":
+                j += 1
+                while j < n and not (toks[j].k == "op" and toks[j].v in ("=", ";", ",")):
+                    j += 1
+            if j < n and toks[j].k == "op" and toks[j].v == "=":
+                k = j + 1
+                slice: list[Tok] = []
+                while k < n:
+                    tk = toks[k]
+                    if tk.k == "op" and tk.v in (";", ",", "{", "}", ")"):
+                        break
+                    if tk.k == "id" and tk.v in DEF_KW | {"export", "pub", "const", "let", "var", "return", "if"}:
+                        break
+                    slice.append(tk)
+                    k += 1
+                    if len(slice) >= 4:
+                        break
+                lit = _literal_from_tokens(slice)
+                if lit is not None:
+                    consts[name] = lit
+        i += 1
+    return consts
+
+
+def parse_file(path: Path, root: Path) -> tuple[list[FuncDef], list[Call], dict[str, list[str]]]:
+    src = read_text(path)
+    if src is None:
+        return [], [], {}
+    try:
+        rel = str(path.relative_to(root))
+    except ValueError:
+        rel = str(path)
+    lang = LANG_BY_EXT.get(path.suffix.lower())
+    if not lang:
+        return [], [], {}
+    try:
+        if lang == "py":
+            defs, calls, _ = parse_python(rel, src)
+        else:
+            defs, calls, _ = parse_generic(rel, src, lang)
+        cols = extract_collections(src)
+    except Exception as ex:  # parser must not crash the census
+        eprint(f"sow: skip {rel}: {ex}")
+        return [], [], {}
+    return defs, calls, cols
+
+
+# ---------------------------------------------------------------------------
+# worlds / fixtures (production only)
+# ---------------------------------------------------------------------------
+
+def lang_of_path(path: str) -> Optional[str]:
+    ext = Path(path).suffix.lower()
+    return LANG_BY_EXT.get(ext)
+
+
+def bind_args(fn: FuncDef, call: Call) -> dict[str, Arg]:
+    bound: dict[str, Arg] = {}
+    params = [p for p in fn.params]
+    used: set[str] = set()
+    # keyword / labeled
+    pos_args = []
+    for a in call.args:
+        if a.value == "{...}":
+            continue
+        if a.name and any(p.name == a.name or p.label == a.name for p in params):
+            pname = next(p.name for p in params if p.name == a.name or p.label == a.name)
+            bound[pname] = a
+            used.add(pname)
+        else:
+            pos_args.append(a)
+    pi = 0
+    for a in pos_args:
+        while pi < len(params) and params[pi].name in used:
+            pi += 1
+        if pi >= len(params):
+            bound[a.name or f"${a.index}"] = a
+            continue
+        # swift: skip params whose label is not "_" when this positional... already handled via labels
+        p = params[pi]
+        if p.label and p.label != "_" and p.label != p.name:
+            # labeled-only, don't bind positional unless label is "_"
+            # still bind if this is positional with no name
+            pass
+        bound[p.name] = Arg(a.index, p.name, a.kind, a.value)
+        used.add(p.name)
+        pi += 1
+    for p in params:
+        if p.name not in bound:
+            if p.default is not None:
+                bound[p.name] = Arg(-1, p.name, "default", p.default)
+            else:
+                bound[p.name] = Arg(-1, p.name, "omit", None)
+    for k, a in call.bags.items():
+        bound[k] = a
+    return bound
+
+
+def world_of(bound: dict[str, Arg]) -> tuple[tuple, str]:
+    parts: list[tuple[str, str, Optional[str]]] = []
+    bits: list[str] = []
+    for name in sorted(bound):
+        a = bound[name]
+        if a.kind == "omit":
+            continue
+        if a.kind == "dyn":
+            parts.append((name, "dyn", None))
+            bits.append(f"{name}=*")
+        elif a.kind == "default":
+            parts.append((name, "val", a.value))
+            bits.append(f"{name}={a.value}d")
+        else:
+            parts.append((name, "val", a.value))
+            bits.append(f"{name}={a.value}")
+    label = "{" + ", ".join(bits) + "}" if bits else "{}"
+    return tuple(parts), label
+
+
+def effective_const(bound: dict[str, Arg]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for n, a in bound.items():
+        if a.kind in ("lit", "default") and a.value is not None:
+            out[n] = a.value
+    return out
+
+
+def extract_arms(fn: FuncDef) -> list[str]:
+    """Predicates in the body that mention a parameter."""
+    names = {p.name for p in fn.params}
+    if not names or not fn.body:
+        return []
+    arms: list[str] = []
+    seen: set[str] = set()
+    body = fn.body
+    name_alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    lit = r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\.[A-Za-z_][\w]*|(?:[\w$]+::)+[\w$]+|[-+]?\d[\d_.]*|true|false|null|nil|None|undefined)"
+    for m in re.finditer(rf"\b({name_alt})\b\s*(===?|!==?|==|!=)\s*({lit})", body):
+        pred = f"{m.group(1)}{m.group(2)}{canon_lit(m.group(3))}"
+        if pred not in seen:
+            seen.add(pred)
+            arms.append(pred)
+    for m in re.finditer(rf"({lit})\s*(===?|!==?|==|!=)\s*\b({name_alt})\b", body):
+        pred = f"{m.group(3)}{m.group(2)}{canon_lit(m.group(1))}"
+        if pred not in seen:
+            seen.add(pred)
+            arms.append(pred)
+    # contains/in membership of a collection assigned from a literal list — handled later
+    return arms[:12]
+
+
+def arm_inhabited(pred: str, const: dict[str, str], open_params: set[str]) -> bool:
+    m = re.match(r"^(\w+)(===?|!==?|==|!=)(.+)$", pred)
+    if not m:
+        return False
+    name, op, lit = m.group(1), m.group(2), m.group(3)
+    if name in open_params:
+        return True  # dynamic can hit either side
+    if name not in const:
+        return False
+    val = const[name]
+    eq = op in ("==", "===", "=")
+    hit = val == lit or val == canon_lit(lit)
+    return hit if eq else not hit
+
+
+def match_calls_to_def(fn: FuncDef, calls: list[Call], name_index: dict[str, list[FuncDef]]) -> list[Call]:
+    out: list[Call] = []
+    siblings = [d for d in name_index.get(fn.name, []) if d.lang == fn.lang]
+    unique = len(siblings) == 1
+    for c in calls:
+        if c.name != fn.name:
+            continue
+        if lang_of_path(c.path) != fn.lang:
+            continue
+        if c.path == fn.path and c.line == fn.line:
+            continue
+        npos = len(c.args)
+        if fn.params and npos > len(fn.params) + 4:
+            continue
+        if not unique:
+            if c.recv and fn.recv and c.recv != fn.recv and c.recv not in {"self", "this", "super", "Self"}:
+                continue
+            if c.recv and fn.recv is None and any(d.recv == c.recv for d in siblings):
+                continue
+            # instance call with no type prefix: keep the def in the same file
+            if c.recv in {None, "self", "this", "super", "Self"} or (c.recv and c.recv[:1].islower()):
+                same_file = [d for d in siblings if d.path == c.path]
+                if same_file and fn.path != c.path:
+                    continue
+            if not c.recv and fn.recv and any(d.recv is None for d in siblings if d is not fn):
+                # ambiguous free function vs method — keep same-path / test-name affinity
+                same = Path(c.path).stem.replace("-", "_")
+                defstem = Path(fn.path).stem.replace("-", "_")
+                if defstem not in same and same not in defstem and Path(c.path).parent != Path(fn.path).parent:
+                    if not (is_test_path(c.path) and defstem.split("_")[0] in same):
+                        continue
+        out.append(c)
+    return out
+
+
+def build_reports(
+    defs: list[FuncDef],
+    calls: list[Call],
+    include_test_defs: bool = False,
+    collections: dict[str, dict[str, list[str]]] | None = None,
+) -> list[Report]:
+    by_name: dict[str, list[FuncDef]] = defaultdict(list)
+    subjects: list[FuncDef] = []
+    for d in defs:
+        if d.name in SKIP_SUBJECT or d.name.endswith("!"):
+            continue
+        if not include_test_defs and (d.is_test or is_test_path(d.path)):
+            continue
+        subjects.append(d)
+        by_name[d.name].append(d)
+    reports: list[Report] = []
+    seen_def: set[tuple[str, int, str]] = set()
+    collections = collections or {}
+    for fn in subjects:
+        key = (fn.path, fn.line, fn.name)
+        if key in seen_def:
+            continue
+        seen_def.add(key)
+        if fn.name in SKIP_SUBJECT:
+            continue
+        matched = match_calls_to_def(fn, calls, by_name)
+        # drop recursive? keep
+        if not matched:
+            continue
+        worlds_map: dict[tuple, World] = {}
+        bounds: list[tuple[Call, dict[str, Arg]]] = []
+        for c in matched:
+            bound = bind_args(fn, c)
+            bounds.append((c, bound))
+            wkey, wlabel = world_of(bound)
+            w = worlds_map.get(wkey)
+            if w is None:
+                w = World(wkey, wlabel)
+                worlds_map[wkey] = w
+            (w.test_calls if c.is_test else w.prod_calls).append(c)
+        worlds = sorted(worlds_map.values(), key=lambda w: (-(w.n_test + w.n_prod), w.label))
+        preds = extract_arms(fn)
+        arms: list[Arm] = []
+        for pred in preds:
+            t_hit = p_hit = False
+            for c, bound in bounds:
+                const = effective_const(bound)
+                open_p = {n for n, a in bound.items() if a.kind == "dyn"}
+                if arm_inhabited(pred, const, open_p):
+                    if c.is_test:
+                        t_hit = True
+                    else:
+                        p_hit = True
+            arms.append(Arm(pred, t_hit, p_hit))
+        file_cols = collections.get(fn.path, {})
+        members = infer_members(fn, bounds, file_cols)
+        fixtures = infer_fixtures(fn, worlds, bounds, members)
+        # production-only: a function with no production callers is not a seed
+        if not any(not c.is_test for c in matched):
+            continue
+        reports.append(Report(fn, matched, worlds, arms, fixtures, members))
+    reports.sort(key=lambda r: (-len(r.due), -len(r.calls), r.fn.qualname))
+    return reports
+
+
+def infer_members(
+    fn: FuncDef,
+    bounds: list[tuple[Call, dict[str, Arg]]],
+    file_cols: dict[str, list[str]],
+) -> list[MemberGap]:
+    params = [p.name for p in fn.params]
+    hits = membership_hits(fn.body, params, file_cols)
+    gaps: list[MemberGap] = []
+    for pname, cname in hits:
+        members = file_cols[cname]
+        test_vals: set[str] = set()
+        for c, b in bounds:
+            if c.is_test and pname in b and b[pname].kind in ("lit", "default") and b[pname].value:
+                test_vals.add(b[pname].value)
+        missing = [m for m in members if m not in test_vals]
+        witnessed = [m for m in members if m in test_vals]
+        gaps.append(MemberGap(pname, cname, members, witnessed, missing))
+    return gaps
+
+
+_SLUG_SYM = {
+    "←": "left",
+    "→": "right",
+    "↑": "up",
+    "↓": "down",
+    "↩": "enter",
+    "✕": "cross",
+    "×": "times",
+    "✓": "ok",
+    "✗": "fail",
+    "–": "dash",
+    "—": "em",
+    "…": "ellip",
+    " ": "_",
+}
+
+
+def _slug(s: str, n: int = 28) -> str:
+    s = s.strip().strip("\"'`")
+    parts: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch == "_":
+            parts.append(ch)
+        elif ch in _SLUG_SYM:
+            parts.append("_" + _SLUG_SYM[ch] + "_")
+        elif ord(ch) > 127:
+            # keep letters (CJK etc.); otherwise a short codepoint
+            parts.append(ch if ch.isalpha() else f"_u{ord(ch):x}_")
+        else:
+            parts.append("_")
+    s = re.sub(r"_+", "_", "".join(parts)).strip("_")
+    return (s or "x")[:n]
+
+
+def suggest_name(fn: FuncDef, args: dict[str, str]) -> str:
+    bits: list[str] = []
+    for k, v in args.items():
+        if v in (None, "*", ""):
+            bits.append(_slug(k, 16))
+        else:
+            bits.append(f"{_slug(k, 16)}_{_slug(v, 24)}")
+    tail = "_".join(bits)[:72]
+    return f"test_{_slug(fn.name, 40)}_{tail}" if tail else f"test_{_slug(fn.name, 40)}_prod"
+
+
+def bound_to_args(bound: dict[str, Arg]) -> dict:
+    out = {}
+    for name, a in bound.items():
+        if a.kind == "omit":
+            continue
+        out[name] = {"kind": a.kind, "value": a.value}
+    return out
+
+
+def infer_fixtures(
+    fn: FuncDef,
+    worlds: list[World],
+    bounds: list[tuple[Call, dict[str, Arg]]],
+    members: list[MemberGap] | None = None,
+) -> list[Fixture]:
+    """Production worlds the tests do not inhabit, as generator records.
+
+    Tests are a subtract filter only. Test-only worlds never become fixtures.
+    """
+    prod_calls = [c for c, _ in bounds if not c.is_test]
+    if not prod_calls:
+        return []
+
+    fixtures: list[Fixture] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(fx: Fixture) -> None:
+        k = (fx.kind, fx.label)
+        if k in seen:
+            return
+        seen.add(k)
+        fixtures.append(fx)
+
+    # Concrete collection members production can hit and tests never pass.
+    member_params: set[str] = set()
+    for g in members or []:
+        member_params.add(g.param)
+        for m in g.missing:
+            add(
+                Fixture(
+                    kind="member",
+                    status="due",
+                    args={g.param: {"kind": "lit", "value": m}},
+                    label=f"{{{g.param}={m}}}",
+                    sites=[],
+                    suggest=suggest_name(fn, {g.param: m}),
+                    generable=True,
+                    collection=g.collection,
+                    param=g.param,
+                )
+            )
+        for m in g.witnessed:
+            add(
+                Fixture(
+                    kind="member",
+                    status="have",
+                    args={g.param: {"kind": "lit", "value": m}},
+                    label=f"{{{g.param}={m}}}",
+                    sites=[],
+                    suggest=suggest_name(fn, {g.param: m}),
+                    generable=True,
+                    collection=g.collection,
+                    param=g.param,
+                )
+            )
+
+    # Production-only worlds (tests never inhabit the same key).
+    bound_by_call = {id(c): b for c, b in bounds}
+    for w in worlds:
+        if w.n_prod == 0:
+            continue
+        sample = w.prod_calls[0]
+        bound = bound_by_call.get(id(sample), {})
+        args = bound_to_args(bound)
+        # Zero-arg calls are not an argument world — skip unless --all
+        # (status have/due still tracked via empty args + kind world).
+        if not args:
+            continue
+        dyn_names = [n for n, a in args.items() if a["kind"] == "dyn"]
+        concrete = [
+            n
+            for n, a in args.items()
+            if a["kind"] in ("lit", "default") and a.get("value") is not None
+        ]
+        # A world is generable when production pinned at least one value.
+        # Dyn slots become `...` placeholders in --emit (duration=1, context="tmux").
+        generable = bool(concrete)
+        suggest_args = {
+            n: ("*" if a["kind"] == "dyn" else (a["value"] or n)) for n, a in args.items()
+        }
+        sites = [rel_site(c) for c in w.prod_calls[:8]]
+        # A dyn world whose param already expanded into members is not a seed.
+        if dyn_names and set(dyn_names) <= member_params and not concrete:
+            if any(g.param in dyn_names and g.missing for g in (members or [])):
+                continue
+        status = "have" if w.n_test else "due"
+        kind = "world" if concrete else "dyn"
+        add(
+            Fixture(
+                kind=kind,
+                status=status,
+                args=args,
+                label=w.label,
+                sites=sites,
+                suggest=suggest_name(fn, suggest_args),
+                generable=generable,
+                param=dyn_names[0] if dyn_names else None,
+            )
+        )
+
+    fixtures.sort(key=lambda f: (0 if f.status == "due" else 1, 0 if f.generable else 1, f.kind, f.label))
+    return fixtures
+
+
+# ---------------------------------------------------------------------------
+# render
+# ---------------------------------------------------------------------------
+
+def use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def wrap(enabled: bool, code: str, s: str) -> str:
+    if not enabled:
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+def rel_site(c: Call) -> str:
+    return f"{c.path}:{c.line}"
+
+
+def fixture_record(r: Report, f: Fixture) -> dict:
+    return {
+        "fn": r.fn.name,
+        "qualname": r.fn.qualname,
+        "def": {
+            "path": r.fn.path,
+            "line": r.fn.line,
+            "lang": r.fn.lang,
+            "params": [
+                {"name": p.name, **({"default": p.default} if p.default is not None else {})}
+                for p in r.fn.params
+            ],
+        },
+        "kind": f.kind,
+        "status": f.status,
+        "generable": f.generable,
+        "args": f.args,
+        "label": f.label,
+        "sites": f.sites,
+        "suggest": f.suggest,
+        "collection": f.collection,
+        "param": f.param,
+    }
+
+
+def iter_fixtures(reports: list[Report], due_only: bool) -> Iterator[tuple[Report, Fixture]]:
+    for r in reports:
+        for f in r.fixtures:
+            if due_only and f.status != "due":
+                continue
+            yield r, f
+
+
+def render_human(reports: list[Report], color: bool, show_all: bool) -> str:
+    lines: list[str] = []
+    shown = 0
+    for r in reports:
+        due = r.due if not show_all else r.fixtures
+        if not show_all and not r.due:
+            continue
+        shown += 1
+        params = ", ".join(
+            (p.name + (f"={p.default}" if p.default is not None else "")) for p in r.fn.params
+        )
+        nprod = sum(1 for c in r.calls if not c.is_test)
+        ndue = len(r.due)
+        head = f"{r.fn.qualname}  {r.fn.path}:{r.fn.line}  ({params})"
+        flag = wrap(color, "31;1", f"  {ndue} due") if ndue else wrap(color, "32", "  sown")
+        lines.append(wrap(color, "1", head) + flag)
+        lines.append(f"  prod:{nprod}  worlds:{sum(1 for w in r.worlds if w.n_prod)}  fixtures:{ndue}")
+        for g in r.members:
+            miss = wrap(color, "31", fmt_vals(g.missing)) if g.missing else "[]"
+            lines.append(
+                f"  members {g.collection}  {g.param}  {len(g.members)}  "
+                f"have={fmt_vals(g.witnessed)}  miss={miss}"
+            )
+        shown_fx = due if show_all else r.due
+        for f in shown_fx:
+            tag = wrap(color, "31" if f.status == "due" else "32", f.status)
+            gen = "" if f.generable else wrap(color, "33", "  *")
+            coll = f"  in {f.collection}" if f.collection else ""
+            lines.append(f"  {tag:s}  {f.kind:6s}  {f.label}{coll}{gen}")
+            extra = f"  {f.suggest}"
+            site = ("  " + ", ".join(f.sites[:3])) if f.sites else ""
+            lines.append(f"         {extra.strip()}{site}")
+        lines.append("")
+    if not shown:
+        nfn = len(reports)
+        nd = sum(len(r.due) for r in reports)
+        lines.append(f"no due fixtures  prod_fns={nfn} due={nd}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_json(reports: list[Report], due_only: bool) -> str:
+    """Test-generator input: a flat fixture list plus per-function grouping."""
+    fixtures = [fixture_record(r, f) for r, f in iter_fixtures(reports, due_only)]
+    functions = []
+    for r in reports:
+        fx = [fixture_record(r, f) for f in (r.due if due_only else r.fixtures)]
+        if due_only and not fx:
+            continue
+        functions.append(
+            {
+                "name": r.fn.name,
+                "qualname": r.fn.qualname,
+                "def": {"path": r.fn.path, "line": r.fn.line, "params": [p.name for p in r.fn.params]},
+                "n_prod": sum(1 for c in r.calls if not c.is_test),
+                "due": len(r.due),
+                "fixtures": fx,
+            }
+        )
+    return json.dumps({"tool": "sow", "version": VERSION, "fixtures": fixtures, "functions": functions}, indent=2, ensure_ascii=False) + "\n"
+
+
+def render_ndjson(reports: list[Report], due_only: bool) -> str:
+    lines = [json.dumps(fixture_record(r, f), ensure_ascii=False) for r, f in iter_fixtures(reports, due_only)]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def render_tsv(reports: list[Report], due_only: bool) -> str:
+    lines = ["kind\tfn\tpath\tline\tstatus\tlabel\tsuggest"]
+    for r, f in iter_fixtures(reports, due_only):
+        lines.append(
+            f"{f.kind}\t{r.fn.qualname}\t{r.fn.path}\t{r.fn.line}\t{f.status}\t{f.label}\t{f.suggest}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_porcelain(reports: list[Report], due_only: bool = True) -> str:
+    lines = []
+    for r, f in iter_fixtures(reports, due_only):
+        gen = "1" if f.generable else "0"
+        lines.append(
+            f"fixture\t{r.fn.qualname}\t{f.kind}\t{f.label}\t{gen}\t{f.suggest}\t{r.fn.path}:{r.fn.line}"
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _emit_call(fn: FuncDef, args: dict) -> str:
+    bits: list[str] = []
+    names = [p.name for p in fn.params] or list(args)
+    used = set()
+    for name in names:
+        if name not in args:
+            continue
+        used.add(name)
+        a = args[name]
+        kind, val = a.get("kind"), a.get("value")
+        if kind == "dyn" or val is None:
+            bits.append(f"{name}=..." if fn.lang == "py" else "...")
+        elif fn.lang == "py":
+            bits.append(f"{name}={val}")
+        elif fn.lang == "swift":
+            label = next((p.label or p.name for p in fn.params if p.name == name), name)
+            if label == "_":
+                bits.append(str(val))
+            else:
+                bits.append(f"{label}: {val}")
+        else:
+            bits.append(str(val))
+    for name, a in args.items():
+        if name in used:
+            continue
+        val = a.get("value")
+        bits.append(f"{name}={val}" if val is not None else f"{name}=...")
+    recv = f"{fn.recv}." if fn.recv else ""
+    return f"{recv}{fn.name}({', '.join(bits)})"
+
+
+def render_emit_pytest(reports: list[Report], due_only: bool = True) -> str:
+    """Stub tests a generator (or a human) can fill in. Only generable due fixtures."""
+    lines = [
+        "# generated by sow — production argument worlds the tests do not inhabit",
+        "import pytest",
+        "",
+    ]
+    n = 0
+    seen: set[str] = set()
+    for r, f in iter_fixtures(reports, due_only):
+        if not f.generable:
+            continue
+        name = f.suggest
+        base, i = name, 2
+        while name in seen:
+            name = f"{base}_{i}"
+            i += 1
+        seen.add(name)
+        call = _emit_call(r.fn, f.args)
+        lines.append(f"def {name}():")
+        lines.append(f"    # {r.fn.path}:{r.fn.line}  {f.kind}  {f.label}")
+        if f.collection:
+            lines.append(f"    # member of {f.collection}")
+        if f.sites:
+            lines.append(f"    # production: {', '.join(f.sites[:3])}")
+        lines.append(f"    {call}")
+        lines.append("")
+        n += 1
+    if n == 0:
+        lines.append("# no generable due fixtures")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# analyze
+# ---------------------------------------------------------------------------
+
+def analyze(
+    root: Path,
+    exclude: list[str] | None = None,
+    include_test_defs: bool = False,
+) -> tuple[list[FuncDef], list[Call], list[Report]]:
+    files = list_source_files(root, exclude)
+    defs: list[FuncDef] = []
+    calls: list[Call] = []
+    collections: dict[str, dict[str, list[str]]] = {}
+    for p in files:
+        d, c, cols = parse_file(p, root)
+        defs.extend(d)
+        calls.extend(c)
+        if cols:
+            try:
+                rel = str(p.relative_to(root))
+            except ValueError:
+                rel = str(p)
+            collections[rel] = cols
+    reports = build_reports(defs, calls, include_test_defs=include_test_defs, collections=collections)
+    return defs, calls, reports
+
+
+def filter_reports(
+    reports: list[Report],
+    names: list[str],
+    min_callers: int,
+    due_only: bool,
+) -> list[Report]:
+    out = []
+    want = {n.lower() for n in names}
+    for r in reports:
+        nprod = sum(1 for c in r.calls if not c.is_test)
+        if nprod == 0:
+            continue
+        if not names and nprod < min_callers:
+            continue
+        if want and r.fn.name.lower() not in want and r.fn.qualname.lower() not in want:
+            if not any(r.fn.qualname.lower().endswith("." + n) or r.fn.qualname.lower().endswith("::" + n) for n in want):
+                continue
+        if due_only and not r.due:
+            continue
+        out.append(r)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    def ok(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+        else:
+            print(f"  ok  {msg}")
+
+    tmp = Path(tempfile.mkdtemp(prefix="sow-self-"))
+    src = tmp / "src"
+    tests = tmp / "tests"
+    src.mkdir()
+    tests.mkdir()
+    weird = src / "weird:colon.py"
+    spaced = tmp / "notes"
+    spaced.mkdir()
+    jp = src / "日本語.py"
+
+    (src / "connect.py").write_text(
+        '''\
+TIMEOUT = 30
+
+def connect(host, timeout=TIMEOUT):
+    if timeout == 0:
+        return "block"
+    if timeout == 30:
+        return "ok"
+    if host == "localhost":
+        return "local"
+    return f"{host}:{timeout}"
+
+def run(argv):
+    connect(argv[1], timeout=0)
+    connect("db.example.com")
+
+def format_host(host):
+    return host.strip()
+
+def unused_helper(x):
+    return x
+''',
+        encoding="utf-8",
+    )
+    (tests / "test_connect.py").write_text(
+        '''\
+from src.connect import connect
+
+def test_local():
+    connect("localhost", timeout=30)
+
+def test_default():
+    connect("localhost")
+
+def test_same_world_positional():
+    connect("localhost", 30)
+''',
+        encoding="utf-8",
+    )
+    weird.write_text(
+        "def colon_fn(x):\n    return x\n\ndef uses():\n    colon_fn(1)\n",
+        encoding="utf-8",
+    )
+    (spaced / "file with spaces.py").write_text(
+        "def spaced(n=1):\n    return n\n\ndef go():\n    spaced(2)\n",
+        encoding="utf-8",
+    )
+    jp.write_text("def 挨拶(name):\n    return name\n\ndef main():\n    挨拶('世界')\n", encoding="utf-8")
+
+    (src / "server.js").write_text(
+        """\
+const DEFAULT_PORT = 8080;
+export function listen(port, host) {
+  if (port === 0) {
+    return "ephemeral";
+  }
+  if (port === 8080) {
+    return "default";
+  }
+  return host + ":" + port;
+}
+export function boot(cfg) {
+  listen(0, cfg.host);
+  listen(DEFAULT_PORT, "0.0.0.0");
+}
+""",
+        encoding="utf-8",
+    )
+    (tests / "server.test.js").write_text(
+        """\
+import { listen } from "../src/server.js";
+test("default", () => {
+  listen(8080, "localhost");
+});
+test("named bag", () => {
+  listen(8080, "localhost");
+});
+""",
+        encoding="utf-8",
+    )
+
+    (src / "net.rs").write_text(
+        r"""
+pub fn connect(host: &str, timeout: u64) -> u64 {
+    if timeout == 0 {
+        return 0;
+    }
+    if timeout == 30 {
+        return 30;
+    }
+    1
+}
+
+pub fn run(host: &str) {
+    connect(host, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn local() {
+        connect("localhost", 30);
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    (src / "lifetime.rs").write_text(
+        r"""
+pub struct SelectState<'a> {
+    pub prompt: &'a str,
+}
+
+impl<'a> SelectState<'a> {
+    pub fn new(prompt: &'a str, items: &'a [&'a str], default: usize) -> Self {
+        let _ = (prompt, items, default);
+        Self { prompt }
+    }
+    pub fn later(x: i32) -> i32 {
+        x
+    }
+}
+
+pub fn boot(s: &str) {
+    let _ = SelectState::new(s, &[s], 0);
+    later(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn later_zero() {
+        later(0);
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    (src / "App.swift").write_text(
+        """\
+public enum WindowTitleParser {
+    private static let browsers: Set<String> = [
+        "Chrome", "Safari", "Brave Browser", "Microsoft Edge"
+    ]
+    public static func isBrowser(_ appName: String) -> Bool {
+        if appName == "Chrome" { return true }
+        if appName == "Safari" { return true }
+        return browsers.contains(appName)
+    }
+    public static func extractSiteName(from title: String, app: String) -> String? {
+        guard isBrowser(app) else { return nil }
+        return title
+    }
+}
+
+public func tick(app: String) {
+    _ = WindowTitleParser.isBrowser(app)
+}
+""",
+        encoding="utf-8",
+    )
+    (tests / "ParserTests.swift").write_text(
+        """\
+func testChrome() {
+    _ = WindowTitleParser.isBrowser("Chrome")
+    _ = WindowTitleParser.isBrowser("Safari")
+    _ = WindowTitleParser.isBrowser("VS Code")
+}
+""",
+        encoding="utf-8",
+    )
+
+    (src / "options.js").write_text(
+        """\
+export function evaluate(request) {
+  return request;
+}
+export function prodRun(scenario, catalog, ruleset) {
+  evaluate({ scenario, catalog, ruleset });
+}
+""",
+        encoding="utf-8",
+    )
+    (tests / "options.test.js").write_text(
+        """\
+import { evaluate } from "../src/options.js";
+test("eval", () => {
+  evaluate({ scenario: "x", catalog: "y" });
+});
+""",
+        encoding="utf-8",
+    )
+
+    defs, calls, reports = analyze(tmp)
+    by = {(r.fn.lang, r.fn.name): r for r in reports}
+
+    def due_labels(r: Report) -> set[str]:
+        return {f.label for f in r.due}
+
+    def due_kinds(r: Report) -> set[str]:
+        return {f.kind for f in r.due}
+
+    # python connect — production timeout=0 and db.example.com; tests only localhost/30
+    ok(("py", "connect") in by, "found connect")
+    if ("py", "connect") in by:
+        r = by[("py", "connect")]
+        labels = due_labels(r)
+        ok(any("timeout=0" in L for L in labels), f"timeout=0 due fixture {labels}")
+        ok(
+            any("timeout=0" in f.label and f.generable for f in r.due),
+            f"mixed timeout=0 world is generable {[(f.label, f.generable, f.kind) for f in r.due]}",
+        )
+        ok(
+            any("db.example.com" in L for L in labels),
+            f"production host literal is a due fixture {labels}",
+        )
+        # tests inhabit localhost/30 — that world is NOT a due fixture
+        ok(
+            not any("localhost" in f.label and f.status == "due" for f in r.fixtures),
+            f"test localhost world must not be due {[(f.status, f.label) for f in r.fixtures]}",
+        )
+        # test-only worlds never become fixtures with status due
+        ok(all(f.status != "due" or "localhost" not in f.label for f in r.fixtures), "no test-only due")
+        ok(any(not c.is_test for c in r.calls), "connect has production callers")
+        # suggested names exist
+        ok(all(f.suggest.startswith("test_") for f in r.due), f"suggest { [f.suggest for f in r.due] }")
+
+    ok(("js", "listen") in by, "found js listen")
+    if ("js", "listen") in by:
+        r = by[("js", "listen")]
+        labels = due_labels(r)
+        ok(any("port=0" in L or "0" in L for L in labels), f"listen ephemeral port is due {labels}")
+        ok(any(c.is_test for c in r.calls), "js nested listen() inside test() seen")
+        # tests pin 8080/"localhost" — not due
+        ok(r.due, f"listen has due fixtures {labels}")
+
+    rust = [r for r in reports if r.fn.lang == "rs" and r.fn.name == "connect"]
+    ok(bool(rust), "rust connect def")
+    if rust:
+        ok(rust[0].due, f"rust connect due {due_labels(rust[0])}")
+        ok(any(c.is_test for c in rust[0].calls) and any(not c.is_test for c in rust[0].calls), "rust cfg(test) classified")
+        ok(any("timeout=0" in f.label for f in rust[0].due), f"rust timeout=0 {due_labels(rust[0])}")
+
+    later = [r for r in reports if r.fn.name == "later"]
+    ok(bool(later), "lifetime file: later survived SelectState::new")
+    if later:
+        ok(any(not c.is_test for c in later[0].calls), "later has production caller")
+        ok(any(c.is_test for c in later[0].calls), "later cfg(test) call classified as test")
+        ok(any("x=1" in f.label for f in later[0].due), f"later(1) is due {due_labels(later[0])}")
+        ok(
+            not any(f.status == "due" and "x=0" in f.label for f in later[0].fixtures),
+            "later(0) is a test world, not due",
+        )
+    jp = [r for r in reports if r.fn.name == "挨拶"]
+    ok(bool(jp), "unicode fn")
+    if jp:
+        ok(
+            any("挨拶" in f.suggest for f in jp[0].fixtures or jp[0].due),
+            f"CJK survives slug { [f.suggest for f in jp[0].fixtures] }",
+        )
+
+    swift = [r for r in reports if r.fn.name == "isBrowser"]
+    ok(bool(swift), "swift isBrowser")
+    if swift:
+        ok(any(c.is_test for c in swift[0].calls), "swift Tests/ classified")
+        kinds = due_kinds(swift[0])
+        ok("member" in kinds, f"isBrowser collection members are fixtures {swift[0].due}")
+        ok(
+            any("Brave Browser" in f.label for f in swift[0].due),
+            f"unwitnessed Brave is a fixture { [f.label for f in swift[0].due] }",
+        )
+        ok(
+            not any(f.status == "due" and "Chrome" in f.label for f in swift[0].fixtures),
+            "Chrome is already a test literal, not due",
+        )
+        # dyn production world is not a second seed when members expanded
+        ok(
+            not any(f.kind == "dyn" and f.status == "due" for f in swift[0].fixtures)
+            or any(f.kind == "member" for f in swift[0].due),
+            "members replace dyn seed",
+        )
+
+    ok(any(r.fn.path.endswith("weird:colon.py") for r in reports), "colon filename parsed")
+    ok(any("file with spaces.py" in r.fn.path for r in reports), "spaced filename parsed")
+    ok(any("日本語" in r.fn.path or r.fn.name == "挨拶" for r in reports), "unicode filename/fn")
+    ok(is_test_path("Engine/Tests/TenaoshiEngineTests/OraclesGenerated.swift"), "Tests/ dir is a test path")
+    ok(is_test_path("src/test_support.rs"), "test_support.rs is a test path")
+    ok(not is_test_path("Sources/SitboneCore/WindowTitleParser.swift"), "prod swift is not a test path")
+    ok(not any(r.fn.name == "helper" for r in reports), "test_support helper is not a subject")
+
+    # comments are not calls
+    (src / "test_support.py").write_text(
+        "def helper(x):\n    return x\n\ndef prod_uses():\n    helper(1)\n",
+        encoding="utf-8",
+    )
+    (tests / "test_helper.py").write_text(
+        "from src.test_support import helper\ndef test_h():\n    helper('a')\n    helper('b')\n",
+        encoding="utf-8",
+    )
+    (src / "comments.py").write_text(
+        "# connect('nope', timeout=99)\n"
+        "def real(x):\n"
+        "    return x  # real(1)\n",
+        encoding="utf-8",
+    )
+    defs2, calls2, reports2 = analyze(tmp)
+    phantom = [c for c in calls2 if c.path.endswith("comments.py") and c.name == "connect"]
+    ok(not phantom, f"comment not a call {phantom}")
+    # helper is defined in test_support.py — not a subject
+    ok(not any(r.fn.name == "helper" for r in reports2), "test_support helper still skipped")
+
+    evalr = [r for r in reports if r.fn.name == "evaluate"]
+    ok(bool(evalr), "js evaluate")
+    if evalr:
+        ok(any(not c.is_test for c in evalr[0].calls), "evaluate has production callers")
+        # production bag has ruleset shorthand; tests don't — due world
+        ok(evalr[0].due or evalr[0].fixtures, f"evaluate fixtures { [f.label for f in evalr[0].fixtures] }")
+
+    # porcelain / json shape: no tilt rows
+    porc = render_porcelain(reports, due_only=True)
+    ok("fixture\t" in porc, f"porcelain fixture rows {porc[:200]}")
+    ok("tilt\t" not in porc, "porcelain must not speak tilt")
+    blob = render_json(reports, due_only=True)
+    ok('"tool": "sow"' in blob, "json names the tool")
+    ok('"fixtures"' in blob, "json is test-generator input")
+    ok("tilt" not in blob.lower() or '"tilt"' not in blob, "json has no tilt field")
+    stubs = render_emit_pytest(reports, due_only=True)
+    ok("def test_" in stubs, f"pytest stubs {stubs[:300]}")
+    ok("Brave" in stubs or "timeout" in stubs or "db.example" in stubs, f"stubs contain production values {stubs[:400]}")
+    ok("timeout=0" in stubs or "timeout=0" in stubs.replace(" ", ""), f"mixed world emitted {stubs}")
+
+    if failures:
+        print("SELF-TEST FAILURES:")
+        for f in failures:
+            print("  FAIL", f)
+        return 1
+    print("self-test ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sow",
+        description="Emit the argument worlds production callers inhabit as "
+        "test-generator input. Tests subtract already-witnessed values; "
+        "test-only worlds are silent.",
+    )
+    p.add_argument("names", nargs="*", help="function names (default: those with due fixtures)")
+    p.add_argument("-C", "--root", default=".", help="repository / tree root")
+    p.add_argument("--json", action="store_true", help="JSON test-generator input (fixtures + functions)")
+    p.add_argument("--ndjson", action="store_true", help="one fixture JSON object per line")
+    p.add_argument("--tsv", action="store_true", help="TSV fixture rows")
+    p.add_argument("--porcelain", action="store_true", help="stable fixture\\tfn\\tkind\\tlabel lines")
+    p.add_argument("--emit", choices=["pytest"], help="stub tests for generable due fixtures")
+    p.add_argument("--all", action="store_true", help="include already-witnessed (have) fixtures")
+    p.add_argument("--due", action="store_true", help="only functions with due fixtures (default)")
+    p.add_argument("--check", action="store_true", help="exit 1 if any due fixture")
+    p.add_argument("--min-callers", type=int, default=1, help="minimum production call sites (default 1)")
+    p.add_argument("--test-defs", action="store_true", help="include functions defined in tests as subjects")
+    p.add_argument("--exclude", action="append", default=[], help="substring of relative path to skip (repeatable)")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--summary", action="store_true", help="one-line census")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    p = build_parser()
+    try:
+        args = p.parse_args(argv)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 2
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.self_test:
+        return self_test()
+    root = Path(args.root).resolve()
+    if not root.exists():
+        eprint(f"sow: no such path: {root}")
+        return 2
+    defs, calls, reports = analyze(root, args.exclude, include_test_defs=args.test_defs)
+    due_only = not args.all
+    filtered = filter_reports(reports, args.names, args.min_callers, due_only=False)
+    if args.names:
+        view = filtered
+    elif args.all:
+        view = filtered
+    else:
+        view = [r for r in filtered if r.due]
+
+    n_due_fns = sum(1 for r in reports if r.due)
+    n_due = sum(len(r.due) for r in reports)
+    n_prod_fns = len(reports)
+
+    if args.summary:
+        print(
+            f"files={len(list_source_files(root, args.exclude))} defs={len(defs)} calls={len(calls)} "
+            f"prod_fns={n_prod_fns} due_fns={n_due_fns} due={n_due} "
+            f"generable={sum(1 for r in reports for f in r.due if f.generable)}"
+        )
+        if args.check:
+            return 1 if n_due_fns else 0
+        return 0
+
+    color = use_color(args.color)
+    out_reports = view
+    if args.json:
+        sys.stdout.write(render_json(out_reports, due_only=due_only))
+    elif args.ndjson:
+        sys.stdout.write(render_ndjson(out_reports, due_only=due_only))
+    elif args.tsv:
+        sys.stdout.write(render_tsv(out_reports, due_only=due_only))
+    elif args.porcelain:
+        sys.stdout.write(render_porcelain(out_reports, due_only=due_only))
+    elif args.emit == "pytest":
+        sys.stdout.write(render_emit_pytest(out_reports, due_only=due_only))
+    else:
+        sys.stdout.write(render_human(out_reports, color, show_all=args.all))
+
+    if args.check:
+        pool = view if args.names else reports
+        return 1 if any(r.due for r in pool) else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

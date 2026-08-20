@@ -1,0 +1,1134 @@
+#!/usr/bin/env python3
+"""doze — use-sites that last saw a different signature than HEAD.
+
+Default output is signature changes only. --check is the CI verb:
+exit 1 if any use-site last saw a different signature than HEAD.
+No ghost English-word ranking.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import dataclasses
+import datetime as dt
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+VERSION = "0.2.0"
+
+# Brace-span runaway (a comment `fn foo` swallowing the rest of the file).
+SPAN_MAX = 160
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+AT_RE = re.compile(r"^(?P<path>.+):(?P<line>\d+)$")
+
+DEF_EXTS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+REF_EXTS = DEF_EXTS | {
+    ".bash",
+    ".json",
+    ".just",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
+REF_FILENAMES = {
+    "dockerfile",
+    "justfile",
+    "makefile",
+    "cmakelists.txt",
+    "gemfile",
+    "rakefile",
+}
+
+# Stacked modifiers + a defining keyword + a name.
+DEF_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])"
+    r"(?:(?:pub(?:\([^)]*\))?|public|private|internal|fileprivate|open|"
+    r"protected|static|override|final|async|export|default|abstract|"
+    r"mutating|convenience|required|indirect|unowned|lazy|weak|"
+    r"constexpr|inline|virtual|friend)\s+)*"
+    r"(?:def|fn|func|function|class|struct|enum|trait|interface|protocol|"
+    r"actor|typealias|type|namespace|union)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# const/let/var Foo = function|/(|<  (JS/TS/Swift bindings that are defs)
+BIND_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])"
+    r"(?:(?:pub(?:\([^)]*\))?|public|private|internal|export|static|const|"
+    r"let|var)\s+)+\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\(|<|\[)"
+)
+
+# Language keywords only. English coincidence names are not ranked away.
+STOP = {
+    "abstract",
+    "actor",
+    "and",
+    "async",
+    "await",
+    "bool",
+    "boolean",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "default",
+    "elif",
+    "else",
+    "enum",
+    "except",
+    "export",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "if",
+    "impl",
+    "implements",
+    "import",
+    "in",
+    "init",
+    "int",
+    "interface",
+    "let",
+    "match",
+    "mod",
+    "module",
+    "mut",
+    "namespace",
+    "new",
+    "nil",
+    "none",
+    "not",
+    "null",
+    "or",
+    "override",
+    "package",
+    "private",
+    "protected",
+    "protocol",
+    "pub",
+    "public",
+    "raise",
+    "return",
+    "self",
+    "static",
+    "str",
+    "string",
+    "struct",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "undefined",
+    "union",
+    "use",
+    "val",
+    "var",
+    "void",
+    "where",
+    "while",
+    "with",
+    "yield",
+}
+
+
+@dataclasses.dataclass
+class BlameLine:
+    commit: str
+    ts: int
+    summary: str
+    author: str
+
+
+@dataclasses.dataclass
+class DefSite:
+    name: str
+    path: str
+    line: int  # 1-based
+    end_line: int  # inclusive, 1-based
+    body: str
+    last: BlameLine | None
+
+
+@dataclasses.dataclass
+class RefSite:
+    name: str
+    path: str
+    line: int
+    last: BlameLine | None
+
+
+@dataclasses.dataclass
+class Cohort:
+    name: str
+    defn: DefSite
+    refs: list[RefSite]
+    old_body: str | None
+    old_commit: str | None
+    status: str  # changed | missing-then | identical | unknown
+    diff: str | None
+    lag_days: int
+    sig_changed: bool
+    old_sig: str
+    new_sig: str
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"doze: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(repo: str, *args: str, check: bool = True) -> str:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"git {' '.join(args)} failed")
+    return r.stdout.decode("utf-8", "replace")
+
+
+def git_ok(repo: str, *args: str) -> tuple[int, str, str]:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return (
+        r.returncode,
+        r.stdout.decode("utf-8", "replace"),
+        r.stderr.decode("utf-8", "replace"),
+    )
+
+
+def toplevel(path: str) -> str:
+    code, out, err = git_ok(path, "rev-parse", "--show-toplevel")
+    if code != 0:
+        die(f"not a git repository: {path}")
+    return out.strip()
+
+
+def is_ref_file(path: str) -> bool:
+    base = os.path.basename(path).lower()
+    if base in REF_FILENAMES:
+        return True
+    ext = os.path.splitext(path)[1].lower()
+    return ext in REF_EXTS
+
+
+def is_def_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext in DEF_EXTS
+
+
+def list_files(repo: str, pathspecs: list[str]) -> list[str]:
+    args = ["ls-files", "-z", "--"]
+    if pathspecs:
+        args.extend(pathspecs)
+    out = git(repo, *args)
+    files = [p for p in out.split("\0") if p]
+    return [p for p in files if is_ref_file(p)]
+
+
+def read_file(repo: str, path: str) -> str | None:
+    full = os.path.join(repo, path)
+    try:
+        if os.path.getsize(full) > 2_000_000:
+            return None
+        with open(full, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def parse_blame(porcelain: str) -> list[BlameLine | None]:
+    """Parse `git blame --line-porcelain`. Index 0 is line 1.
+
+    Porcelain prints author/summary only the first time a commit appears,
+    so metadata is cached per hash.
+    """
+    lines: list[BlameLine | None] = []
+    meta: dict[str, tuple[int, str, str]] = {}
+    commit = ""
+    ts = 0
+    summary = ""
+    author = ""
+    raw_lines = porcelain.splitlines()
+    i = 0
+    header_re = re.compile(r"^[0-9a-f]{8,40}\s+\d+\s+\d+")
+    while i < len(raw_lines):
+        raw = raw_lines[i]
+        if raw.startswith("\t"):
+            if commit in meta and ts == 0:
+                ts, summary, author = meta[commit]
+            lines.append(BlameLine(commit=commit, ts=ts, summary=summary, author=author))
+            i += 1
+            continue
+        if header_re.match(raw):
+            commit = raw.split()[0]
+            ts, summary, author = meta.get(commit, (0, "", ""))
+            i += 1
+            continue
+        if raw.startswith("author-time "):
+            try:
+                ts = int(raw.split(" ", 1)[1])
+            except ValueError:
+                ts = 0
+        elif raw.startswith("author "):
+            author = raw[7:]
+        elif raw.startswith("summary "):
+            summary = raw[8:]
+        if commit and ts:
+            meta[commit] = (ts, summary, author)
+        i += 1
+    return lines
+
+
+def blame_file(repo: str, path: str) -> list[BlameLine | None]:
+    code, out, err = git_ok(
+        repo, "blame", "--line-porcelain", "-w", "--", path
+    )
+    if code != 0:
+        return []
+    return parse_blame(out)
+
+
+def line_at(text: str, pos: int) -> tuple[int, str, int]:
+    """Return (1-based line, line text, column of pos on that line)."""
+    line_no = text.count("\n", 0, pos) + 1
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    if end < 0:
+        end = len(text)
+    return line_no, text[start:end], pos - start
+
+
+def token_buried(line: str, col: int) -> bool:
+    """True if col sits inside a string or after a line-comment marker."""
+    s = line.lstrip()
+    if s.startswith(("#", "//", "///", "//!", "*", "/*")):
+        return True
+    in_s = False
+    quote = ""
+    i = 0
+    while i < len(line) and i < col:
+        c = line[i]
+        if not in_s:
+            if c in "\"'":
+                in_s = True
+                quote = c
+            elif c == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                return True
+            elif c == "#":
+                return True
+        else:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                in_s = False
+        i += 1
+    return in_s
+
+
+def def_matches(text: str) -> list[tuple[str, int]]:
+    """Return (name, 1-based line) definition sites."""
+    found: list[tuple[str, int]] = []
+    seen_at: set[tuple[str, int]] = set()
+    for rx in (DEF_RE, BIND_RE):
+        for m in rx.finditer(text):
+            name = m.group(1)
+            if not keep_name(name):
+                continue
+            line, line_text, col = line_at(text, m.start(1))
+            if token_buried(line_text, col):
+                continue
+            key = (name, line)
+            if key in seen_at:
+                continue
+            seen_at.add(key)
+            found.append((name, line))
+    return found
+
+
+def keep_name(name: str, forced: set[str] | None = None) -> bool:
+    if forced and name in forced:
+        return True
+    if name.lower() in STOP:
+        return False
+    if len(name) < 3:
+        return False
+    if name.startswith("_") and len(name) < 5:
+        return False
+    return True
+
+
+def header_kind(lines: list[str], start: int) -> tuple[int, str]:
+    """Return (last_header_index, kind) where kind is brace|indent|decl."""
+    i = start
+    n = len(lines)
+    seen = ""
+    while i < n and i - start <= 40:
+        seen += lines[i]
+        stripped = lines[i].rstrip()
+        if "{" in lines[i]:
+            return i, "brace"
+        if stripped.endswith(";") and ":" not in stripped[-4:]:
+            return i, "decl"
+        if stripped.endswith(":") and not stripped.endswith(","):
+            return i, "indent"
+        i += 1
+    return start, "indent"
+
+
+def span_end(lines: list[str], start: int) -> int:
+    """Inclusive 0-based end index of a definition starting at start."""
+    n = len(lines)
+    last, kind = header_kind(lines, start)
+    if kind == "decl":
+        return last
+    if kind == "brace":
+        depth = 0
+        started = False
+        i = start
+        while i < n:
+            depth += lines[i].count("{") - lines[i].count("}")
+            if "{" in lines[i]:
+                started = True
+            if started and depth <= 0:
+                return i
+            i += 1
+        return n - 1
+    base = len(lines[start]) - len(lines[start].lstrip(" \t"))
+    end = last
+    i = last + 1
+    while i < n:
+        if not lines[i].strip():
+            end = i
+            i += 1
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip(" \t"))
+        if indent <= base:
+            break
+        end = i
+        i += 1
+    return end
+
+
+def extract_named_span(text: str, name: str, near_line: int | None = None) -> tuple[int, int, str] | None:
+    """Return (start_line, end_line, body) for definition of name."""
+    sites = [(n, ln) for n, ln in def_matches(text) if n == name]
+    if not sites:
+        return None
+    if near_line is None:
+        line = sites[0][1]
+    else:
+        line = min(sites, key=lambda s: abs(s[1] - near_line))[1]
+    lines = text.splitlines()
+    if line < 1 or line > len(lines):
+        return None
+    start = line - 1
+    end = span_end(lines, start)
+    body = "\n".join(lines[start : end + 1])
+    return line, end + 1, body
+
+
+def newest_blame(blames: list[BlameLine | None], start: int, end: int) -> BlameLine | None:
+    """start/end are 1-based inclusive."""
+    best: BlameLine | None = None
+    for ln in range(start, end + 1):
+        if ln - 1 >= len(blames):
+            break
+        b = blames[ln - 1]
+        if b is None:
+            continue
+        if best is None or b.ts > best.ts or (b.ts == best.ts and b.commit > best.commit):
+            best = b
+    return best
+
+
+def show_at(repo: str, commit: str, path: str, cache: dict[tuple[str, str], str | None]) -> str | None:
+    key = (commit, path)
+    if key in cache:
+        return cache[key]
+    if commit.strip("0") == "":
+        cache[key] = None
+        return None
+    code, out, _ = git_ok(repo, "show", f"{commit}:{path}")
+    if code != 0:
+        cache[key] = None
+        return None
+    cache[key] = out
+    return out
+
+
+def unify(old: str, new: str, name: str, old_label: str, new_label: str) -> str:
+    old_lines = (old or "").splitlines()
+    new_lines = (new or "").splitlines()
+    diff = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{name}@{old_label}",
+        tofile=f"b/{name}@{new_label}",
+        lineterm="",
+        n=2,
+    )
+    return "\n".join(diff)
+
+
+def is_wip(commit: str) -> bool:
+    return not commit or commit.strip("0") == ""
+
+
+def short(commit: str) -> str:
+    if is_wip(commit):
+        return "WIP"
+    return commit[:9]
+
+
+def blame_summary(b: BlameLine | None) -> str:
+    if b is None:
+        return ""
+    if is_wip(b.commit):
+        return "uncommitted"
+    return b.summary
+
+
+def ymd(ts: int) -> str:
+    if not ts:
+        return "unknown"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def days_between(newer: int, older: int) -> int:
+    if not newer or not older:
+        return 0
+    return max(0, int((newer - older) / 86400))
+
+
+def classify_query(repo: str, q: str) -> tuple[str, str, int | None]:
+    m = AT_RE.match(q)
+    if m:
+        return "at", m.group("path"), int(m.group("line"))
+    full = os.path.join(repo, q)
+    if os.path.exists(full) or "/" in q or q.startswith("."):
+        return "path", q, None
+    return "symbol", q, None
+
+
+def collect(
+    repo: str,
+    files: list[str],
+    forced: set[str],
+    jobs: int,
+    progress: bool,
+) -> tuple[list[DefSite], list[RefSite], dict[str, list[BlameLine | None]]]:
+    texts: dict[str, str] = {}
+    for path in files:
+        text = read_file(repo, path)
+        if text is None:
+            continue
+        texts[path] = text
+
+    defs: list[DefSite] = []
+    def_index: dict[str, list[DefSite]] = defaultdict(list)
+    for path, text in texts.items():
+        if not is_def_file(path):
+            continue
+        lines = text.splitlines()
+        for name, line in def_matches(text):
+            if not keep_name(name, forced):
+                continue
+            start = line - 1
+            if start >= len(lines):
+                continue
+            end = span_end(lines, start)
+            if end - start + 1 > SPAN_MAX:
+                continue
+            body = "\n".join(lines[start : end + 1])
+            if not looks_like_sig(name, header_sig(body)):
+                continue
+            site = DefSite(
+                name=name,
+                path=path,
+                line=line,
+                end_line=end + 1,
+                body=body,
+                last=None,
+            )
+            defs.append(site)
+            def_index[name].append(site)
+
+    if forced:
+        names = set(forced)
+    else:
+        names = {d.name for d in defs}
+
+    defs = [d for d in defs if d.name in names]
+
+    need_blame = set()
+    refs: list[RefSite] = []
+    for path, text in texts.items():
+        for i, line in enumerate(text.splitlines(), 1):
+            for tok in IDENT_RE.findall(line):
+                if tok not in names and tok not in forced:
+                    continue
+                if not keep_name(tok, forced):
+                    continue
+                refs.append(RefSite(name=tok, path=path, line=i, last=None))
+                need_blame.add(path)
+
+    for d in defs:
+        need_blame.add(d.path)
+
+    blame_paths = sorted(need_blame)
+    blames: dict[str, list[BlameLine | None]] = {}
+
+    def _one(p: str) -> tuple[str, list[BlameLine | None]]:
+        return p, blame_file(repo, p)
+
+    if progress:
+        print(f"doze: blaming {len(blame_paths)} files", file=sys.stderr)
+
+    workers = max(1, jobs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_one, p) for p in blame_paths]
+        done = 0
+        for fut in concurrent.futures.as_completed(futs):
+            p, b = fut.result()
+            blames[p] = b
+            done += 1
+            if progress and done % 25 == 0:
+                print(f"doze: blamed {done}/{len(blame_paths)}", file=sys.stderr)
+
+    for d in defs:
+        d.last = newest_blame(blames.get(d.path, []), d.line, d.end_line)
+
+    def_line = {(d.path, d.line, d.name) for d in defs}
+    real_refs: list[RefSite] = []
+    seen_ref: set[tuple[str, str, int]] = set()
+    for r in refs:
+        key = (r.name, r.path, r.line)
+        if key in seen_ref:
+            continue
+        seen_ref.add(key)
+        if (r.path, r.line, r.name) in def_line:
+            continue
+        skip = False
+        for d in def_index.get(r.name, []):
+            if d.path == r.path and d.line <= r.line <= d.end_line:
+                skip = True
+                break
+        if skip:
+            continue
+        blamed = blames.get(r.path, [])
+        if r.line - 1 < len(blamed):
+            r.last = blamed[r.line - 1]
+        real_refs.append(r)
+
+    # No IDF / English-word rarity filter. CI completeness over ranking.
+    return defs, real_refs, blames
+
+
+def pick_def(sites: list[DefSite], ref: RefSite) -> DefSite | None:
+    if not sites:
+        return None
+    other = [s for s in sites if s.path != ref.path]
+    pool = other or sites
+    return min(pool, key=lambda s: (s.path != ref.path, abs(s.line - ref.line), s.path))
+
+
+def _norm(s: str) -> str:
+    return "\n".join(line.rstrip() for line in s.strip().splitlines())
+
+
+def header_sig(body: str) -> str:
+    """Approximate the callable/type header, ignoring the body."""
+    if not body:
+        return ""
+    acc: list[str] = []
+    for line in body.splitlines()[:40]:
+        acc.append(line.rstrip())
+        if "{" in line or line.rstrip().endswith(":") or (
+            line.rstrip().endswith(";") and len(acc) == 1
+        ):
+            break
+    text = "\n".join(acc)
+    if "{" in text:
+        text = text.split("{", 1)[0]
+    return _norm(text)
+
+
+def collapse_sig(sig: str) -> str:
+    """Whitespace-insensitive signature for equality, grouping, and CI display."""
+    s = re.sub(r"\s+", " ", sig).strip()
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",\s+", ", ", s)
+    s = re.sub(r",\s*\)", ")", s)
+    return s
+
+
+def looks_like_sig(name: str, sig: str) -> bool:
+    """A header is a signature only if it names a callable or type, not a let-binding."""
+    if not name or not sig:
+        return False
+    s = collapse_sig(sig)
+    if name not in s:
+        return False
+    type_kw = r"(?:class|struct|enum|trait|interface|protocol|typealias|type)"
+    if re.search(rf"\b{type_kw}\s+{re.escape(name)}\b", s):
+        return True
+    if re.search(rf"\b(?:def|fn|func|function)\s+{re.escape(name)}\s*\(", s):
+        return True
+    if re.search(rf"\b{re.escape(name)}\s*\(", s) and re.search(
+        r"\b(?:def|fn|func|function)\b", s
+    ):
+        return True
+    return False
+
+
+def build_cohorts(
+    repo: str,
+    defs: list[DefSite],
+    refs: list[RefSite],
+    min_days: int,
+    at_filter: tuple[str, int] | None,
+    limit: int | None,
+    ghosts: bool,
+    sig_only: bool,
+    stable: bool,
+) -> list[Cohort]:
+    by_name: dict[str, list[DefSite]] = defaultdict(list)
+    for d in defs:
+        if d.last is None:
+            continue
+        by_name[d.name].append(d)
+
+    show_cache: dict[tuple[str, str], str | None] = {}
+    raw: list[tuple[DefSite, RefSite, int]] = []
+
+    for r in refs:
+        if r.last is None:
+            continue
+        if at_filter and (r.path != at_filter[0] or r.line != at_filter[1]):
+            continue
+        d = pick_def(by_name.get(r.name, []), r)
+        if d is None or d.last is None:
+            continue
+        def_ts = d.last.ts
+        ref_ts = r.last.ts
+        if d.last.commit.strip("0") == "":
+            def_ts = max(def_ts, ref_ts + 1)
+        if ref_ts >= def_ts:
+            continue
+        if d.last.commit == r.last.commit:
+            continue
+        lag = days_between(def_ts, ref_ts)
+        if lag < min_days and d.last.commit.strip("0") != "":
+            continue
+        raw.append((d, r, lag))
+
+    raw.sort(key=lambda t: (t[1].name, t[1].path, t[1].line))
+
+    groups: dict[tuple[str, str, str], Cohort] = {}
+    for d, r, lag in raw:
+        old_commit = r.last.commit if r.last else None
+        text = show_at(repo, old_commit or "", d.path, show_cache)
+        old_body = None
+        diff = None
+        if text is None:
+            status = "missing-then"
+        else:
+            got = extract_named_span(text, d.name, d.line)
+            if got is None:
+                status = "missing-then"
+            else:
+                old_body = got[2]
+                if _norm(old_body) == _norm(d.body):
+                    continue
+                status = "changed"
+                diff = unify(
+                    old_body,
+                    d.body,
+                    d.name,
+                    short(old_commit or ""),
+                    "HEAD",
+                )
+        old_sig = collapse_sig(header_sig(old_body or ""))
+        new_sig = collapse_sig(header_sig(d.body))
+        if status == "changed" and not looks_like_sig(d.name, new_sig):
+            continue
+        sig_changed = bool(old_body and old_sig != new_sig)
+        # Group by last-saw signature, not body: reflowed headers are one cohort.
+        key = (
+            d.name,
+            d.path,
+            old_sig if old_body is not None else f"#{status}",
+        )
+        if key not in groups:
+            groups[key] = Cohort(
+                name=d.name,
+                defn=d,
+                refs=[],
+                old_body=old_body,
+                old_commit=old_commit,
+                status=status,
+                diff=diff,
+                lag_days=lag,
+                sig_changed=sig_changed,
+                old_sig=old_sig,
+                new_sig=new_sig,
+            )
+        c = groups[key]
+        c.refs.append(r)
+        c.lag_days = max(c.lag_days, lag)
+
+    cohorts = list(groups.values())
+    if not ghosts:
+        cohorts = [c for c in cohorts if c.status == "changed"]
+    if sig_only:
+        cohorts = [c for c in cohorts if c.sig_changed]
+    if stable:
+        cohorts.sort(key=lambda c: (c.name, c.defn.path, c.refs[0].path if c.refs else ""))
+        for c in cohorts:
+            c.refs.sort(key=lambda r: (r.path, r.line))
+    else:
+        cohorts.sort(
+            key=lambda c: (
+                0 if c.sig_changed else 1,
+                -c.lag_days,
+                c.name,
+                c.defn.path,
+            )
+        )
+    if limit is None:
+        return cohorts
+    return cohorts[: max(0, limit)]
+
+
+def format_human(cohorts: list[Cohort], show_diff: bool, sig_only: bool) -> str:
+    if not cohorts:
+        return "doze: no use-sites last saw a different signature than HEAD\n"
+    out: list[str] = []
+    for c in cohorts:
+        d = c.defn
+        last = d.last
+        out.append(
+            f"{c.name}\n"
+            f"  def   {d.path}:{d.line}-{d.end_line}  {ymd(last.ts if last else 0)}  "
+            f"{short(last.commit if last else '')}  {blame_summary(last)}"
+        )
+        shape = "sig" if c.sig_changed else "body"
+        label = f"{c.status}  {shape}  " if not sig_only else ""
+        out.append(
+            f"  {label}{len(c.refs)} use-site{'s' if len(c.refs) != 1 else ''}  "
+            f"lag {c.lag_days}d"
+        )
+        if c.sig_changed:
+            out.append(f"    last-saw  {collapse_sig(c.old_sig)}")
+            out.append(f"    HEAD      {collapse_sig(c.new_sig)}")
+        for r in c.refs[:12]:
+            bl = r.last
+            out.append(
+                f"    {r.path}:{r.line}  {ymd(bl.ts if bl else 0)}  "
+                f"{short(bl.commit if bl else '')}  {blame_summary(bl)}"
+            )
+        if len(c.refs) > 12:
+            out.append(f"    … {len(c.refs) - 12} more")
+        if show_diff and c.diff:
+            for line in c.diff.splitlines():
+                out.append(f"    {line}")
+        elif show_diff and c.status == "missing-then":
+            out.append("    (definition did not exist at use-site's last commit)")
+        out.append("")
+    return "\n".join(out)
+
+
+def format_check(cohorts: list[Cohort], show_diff: bool) -> str:
+    """Compiler-like CI output: one use-site, the two signatures."""
+    if not cohorts:
+        return ""
+    out: list[str] = []
+    n = 0
+    for c in cohorts:
+        for r in c.refs:
+            n += 1
+            out.append(f"{r.path}:{r.line}: {c.name}: signature changed")
+            out.append(f"  last-saw  {collapse_sig(c.old_sig)}")
+            out.append(f"  HEAD      {collapse_sig(c.new_sig)}")
+            if show_diff and c.diff:
+                for line in c.diff.splitlines():
+                    out.append(f"  {line}")
+    out.append(f"doze: {n} use-site{'s' if n != 1 else ''} last saw a different signature than HEAD")
+    return "\n".join(out) + "\n"
+
+
+def format_tsv(cohorts: list[Cohort]) -> str:
+    rows = [
+        "name\tstatus\tsig_changed\tlag_days\tdef_path\tdef_line\tdef_commit\tdef_date\t"
+        "ref_path\tref_line\tref_commit\tref_date\tref_summary\told_sig\tnew_sig"
+    ]
+    for c in cohorts:
+        d = c.defn
+        for r in c.refs:
+            rows.append(
+                "\t".join(
+                    [
+                        c.name,
+                        c.status,
+                        "1" if c.sig_changed else "0",
+                        str(c.lag_days),
+                        d.path,
+                        str(d.line),
+                        short(d.last.commit if d.last else ""),
+                        ymd(d.last.ts if d.last else 0),
+                        r.path,
+                        str(r.line),
+                        short(r.last.commit if r.last else ""),
+                        ymd(r.last.ts if r.last else 0),
+                        blame_summary(r.last).replace("\t", " "),
+                        collapse_sig(c.old_sig).replace("\t", " "),
+                        collapse_sig(c.new_sig).replace("\t", " "),
+                    ]
+                )
+            )
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def format_json(cohorts: list[Cohort], show_diff: bool) -> str:
+    payload = []
+    for c in cohorts:
+        d = c.defn
+        payload.append(
+            {
+                "name": c.name,
+                "status": c.status,
+                "sig_changed": c.sig_changed,
+                "lag_days": c.lag_days,
+                "old_sig": c.old_sig,
+                "new_sig": c.new_sig,
+                "def": {
+                    "path": d.path,
+                    "line": d.line,
+                    "end_line": d.end_line,
+                    "commit": d.last.commit if d.last else None,
+                    "date": ymd(d.last.ts if d.last else 0),
+                    "summary": blame_summary(d.last) if d.last else None,
+                },
+                "refs": [
+                    {
+                        "path": r.path,
+                        "line": r.line,
+                        "commit": r.last.commit if r.last else None,
+                        "date": ymd(r.last.ts if r.last else 0),
+                        "summary": blame_summary(r.last),
+                    }
+                    for r in c.refs
+                ],
+                "diff": c.diff if show_diff else None,
+            }
+        )
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="doze",
+        description=(
+            "Show use-sites that last saw a different signature than HEAD. "
+            "--check exits 1 if any such use-site exists (CI)."
+        ),
+    )
+    p.add_argument("queries", nargs="*", help="symbol, path, or path:line")
+    p.add_argument("--repo", default=".", help="git repository (default: .)")
+    p.add_argument(
+        "--format",
+        choices=("human", "json", "tsv"),
+        default="human",
+    )
+    p.add_argument("--diff", action="store_true", help="print unified body diffs")
+    p.add_argument(
+        "--ghosts",
+        action="store_true",
+        help="include use-sites whose definition did not exist yet (default: hide)",
+    )
+    p.add_argument(
+        "--body",
+        action="store_true",
+        help="include body-only definition diffs (default: signatures only)",
+    )
+    p.add_argument(
+        "--sig",
+        action="store_true",
+        help="signatures only (default; opposite of --body)",
+    )
+    p.add_argument("--min-days", type=int, default=0, help="minimum lag in days")
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="max cohorts (default: 40; --check: unlimited)",
+    )
+    p.add_argument("--jobs", type=int, default=8)
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="CI: exit 1 if any use-site last saw a different signature than HEAD",
+    )
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.version:
+        print(VERSION)
+        return 0
+    repo = toplevel(os.path.abspath(args.repo))
+    forced: set[str] = set()
+    pathspecs: list[str] = []
+    at_filter: tuple[str, int] | None = None
+    for q in args.queries:
+        kind, val, line = classify_query(repo, q)
+        if kind == "symbol":
+            forced.add(val)
+        elif kind == "at":
+            at_filter = (val, line or 0)
+        else:
+            pathspecs.append(val)
+
+    all_files = list_files(repo, [])
+    if not all_files:
+        die("no tracked source files match", 1)
+    allow: set[str] | None = None
+    if pathspecs:
+        allow = set(list_files(repo, pathspecs))
+    if at_filter:
+        allow = (allow or set()) | {at_filter[0]}
+
+    progress = args.verbose or (sys.stderr.isatty() and len(all_files) > 40)
+    defs, refs, _ = collect(repo, all_files, forced, args.jobs, progress)
+
+    if forced:
+        defs = [d for d in defs if d.name in forced]
+        refs = [r for r in refs if r.name in forced]
+    if allow is not None:
+        refs = [r for r in refs if r.path in allow]
+
+    if at_filter:
+        names_on_line = {
+            r.name for r in refs if r.path == at_filter[0] and r.line == at_filter[1]
+        }
+        refs = [r for r in refs if r.path == at_filter[0] and r.line == at_filter[1]]
+        defs = [d for d in defs if d.name in names_on_line]
+        if not refs:
+            print(
+                f"doze: no tracked symbols on {at_filter[0]}:{at_filter[1]}",
+                file=sys.stderr,
+            )
+
+    # --check is signature-only even with --body: the CI predicate is the header.
+    sig_only = True if args.check else (not args.body)
+    ghosts = args.ghosts
+    if args.limit is not None:
+        limit: int | None = max(0, args.limit)
+    elif args.check:
+        limit = None
+    else:
+        limit = 40
+
+    cohorts = build_cohorts(
+        repo,
+        defs,
+        refs,
+        min_days=args.min_days,
+        at_filter=at_filter,
+        limit=limit,
+        ghosts=ghosts,
+        sig_only=sig_only,
+        stable=args.check,
+    )
+
+    if args.check and args.format == "human":
+        sys.stdout.write(format_check(cohorts, show_diff=args.diff))
+    elif args.format == "json":
+        sys.stdout.write(format_json(cohorts, show_diff=args.diff or args.check))
+    elif args.format == "tsv":
+        sys.stdout.write(format_tsv(cohorts))
+    else:
+        sys.stdout.write(format_human(cohorts, show_diff=args.diff, sig_only=sig_only))
+
+    if args.check and cohorts:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

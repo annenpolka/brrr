@@ -1,0 +1,1941 @@
+#!/usr/bin/env python3
+"""berth — natal cohorts of a change; leftover occupancy is identity birth.
+
+Natal keys inflect (t1 ↔ driftDelay from the same line's history;
+present_threshold ↔ presentThreshold by snake/camel). The change is
+the query; FILE:LINE is refused.
+
+Leftover `since` is the leftover *identity birth* — the rename that made
+the mention unpaid, or the later pickaxe intro of that identity on the
+path — not git-blame last-touch of the leftover line.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+VERSION = "0.2.0"
+TOOL = "berth"
+
+FILE_LINE_RE = re.compile(r".+\.[A-Za-z0-9_+-]+(?::\d+)+$")
+RANGE_RE = re.compile(r"^(?P<a>.+?)(?P<dots>\.{2,3})(?P<b>.+)$")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+NUMBER_RE = re.compile(r"\d+\.\d+|\d+")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+SELF_ASSIGN_RE = re.compile(
+    r"self\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"
+)
+TYPED_EQ_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[A-Za-z_][\w.<>\[\], ]*=\s*([^,;)\n]+)"
+)
+BARE_EQ_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+YAML_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$")
+CAMEL_PART_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+
+COMMON_PREFIXES = {
+    "updated",
+    "focused",
+    "current",
+    "old",
+    "new",
+    "last",
+    "next",
+    "prev",
+    "default",
+    "custom",
+    "the",
+    "my",
+    "our",
+}
+GENERIC_IDENTS = {
+    "threshold",
+    "window",
+    "counters",
+    "radius",
+    "geo",
+    "geometry",
+    "name",
+    "value",
+    "index",
+    "count",
+    "size",
+    "length",
+    "status",
+    "score",
+    "data",
+    "item",
+    "list",
+    "file",
+    "path",
+    "type",
+    "text",
+    "line",
+    "key",
+    "id",
+    "state",
+    "error",
+    "result",
+    "config",
+    "options",
+    "settings",
+    "context",
+    "parent",
+    "child",
+    "snapshot",
+    "container",
+    "background",
+    "trailing",
+    "leading",
+    "coding",
+    "writing",
+    "offset",
+    "origin",
+    "center",
+    "frame",
+    "width",
+    "height",
+    "color",
+    "point",
+    "rect",
+    "view",
+    "layer",
+    "buffer",
+    "string",
+    "double",
+    "int",
+    "float",
+    "bool",
+    "true",
+    "false",
+    "nil",
+    "null",
+    "none",
+    "self",
+    "this",
+    "init",
+    "func",
+    "class",
+    "struct",
+    "enum",
+    "let",
+    "var",
+    "public",
+    "private",
+    "return",
+    "import",
+    "from",
+    "def",
+    "present",
+    "absent",
+    "unknown",
+    "enabled",
+    "disabled",
+    "hidden",
+    "visible",
+    "active",
+    "isactive",
+    "isenabled",
+    "confidence",
+    "precondition",
+    "sensors",
+    "sensor",
+    "alpha",
+    "lock",
+    "logger",
+    "provider",
+    "reading",
+    "session",
+    "profile",
+    "engine",
+    "machine",
+    "idle",
+    "presence",
+    "duration",
+    "recovery",
+    "flow",
+    "drift",
+    "away",
+    "core",
+    "keep",
+    "sync",
+    "assert",
+    "seconds",
+    "port",
+    "listen",
+    "timing",
+    "updatedcounters",
+    "cornerradius",
+    "focusedwindow",
+    "focusedwindowvalue",
+    "currentapp",
+    "focusphase",
+    "focusstate",
+    "ghostteacherpanel",
+    "notchheight",
+    "siteobserver",
+    "siteisdrift",
+    "cgpoint",
+    "timeinterval",
+}
+
+STOP_IDENTS = GENERIC_IDENTS | {
+    "if",
+    "else",
+    "elif",
+    "for",
+    "while",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "try",
+    "catch",
+    "except",
+    "finally",
+    "with",
+    "as",
+    "in",
+    "not",
+    "and",
+    "or",
+    "is",
+    "to",
+    "of",
+    "the",
+    "a",
+    "an",
+    "on",
+    "at",
+    "by",
+    "or",
+    "and",
+}
+
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+
+def git(repo: str, *args: str, check: bool = False, input: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", repo, *args],
+        text=True,
+        capture_output=True,
+        input=input,
+        check=check,
+    )
+
+
+def git_ok(repo: str, *args: str) -> str | None:
+    p = git(repo, *args)
+    if p.returncode != 0:
+        return None
+    return p.stdout
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"{TOOL}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def debug(enabled: bool, msg: str) -> None:
+    if enabled:
+        print(f"debug: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# tokens / inflection
+# ---------------------------------------------------------------------------
+
+
+def camel_parts(name: str) -> list[str]:
+    return [p for p in CAMEL_PART_RE.findall(name) if p]
+
+
+def to_snake(name: str) -> str:
+    if "_" in name:
+        return name.lower()
+    # t1 / T1 have no camel hump — do not invent t_1.
+    if not re.search(r"[a-z][A-Z]|[A-Z]{2,}[a-z]", name):
+        return name.lower()
+    parts = camel_parts(name) or [name]
+    return "_".join(p.lower() for p in parts)
+
+
+def to_camel(name: str) -> str:
+    parts = [p for p in name.split("_") if p]
+    if not parts:
+        return name
+    return parts[0].lower() + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+
+def surfaces(tok: str) -> set[str]:
+    out = {tok, tok.lower(), tok.upper()}
+    if len(tok) <= 3:
+        out.add(tok[:1].upper() + tok[1:].lower())  # T1, T2
+    if "_" in tok:
+        out.add(to_camel(tok))
+        cam = to_camel(tok)
+        out.add(cam[:1].upper() + cam[1:])
+    else:
+        sn = to_snake(tok)
+        out.add(sn)
+        if sn != tok.lower():
+            out.add(to_camel(sn))
+    return {s for s in out if s}
+
+
+def is_distinctive(name: str) -> bool:
+    """t1 / T2 / present_threshold — not a 1-letter local (s, r)."""
+    if not name:
+        return False
+    if re.match(r"^[A-Za-z]+\d+$", name):
+        return True
+    if "_" in name:
+        return True
+    return False
+
+
+def is_generic(name: str) -> bool:
+    low = name.lower()
+    if low in GENERIC_IDENTS:
+        return True
+    if is_distinctive(name):
+        return False
+    parts = [p.lower() for p in camel_parts(name)]
+    if parts and parts[0] in COMMON_PREFIXES:
+        return True
+    if len(name) >= 4 and low.isalpha() and low in GENERIC_IDENTS:
+        return True
+    return False
+
+
+def stem_noise(a: str, b: str) -> bool:
+    """Reject prefix/suffix containment like counters ⊂ updatedCounters."""
+    if a.lower() == b.lower():
+        return False
+    pa, pb = [p.lower() for p in camel_parts(a)], [p.lower() for p in camel_parts(b)]
+    if not pa or not pb:
+        return False
+    shorter, longer = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
+    extra = longer[: len(longer) - len(shorter)]
+    if longer[-len(shorter) :] == shorter and extra and extra[0] in COMMON_PREFIXES:
+        return True
+    extra2 = longer[len(shorter) :]
+    if longer[: len(shorter)] == shorter and extra2 and extra2[-1] in COMMON_PREFIXES:
+        return True
+    # simple string containment with a common prefix glued on
+    al, bl = a.lower(), b.lower()
+    if al in bl or bl in al:
+        host, guest = (bl, al) if al in bl else (al, bl)
+        rest = host.replace(guest, "", 1)
+        if rest in COMMON_PREFIXES or rest.rstrip("s") in COMMON_PREFIXES:
+            return True
+    return False
+
+
+def inflect_pair(a: str, b: str) -> bool:
+    if a.lower() == b.lower():
+        return True
+    sa, sb = surfaces(a), surfaces(b)
+    if sa & sb:
+        return True
+    if to_snake(a) == to_snake(b):
+        return True
+    return False
+
+
+def tokenize(text: str) -> list[str]:
+    found: list[str] = []
+    for m in IDENT_RE.finditer(text):
+        found.append(m.group(0))
+    for m in NUMBER_RE.finditer(text):
+        found.append(m.group(0))
+    return found
+
+
+def ident_in(text: str, tok: str) -> bool:
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(tok) + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def number_in(text: str, num: str) -> bool:
+    # 0.4 must not match 0.45 or v0.4; trailing punctuation (0.4.) is allowed.
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(num) + r"(?!\d)", text) is not None
+
+
+def abandoned_forms(tok: str) -> set[str]:
+    """Surfaces of a natal name still owed — case, not snake↔camel.
+
+    present_threshold leftover is the snake spelling (and T1 for t1).
+    The adopted camel presentThreshold is paid, not unpaid kin.
+    """
+    if is_number(tok):
+        return {tok}
+    forms = {tok, tok.lower(), tok.upper()}
+    if len(tok) <= 3:
+        forms.add(tok[:1].upper() + tok[1:].lower())
+        forms.add(tok[:1].lower() + tok[1:].upper())
+    return {s for s in forms if s}
+
+
+def token_in(text: str, tok: str, *, inflect: bool = False) -> bool:
+    if re.fullmatch(r"\d+\.\d+|\d+", tok):
+        return number_in(text, tok)
+    forms = surfaces(tok) if inflect else abandoned_forms(tok)
+    return any(ident_in(text, s) for s in forms)
+
+
+def strip_comments(text: str) -> str:
+    text = re.sub(r"#.*$", "", text)
+    text = re.sub(r"//.*$", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text)
+    return text
+
+
+def only_quoted(text: str, tok: str) -> bool:
+    """True if every occurrence of tok is inside quotes (adapter / CodingKeys)."""
+    hits = 0
+    quoted = 0
+    for m in re.finditer(r"(?<![A-Za-z0-9_])" + re.escape(tok) + r"(?![A-Za-z0-9_])", text):
+        hits += 1
+        i = m.start()
+        before = text[:i]
+        # crude: odd number of quotes before this point on the line
+        if before.count('"') % 2 == 1 or before.count("'") % 2 == 1:
+            quoted += 1
+        elif re.search(r"""['"]\s*$""", before) and re.search(
+            r"""^\s*['"]""", text[m.end() :]
+        ):
+            quoted += 1
+    return hits > 0 and quoted == hits
+
+
+def is_number(tok: str) -> bool:
+    return bool(re.fullmatch(r"\d+\.\d+|\d+", tok))
+
+
+# ---------------------------------------------------------------------------
+# slots
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Slot:
+    name: str
+    value: str | None
+    line: int
+    text: str
+    kind: str
+
+
+def clean_value(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    v = raw.strip().rstrip(",;").strip()
+    v = v.split("#")[0].split("//")[0].strip()
+    if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+        v = v[1:-1]
+    return v or None
+
+
+LET_DECL_RE = re.compile(r"\b(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:")
+
+
+def extract_slots(line: str, lineno: int) -> list[Slot]:
+    s = line.rstrip("\n")
+    stripped = s.strip()
+    if not stripped or stripped.startswith(("#", "//", "/*", "*")):
+        return []
+    slots: list[Slot] = []
+    m = SELF_ASSIGN_RE.search(s)
+    if m:
+        slots.append(Slot(m.group(1), None, lineno, s, "self"))
+        return slots
+    if "=" in s:
+        for m in TYPED_EQ_RE.finditer(s):
+            slots.append(Slot(m.group(1), clean_value(m.group(2)), lineno, s, "typed"))
+        if slots:
+            return slots
+        if "==" in stripped.split("#")[0].split("//")[0] and re.search(
+            r"\b(assert|if|while|return)\b", stripped
+        ):
+            return []
+        m = BARE_EQ_RE.match(s)
+        if m and not stripped.startswith(("if ", "elif ", "while ", "return ", "assert ", "for ")):
+            name, val = m.group(1), clean_value(m.group(2))
+            if name not in STOP_IDENTS:
+                slots.append(Slot(name, val, lineno, s, "assign"))
+                return slots
+        return slots
+    # `let t1: TimeInterval` — declaration slot without a default.
+    for m in LET_DECL_RE.finditer(s):
+        name = m.group(1)
+        if name not in STOP_IDENTS:
+            slots.append(Slot(name, None, lineno, s, "let"))
+    return slots
+
+
+def file_role(path: str) -> str:
+    low = path.lower().replace("\\", "/")
+    base = os.path.basename(low)
+    if low.endswith((".md", ".rst", ".txt", ".adoc")) or base in {
+        "readme",
+        "readme.md",
+        "spec.md",
+        "claude.md",
+        "agents.md",
+    }:
+        return "docs"
+    if "/docs/" in "/" + low or "/adr/" in "/" + low or "/doc/" in "/" + low:
+        return "docs"
+    if (
+        "/test/" in "/" + low
+        or "/tests/" in "/" + low
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+        or "tests." in low
+    ):
+        return "tests"
+    if low.endswith((".yaml", ".yml", ".toml", ".ini", ".json", ".plist", ".cfg")):
+        return "config"
+    return "code"
+
+
+# ---------------------------------------------------------------------------
+# diff
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Hunk:
+    old_slots: list[Slot] = field(default_factory=list)
+    new_slots: list[Slot] = field(default_factory=list)
+    added: list[tuple[int, str]] = field(default_factory=list)
+    removed: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    old_path: str
+    old_lines: dict[int, str] = field(default_factory=dict)
+    new_lines: dict[int, str] = field(default_factory=dict)
+    added: list[tuple[int, str]] = field(default_factory=list)
+    removed: list[tuple[int, str]] = field(default_factory=list)
+    hunks: list[Hunk] = field(default_factory=list)
+
+
+def parse_diff(text: str) -> list[FileDiff]:
+    files: list[FileDiff] = []
+    cur: FileDiff | None = None
+    hunk: Hunk | None = None
+    old_ln = new_ln = 0
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            rest = raw[len("diff --git a/") :]
+            mid = rest.find(" b/")
+            if mid == -1:
+                continue
+            old_p, new_p = rest[:mid], rest[mid + 3 :]
+            cur = FileDiff(path=new_p, old_path=old_p)
+            files.append(cur)
+            hunk = None
+            continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
+        if raw.startswith("rename from ") and cur:
+            cur.old_path = raw[len("rename from ") :]
+            continue
+        if raw.startswith("rename to ") and cur:
+            cur.path = raw[len("rename to ") :]
+            continue
+        m = HUNK_RE.match(raw)
+        if m and cur is not None:
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(3))
+            hunk = Hunk()
+            cur.hunks.append(hunk)
+            continue
+        if cur is None:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            line = raw[1:]
+            cur.new_lines[new_ln] = line
+            cur.added.append((new_ln, line))
+            if hunk is not None:
+                hunk.added.append((new_ln, line))
+                hunk.new_slots.extend(extract_slots(line, new_ln))
+            new_ln += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            line = raw[1:]
+            cur.old_lines[old_ln] = line
+            cur.removed.append((old_ln, line))
+            if hunk is not None:
+                hunk.removed.append((old_ln, line))
+                hunk.old_slots.extend(extract_slots(line, old_ln))
+            old_ln += 1
+        elif raw.startswith("\\"):
+            continue
+        else:
+            old_ln += 1
+            new_ln += 1
+    return files
+
+
+# ---------------------------------------------------------------------------
+# change resolution
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Change:
+    spec: str
+    kind: str
+    commit: str | None
+    parent: str | None
+    date: str
+    subject: str
+    diff: str
+
+
+def looks_like_file_line(spec: str) -> bool:
+    s = spec.strip()
+    if FILE_LINE_RE.match(s):
+        return True
+    # bare File.swift:33 without directories
+    if re.match(r"^[\w./ +-]+\.[A-Za-z0-9_+-]+\:\d+$", s):
+        return True
+    return False
+
+
+def rev_parse(repo: str, spec: str) -> str | None:
+    p = git(repo, "rev-parse", "--verify", spec)
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip()
+
+
+def commit_meta(repo: str, sha: str) -> tuple[str, str, str]:
+    p = git(repo, "log", "-1", "--format=%H%n%aI%n%s", sha)
+    if p.returncode != 0:
+        return sha, "", ""
+    lines = p.stdout.splitlines()
+    while len(lines) < 3:
+        lines.append("")
+    return lines[0], lines[1], lines[2]
+
+
+def parent_of(repo: str, sha: str) -> str | None:
+    p = git(repo, "rev-parse", f"{sha}^")
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip()
+
+
+def resolve_change(repo: str, spec: str | None, wt: bool) -> Change:
+    if spec == "-" or spec == "/dev/stdin":
+        diff = sys.stdin.read()
+        if not diff.strip():
+            print(f"{TOOL}: empty diff for -", file=sys.stderr)
+            raise SystemExit(0)
+        head = rev_parse(repo, "HEAD")
+        h, date, subj = commit_meta(repo, head) if head else ("", "", "")
+        return Change(
+            spec="-",
+            kind="stdin",
+            commit="-",
+            parent=head,
+            date="",
+            subject="stdin diff",
+            diff=diff,
+        )
+    if wt or spec == "wt":
+        diff = git_ok(repo, "diff", "-U0", "HEAD") or ""
+        head = rev_parse(repo, "HEAD")
+        return Change(
+            spec="wt",
+            kind="wt",
+            commit="UNCOMMITTED",
+            parent=head,
+            date="",
+            subject="working tree",
+            diff=diff,
+        )
+    if spec is None:
+        spec = "HEAD"
+    spec = spec.strip()
+    if looks_like_file_line(spec):
+        die(
+            "pass a commit or a diff, not FILE:LINE "
+            f"({TOOL} starts from a change; natal keys inflect from the rename itself)"
+        )
+    m = RANGE_RE.match(spec)
+    if m and m.group("dots") in ("..", "..."):
+        a, b = m.group("a"), m.group("b")
+        ra, rb = rev_parse(repo, a), rev_parse(repo, b)
+        if not ra or not rb:
+            die(f"not a commit range: {spec}")
+        diff = git_ok(repo, "diff", "-U0", ra, rb) or ""
+        h, date, subj = commit_meta(repo, rb)
+        return Change(
+            spec=spec,
+            kind="range",
+            commit=h,
+            parent=ra,
+            date=date,
+            subject=subj,
+            diff=diff,
+        )
+    sha = rev_parse(repo, spec)
+    if not sha:
+        die(f"not a commit: {spec}")
+    parent = parent_of(repo, sha)
+    if parent:
+        diff = git_ok(repo, "diff", "-U0", parent, sha) or ""
+    else:
+        diff = git_ok(repo, "show", "--format=", "-U0", sha) or ""
+    h, date, subj = commit_meta(repo, sha)
+    return Change(
+        spec=spec,
+        kind="commit",
+        commit=h,
+        parent=parent,
+        date=date,
+        subject=subj,
+        diff=diff,
+    )
+
+
+def short_sha(sha: str | None, n: int = 12) -> str:
+    if not sha or sha in {"-", "UNCOMMITTED"}:
+        return sha or "-"
+    return sha[:n]
+
+
+# ---------------------------------------------------------------------------
+# blame / show
+# ---------------------------------------------------------------------------
+
+
+def blame_sha(repo: str, rev: str, path: str, line: int) -> tuple[str, str] | None:
+    p = git(repo, "blame", "-l", "-L", f"{line},{line}", rev, "--", path)
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
+    row = p.stdout.splitlines()[0]
+    sha = row.split()[0]
+    if sha.startswith("^"):
+        sha = sha[1:]
+    # text after ') '
+    text = row.split(") ", 1)[-1] if ") " in row else ""
+    return sha, text
+
+
+# pickaxe / ancestry caches for leftover identity birth
+_PICKAXE_FIRST: dict[tuple[str, str, str, str], str | None] = {}
+_IS_ANCESTOR: dict[tuple[str, str, str], bool] = {}
+
+
+def pickaxe_first(repo: str, path: str, needle: str, rev: str) -> str | None:
+    """Oldest commit reachable from rev that changed the count of needle on path.
+
+    Do not combine `--reverse` with `--max-count=1`: git applies the cap
+    before pickaxe, so a later formatter commit that keeps T1 count
+    swallows the identity intro.
+    """
+    key = (repo, path, needle, rev)
+    if key in _PICKAXE_FIRST:
+        return _PICKAXE_FIRST[key]
+    args = ["log", "--reverse", "--format=%H"]
+    # case-fold identity for names (T1/t1); numbers stay exact
+    if not is_number(needle):
+        args.append("-i")
+    # :(literal) so spaces/parens in `how to set (t1).md` are not pathspec magic
+    args.extend(["-S", needle, rev, "--", f":(literal){path}"])
+    p = git(repo, *args)
+    sha = None
+    if p.returncode == 0:
+        for line in p.stdout.splitlines():
+            line = line.strip()
+            if line:
+                sha = line
+                break
+    _PICKAXE_FIRST[key] = sha
+    return sha
+
+
+def is_ancestor(repo: str, a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    key = (repo, a, b)
+    if key in _IS_ANCESTOR:
+        return _IS_ANCESTOR[key]
+    p = git(repo, "merge-base", "--is-ancestor", a, b)
+    ok = p.returncode == 0
+    _IS_ANCESTOR[key] = ok
+    return ok
+
+
+def identity_needles(holds: str | None, natal_keys: list[str]) -> list[str]:
+    """Distinct leftover identity strings, holds first then natal names."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(tok: str) -> None:
+        if not tok or tok in seen:
+            return
+        seen.add(tok)
+        out.append(tok)
+
+    if holds:
+        add(holds)
+        if not is_number(holds):
+            for s in abandoned_forms(holds):
+                add(s)
+    for k in natal_keys:
+        add(k)
+        if not is_number(k):
+            for s in abandoned_forms(k):
+                add(s)
+    return out
+
+
+def _meta_dict(repo: str, sha: str | None) -> dict[str, str] | None:
+    if not sha:
+        return None
+    h, date, subj = commit_meta(repo, sha)
+    if not h:
+        return None
+    return {"commit": h, "date": date, "subject": subj}
+
+
+def leftover_identity_clocks(
+    repo: str,
+    path: str,
+    holds: str | None,
+    natal_keys: list[str],
+    change: "Change",
+    search_rev: str | None,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Return (since, born) for leftover occupancy.
+
+    `born` is pickaxe intro of the leftover identity on this path (not
+    last-touch). `since` is leftover identity birth *as unpaid kin*: the
+    rename, if the mention already sat there; otherwise the later intro.
+    sitbone SPEC `T1`: since 1fcdec6, born a2512fe — not blame a2512fe.
+    """
+    rev = search_rev or "HEAD"
+    if rev in {"UNCOMMITTED", "-", "wt"}:
+        rev = "HEAD"
+    rename_sha = None
+    if change.kind == "commit" and change.commit and change.commit not in {
+        "-",
+        "UNCOMMITTED",
+    }:
+        rename_sha = change.commit
+    elif change.kind == "stdin" and change.parent and change.parent not in {
+        "-",
+        "UNCOMMITTED",
+    }:
+        # already-committed rename piped as `git show | berth -`
+        rename_sha = change.parent
+
+    path_intro = None
+    for needle in identity_needles(holds, natal_keys):
+        path_intro = pickaxe_first(repo, path, needle, rev)
+        if path_intro:
+            break
+
+    since_sha = None
+    if path_intro and rename_sha:
+        if is_ancestor(repo, path_intro, rename_sha) or path_intro == rename_sha:
+            since_sha = rename_sha
+        else:
+            since_sha = path_intro
+    elif rename_sha:
+        since_sha = rename_sha
+    elif path_intro:
+        since_sha = path_intro
+    return _meta_dict(repo, since_sha), _meta_dict(repo, path_intro)
+
+
+def show_line(repo: str, rev: str, path: str, line: int) -> str | None:
+    blob = git_ok(repo, "show", f"{rev}:{path}")
+    if blob is None:
+        return None
+    lines = blob.splitlines()
+    if 1 <= line <= len(lines):
+        return lines[line - 1]
+    return None
+
+
+def head_file(repo: str, path: str, rev: str | None) -> str | None:
+    if rev and rev not in {"UNCOMMITTED", "-"}:
+        return git_ok(repo, "show", f"{rev}:{path}")
+    try:
+        return Path(repo, path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# pairing
+# ---------------------------------------------------------------------------
+
+
+def _value_distance(ov: str | None, nv: str | None) -> float:
+    try:
+        return abs(float(ov) - float(nv))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 9.0
+
+
+def _name_related(a: str, b: str) -> bool:
+    if inflect_pair(a, b):
+        return True
+    pa = [p.lower() for p in camel_parts(a)]
+    pb = [p.lower() for p in camel_parts(b)]
+    if (
+        pa
+        and pb
+        and pa[-1] == pb[-1]
+        and len(pa[-1]) >= 4
+        and pa[-1] not in {"id", "value", "type", "item"}
+    ):
+        return True
+    al, bl = a.lower(), b.lower()
+    # substring only for real stems (threshold ⊂ presentThreshold), not 's' ⊂ 'score'
+    if min(len(al), len(bl)) >= 4 and (al in bl or bl in al):
+        return True
+    return False
+
+
+def _allow_slot_pair(o: Slot, n: Slot) -> bool:
+    if o.name == n.name and o.value == n.value:
+        return False
+    if stem_noise(o.name, n.name) and not (o.value and is_number(o.value)):
+        return False
+    if is_generic(o.name):
+        # generic 1:1 only when snake/camel OR bound to a natal literal.
+        # title→titleValue and window→focusedWindow stay silent.
+        if inflect_pair(o.name, n.name):
+            return True
+        if o.value and is_number(o.value):
+            return True
+        return False
+    return True
+
+
+def pair_slots(old: list[Slot], new: list[Slot]) -> list[tuple[Slot, Slot]]:
+    pairs: list[tuple[Slot, Slot]] = []
+    used_new: set[int] = set()
+    used_old: set[int] = set()
+    # 1. inflection (snake/camel, case)
+    for i, o in enumerate(old):
+        for j, n in enumerate(new):
+            if j in used_new:
+                continue
+            if inflect_pair(o.name, n.name) and not stem_noise(o.name, n.name):
+                pairs.append((o, n))
+                used_old.add(i)
+                used_new.add(j)
+                break
+    # 2. related names (threshold ⊂ presentThreshold) — 1 old vs many new
+    for i, o in enumerate(old):
+        if i in used_old:
+            continue
+        cands: list[tuple[float, int, Slot]] = []
+        for j, n in enumerate(new):
+            if j in used_new:
+                continue
+            if not _allow_slot_pair(o, n):
+                continue
+            if not _name_related(o.name, n.name):
+                continue
+            score = _value_distance(o.value, n.value)
+            if o.name.lower() in n.name.lower():
+                score -= 0.05
+            cands.append((score, j, n))
+        if cands:
+            cands.sort()
+            _, j, n = cands[0]
+            pairs.append((o, n))
+            used_old.add(i)
+            used_new.add(j)
+    # 3. leftover 1:1 — distinctive names, or generic bound to a natal literal
+    rest_old = [(i, o) for i, o in enumerate(old) if i not in used_old]
+    rest_new = [(j, n) for j, n in enumerate(new) if j not in used_new]
+    if len(rest_old) == 1 and rest_new:
+        i, o = rest_old[0]
+        # pick closest value among remaining, else first
+        scored = []
+        for j, n in rest_new:
+            if not _allow_slot_pair(o, n):
+                continue
+            if is_distinctive(o.name) or (
+                o.value and n.value and o.value != n.value and is_number(o.value)
+            ):
+                scored.append((_value_distance(o.value, n.value), j, n))
+        if scored:
+            scored.sort()
+            _, j, n = scored[0]
+            pairs.append((o, n))
+            used_old.add(i)
+            used_new.add(j)
+    elif len(rest_old) == len(rest_new) and rest_old:
+        for (i, o), (j, n) in zip(rest_old, rest_new):
+            if not _allow_slot_pair(o, n):
+                continue
+            if is_distinctive(o.name) or (
+                o.value and n.value and o.value != n.value and is_number(o.value)
+            ):
+                pairs.append((o, n))
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# search HEAD
+# ---------------------------------------------------------------------------
+
+
+def git_grep_fixed(repo: str, rev: str | None, needles: list[str]) -> list[tuple[str, int, str]]:
+    if not needles:
+        return []
+    args = ["grep", "-n", "-I", "-F"]
+    for n in needles:
+        args.extend(["-e", n])
+    if rev and rev not in {"UNCOMMITTED", "-", "wt"}:
+        args.append(rev)
+    p = git(repo, *args)
+    hits: list[tuple[str, int, str]] = []
+    for row in (p.stdout or "").splitlines():
+        # rev:path:line:text  OR path:line:text
+        parts = row.split(":", 3)
+        if rev and rev not in {"UNCOMMITTED", "-", "wt"} and len(parts) >= 4:
+            # HEAD:path:line:text — path may contain no colons
+            _, path, ln, text = parts[0], parts[1], parts[2], parts[3]
+        elif len(parts) >= 3:
+            path, ln, text = parts[0], parts[1], parts[2] if len(parts) == 3 else ":".join(parts[2:])
+            if not ln.isdigit() and len(parts) >= 4:
+                path, ln, text = parts[1], parts[2], parts[3]
+        else:
+            continue
+        try:
+            line_no = int(ln)
+        except ValueError:
+            continue
+        hits.append((path, line_no, text))
+    return hits
+
+
+def holds_which(text: str, keys: Iterable[str]) -> str | None:
+    # prefer distinctive idents, then numbers
+    idents = []
+    nums = []
+    for k in keys:
+        if not token_in(text, k):
+            continue
+        if is_number(k):
+            nums.append(k)
+        else:
+            idents.append(k)
+    if idents:
+        idents.sort(key=lambda s: (0 if is_distinctive(s) else 1, len(s)))
+        # surface form actually on the line
+        for k in idents:
+            for s in sorted(surfaces(k), key=len, reverse=True):
+                if ident_in(text, s):
+                    return s if s.lower() == k.lower() or s == k else k
+        return idents[0]
+    if nums:
+        return nums[0]
+    return None
+
+
+def _slot_holds_abandoned(text: str, abandoned: list[str]) -> bool:
+    names = [s.name for s in extract_slots(text, 0)]
+    for n in names:
+        for k in abandoned:
+            if is_number(k):
+                continue
+            if n.lower() == k.lower() or inflect_pair(n, k):
+                return True
+    return False
+
+
+def _kin_path(path: str, birth_path: str) -> bool:
+    if not birth_path:
+        return False
+    stem = os.path.splitext(os.path.basename(birth_path))[0].lower()
+    if len(stem) < 4:
+        return False
+    return stem in path.lower().replace("\\", "/")
+
+
+def classify_hit(
+    path: str,
+    text: str,
+    abandoned: list[str],
+    natal_literals: list[str],
+    distinctive: list[str],
+    birth_path: str = "",
+) -> str | None:
+    """Return owing / echo / alias / None (drop)."""
+    role = file_role(path)
+    has_ident = any(token_in(text, k) for k in abandoned if not is_number(k))
+    has_dist = any(token_in(text, k) for k in distinctive)
+    has_lit = any(token_in(text, k) for k in natal_literals)
+    slotish = _slot_holds_abandoned(text, abandoned)
+
+    # quoted-only adapter
+    for k in abandoned:
+        if is_number(k):
+            continue
+        for s in abandoned_forms(k):
+            if ident_in(text, s) and only_quoted(text, s) and not has_lit:
+                return "alias"
+
+    if has_dist:
+        if role == "docs" and not has_lit:
+            return "echo"
+        if role == "tests":
+            code = strip_comments(text)
+            if not any(token_in(code, k) for k in distinctive) and not has_lit:
+                return "echo"
+        return "owing"
+
+    # generic ident / literal
+    if slotish and (has_lit or has_dist):
+        return "owing"
+    if slotish and role == "code":
+        # generic slot bound to a different literal (SiteObserver.threshold = 0.7)
+        return None
+    if has_lit and role in {"tests", "config"}:
+        if has_ident or _kin_path(path, birth_path):
+            return "owing"
+        return "echo"
+    if has_ident and role in {"docs", "tests"}:
+        return "echo"
+    if has_lit and role == "docs":
+        return "echo"
+    if has_ident and role == "code" and has_lit:
+        return "owing"
+    # generic ident in code without natal literal: different domain
+    return None
+
+
+# ---------------------------------------------------------------------------
+# cohorts
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Member:
+    status: str
+    path: str
+    line: int
+    text: str
+    birth_path: str
+    birth_line: int
+    birth_text: str
+    shared: list[str]
+    holds: str | None
+    since: dict[str, str] | None = None
+    born: dict[str, str] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "status": self.status,
+            "path": self.path,
+            "line": self.line,
+            "text": self.text,
+            "birth_path": self.birth_path,
+            "birth_line": self.birth_line,
+            "birth_text": self.birth_text,
+            "shared": self.shared,
+            "holds": self.holds,
+        }
+        if self.since:
+            d["since"] = self.since
+        if self.born:
+            d["born"] = self.born
+        return d
+
+
+@dataclass
+class Cohort:
+    kind: str
+    birth_commit: str
+    birth_date: str
+    birth_subject: str
+    birth_path: str
+    birth_region: list[str]
+    keys: list[str]
+    abandoned: list[str]
+    adopted: list[str]
+    pairs: list[str]
+    paid: list[Member] = field(default_factory=list)
+    owing: list[Member] = field(default_factory=list)
+    ok: list[Member] = field(default_factory=list)
+    gone: list[Member] = field(default_factory=list)
+    echo: list[Member] = field(default_factory=list)
+    alias: list[Member] = field(default_factory=list)
+    factions: dict[str, int] = field(default_factory=dict)
+    uncommitted: bool = False
+
+    def merge_from(self, other: "Cohort") -> None:
+        for attr in ("paid", "owing", "ok", "gone", "echo", "alias"):
+            seen = {(m.path, m.line) for m in getattr(self, attr)}
+            for m in getattr(other, attr):
+                if (m.path, m.line) not in seen:
+                    getattr(self, attr).append(m)
+                    seen.add((m.path, m.line))
+        for k, v in other.factions.items():
+            self.factions[k] = self.factions.get(k, 0) + v
+        if other.birth_region and other.birth_region[0] not in self.birth_region:
+            self.birth_region.extend(other.birth_region)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "birth": {
+                "commit": self.birth_commit,
+                "date": self.birth_date,
+                "subject": self.birth_subject,
+                "path": self.birth_path,
+                "region": self.birth_region,
+                "uncommitted": self.uncommitted,
+            },
+            "keys": self.keys,
+            "abandoned": self.abandoned,
+            "adopted": self.adopted,
+            "pairs": self.pairs,
+            "paid": [m.as_dict() for m in self.paid],
+            "owing": [m.as_dict() for m in self.owing],
+            "ok": [m.as_dict() for m in self.ok],
+            "gone": [m.as_dict() for m in self.gone],
+            "echo": [m.as_dict() for m in self.echo],
+            "alias": [m.as_dict() for m in self.alias],
+            "factions": self.factions,
+        }
+
+
+def member_shared(text: str, birth_text: str, keys: list[str]) -> list[str]:
+    toks = set(t.lower() for t in tokenize(text)) | set(t.lower() for t in tokenize(birth_text))
+    shared = []
+    for k in tokenize(birth_text):
+        if k.lower() in toks and (k.lower() not in {s.lower() for s in shared}):
+            if k.lower() in STOP_IDENTS and k.lower() not in {x.lower() for x in keys}:
+                continue
+            shared.append(k.lower() if not any(c.isupper() for c in k) else k)
+    # always include natal keys present in birth
+    for k in keys:
+        if token_in(birth_text, k) or token_in(text, k):
+            if k not in shared and k.lower() not in {s.lower() for s in shared}:
+                shared.append(k)
+    return sorted(set(shared), key=str.lower)
+
+
+def search_needles(abandoned: list[str], adopted: list[str]) -> list[str]:
+    needles: list[str] = []
+    seen: set[str] = set()
+    for k in abandoned:
+        forms = {k} if is_number(k) else abandoned_forms(k)
+        for s in forms:
+            if s not in seen and len(s) >= 1:
+                seen.add(s)
+                needles.append(s)
+    for k in adopted:
+        forms = {k} if is_number(k) else abandoned_forms(k)
+        for s in forms:
+            if s not in seen and len(s) >= 1:
+                seen.add(s)
+                needles.append(s)
+    return needles
+
+
+def populate_hits(
+    repo: str,
+    search_rev: str | None,
+    coh: Cohort,
+    changed_paths: set[str],
+    dbg: bool,
+    change: Change | None = None,
+) -> None:
+    abandoned = coh.abandoned
+    adopted = coh.adopted
+    # Numbers on the natal line still bind leftover docs ("T1 is 15 seconds")
+    # even when the number itself did not move.
+    literals = [k for k in abandoned if is_number(k)]
+    for region in coh.birth_region:
+        for tok in tokenize(region):
+            if is_number(tok) and tok not in literals:
+                literals.append(tok)
+    distinctive = [k for k in abandoned if not is_number(k) and is_distinctive(k)]
+    needles = search_needles(abandoned, adopted)
+    # generic names still searched but filtered later
+    hits = git_grep_fixed(repo, search_rev, needles)
+    debug(dbg, f"search needles={needles[:12]} hits={len(hits)}")
+    paid_locs: set[tuple[str, int]] = set()
+
+    adopted_names = [k for k in adopted if not is_number(k)]
+    # paid: changed-file *slots* that hold the adopted name, not every mention
+    for path, ln, text in hits:
+        holds_adopted = any(token_in(text, k) for k in adopted)
+        holds_ab_ident = any(token_in(text, k) for k in abandoned if not is_number(k))
+        if not (holds_adopted and path in changed_paths and not holds_ab_ident):
+            continue
+        slots = extract_slots(text, ln)
+        if adopted_names and not any(
+            s.name == a or inflect_pair(s.name, a) for s in slots for a in adopted_names
+        ):
+            continue
+        holds = holds_which(text, adopted) or (adopted[0] if adopted else None)
+        m = Member(
+            status="paid",
+            path=path,
+            line=ln,
+            text=text,
+            birth_path=coh.birth_path or path,
+            birth_line=1,
+            birth_text=coh.birth_region[0] if coh.birth_region else text,
+            shared=member_shared(text, coh.birth_region[0] if coh.birth_region else text, coh.keys),
+            holds=holds,
+        )
+        if (path, ln) not in {(x.path, x.line) for x in coh.paid}:
+            coh.paid.append(m)
+            paid_locs.add((path, ln))
+
+    for path, ln, text in hits:
+        if (path, ln) in paid_locs:
+            continue
+        if not any(token_in(text, k) for k in abandoned):
+            continue
+        kind = classify_hit(
+            path, text, abandoned, literals, distinctive, birth_path=coh.birth_path
+        )
+        if kind is None:
+            continue
+        holds = holds_which(text, abandoned) or holds_which(text, coh.keys)
+        since = None
+        born = None
+        if kind in {"owing", "echo"} and search_rev != "UNCOMMITTED" and change is not None:
+            since, born = leftover_identity_clocks(
+                repo, path, holds, abandoned + [k for k in coh.keys if k not in abandoned],
+                change, search_rev,
+            )
+        m = Member(
+            status=kind,
+            path=path,
+            line=ln,
+            text=text,
+            birth_path=path,
+            birth_line=ln,
+            birth_text=text,
+            shared=member_shared(text, text, coh.keys + abandoned),
+            holds=holds,
+            since=since,
+            born=born,
+        )
+        bucket = {
+            "owing": coh.owing,
+            "echo": coh.echo,
+            "alias": coh.alias,
+        }[kind]
+        if (path, ln) not in {(x.path, x.line) for x in bucket}:
+            bucket.append(m)
+
+    # factions: how HEAD leftovers cluster by the token they hold
+    fac: dict[str, int] = defaultdict(int)
+    for m in coh.paid + coh.owing:
+        if m.holds:
+            fac[m.holds] += 1
+    coh.factions = dict(fac)
+
+
+def sort_members(ms: list[Member]) -> list[Member]:
+    return sorted(ms, key=lambda m: (m.path, m.line))
+
+
+# ---------------------------------------------------------------------------
+# engine
+# ---------------------------------------------------------------------------
+
+
+def analyze(repo: str, change: Change, args: argparse.Namespace) -> list[Cohort]:
+    files = parse_diff(change.diff)
+    search_rev = None if change.kind == "wt" else "HEAD"
+    if change.kind == "stdin":
+        search_rev = "HEAD"
+    dbg = args.debug
+    changed_paths = {f.path for f in files}
+    path_a: list[Cohort] = []
+
+    for fd in files:
+        hunk_pairs: list[tuple[Slot, Slot]] = []
+        if fd.hunks:
+            for hk in fd.hunks:
+                hunk_pairs.extend(pair_slots(hk.old_slots, hk.new_slots))
+        else:
+            old_slots: list[Slot] = []
+            new_slots: list[Slot] = []
+            for ln, text in fd.removed:
+                old_slots.extend(extract_slots(text, ln))
+            for ln, text in fd.added:
+                new_slots.extend(extract_slots(text, ln))
+            hunk_pairs = pair_slots(old_slots, new_slots)
+        for old_s, new_s in hunk_pairs:
+            if old_s.name == new_s.name and old_s.value == new_s.value:
+                continue
+            abandoned: list[str] = []
+            adopted: list[str] = []
+            if old_s.name != new_s.name:
+                abandoned.append(old_s.name)
+                adopted.append(new_s.name)
+            if old_s.value and new_s.value and old_s.value != new_s.value:
+                if is_number(old_s.value) or is_number(new_s.value):
+                    abandoned.append(old_s.value)
+                    adopted.append(new_s.value)
+            if not abandoned:
+                continue
+            # drop generic-only rename without literal
+            names_ab = [k for k in abandoned if not is_number(k)]
+            if names_ab and all(is_generic(n) for n in names_ab) and not any(
+                is_number(k) for k in abandoned
+            ):
+                # still allow if distinctive? already generic. skip 1:1 window↔focusedWindow
+                if not any(is_distinctive(n) for n in names_ab):
+                    continue
+            blame_rev = change.parent or change.commit
+            birth_sha = change.commit or ""
+            birth_text = old_s.text
+            if blame_rev and blame_rev not in {"UNCOMMITTED", "-"}:
+                bl = blame_sha(repo, blame_rev, fd.old_path, old_s.line)
+                if bl:
+                    birth_sha, blamed = bl
+                    if blamed:
+                        birth_text = blamed
+            b_h, b_date, b_subj = commit_meta(repo, birth_sha) if birth_sha else ("", "", "")
+            keys: list[str] = []
+            for k in abandoned:
+                if k not in keys:
+                    # keys: natal names + natal literals that moved
+                    keys.append(k)
+            pair_labels = []
+            if old_s.name != new_s.name:
+                pair_labels.append(f"{old_s.name}↔{new_s.name}")
+            debug(
+                dbg,
+                f"birth {short_sha(b_h, 8)} {fd.old_path}:{old_s.line} region={[birth_text]}",
+            )
+            coh = Cohort(
+                kind="owing",
+                birth_commit=b_h,
+                birth_date=b_date,
+                birth_subject=b_subj,
+                birth_path=fd.old_path,
+                birth_region=[birth_text],
+                keys=keys,
+                abandoned=abandoned,
+                adopted=adopted,
+                pairs=pair_labels,
+                uncommitted=change.kind == "wt",
+            )
+            path_a.append(coh)
+
+    # merge identical pairing signatures
+    merged: list[Cohort] = []
+    index: dict[tuple, Cohort] = {}
+    for c in path_a:
+        sig = (tuple(c.pairs), tuple(c.keys), c.birth_commit)
+        if sig in index:
+            index[sig].merge_from(c)
+            if c.birth_region[0] not in index[sig].birth_region:
+                index[sig].birth_region.extend(c.birth_region)
+        else:
+            index[sig] = c
+            merged.append(c)
+
+    for c in merged:
+        populate_hits(repo, search_rev, c, changed_paths, dbg, change)
+        c.paid = sort_members(c.paid)
+        c.owing = sort_members(c.owing)
+        c.echo = sort_members(c.echo)
+        c.alias = sort_members(c.alias)
+        if c.owing or c.echo:
+            c.kind = "owing"
+        elif c.paid and not c.owing:
+            c.kind = "ok"
+        debug(
+            dbg,
+            f"cohort keys={c.keys} paid={len(c.paid)} owing={len(c.owing)} echo={len(c.echo)}",
+        )
+
+    # Path B: change-as-birth clusters (introduced keys already split at HEAD)
+    path_b: list[Cohort] = []
+    if not args.no_birth_clusters:
+        path_b = path_b_cohorts(repo, change, files, search_rev, dbg, args)
+
+    out = merged + path_b
+    if not args.all:
+        out = [c for c in out if c.owing or c.kind == "split"]
+    return out
+
+
+def path_b_cohorts(
+    repo: str,
+    change: Change,
+    files: list[FileDiff],
+    search_rev: str | None,
+    dbg: bool,
+    args: argparse.Namespace,
+) -> list[Cohort]:
+    """Keys introduced by the change, scored at HEAD (factions / split)."""
+    # Only interesting when the change itself is a birth (added slots)
+    # or a natal literal later mutated.
+    introduced: list[tuple[str, Slot, str]] = []  # path, slot, file text at add
+    for fd in files:
+        if fd.removed and fd.added:
+            # modified file: Path A already handles slot renames; still
+            # catch added literals that have no old slot (new keys).
+            old_names = {s.name.lower() for ln, t in fd.removed for s in extract_slots(t, ln)}
+            for ln, text in fd.added:
+                for s in extract_slots(text, ln):
+                    if s.name.lower() not in old_names and s.value and is_number(s.value):
+                        introduced.append((fd.path, s, text))
+            continue
+        if fd.added and not fd.removed:
+            for ln, text in fd.added:
+                for s in extract_slots(text, ln):
+                    introduced.append((fd.path, s, text))
+
+    # For birth commits, every added slot is natal. Group by natal value
+    # when it is a number that has factions at HEAD.
+    by_lit: dict[str, list[tuple[str, Slot, str]]] = defaultdict(list)
+    for path, slot, text in introduced:
+        if slot.value and is_number(slot.value):
+            by_lit[slot.value].append((path, slot, text))
+
+    out: list[Cohort] = []
+    birth_sha = change.commit if change.kind == "commit" else (change.parent or "")
+    if not birth_sha or birth_sha in {"-", "UNCOMMITTED"}:
+        b_h, b_date, b_subj = "", change.date, change.subject
+    else:
+        b_h, b_date, b_subj = commit_meta(repo, birth_sha)
+
+    for lit, slots in by_lit.items():
+        # skip quiet intact families unless --all: look for a mutated
+        # descendant in the same file.
+        needles = [lit]
+        hits = git_grep_fixed(repo, search_rev, needles)
+        # also look at HEAD of the introducing files for a new number on the slot
+        adopted_nums: set[str] = set()
+        paid: list[Member] = []
+        owing: list[Member] = []
+        for path, slot, text in slots:
+            blob = head_file(repo, path, "HEAD" if search_rev else None)
+            if not blob:
+                continue
+            head_slots = []
+            for i, line in enumerate(blob.splitlines(), 1):
+                head_slots.extend(extract_slots(line, i))
+            # match by inflection of the slot name
+            for hs in head_slots:
+                if inflect_pair(slot.name, hs.name) or slot.name.lower() == hs.name.lower():
+                    if hs.value and hs.value != lit and is_number(hs.value):
+                        adopted_nums.add(hs.value)
+                        paid.append(
+                            Member(
+                                "paid",
+                                path,
+                                hs.line,
+                                hs.text,
+                                path,
+                                slot.line,
+                                text,
+                                [hs.value],
+                                hs.value,
+                            )
+                        )
+                    break
+        if not adopted_nums:
+            debug(dbg, f"path-b key='{lit}' natal={len(slots)} intact")
+            if not args.all:
+                continue
+        # leftover natal literal
+        for path, ln, text in hits:
+            if not number_in(text, lit):
+                continue
+            role = file_role(path)
+            if role == "code" and path in {p for p, _, _ in slots}:
+                continue  # paid file no longer holds it
+            st = "owing" if role in {"tests", "config"} or (
+                role == "docs" and any(token_in(text, s.name) for _, s, _ in slots)
+            ) else "echo"
+            if role == "docs" and st == "owing" and not any(
+                token_in(text, s.name) for _, s, _ in slots
+            ):
+                st = "echo"
+            m = Member(st, path, ln, text, path, ln, text, [lit], lit)
+            if st == "owing":
+                owing.append(m)
+            # echo handled below if we want — keep owing/echo split via classify
+        # reclassify docs-only literal as owing if docs mention the natal name too
+        echo: list[Member] = []
+        kept_owing: list[Member] = []
+        natal_names = [s.name for _, s, _ in slots]
+        for m in owing:
+            role = file_role(m.path)
+            if role == "docs" and not any(token_in(m.text, n) for n in natal_names):
+                m.status = "echo"
+                echo.append(m)
+            else:
+                kept_owing.append(m)
+        # docs leftover of the literal without the name → echo
+        for path, ln, text in hits:
+            if not number_in(text, lit):
+                continue
+            if (path, ln) in {(m.path, m.line) for m in kept_owing + paid + echo}:
+                continue
+            role = file_role(path)
+            if role in {"docs", "tests"}:
+                echo.append(Member("echo", path, ln, text, path, ln, text, [lit], lit))
+
+        if not kept_owing and not adopted_nums and not args.all:
+            continue
+        adopted_list = sorted(adopted_nums)
+        debug(
+            dbg,
+            f"path-b key='{lit}' natal={len(hits)} factions={{{lit}: {len(kept_owing)}}}",
+        )
+        fac: dict[str, int] = defaultdict(int)
+        for m in paid + kept_owing:
+            if m.holds:
+                fac[m.holds] += 1
+        kind = "split" if adopted_list and kept_owing else ("owing" if kept_owing else "ok")
+        out.append(
+            Cohort(
+                kind=kind,
+                birth_commit=b_h,
+                birth_date=b_date,
+                birth_subject=b_subj,
+                birth_path=slots[0][0] if slots else "",
+                birth_region=[],
+                keys=[lit],
+                abandoned=[lit],
+                adopted=adopted_list,
+                pairs=[],
+                paid=sort_members(paid),
+                owing=sort_members(kept_owing),
+                echo=sort_members(echo),
+                factions=dict(fac),
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# render
+# ---------------------------------------------------------------------------
+
+
+def colorize(enabled: bool, code: str, s: str) -> str:
+    if not enabled:
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+def render_human(change: Change, cohorts: list[Cohort], args: argparse.Namespace) -> str:
+    use_color = (not args.no_color) and sys.stdout.isatty()
+    lines: list[str] = []
+    sha = short_sha(change.commit)
+    if change.kind == "commit":
+        lines.append(f"change commit  {sha}  {change.subject}")
+    elif change.kind == "range":
+        lines.append(f"change range  {sha}  {change.subject}")
+    elif change.kind == "wt":
+        lines.append("change wt  UNCOMMITTED  working tree")
+    elif change.kind == "stdin":
+        lines.append("change stdin  -  stdin diff")
+    else:
+        lines.append(f"change {change.kind}  {sha}  {change.subject}")
+
+    if not cohorts:
+        lines.append("")
+        lines.append("no unpaid kin at HEAD")
+        return "\n".join(lines) + "\n"
+
+    max_n = args.max
+    for i, c in enumerate(cohorts):
+        lines.append("")
+        bshort = short_sha(c.birth_commit)
+        unpaid = c.owing[:max_n] if max_n else c.owing
+        extra = c.owing[max_n:] if max_n else []
+        echo = c.echo + extra
+        if max_n:
+            echo = echo[: max(0, max_n * 4)]
+        n_unpaid = len(unpaid)
+        date = c.birth_date
+        subj = c.birth_subject
+        if c.kind == "split":
+            nfac = max(len(c.factions), 2)
+            head = f"split  {nfac} factions  ·  {bshort}  {date}  {subj}".rstrip()
+            lines.append(head)
+            if c.factions:
+                bits = "  ".join(f"{k}×{v}" for k, v in c.factions.items())
+                lines.append(f"       HEAD {bits}")
+        else:
+            lines.append(f"owing  {n_unpaid} unpaid  ·  {bshort}  {date}  {subj}".rstrip())
+        if c.pairs:
+            lines.append("nee    " + ", ".join(c.pairs))
+        if c.keys:
+            lines.append("keys   " + ", ".join(c.keys))
+        if c.abandoned or c.adopted:
+            left = ", ".join(c.abandoned)
+            right = ", ".join(c.adopted)
+            if right:
+                lines.append(f"delta  {left} → {right}")
+            else:
+                lines.append(f"delta  {left}")
+        if c.kind != "split" and not c.pairs and not c.abandoned and c.keys:
+            lines.append("token  " + ", ".join(c.keys))
+
+        def emit(tag: str, ms: list[Member]) -> None:
+            for m in ms:
+                text = m.text.lstrip()
+                lines.append(f"{tag:6} {m.path}:{m.line}: {text}")
+                extra_bits = []
+                if m.holds:
+                    extra_bits.append(f"(holds {m.holds})")
+                if m.since:
+                    extra_bits.append(f"since {short_sha(m.since.get('commit',''), 7)}")
+                born_sha = (m.born or {}).get("commit") or ""
+                since_sha = (m.since or {}).get("commit") or ""
+                if m.born and born_sha and born_sha != since_sha:
+                    extra_bits.append(f"born {short_sha(born_sha, 7)}")
+                if extra_bits:
+                    lines.append("       " + " ".join(extra_bits))
+
+        if c.paid or unpaid or echo or c.alias:
+            lines.append("")
+        emit("paid", c.paid[:max_n] if max_n else c.paid)
+        emit("owing", unpaid)
+        emit("echo", echo)
+        emit("alias", c.alias)
+        if i != len(cohorts) - 1:
+            lines.append("")
+            lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def render_json(change: Change, cohorts: list[Cohort]) -> str:
+    doc = {
+        "version": VERSION,
+        "change": {
+            "spec": change.spec,
+            "kind": change.kind,
+            "commit": change.commit,
+            "parent": change.parent,
+            "date": change.date,
+            "subject": change.subject,
+        },
+        "cohorts": [c.as_dict() for c in cohorts],
+    }
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+
+def selftest() -> int:
+    failures = []
+
+    def check(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    # tokenizer / inflection
+    check("t1" in surfaces("T1") or "T1" in surfaces("t1"), "t1 inflects T1")
+    check(inflect_pair("present_threshold", "presentThreshold"), "snake/camel")
+    check(not inflect_pair("t1", "driftDelay"), "t1 does not stem-match driftDelay")
+    check(is_distinctive("t1") and is_distinctive("present_threshold"), "distinctive")
+    check(is_generic("threshold") and is_generic("window"), "generic")
+    check(stem_noise("counters", "updatedCounters"), "stem noise")
+    check(not stem_noise("t1", "driftDelay"), "t1/driftDelay not stem noise")
+    check(number_in("x = 0.4", "0.4") and not number_in("x = 0.45", "0.4"), "0.4 bound")
+    check(looks_like_file_line("core.py:1"), "file:line")
+    check(not looks_like_file_line("HEAD"), "HEAD not file:line")
+    check(not looks_like_file_line("foo:bar"), "foo:bar not file:line")
+
+    # slot extract
+    s = extract_slots("t1 = 15", 1)
+    check(s and s[0].name == "t1" and s[0].value == "15", "py slot")
+    s = extract_slots("        threshold: Double = 0.4,", 30)
+    check(s and s[0].name == "threshold" and s[0].value == "0.4", "swift slot")
+    s = extract_slots("        self.t1 = t1", 86)
+    check(s and s[0].name == "t1", "self assign")
+    s = extract_slots("        presentThreshold: Double = 0.45,", 33)
+    t = extract_slots("        threshold: Double = 0.4,", 30)
+    pairs = pair_slots(t, s)
+    check(pairs and pairs[0][0].name == "threshold" and pairs[0][1].name == "presentThreshold", "slot pair")
+
+    # fixture repo — docs rewrite between birth and rename so last-touch ≠ identity birth
+    here = os.path.dirname(os.path.abspath(__file__))
+    tool = os.path.join(here, os.path.basename(__file__))
+    fix = tempfile.mkdtemp(prefix="berth-selftest-")
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=fix, check=True, capture_output=True)
+        subprocess.run(["git", "-C", fix, "config", "user.email", "b@b"], check=True)
+        subprocess.run(["git", "-C", fix, "config", "user.name", "b"], check=True)
+        Path(fix, "core.py").write_text("t1 = 15\nthreshold = 0.4\nPORT = 8080\n")
+        Path(fix, "docs.md").write_text("T1 is 15 seconds.\n")
+        Path(fix, "other.py").write_text("threshold = 0.7  # different domain\n")
+        subprocess.run(
+            ["git", "-C", fix, "add", "core.py", "docs.md", "other.py"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", fix, "commit", "-q", "-m", "introduce t1=15"], check=True)
+        # last-touch of leftover T1 line (formatter / docs rewrite); identity stays T1
+        Path(fix, "docs.md").write_text("# Timing\nT1 is 15 seconds.\nKeep in sync.\n")
+        subprocess.run(["git", "-C", fix, "add", "docs.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", fix, "commit", "-q", "-m", "rewrite docs keep T1"], check=True)
+        rewrite = subprocess.run(
+            ["git", "-C", fix, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        Path(fix, "core.py").write_text("driftDelay = 15\npresentThreshold = 0.45\nPORT = 8080\n")
+        subprocess.run(["git", "-C", fix, "add", "core.py"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", fix, "commit", "-q", "-m", "rename t1→driftDelay"],
+            check=True,
+        )
+        rename = subprocess.run(
+            ["git", "-C", fix, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        p = subprocess.run(
+            [sys.executable, tool, "--no-color", "-C", fix, "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        out = p.stdout
+        check(p.returncode == 0, f"HEAD exit {p.returncode} {p.stderr}")
+        check("t1" in out and "driftDelay" in out, "HEAD mentions t1/driftDelay")
+        check("docs.md" in out, "docs leftover")
+        check("T1" in out or "t1" in out, "T1 inflection")
+        check("other.py" not in out, "generic threshold=0.7 different domain")
+        check(not number_in("v0.4 camera", "0.4"), "v0.4 is not natal 0.4")
+        # occupancy: leftover identity birth is the rename, not last-touch rewrite
+        birth = subprocess.run(
+            ["git", "-C", fix, "rev-parse", "HEAD~2"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        check(
+            f"since {rename[:7]}" in out,
+            f"occupancy should berth at rename {rename[:7]}, got:\n{out}",
+        )
+        check(
+            f"since {rewrite[:7]}" not in out,
+            f"occupancy must not be last-touch rewrite {rewrite[:7]}:\n{out}",
+        )
+        check(
+            f"born {birth[:7]}" in out,
+            f"path identity intro should be born {birth[:7]}, got:\n{out}",
+        )
+        p2 = subprocess.run(
+            [sys.executable, tool, "--no-color", "-C", fix, "core.py:1"],
+            capture_output=True,
+            text=True,
+        )
+        check(p2.returncode == 2, "FILE:LINE exit 2")
+        check("not FILE:LINE" in p2.stderr, "FILE:LINE message")
+        p3 = subprocess.run(
+            [sys.executable, tool, "--no-color", "--check", "-C", fix, "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        check(p3.returncode == 1, "--check exit 1")
+    finally:
+        subprocess.run(["rm", "-rf", fix], check=False)
+
+    if failures:
+        print("selftest FAIL:", file=sys.stderr)
+        for f in failures:
+            print(" -", f, file=sys.stderr)
+        return 1
+    print("selftest ok")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=TOOL,
+        description=(
+            "From a commit or a diff, list natal cohorts still unpaid at HEAD. "
+            "Natal keys inflect (t1 ↔ driftDelay, snake/camel); renamed siblings "
+            "count. Leftover occupancy is identity birth, not last-touch. "
+            "No FILE:LINE — the change is the query."
+        ),
+    )
+    p.add_argument("change", nargs="?", help="commit, A..B range, 'wt', or '-' (stdin diff). Default: HEAD")
+    p.add_argument("-C", "--repo", default=".", help="repository working tree")
+    p.add_argument("--wt", action="store_true", help="analyze the working tree vs HEAD")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--check", action="store_true", help="exit 1 if any cohort is unpaid")
+    p.add_argument("--all", action="store_true", help="include intact (non-debt) cohorts")
+    p.add_argument("--no-birth-clusters", action="store_true", help="skip Path B (change-as-birth clusters)")
+    p.add_argument("--max", type=int, default=12, help="max members listed per cohort")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="store_true", help="show program's version number and exit")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"{TOOL} {VERSION}")
+        return 0
+    if args.selftest:
+        return selftest()
+
+    repo = os.path.abspath(args.repo)
+    p = git(repo, "rev-parse", "--is-inside-work-tree")
+    if p.returncode != 0:
+        die(f"not a git repository: {args.repo}")
+
+    try:
+        change = resolve_change(repo, args.change, args.wt)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 2
+
+    cohorts = analyze(repo, change, args)
+    if args.json:
+        sys.stdout.write(render_json(change, cohorts))
+    else:
+        sys.stdout.write(render_human(change, cohorts, args))
+
+    if args.check and any(c.owing for c in cohorts):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

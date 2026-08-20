@@ -1,0 +1,109 @@
+{
+  "tool": "pinch",
+  "version": "0.1.0",
+  "wall_s": 2.300711791962385,
+  "exit": 0,
+  "stages": [
+    {
+      "i": 0,
+      "argv": [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1"
+      ],
+      "label": "cargo metadata --format-version 1",
+      "exit": 0,
+      "pid": 29018,
+      "wall_s": 2.202701083,
+      "ru_utime": 0.308811,
+      "ru_stime": 0.929086,
+      "ru_maxrss": 130809856,
+      "cpu_s": 1.237897,
+      "cpu_frac": 0.5619904623254776
+    },
+    {
+      "i": 1,
+      "argv": [
+        "jq",
+        ".packages | length"
+      ],
+      "label": "jq .packages | length",
+      "exit": 0,
+      "pid": 29019,
+      "wall_s": 2.221065375,
+      "ru_utime": 0.012480999999999999,
+      "ru_stime": 0.002271,
+      "ru_maxrss": 13877248,
+      "cpu_s": 0.014752,
+      "cpu_frac": 0.006641857626545549
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "bytes": 1317847,
+      "reads": 75,
+      "writes": 78,
+      "read_stall_s": 2.200028374,
+      "write_stall_s": 0.0087965,
+      "both_stall_s": 0.000422375,
+      "copy_s": 0.000237173,
+      "wall_s": 2.209897958,
+      "epipe": false,
+      "read_eof": true,
+      "relation": "blocked-on-read",
+      "toward": 0
+    }
+  ],
+  "pinch": {
+    "stage": 0,
+    "kind": "compute",
+    "reason": "stage 0 (cargo metadata --format-version 1) absorbed 2.200s of neighbor stall and looks compute-bound",
+    "blame": [
+      2.200028374,
+      0.0087965
+    ],
+    "wait_for": [
+      {
+        "waiter": 1,
+        "waited_s": 2.200028374,
+        "reason": "blocked-on-read",
+        "on": 0
+      }
+    ],
+    "busy_frac": 0.5619904623254776
+  },
+  "samples": {
+    "n": 51,
+    "span_s": 2.258252542000264,
+    "busy_frac": 0.10101010101010101,
+    "run_slots": 30,
+    "sleep_slots": 267,
+    "by_comm": {
+      "bash": {
+        "run": 1,
+        "sleep": 50,
+        "other": 0
+      },
+      "Python": {
+        "run": 1,
+        "sleep": 147,
+        "other": 0
+      },
+      "cargo": {
+        "run": 28,
+        "sleep": 21,
+        "other": 0
+      },
+      "jq": {
+        "run": 0,
+        "sleep": 49,
+        "other": 0
+      }
+    },
+    "wall_s": 2.300711791962385
+  },
+  "tmpdir": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/pinch-wnjjp_m4"
+}

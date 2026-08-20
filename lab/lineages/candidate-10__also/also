@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+"""also — show what was born with a source line, and what you forgot to update."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+VERSION = "0.2.0"
+
+STOP = frozenset(
+    """
+    a an the and or for from with this that these those are was were been being
+    have has had not but can will into over such than then them they their its
+    true false none null undefined void nil yes no ok err error result
+    int str bool char float double long short byte string number object array
+    list dict map set type var let const func function fn def class struct enum
+    trait interface public private protected static final async await return
+    import export use using require include package module self super new
+    delete typeof instanceof where select insert update value values name data
+    file line path text todo fixme note hack pub mut impl mod crate ref inout
+    some any sizeof typedef unsigned signed volatile register break continue
+    switch case default else elif endif try catch throw throws finally yield
+    begin end do done fi esac int8 int16 int32 int64 uint usize isize
+    timeinterval duration nsstring sendable view body some view
+    echo export local readonly unset shift test true false
+    init initializer initialise initialize constructor destructor
+    json yaml xml html http https url uri status response request
+    """.split()
+)
+
+EXCLUDE_PATHSPEC = [
+    ":(exclude)*.lock",
+    ":(exclude)*-lock.json",
+    ":(exclude)*/node_modules/*",
+    ":(exclude)*/target/*",
+    ":(exclude)*/dist/*",
+    ":(exclude)*/build/*",
+    ":(exclude)*.min.js",
+    ":(exclude)*.min.css",
+    ":(exclude)*.map",
+    ":(exclude)*.png",
+    ":(exclude)*.jpg",
+    ":(exclude)*.jpeg",
+    ":(exclude)*.gif",
+    ":(exclude)*.webp",
+    ":(exclude)*.ico",
+    ":(exclude)*.pdf",
+    ":(exclude)*.woff*",
+    ":(exclude)*.bin",
+]
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+# Numbers, including unit suffixes so "15s" and "64px" still yield 15 / 64.
+NUM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d+(?:\.\d+)?)(ms|us|ns|px|em|rem|kb|mb|gb|mib|kib|gib|s)?(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+STR_RE = re.compile(r"""["'`]([^"'`\n]{2,80})["'`]""")
+LOC_RE = re.compile(r"^(.*?):(\d+)(?::\d+)?$")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+COMMON_NUM = frozenset({"0", "1", "2", "10", "100"})
+
+
+@dataclass
+class AddedLine:
+    path: str
+    line: int
+    text: str
+
+
+@dataclass
+class Hunk:
+    path: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list[tuple[str, str]]  # ('+', text) etc.
+
+
+@dataclass
+class Birth:
+    commit: str
+    date: str
+    subject: str
+    path: str
+    region: list[str]
+    uncommitted: bool = False
+
+
+@dataclass
+class Hit:
+    path: str
+    line: int
+    text: str
+
+
+@dataclass
+class Sibling:
+    status: str  # ok | drift | gone | paid
+    birth_path: str
+    birth_line: int
+    birth_text: str
+    shared: list[str]
+    path: str | None = None
+    line: int | None = None
+    text: str | None = None
+    lost_from_query: list[str] = field(default_factory=list)
+    lost_from_sib: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Report:
+    query_path: str
+    query_line: int
+    query_text: str
+    birth: Birth
+    keys: list[str]
+    siblings: list[Sibling]
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"also: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(
+    repo: str,
+    args: list[str],
+    *,
+    check: bool = True,
+    raw: bool = False,
+) -> str | bytes:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+    )
+    if check and r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip()
+        die(err or f"git {' '.join(args)} failed (exit {r.returncode})")
+    if raw:
+        return r.stdout
+    return r.stdout.decode("utf-8", "replace")
+
+
+def git_ok(repo: str, args: list[str]) -> tuple[int, str]:
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def find_repo(start: str) -> str:
+    r = subprocess.run(
+        ["git", "-C", start, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        die(f"not a git repository: {start}")
+    return r.stdout.decode("utf-8", "replace").strip()
+
+
+def relpath(repo: str, path: str) -> str:
+    repo_p = Path(repo).resolve()
+    p = Path(path)
+    candidates = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append(Path(os.getcwd()) / p)
+        candidates.append(repo_p / p)
+    for c in candidates:
+        if c.exists():
+            try:
+                return str(c.resolve().relative_to(repo_p)).replace("\\", "/")
+            except ValueError:
+                die(f"{path} is outside the repository {repo}")
+    die(f"no such file: {path}")
+    raise AssertionError
+
+
+def unquote_git_path(path: str) -> str:
+    path = path.split("\t", 1)[0]
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        inner = path[1:-1]
+        out = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt in '"\\nrtab':
+                    out.append({"n": "\n", "r": "\r", "t": "\t", "a": "\a", "b": "\b"}.get(nxt, nxt))
+                    i += 2
+                    continue
+                if nxt.isdigit():
+                    out.append(chr(int(inner[i + 1 : i + 4], 8)))
+                    i += 4
+                    continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
+    return path
+
+
+def _string_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in STR_RE.finditer(text)]
+
+
+def _in_span(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(a <= pos < b for a, b in spans)
+
+
+def tokenize(text: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind: str, value: str) -> None:
+        key = (kind, value)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    spans = _string_spans(text)
+    for m in STR_RE.finditer(text):
+        s = m.group(1).strip()
+        if len(s) >= 2:
+            add("str", s)
+
+    for m in IDENT_RE.finditer(text):
+        if _in_span(m.start(), spans):
+            continue
+        w = m.group(0)
+        if w.lower() in STOP:
+            continue
+        if len(w) == 40 and all(c in "0123456789abcdefABCDEF" for c in w):
+            continue
+        add("id", w.lower())
+
+    for m in NUM_RE.finditer(text):
+        if _in_span(m.start(), spans):
+            continue
+        n = m.group(1)
+        if n in COMMON_NUM:
+            continue
+        add("num", n)
+
+    return found
+
+
+def token_values(text: str) -> set[str]:
+    return {v for _, v in tokenize(text)}
+
+
+def literal_values(text: str) -> set[str]:
+    return {v for k, v in tokenize(text) if k in ("num", "str")}
+
+
+def ident_values(text: str) -> set[str]:
+    return {v for k, v in tokenize(text) if k == "id"}
+
+
+def is_number_token(tok: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?", tok))
+
+
+_STYLE_BEFORE = re.compile(
+    r"(?:opacity|response|duration|delay|brightness|saturation|hue|damping"
+    r"|milliseconds|seconds|font|width|height|radius|padding|spacing|"
+    r"weight|size)\s*[\(:]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def number_context_ok(text: str, num: str) -> bool:
+    """Reject range bounds, version suffixes, and UI/style numeric args."""
+    for m in re.finditer(re.escape(num), text):
+        before = text[max(0, m.start() - 24) : m.start()]
+        after = text[m.end() : m.end() + 2]
+        if before.endswith("..<") or before.endswith("...") or before.endswith(".."):
+            continue
+        if after.startswith(".."):
+            continue
+        # macos-15, utf-8, foo-300: hyphenated identifier suffix
+        if re.search(r"[A-Za-z]$", before) or before.endswith("-"):
+            if re.search(r"[A-Za-z0-9]-$", before) or re.search(r"[A-Za-z]$", before):
+                continue
+        if _STYLE_BEFORE.search(before):
+            continue
+        if re.search(r"[\*\/]\s*$", before):
+            continue
+        if after.startswith("+"):
+            continue
+        if re.search(r"(macos|iphoneos|ipados|osx)\s*$", before, re.I):
+            continue
+        return True
+    return False
+
+
+_STYLE_LINE = re.compile(
+    r"(opacity|brightness|saturation|hue|spring|yaw|pitch|colorhue)",
+    re.I,
+)
+_THRESHOLD_LINE = re.compile(r"(threshold|閾値|score|ema)", re.I)
+
+
+def float_hit_ok(text: str, num: str) -> bool:
+    if "." not in num:
+        return True
+    if _STYLE_LINE.search(text) and not _THRESHOLD_LINE.search(text):
+        return False
+    return True
+
+
+def best_ancestral_line(region: list[str], query_text: str) -> str | None:
+    if not region:
+        return None
+    q = token_values(query_text)
+    best = region[0]
+    best_n = -1
+    for line in region:
+        n = len(token_values(line) & q)
+        if n > best_n:
+            best_n = n
+            best = line
+    return best
+
+
+def select_keys(
+    query_text: str, birth: Birth, added: list[AddedLine]
+) -> tuple[list[str], set[str], set[str]]:
+    """Keys come from the *current* line, plus a replaced literal.
+
+    Tokens that only lived on a split ancestral mega-line (the other
+    default arguments) are not claimed by this query.
+    """
+    q_lits = literal_values(query_text)
+    q_ids = ident_values(query_text)
+    anc = best_ancestral_line(birth.region, query_text)
+    a_lits = literal_values(anc) if anc else set()
+    abandoned: set[str] = set()
+    if len(q_lits) == 1 and len(a_lits) == 1 and q_lits != a_lits:
+        abandoned = set(a_lits)
+
+    rare_q = rarity_keys(q_ids, added)
+
+    keys: list[str] = []
+    for tok in sorted(q_lits, key=len, reverse=True):
+        keys.append(tok)
+    for tok in sorted(abandoned, key=len, reverse=True):
+        if tok not in keys:
+            keys.append(tok)
+    for tok in rare_q:
+        if tok not in keys:
+            keys.append(tok)
+    if not keys:
+        keys = sorted(q_ids | q_lits, key=len, reverse=True)[:5]
+    return keys, abandoned, q_lits
+
+
+def parse_hunks(diff: str) -> list[Hunk]:
+    hunks: list[Hunk] = []
+    path = ""
+    i = 0
+    lines = diff.splitlines()
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            path = ""
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            rest = line[4:]
+            if rest.startswith("/dev/null"):
+                path = ""
+            else:
+                if rest.startswith("b/"):
+                    rest = rest[2:]
+                path = unquote_git_path(rest)
+            i += 1
+            continue
+        m = HUNK_RE.match(line)
+        if m and path:
+            old_start = int(m.group(1))
+            old_count = int(m.group(2) or "1")
+            new_start = int(m.group(3))
+            new_count = int(m.group(4) or "1")
+            body: list[tuple[str, str]] = []
+            i += 1
+            while i < len(lines):
+                l = lines[i]
+                if l.startswith("diff --git ") or l.startswith("@@ "):
+                    break
+                if l.startswith("\\"):
+                    i += 1
+                    continue
+                if l.startswith("+") or l.startswith("-") or l.startswith(" "):
+                    body.append((l[0], l[1:]))
+                    i += 1
+                    continue
+                break
+            hunks.append(
+                Hunk(path, old_start, old_count, new_start, new_count, body)
+            )
+            continue
+        i += 1
+    return hunks
+
+
+def added_from_hunks(hunks: Iterable[Hunk]) -> list[AddedLine]:
+    out: list[AddedLine] = []
+    for h in hunks:
+        new_line = h.new_start
+        for kind, text in h.lines:
+            if kind == " ":
+                new_line += 1
+            elif kind == "+":
+                out.append(AddedLine(h.path, new_line, text))
+                new_line += 1
+            elif kind == "-":
+                pass
+    return out
+
+
+def changed_new_lines(hunks: Iterable[Hunk]) -> set[tuple[str, int]]:
+    """New-side line numbers that were added or replaced."""
+    out: set[tuple[str, int]] = set()
+    for h in hunks:
+        new_line = h.new_start
+        for kind, _text in h.lines:
+            if kind == " ":
+                new_line += 1
+            elif kind == "+":
+                out.add((h.path, new_line))
+                new_line += 1
+    return out
+
+
+def map_wt_line(hunks: list[Hunk], path: str, wt_line: int) -> tuple[str, int | None]:
+    """Map a working-tree line to HEAD.
+
+    Returns ('head', line) | ('added', None) | ('clean', line).
+    A replacement (minus+plus at the same logical site) is ('head', old_line)
+    so we can still walk birth of the line identity.
+    """
+    file_hunks = [h for h in hunks if h.path == path]
+    if not file_hunks:
+        return ("clean", wt_line)
+
+    off = 0
+    for h in file_hunks:
+        new_end = h.new_start + max(h.new_count, 0)
+        if wt_line < h.new_start:
+            return ("head", wt_line - off)
+        if wt_line < new_end or (h.new_count == 0 and wt_line == h.new_start):
+            new_line = h.new_start
+            old_line = h.old_start
+            plus_at: int | None = None
+            minus_at: int | None = None
+            # Pair minuses/pluses in order for U0 replacements.
+            minuses: list[int] = []
+            pluses: list[int] = []
+            for kind, _text in h.lines:
+                if kind == " ":
+                    new_line += 1
+                    old_line += 1
+                elif kind == "-":
+                    minuses.append(old_line)
+                    old_line += 1
+                elif kind == "+":
+                    pluses.append(new_line)
+                    if new_line == wt_line:
+                        plus_at = new_line
+                    new_line += 1
+            if plus_at is not None:
+                # If there is a corresponding minus, treat as modification.
+                idx = pluses.index(plus_at)
+                if idx < len(minuses):
+                    return ("head", minuses[idx])
+                return ("added", None)
+            return ("head", h.old_start)
+        off += h.new_count - h.old_count
+    return ("head", wt_line - off)
+
+
+def read_wt_line(repo: str, path: str, line: int) -> str:
+    abs_path = Path(repo) / path
+    if not abs_path.exists():
+        die(f"no such file: {path}")
+    try:
+        text = abs_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        die(f"not a utf-8 text file: {path}")
+    lines = text.splitlines()
+    if line < 1 or line > len(lines):
+        die(f"{path}:{line} is out of range (1..{len(lines)})")
+    return lines[line - 1]
+
+
+def parse_location(spec: str) -> tuple[str, int]:
+    m = LOC_RE.match(spec)
+    if not m:
+        die(f"expected FILE:LINE, got {spec!r}")
+    return m.group(1), int(m.group(2))
+
+
+def rarity_keys(birth_tokens: set[str], added: list[AddedLine]) -> list[str]:
+    if not added:
+        return []
+    df: dict[str, int] = {}
+    for al in added:
+        vals = token_values(al.text)
+        for t in birth_tokens:
+            if t in vals:
+                df[t] = df.get(t, 0) + 1
+    n = len(added)
+    cap = max(8, int(n * 0.08))
+    keys = []
+    for t in birth_tokens:
+        c = df.get(t, 0)
+        if c < 2:
+            continue
+        if c > cap:
+            continue
+        keys.append(t)
+    # Prefer more distinctive keys first: longer, then rarer.
+    keys.sort(key=lambda t: (-len(t), df.get(t, 0), t))
+    return keys
+
+
+def birth_of_head_line(repo: str, path: str, head_line: int, debug: bool) -> Birth:
+    spec = f"{head_line},{head_line}:{path}"
+    code, out = git_ok(
+        repo,
+        [
+            "log",
+            "-L",
+            spec,
+            "-p",
+            "--pretty=format:%x1e%H%x09%cI%x09%s",
+            "--follow",
+        ],
+    )
+    if code != 0 or not out.strip():
+        # --follow is not always legal with -L; retry without.
+        code, out = git_ok(
+            repo,
+            ["log", "-L", spec, "-p", "--pretty=format:%x1e%H%x09%cI%x09%s"],
+        )
+    if code != 0 or not out.strip():
+        die(f"no history for {path}:{head_line}")
+    records = [r for r in out.split("\x1e") if r.strip()]
+    if not records:
+        die(f"no history for {path}:{head_line}")
+    oldest = records[-1]
+    header, _, body = oldest.partition("\n")
+    parts = header.strip().split("\t", 2)
+    if len(parts) < 3:
+        die(f"could not parse birth header for {path}:{head_line}")
+    commit, date, subject = parts[0], parts[1], parts[2]
+    region = []
+    birth_path = path
+    for line in body.splitlines():
+        if line.startswith("+++ "):
+            rest = line[4:]
+            if rest.startswith("b/"):
+                rest = rest[2:]
+            if not rest.startswith("/dev/null"):
+                birth_path = unquote_git_path(rest)
+        if line.startswith("+") and not line.startswith("+++"):
+            region.append(line[1:])
+    if debug:
+        print(
+            f"debug: birth {commit[:8]} {path}:{head_line} region={region!r}",
+            file=sys.stderr,
+        )
+    return Birth(commit, date, subject, birth_path, region, uncommitted=False)
+
+
+def added_lines_in_commit(repo: str, commit: str) -> list[AddedLine]:
+    diff = git(repo, ["show", "--format=", "-U0", "--find-renames", commit])
+    if not isinstance(diff, str):
+        diff = diff.decode("utf-8", "replace")
+    return added_from_hunks(parse_hunks(diff))
+
+
+def grep_token(repo: str, token: str, *, kind: str | None = None) -> list[Hit]:
+    args = ["grep", "-n", "-I", "-i", "-F"]
+    # Numbers and dotted literals must not use -w: "15s" and "0.4" would miss.
+    if kind != "num" and " " not in token and "." not in token:
+        args.append("-w")
+    args.extend(["-e", token, "--", ".", *EXCLUDE_PATHSPEC])
+    code, out = git_ok(repo, args)
+    if code not in (0, 1):
+        return []
+    hits: list[Hit] = []
+    for line in out.splitlines():
+        m = re.match(r"^(.*):(\d+):(.*)$", line)
+        if not m:
+            continue
+        path, ln, text = m.group(1), int(m.group(2)), m.group(3)
+        if is_number_token(token) and not number_context_ok(text, token):
+            continue
+        if is_number_token(token) and not float_hit_ok(text, token):
+            continue
+        if is_number_token(token) and token not in {v for k, v in tokenize(text) if k == "num"}:
+            # tokenize extracts 15 from 15s; reject accidental substring hits
+            if token not in token_values(text):
+                continue
+        hits.append(Hit(path, ln, text))
+    return hits
+
+
+def locate_sibling(
+    repo: str,
+    birth_line: AddedLine,
+    keys: list[str],
+    query_path: str,
+    query_line: int,
+) -> list[Hit]:
+    sib_tokens = token_values(birth_line.text)
+    search_keys = [k for k in keys if k in sib_tokens]
+    if not search_keys:
+        search_keys = sorted(sib_tokens, key=len, reverse=True)[:3]
+    if not search_keys:
+        return []
+
+    # Try the most distinctive key first; fall back to others.
+    candidates: list[Hit] = []
+    for key in search_keys:
+        kind = "num" if is_number_token(key) else None
+        hits = grep_token(repo, key, kind=kind)
+        if hits:
+            candidates = hits
+            break
+    if not candidates:
+        return []
+
+    scored: list[tuple[int, bool, Hit]] = []
+    for h in candidates:
+        if h.path == query_path and h.line == query_line:
+            continue
+        overlap = token_values(h.text) & sib_tokens
+        score = len(overlap)
+        if score <= 0:
+            continue
+        literal = any(
+            any(ch.isdigit() for ch in tok) or (" " in tok)
+            for tok in overlap
+        )
+        scored.append((score, literal, h))
+    if not scored:
+        return []
+    best = max(s for s, _, _ in scored)
+    kept: list[Hit] = []
+    for score, literal, h in scored:
+        if score < best:
+            continue
+        if score >= 2 or h.path == birth_line.path or literal:
+            kept.append(h)
+    if best == 1 and len(kept) > 8:
+        same = [h for h in kept if h.path == birth_line.path]
+        kept = same or kept[:5]
+    elif len(kept) > 12:
+        same = [h for h in kept if h.path == birth_line.path]
+        kept = same or kept[:12]
+    return kept
+
+
+def classify(
+    query_now: str,
+    sib_now: str | None,
+    shared_at_birth: set[str],
+    paid: bool,
+) -> tuple[str, list[str], list[str]]:
+    if sib_now is None:
+        return "gone", [], []
+    q = token_values(query_now)
+    s = token_values(sib_now)
+    lost_q = sorted(t for t in shared_at_birth if t in s and t not in q)
+    lost_s = sorted(t for t in shared_at_birth if t in q and t not in s)
+    if paid:
+        return "paid", lost_q, lost_s
+    if lost_q or lost_s:
+        return "drift", lost_q, lost_s
+    return "ok", [], []
+
+
+def analyze_line(
+    repo: str,
+    path: str,
+    wt_line: int,
+    *,
+    debug: bool,
+    max_sibs: int,
+    paid_locs: set[tuple[str, int]] | None = None,
+) -> Report:
+    query_text = read_wt_line(repo, path, wt_line)
+    code, diff_out = git_ok(repo, ["diff", "-U0", "HEAD", "--", path])
+    hunks = parse_hunks(diff_out) if code == 0 else []
+    kind, head_line = map_wt_line(hunks, path, wt_line)
+
+    if kind == "added" or head_line is None:
+        # Uncommitted addition: birth is the working-tree diff of this path plus
+        # other unstaged/staged added lines in the repo.
+        code, full = git_ok(repo, ["diff", "-U0", "HEAD"])
+        added = added_from_hunks(parse_hunks(full))
+        birth = Birth(
+            commit="UNCOMMITTED",
+            date="",
+            subject="working tree",
+            path=path,
+            region=[query_text],
+            uncommitted=True,
+        )
+        keys, abandoned, q_lits = select_keys(query_text, birth, added)
+        must_lits = q_lits | abandoned
+        siblings: list[Sibling] = []
+        for al in added:
+            if al.path == path and al.line == wt_line:
+                continue
+            shared = token_values(al.text) & set(keys)
+            if not shared:
+                continue
+            if must_lits and not (shared & must_lits):
+                continue
+            now_text = al.text
+            paid = bool(paid_locs and (al.path, al.line) in paid_locs)
+            status, lost_q, lost_s = classify(query_text, now_text, shared, paid)
+            siblings.append(
+                Sibling(
+                    status=status,
+                    birth_path=al.path,
+                    birth_line=al.line,
+                    birth_text=al.text,
+                    shared=sorted(shared),
+                    path=al.path,
+                    line=al.line,
+                    text=now_text,
+                    lost_from_query=lost_q,
+                    lost_from_sib=lost_s,
+                )
+            )
+            if len(siblings) >= max_sibs:
+                break
+        return Report(path, wt_line, query_text, birth, keys, siblings)
+
+    birth = birth_of_head_line(repo, path, head_line, debug)
+    added = added_lines_in_commit(repo, birth.commit)
+    keys, abandoned, q_lits = select_keys(query_text, birth, added)
+    must_lits = q_lits | abandoned
+    keyset = set(keys)
+    if debug:
+        print(
+            f"debug: keys={keys!r} abandoned={abandoned!r} q_lits={q_lits!r}",
+            file=sys.stderr,
+        )
+
+    siblings = []
+    seen_now: set[tuple[str, int]] = set()
+    for al in added:
+        if al.path == path and (
+            birth.region
+            and al.text in birth.region
+            and al.text.strip() == query_text.strip()
+        ):
+            continue
+        shared = token_values(al.text) & keyset
+        if not shared:
+            continue
+        if must_lits and not (shared & must_lits):
+            continue
+        hits = locate_sibling(repo, al, keys, path, wt_line)
+        if not hits:
+            paid = False
+            status, lost_q, lost_s = classify(query_text, None, shared, paid)
+            siblings.append(
+                Sibling(
+                    status=status,
+                    birth_path=al.path,
+                    birth_line=al.line,
+                    birth_text=al.text,
+                    shared=sorted(shared),
+                    lost_from_query=lost_q,
+                    lost_from_sib=lost_s,
+                )
+            )
+        else:
+            for h in hits:
+                loc = (h.path, h.line)
+                if loc in seen_now or loc == (path, wt_line):
+                    continue
+                seen_now.add(loc)
+                paid = bool(paid_locs and loc in paid_locs)
+                status, lost_q, lost_s = classify(query_text, h.text, shared, paid)
+                siblings.append(
+                    Sibling(
+                        status=status,
+                        birth_path=al.path,
+                        birth_line=al.line,
+                        birth_text=al.text,
+                        shared=sorted(shared),
+                        path=h.path,
+                        line=h.line,
+                        text=h.text,
+                        lost_from_query=lost_q,
+                        lost_from_sib=lost_s,
+                    )
+                )
+        if len(siblings) >= max_sibs:
+            break
+
+    # Echo pass: current copies of this line's literals (and the replaced
+    # ancestral literal) even when they were not in the birth commit.
+    echo_lits = q_lits | abandoned
+    for lit in echo_lits:
+        if len(siblings) >= max_sibs:
+            break
+        kind = "num" if is_number_token(lit) else "str"
+        for h in grep_token(repo, lit, kind=kind):
+            loc = (h.path, h.line)
+            if loc in seen_now or loc == (path, wt_line):
+                continue
+            if lit not in token_values(h.text):
+                continue
+            seen_now.add(loc)
+            shared = {lit}
+            paid = bool(paid_locs and loc in paid_locs)
+            status, lost_q, lost_s = classify(query_text, h.text, shared, paid)
+            siblings.append(
+                Sibling(
+                    status=status,
+                    birth_path=h.path,
+                    birth_line=h.line,
+                    birth_text=h.text,
+                    shared=sorted(shared),
+                    path=h.path,
+                    line=h.line,
+                    text=h.text,
+                    lost_from_query=lost_q,
+                    lost_from_sib=lost_s,
+                )
+            )
+            if len(siblings) >= max_sibs:
+                break
+
+    return Report(path, wt_line, query_text, birth, keys, siblings)
+
+
+def colorize(enabled: bool, code: str, text: str) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def format_human(rep: Report, color: bool) -> str:
+    st_color = {
+        "ok": "32",
+        "drift": "31",
+        "gone": "33",
+        "paid": "36",
+    }
+    b = rep.birth
+    birth_bit = f"{b.commit[:12]}  {b.date}  {b.subject}".strip()
+    lines = [
+        f"query  {rep.query_path}:{rep.query_line}",
+        f"       {rep.query_text.strip()}",
+        f"birth  {birth_bit}",
+    ]
+    if b.region:
+        was = b.region[0].strip()
+        if was and was != rep.query_text.strip():
+            lines.append(f"       was: {was}")
+            if len(b.region) > 1:
+                lines.append(f"       (+{len(b.region) - 1} more ancestral lines)")
+    lines.append(f"keys   {', '.join(rep.keys) if rep.keys else '(none)'}")
+    lines.append("")
+    if not rep.siblings:
+        lines.append("no siblings")
+        return "\n".join(lines)
+
+    order = {"drift": 0, "gone": 1, "ok": 2, "paid": 3}
+    sibs = sorted(rep.siblings, key=lambda s: (order.get(s.status, 9), s.path or "", s.line or 0))
+    for s in sibs:
+        tag = colorize(color, st_color.get(s.status, "0"), f"{s.status:<5}")
+        if s.status == "gone":
+            lines.append(f"{tag} {s.birth_path}:{s.birth_line}: {s.birth_text.strip()}")
+        else:
+            loc = f"{s.path}:{s.line}:"
+            lines.append(f"{tag} {loc} {s.text.strip() if s.text else ''}")
+        extra = []
+        if s.lost_from_query:
+            extra.append("query lost " + ", ".join(s.lost_from_query))
+        if s.lost_from_sib:
+            extra.append("sibling lost " + ", ".join(s.lost_from_sib))
+        if extra:
+            lines.append(f"       ({'; '.join(extra)})")
+    return "\n".join(lines)
+
+
+def report_to_json(rep: Report) -> dict:
+    return {
+        "query": {
+            "path": rep.query_path,
+            "line": rep.query_line,
+            "text": rep.query_text,
+        },
+        "birth": {
+            "commit": rep.birth.commit,
+            "date": rep.birth.date,
+            "subject": rep.birth.subject,
+            "path": rep.birth.path,
+            "region": rep.birth.region,
+            "uncommitted": rep.birth.uncommitted,
+        },
+        "keys": rep.keys,
+        "siblings": [
+            {
+                "status": s.status,
+                "birth_path": s.birth_path,
+                "birth_line": s.birth_line,
+                "birth_text": s.birth_text,
+                "path": s.path,
+                "line": s.line,
+                "text": s.text,
+                "shared": s.shared,
+                "lost_from_query": s.lost_from_query,
+                "lost_from_sib": s.lost_from_sib,
+            }
+            for s in rep.siblings
+        ],
+    }
+
+
+def has_drift(rep: Report) -> bool:
+    return any(s.status == "drift" for s in rep.siblings)
+
+
+def interesting_for_diff(text: str) -> bool:
+    return any(k in ("num", "str") for k, _ in tokenize(text))
+
+
+def run_selftest() -> None:
+    fails: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            fails.append(msg)
+
+    toks = token_values('TIMEOUT = 30  # 15s later')
+    expect("timeout" in toks, f"ident TIMEOUT missing: {toks}")
+    expect("30" in toks, f"num 30 missing: {toks}")
+    expect("15" in toks, f"unit 15s should yield 15: {toks}")
+
+    toks = token_values('presentThreshold: Double = 0.45')
+    expect("0.45" in toks, f"float missing: {toks}")
+    expect("presentthreshold" in toks, f"camel missing: {toks}")
+
+    toks = token_values('pub(crate) const SCAR_TEXT_ASK: &str = "explain this change";')
+    expect("scar_text_ask" in toks, f"const missing: {toks}")
+    expect("explain this change" in toks, f"string missing: {toks}")
+
+    toks = token_values(
+        'const P = "data/fixtures/golden/direct-critical-armor.scenario.json";'
+    )
+    expect(
+        "data/fixtures/golden/direct-critical-armor.scenario.json" in toks,
+        f"full string token missing: {toks}",
+    )
+    expect("critical" not in toks, f"idents leaked from string: {toks}")
+    expect("golden" not in toks, f"idents leaked from string: {toks}")
+    expect("armor" not in toks, f"idents leaked from string: {toks}")
+
+    expect(number_context_ok("timeout: 300", "300"), "bare 300 should pass")
+    expect(
+        not number_context_ok("if !(200..<300).contains(code)", "300"),
+        "range bound 300 should fail",
+    )
+    expect(not number_context_ok("runs-on: macos-15", "15"), "macos-15 suffix")
+    expect(not number_context_ok(".foregroundStyle(.white.opacity(0.4))", "0.4"), "opacity")
+    expect(not number_context_ok("Task.sleep(for: .milliseconds(300))", "300"), "ms wrapper")
+    expect(not number_context_ok("- macOS 15+ (Sequoia)", "15"), "os version 15+")
+    expect(float_hit_ok("// 3回目で0.4を下回る", "0.4"), "threshold comment")
+    expect(not float_hit_ok("yaw: 0.4, pitch: 0.0", "0.4"), "gaze yaw")
+
+    keys, abandoned, q_lits = select_keys(
+        "driftDelay: TimeInterval = 15,",
+        Birth(
+            "c",
+            "",
+            "s",
+            "f",
+            [
+                "public init(t1: TimeInterval = 15, t2: TimeInterval = 90, flowRecovery: TimeInterval = 5) {"
+            ],
+        ),
+        [
+            AddedLine("f", 1, "t1 = 15"),
+            AddedLine("f", 2, "t2 = 90"),
+            AddedLine("g", 1, "public init() {}"),
+        ],
+    )
+    expect("15" in keys, f"current literal should be a key: {keys}")
+    expect("90" not in keys, f"split ancestral 90 must not be claimed: {keys}")
+    expect("init" not in keys, f"init must not be a key: {keys}")
+    expect("15" in q_lits, f"q_lits {q_lits}")
+
+    keys, abandoned, q_lits = select_keys(
+        "presentThreshold: Double = 0.45,",
+        Birth("c", "", "s", "f", ["threshold: Double = 0.4,"]),
+        [
+            AddedLine("f", 1, "threshold: Double = 0.4,"),
+            AddedLine("t", 1, "threshold 0.4"),
+        ],
+    )
+    expect(abandoned == {"0.4"}, f"replaced 0.4 should be abandoned: {abandoned}")
+    expect("0.45" in keys and "0.4" in keys, f"both literals: {keys}")
+
+    diff = """diff --git a/config.py b/config.py
+--- a/config.py
++++ b/config.py
+@@ -1,1 +1,1 @@
+-TIMEOUT = 30
++TIMEOUT = 60
+diff --git a/docs/how to set (timeout).md b/docs/how to set (timeout).md
+new file mode 100644
+--- /dev/null
++++ b/docs/how to set (timeout).md
+@@ -0,0 +1,2 @@
++# timeout
++timeout is 30 seconds
+"""
+    hunks = parse_hunks(diff)
+    added = added_from_hunks(hunks)
+    expect(any(a.path.endswith(".md") and "30" in a.text for a in added), f"weird path added: {added}")
+    kind, head = map_wt_line(hunks, "config.py", 1)
+    expect(kind == "head" and head == 1, f"replacement should map to head 1, got {kind} {head}")
+
+    diff_add = """diff --git a/config.py b/config.py
+--- a/config.py
++++ b/config.py
+@@ -3,0 +4,1 @@
++NEW = 1
+"""
+    hunks = parse_hunks(diff_add)
+    kind, head = map_wt_line(hunks, "config.py", 4)
+    expect(kind == "added" and head is None, f"pure add: {kind} {head}")
+
+    st, lq, ls = classify("TIMEOUT = 60", "timeout is 30 seconds", {"timeout", "30"}, False)
+    expect(st == "drift", f"expected drift, got {st} {lq} {ls}")
+    expect("30" in lq, f"query should have lost 30: {lq}")
+
+    st, _, _ = classify("TIMEOUT = 60", "timeout is 60 seconds", {"timeout", "30"}, False)
+    expect(st == "ok", f"both moved on from 30: {st}")
+
+    st, _, _ = classify("TIMEOUT = 60", None, {"timeout", "30"}, False)
+    expect(st == "gone", f"expected gone: {st}")
+
+    added_lines = [
+        AddedLine("a.py", 1, "TIMEOUT = 30"),
+        AddedLine("b.md", 1, "timeout is 30 seconds"),
+        AddedLine("c.py", 1, "import os"),
+        AddedLine("d.py", 1, "import sys"),
+        AddedLine("e.py", 1, "import json"),
+        AddedLine("f.py", 1, "import re"),
+        AddedLine("g.py", 1, "import math"),
+        AddedLine("h.py", 1, "import time"),
+        AddedLine("i.py", 1, "import json"),
+    ]
+    keys = rarity_keys({"timeout", "30", "import"}, added_lines)
+    expect("30" in keys or "timeout" in keys, f"keys should keep distinctive tokens: {keys}")
+    expect("import" not in keys, f"import should be too common or stopped: {keys}")
+
+    if fails:
+        print("selftest FAILED:")
+        for f in fails:
+            print(" -", f)
+        raise SystemExit(1)
+    print("selftest ok")
+
+
+def emit(rep: Report, as_json: bool, color: bool) -> None:
+    if as_json:
+        print(json.dumps(report_to_json(rep), indent=2, ensure_ascii=False))
+    else:
+        print(format_human(rep, color))
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="also",
+        description="Show birth-siblings of a source line and whether they drifted.",
+    )
+    p.add_argument("targets", nargs="*", help="FILE:LINE ...")
+    p.add_argument("-n", "--line", type=int, help="line number when FILE is given alone")
+    p.add_argument("-C", "--repo", default=os.getcwd(), help="repository working tree")
+    p.add_argument(
+        "--diff",
+        nargs="?",
+        const="HEAD",
+        metavar="FROM",
+        help="analyze added/replaced literal lines in a diff (default: git diff FROM; FROM=- reads stdin)",
+    )
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--check", action="store_true", help="exit 1 if any sibling drifted")
+    p.add_argument("--max", type=int, default=40, help="max siblings per query")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--version", action="version", version=f"also {VERSION}")
+    args = p.parse_args(argv)
+
+    if args.selftest:
+        run_selftest()
+        return 0
+
+    repo = find_repo(args.repo)
+    color = (not args.no_color) and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    drifted = False
+
+    if args.diff is not None:
+        if args.diff == "-":
+            diff_text = sys.stdin.read()
+        else:
+            diff_text = git(repo, ["diff", "-U0", args.diff])
+            if not isinstance(diff_text, str):
+                diff_text = diff_text.decode("utf-8", "replace")
+        hunks = parse_hunks(diff_text)
+        paid = changed_new_lines(hunks)
+        added = added_from_hunks(hunks)
+        queries = [
+            al
+            for al in added
+            if interesting_for_diff(al.text)
+        ]
+        if not queries:
+            if not args.json:
+                print("also: no literal-bearing added lines in diff")
+            return 1 if args.check else 0
+        reports = []
+        seen_q: set[tuple[str, int]] = set()
+        for al in queries:
+            loc = (al.path, al.line)
+            if loc in seen_q:
+                continue
+            seen_q.add(loc)
+            try:
+                rep = analyze_line(
+                    repo,
+                    al.path,
+                    al.line,
+                    debug=args.debug,
+                    max_sibs=args.max,
+                    paid_locs=paid,
+                )
+            except SystemExit:
+                raise
+            except Exception as e:  # pragma: no cover - defensive
+                print(f"also: skip {al.path}:{al.line}: {e}", file=sys.stderr)
+                continue
+            reports.append(rep)
+            drifted = drifted or has_drift(rep)
+        if args.json:
+            print(json.dumps([report_to_json(r) for r in reports], indent=2, ensure_ascii=False))
+        else:
+            for i, rep in enumerate(reports):
+                if i:
+                    print()
+                    print("---")
+                    print()
+                emit(rep, False, color)
+        return 1 if args.check and drifted else 0
+
+    if not args.targets:
+        p.print_help()
+        return 2
+
+    locs: list[tuple[str, int]] = []
+    if args.line is not None:
+        if len(args.targets) != 1:
+            die("with -n/--line, pass a single FILE")
+        locs.append((args.targets[0], args.line))
+    else:
+        for t in args.targets:
+            locs.append(parse_location(t))
+
+    reports = []
+    for path, line in locs:
+        path = relpath(repo, path)
+        rep = analyze_line(repo, path, line, debug=args.debug, max_sibs=args.max)
+        reports.append(rep)
+        drifted = drifted or has_drift(rep)
+        if not args.json:
+            if len(reports) > 1:
+                print()
+                print("---")
+                print()
+            emit(rep, False, color)
+    if args.json:
+        payload: dict | list = reports[0] if len(reports) == 1 else reports
+        if isinstance(payload, list):
+            print(json.dumps([report_to_json(r) for r in payload], indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(report_to_json(payload), indent=2, ensure_ascii=False))
+    return 1 if args.check and drifted else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0)

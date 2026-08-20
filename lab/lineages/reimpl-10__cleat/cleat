@@ -1,0 +1,2226 @@
+#!/usr/bin/env python3
+"""cleat — mint a locus once; leftover is an import relative to the leftover file."""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import zlib
+from difflib import SequenceMatcher
+from pathlib import Path
+from urllib.parse import urlparse
+
+PREFIX = "cleat1."
+VERSION = "0.1"
+HARD_MAX_BYTES = 48_000_000
+DEFAULT_CTX = 3
+TIE_EPS = 0.02
+MIN_TAIL = 3
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".build",
+    "Coverage",
+}
+
+KEYWORDS = {
+    "def",
+    "return",
+    "from",
+    "import",
+    "as",
+    "class",
+    "fn",
+    "pub",
+    "let",
+    "const",
+    "var",
+    "function",
+    "if",
+    "else",
+    "for",
+    "while",
+    "in",
+    "is",
+    "not",
+    "and",
+    "or",
+    "try",
+    "except",
+    "catch",
+    "throw",
+    "public",
+    "private",
+    "protected",
+    "internal",
+    "struct",
+    "enum",
+    "impl",
+    "trait",
+    "type",
+    "interface",
+    "protocol",
+    "async",
+    "await",
+    "crate",
+    "super",
+    "self",
+    "mut",
+    "use",
+    "module",
+    "package",
+    "true",
+    "false",
+    "none",
+    "null",
+    "this",
+    "new",
+    "static",
+    "export",
+    "default",
+    "func",
+    "void",
+    "where",
+    "match",
+    "case",
+    "break",
+    "continue",
+    "yield",
+    "with",
+    "pass",
+    "lambda",
+    "typeof",
+    "sizeof",
+}
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DEF_RE = re.compile(
+    r"^\s*(?:(?:pub(?:\([^)]*\))?|async|export|static|public|private|"
+    r"protected|internal|override|open|final|mut|crate)\s+)*"
+    r"(?:def|fn|func|function|class|struct|enum|impl|trait|type|"
+    r"interface|protocol|extension)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+STORE_TRUE = {
+    "porcelain",
+    "json",
+    "strict",
+    "any_repo",
+    "pretty",
+    "selftest",
+    "help",
+    "version",
+}
+
+
+class CleatError(Exception):
+    def __init__(self, msg: str, code: int = 1):
+        super().__init__(msg)
+        self.code = code
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+def die(msg: str, code: int = 1) -> None:
+    eprint(f"cleat: {msg}")
+    raise SystemExit(code)
+
+
+# --- git / snapshot ----------------------------------------------------------
+
+
+def run_git(repo: str, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+    )
+    if check and r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        raise CleatError(err or f"git {' '.join(args)} failed", 2)
+    return r
+
+
+def git_text(repo: str, args: list[str], check: bool = True) -> str:
+    r = run_git(repo, args, check=check)
+    return (r.stdout or b"").decode("utf-8", "replace")
+
+
+def git_ok(repo: str, args: list[str]) -> bool:
+    return run_git(repo, args, check=False).returncode == 0
+
+
+def discover_repo(directory: str) -> str | None:
+    p = Path(directory).resolve()
+    if (p / ".git").exists():
+        return str(p)
+    r = subprocess.run(
+        ["git", "-C", str(p), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == 0:
+        return r.stdout.strip()
+    return None
+
+
+def resolve_ref(repo: str, ref: str) -> str:
+    r = run_git(repo, ["rev-parse", "--verify", ref], check=False)
+    if r.returncode != 0:
+        raise CleatError(f"unknown ref: {ref}", 2)
+    return (r.stdout or b"").decode().strip()
+
+
+def norm_remote(url: str) -> str:
+    u = url.strip()
+    if not u:
+        return u
+    if u.startswith("git@"):
+        rest = u[4:]
+        if ":" in rest:
+            host, path = rest.split(":", 1)
+            path = path.removesuffix(".git").strip("/")
+            return f"{host}/{path}"
+    parsed = urlparse(u)
+    if parsed.scheme == "file":
+        return str(Path(parsed.path).resolve())
+    if parsed.scheme in ("http", "https", "ssh", "git"):
+        host = parsed.hostname or ""
+        path = (parsed.path or "").removesuffix(".git").strip("/")
+        return f"{host}/{path}"
+    if u.endswith(".git"):
+        u = u[:-4]
+    return u
+
+
+def collect_remotes(repo: str) -> list[str]:
+    r = run_git(repo, ["remote", "-v"], check=False)
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        n = norm_remote(parts[1])
+        if n and n not in seen:
+            seen.add(n)
+            found.append(n)
+    return found
+
+
+def follow_local_remotes(repo: str) -> list[str]:
+    remotes = collect_remotes(repo)
+    extra: list[str] = []
+    r = run_git(repo, ["remote", "get-url", "origin"], check=False)
+    if r.returncode != 0:
+        return remotes
+    origin = (r.stdout or b"").decode().strip()
+    path = None
+    if origin.startswith("/") or origin.startswith("file://"):
+        path = origin[7:] if origin.startswith("file://") else origin
+    if path:
+        try:
+            hop = str(Path(path).resolve())
+            if hop != str(Path(repo).resolve()) and Path(hop, ".git").exists() or (
+                Path(hop).exists() and discover_repo(hop)
+            ):
+                extra.extend(collect_remotes(hop))
+        except OSError:
+            pass
+    merged: list[str] = []
+    seen: set[str] = set()
+    for x in remotes + extra:
+        if x not in seen:
+            seen.add(x)
+            merged.append(x)
+    return merged
+
+
+def collect_witnesses(repo: str, extra: list[str] | None = None) -> list[str]:
+    w: list[str] = []
+    seen: set[str] = set()
+
+    def add(sha: str) -> None:
+        sha = sha.strip()
+        if sha and sha not in seen and re.fullmatch(r"[0-9a-f]{7,40}", sha):
+            seen.add(sha)
+            w.append(sha)
+
+    for x in extra or []:
+        add(x)
+    head = git_text(repo, ["rev-parse", "HEAD"], check=False).strip()
+    add(head)
+    tips = git_text(repo, ["rev-list", "-n", "4", "--all"], check=False)
+    for line in tips.splitlines():
+        add(line)
+        if len(w) >= 8:
+            break
+    return w
+
+
+def origin_payload(repo: str | None, from_sha: str | None = None) -> dict | None:
+    if not repo:
+        return None
+    remotes = follow_local_remotes(repo)
+    witnesses = collect_witnesses(repo, [from_sha] if from_sha else None)
+    if not remotes and not witnesses:
+        return None
+    return {"r": remotes, "w": witnesses}
+
+
+def origin_str(o: dict | None) -> str:
+    if not o:
+        return "-"
+    r = ",".join(o.get("r") or [])
+    w = ",".join((x[:12] for x in (o.get("w") or [])[:4]))
+    return f"cleat1:r:{r};w:{w}"
+
+
+def dest_has_witness(repo: str, sha: str) -> bool:
+    return git_ok(repo, ["cat-file", "-e", f"{sha}^{{commit}}"]) or git_ok(
+        repo, ["cat-file", "-e", sha]
+    )
+
+
+def origins_match(token_o: dict | None, dest_repo: str | None, dest_o: dict | None) -> bool:
+    if not token_o and not dest_o:
+        return True
+    if not token_o or not dest_o:
+        return False
+    tr = set(token_o.get("r") or [])
+    dr = set(dest_o.get("r") or [])
+    if tr and dr and tr & dr:
+        return True
+    if dest_repo:
+        for w in token_o.get("w") or []:
+            if dest_has_witness(dest_repo, w):
+                return True
+    return False
+
+
+def skipped_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    return any(p in SKIP_DIRS for p in parts)
+
+
+def list_git_paths(repo: str, ref: str) -> list[str]:
+    raw = git_text(repo, ["ls-tree", "-r", "--name-only", "-z", ref])
+    paths = [nfc(p) for p in raw.split("\0") if p]
+    return [p for p in paths if not skipped_path(p)]
+
+
+def git_show_file(repo: str, ref: str, path: str) -> str | None:
+    r = run_git(repo, ["show", f"{ref}:{path}"], check=False)
+    if r.returncode != 0:
+        for alt in (nfc(path), unicodedata.normalize("NFD", path)):
+            if alt != path:
+                r = run_git(repo, ["show", f"{ref}:{alt}"], check=False)
+                if r.returncode == 0:
+                    break
+        else:
+            return None
+    data = r.stdout or b""
+    if b"\0" in data[:4096]:
+        return None
+    if len(data) > HARD_MAX_BYTES:
+        raise CleatError(f"file exceeds {HARD_MAX_BYTES} bytes")
+    return data.decode("utf-8", "replace")
+
+
+def walk_dir_files(root: str) -> list[str]:
+    out: list[str] = []
+    root_p = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir != "." and skipped_path(rel_dir):
+            continue
+        for name in filenames:
+            rel = name if rel_dir == "." else os.path.join(rel_dir, name)
+            rel = rel.replace(os.sep, "/")
+            if skipped_path(rel):
+                continue
+            out.append(nfc(rel))
+    return out
+
+
+def read_dir_file(root: str, rel: str) -> str | None:
+    p = Path(root, rel)
+    if not p.is_file():
+        for cand in Path(root).rglob("*"):
+            if cand.is_file() and nfc(str(cand.relative_to(root)).replace(os.sep, "/")) == nfc(rel):
+                p = cand
+                break
+        else:
+            return None
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    if size > HARD_MAX_BYTES:
+        eprint(f"cleat: skipping huge file {rel} ({size} bytes)")
+        return None
+    data = p.read_bytes()
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+class Snapshot:
+    def __init__(self, kind: str, root: str, ref: str | None = None):
+        self.kind = kind
+        self.root = root
+        self.ref = ref
+        self._paths: list[str] | None = None
+        self._cache: dict[str, str | None] = {}
+
+    def paths(self) -> list[str]:
+        if self._paths is None:
+            if self.kind == "git":
+                self._paths = list_git_paths(self.root, self.ref or "HEAD")
+            else:
+                self._paths = walk_dir_files(self.root)
+        return self._paths
+
+    def read(self, path: str, mint: bool = False) -> str | None:
+        key = path
+        if key in self._cache:
+            return self._cache[key]
+        if self.kind == "git":
+            text = git_show_file(self.root, self.ref or "HEAD", path)
+        else:
+            p = Path(self.root, path)
+            if mint and p.is_file() and p.stat().st_size > HARD_MAX_BYTES:
+                raise CleatError(f"file exceeds {HARD_MAX_BYTES} bytes")
+            if not mint and p.is_file() and p.stat().st_size > HARD_MAX_BYTES:
+                eprint(f"cleat: skipping huge file {path} ({p.stat().st_size} bytes)")
+                text = None
+            else:
+                text = read_dir_file(self.root, path)
+        self._cache[key] = text
+        return text
+
+    def find_path(self, want: str) -> str | None:
+        want_nfc = nfc(want)
+        want_nfd = unicodedata.normalize("NFD", want)
+        paths = self.paths()
+        for p in paths:
+            if p == want or p == want_nfc or p == want_nfd:
+                return p
+            if nfc(p) == want_nfc:
+                return p
+        # mint may name a path not in the filtered index (vendor)
+        if self.kind == "git":
+            raw = git_text(self.root, ["ls-tree", "-r", "--name-only", "-z", self.ref or "HEAD"])
+            for p in raw.split("\0"):
+                if not p:
+                    continue
+                if nfc(p) == want_nfc or p == want or unicodedata.normalize("NFD", p) == unicodedata.normalize("NFD", want):
+                    return p
+        else:
+            p = Path(self.root, want)
+            if p.is_file():
+                return want.replace(os.sep, "/")
+        return None
+
+
+# --- source shape ------------------------------------------------------------
+
+
+def is_def_line(line: str) -> bool:
+    return bool(DEF_RE.match(line))
+
+
+def def_name(line: str) -> str | None:
+    m = DEF_RE.match(line)
+    return m.group(1) if m else None
+
+
+def is_comment_or_attr(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    return (
+        s.startswith("#")
+        or s.startswith("//")
+        or s.startswith("/*")
+        or s.startswith("*")
+        or s.startswith("///")
+        or s.startswith("--")
+        or s.startswith("@")
+        or s.startswith("#[")
+        or s.startswith("//!")
+    )
+
+
+def strip_noise(text: str) -> str:
+    text = re.sub(r'"""[\s\S]*?"""', " ", text)
+    text = re.sub(r"'''[\s\S]*?'''", " ", text)
+    text = re.sub(r"/\*[\s\S]*?\*/", " ", text)
+    out = []
+    for line in text.splitlines():
+        s = line
+        if "//" in s and not s.strip().startswith(("http://", "https://")):
+            s = re.sub(r"//.*", "", s)
+        if "#" in s:
+            stripped = s.lstrip()
+            if stripped.startswith("#"):
+                s = ""
+            else:
+                s = re.sub(r"\s+#.*", "", s)
+        out.append(s)
+    return "\n".join(out)
+
+
+def enclosing_span(lines: list[str], idx: int) -> tuple[int, int, int]:
+    start = idx
+    while start > 0 and not is_def_line(lines[start]):
+        start -= 1
+    comment_start = start
+    while comment_start > 0 and is_comment_or_attr(lines[comment_start - 1]):
+        comment_start -= 1
+    end = idx
+    while end + 1 < len(lines) and not is_def_line(lines[end + 1]):
+        end += 1
+    return comment_start, start, end
+
+
+def impl_lines(lines: list[str], def_i: int, end: int) -> list[str]:
+    out = []
+    for i in range(def_i + 1, end + 1):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s.startswith(("#", "//", "/*", "*", '"""', "'''", "///")):
+            continue
+        if (s.startswith('"""') or s.startswith("'''")) and s.endswith(('"""', "'''")):
+            continue
+        if is_def_line(lines[i]):
+            continue
+        out.append(s)
+    return out
+
+
+def idents_of(line: str) -> list[str]:
+    found = []
+    seen = set()
+    for m in IDENT_RE.finditer(line):
+        w = m.group(0)
+        if w.lower() in KEYWORDS or w in seen:
+            continue
+        seen.add(w)
+        found.append(w)
+    return found
+
+
+def nearest_anchors(lines: list[str], idx: int, limit: int = 4) -> list[str]:
+    names: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        n = def_name(line)
+        if n:
+            names.append((i, n))
+    if not names:
+        return []
+    names.sort(key=lambda t: abs(t[0] - idx))
+    out = []
+    seen = set()
+    for i, n in names:
+        if i == idx:
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def too_trivial(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if s in {"}", "{", "};", ");", "]", "[", "pass", "...", "()", "{}", "[]"}:
+        return True
+    if len(s) < 2:
+        return True
+    return False
+
+
+def parse_locator(spec: str) -> tuple[str, int]:
+    idx = spec.rfind(":")
+    if idx <= 0:
+        raise CleatError(f"not a locator: {spec}", 2)
+    line_s = spec[idx + 1 :]
+    if not line_s.isdigit():
+        raise CleatError(f"not a locator: {spec}", 2)
+    return spec[:idx], int(line_s)
+
+
+def dest_module(path: str) -> str:
+    p = path.replace("\\", "/")
+    if p.endswith("/__init__.py"):
+        p = p[: -len("/__init__.py")]
+    else:
+        p = re.sub(r"\.[A-Za-z0-9]+$", "", p)
+    return p.replace("/", ".")
+
+
+def suffix_identity(mod: str, form: str) -> bool:
+    if not form or not mod:
+        return False
+    return mod == form or mod.endswith("." + form)
+
+
+def is_stem_split(old: str, new: str) -> bool:
+    stem, _ext = os.path.splitext(old.replace("\\", "/"))
+    return new.replace("\\", "/").startswith(stem + "/")
+
+
+def parse_import_names(blob: str) -> list[str]:
+    blob = blob.replace("(", " ").replace(")", " ").replace("\\", " ")
+    names = []
+    for part in blob.split(","):
+        part = part.strip()
+        if not part or part == "*":
+            continue
+        tok = part.split()
+        if not tok:
+            continue
+        if tok[0] == "as" and len(tok) > 1:
+            continue
+        names.append(tok[0].strip())
+    return names
+
+
+def python_from_imports(text: str) -> list[tuple[str, list[str]]]:
+    hits: list[tuple[str, list[str]]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        s = raw.strip()
+        m = re.match(r"from\s+(\S+)\s+import\s+(.*)$", s)
+        if m:
+            spec, rest = m.group(1), m.group(2)
+            if rest.strip().startswith("(") and ")" not in rest:
+                parts = [rest]
+                i += 1
+                while i < len(lines) and ")" not in lines[i]:
+                    parts.append(lines[i])
+                    i += 1
+                if i < len(lines):
+                    parts.append(lines[i])
+                rest = " ".join(parts)
+            hits.append((spec, parse_import_names(rest)))
+        i += 1
+    return hits
+
+
+def relative_tails(spec: str) -> list[str]:
+    """Tails spelled relative to the leftover file. Short last components drop."""
+    if not spec.startswith("."):
+        return []
+    rest = spec.lstrip(".")
+    if not rest:
+        return []
+    rest = rest.replace("/", ".")
+    last = rest.split(".")[-1]
+    if len(last) < MIN_TAIL:
+        return []
+    return [rest]
+
+
+def js_relative_specs(text: str) -> list[tuple[str, list[str]]]:
+    hits: list[tuple[str, list[str]]] = []
+    for m in re.finditer(
+        r"(?:require\(\s*['\"](\.[^'\"]+)['\"]\s*\)|from\s+['\"](\.[^'\"]+)['\"])",
+        text,
+    ):
+        spec = m.group(1) or m.group(2)
+        if not spec:
+            continue
+        # names from destructure on the same statement-ish window
+        start = max(0, m.start() - 80)
+        window = text[start : m.end() + 10]
+        names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:", window)
+        names += re.findall(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)", window)
+        hits.append((spec, names))
+    return hits
+
+
+def rust_paths(text: str) -> list[tuple[str, str]]:
+    """(module, name) from crate::mod::name."""
+    out = []
+    for m in re.finditer(r"(?:crate|super|self)::([A-Za-z_][A-Za-z0-9_:]*)", text):
+        parts = m.group(1).split("::")
+        if len(parts) < 2:
+            continue
+        name = parts[-1]
+        mod = ".".join(parts[:-1])
+        out.append((mod, name))
+    return out
+
+
+def importlib_modules(text: str) -> list[str]:
+    return re.findall(r"import_module\(\s*['\"]([^'\"]+)['\"]", text)
+
+
+def forms_for_locus(text: str, leftover_path: str, locus: str | None) -> list[str]:
+    """Parse leftover *grammar* of this name. Not substring search of dest paths."""
+    clean = strip_noise(text)
+    forms: list[str] = []
+    seen: set[str] = set()
+
+    def add(form: str) -> None:
+        form = form.strip().strip(".")
+        if not form or form in seen:
+            return
+        last = form.split(".")[-1]
+        if "." not in form and len(last) < MIN_TAIL:
+            return
+        seen.add(form)
+        forms.append(form)
+
+    locus_ok = {locus} if locus else set()
+
+    for spec, names in python_from_imports(clean):
+        name_hit = bool(locus and any(n == locus for n in names))
+        if spec.startswith("."):
+            if name_hit or (locus and _alias_used_for(clean, names, locus)):
+                for t in relative_tails(spec):
+                    add(t)
+            continue
+        if name_hit:
+            add(spec)
+            continue
+        # from pkg import mod  +  mod.locus()
+        if locus:
+            for n in names:
+                if re.search(rf"\b{re.escape(n)}\.{re.escape(locus)}\b", clean):
+                    add(spec + "." + n)
+
+    if locus:
+        for spec, names in js_relative_specs(clean):
+            spec_n = spec.split("?")[0]
+            spec_n = re.sub(r"\.[A-Za-z0-9]+$", "", spec_n)
+            rel = spec_n.replace("\\", "/")
+            if rel.startswith("./"):
+                rel = "." + rel[2:]
+            elif not rel.startswith("."):
+                rel = "." + rel
+            rel_mod = rel.replace("/", ".")
+            if locus in names or _js_require_in_fn(clean, leftover_path, locus):
+                for t in relative_tails(rel_mod if rel_mod.startswith(".") else "." + rel_mod.lstrip(".")):
+                    add(t)
+                # ./math/ops → math.ops already; also ops tail if spelled
+                rest = rel_mod.lstrip(".")
+                if rest:
+                    add(rest) if len(rest.split(".")[-1]) >= MIN_TAIL else None
+
+        for mod, name in rust_paths(clean):
+            if name == locus:
+                add(mod)
+                add("src." + mod)
+
+        for mod in importlib_modules(clean):
+            if re.search(rf"\.{re.escape(locus)}\b", clean) or True:
+                # import_module("src.math.ops") used as the re-export vehicle
+                if _importlib_for_locus(clean, mod, locus):
+                    add(mod)
+
+    return forms
+
+
+def _alias_used_for(text: str, names: list[str], locus: str) -> bool:
+    return locus in names
+
+
+def _js_require_in_fn(text: str, _path: str, locus: str) -> bool:
+    # leftover function that require()s and returns — count as this name
+    if not locus:
+        return False
+    return bool(re.search(rf"(?:function|def|fn|const|let|var)\s+{re.escape(locus)}\b", text))
+
+
+def _importlib_for_locus(text: str, mod: str, locus: str) -> bool:
+    if re.search(rf"{re.escape(mod.split('.')[-1])}\.{re.escape(locus)}\b", text):
+        return True
+    if re.search(rf"import_module\(\s*['\"]{re.escape(mod)}['\"]", text) and re.search(
+        rf"\.{re.escape(locus)}\s*\(", text
+    ):
+        return True
+    if re.search(rf"import_module\(\s*['\"]{re.escape(mod)}['\"]", text) and re.search(
+        rf"(?:def|fn|function)\s+{re.escape(locus)}\b", text
+    ):
+        return True
+    return False
+
+
+def leftover_is_def_reexport(text: str, locus: str | None, ib: list[str]) -> bool:
+    if not locus:
+        return False
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if def_name(line) != locus:
+            continue
+        _, d0, d1 = enclosing_span(lines, i)
+        body = "\n".join(lines[d0 : d1 + 1])
+        if ib and all(x in body for x in ib):
+            return False
+        if re.search(r"\b(from|import|require|import_module|crate::)\b", body) or re.search(
+            r"return\s+\w+\(", body
+        ):
+            return True
+        # module-level import + thin wrapper
+    if re.search(rf"\bimport\b.*\b{re.escape(locus)}\b", text) and re.search(
+        rf"(?:def|fn|function)\s+{re.escape(locus)}\b", text
+    ):
+        # body of that def does not hold ib
+        for i, line in enumerate(lines):
+            if def_name(line) == locus:
+                _, d0, d1 = enclosing_span(lines, i)
+                body = "\n".join(lines[d0 : d1 + 1])
+                if not ib or not any(x in body for x in ib):
+                    return True
+    return False
+
+
+def count_defs(text: str) -> int:
+    return sum(1 for line in text.splitlines() if is_def_line(line))
+
+
+def file_has_body(text: str, ib: list[str]) -> int:
+    if not ib:
+        return 0
+    return sum(1 for x in ib if x in text)
+
+
+# --- token -------------------------------------------------------------------
+
+
+def b64enc(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def b64dec(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode(s + pad)
+    except Exception as ex:
+        raise CleatError(f"corrupt pin: {ex}") from ex
+
+
+def encode_token(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return PREFIX + b64enc(zlib.compress(raw, 9))
+
+
+def decode_token(tok: str) -> dict:
+    if not tok.startswith(PREFIX):
+        raise CleatError("corrupt pin: not a cleat token")
+    blob = tok[len(PREFIX) :]
+    if len(blob) < 8:
+        raise CleatError("corrupt pin: truncated")
+    try:
+        raw = zlib.decompress(b64dec(blob))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as ex:
+        raise CleatError(f"corrupt pin: {ex}") from ex
+    if not isinstance(payload, dict) or "p" not in payload or "n" not in payload:
+        raise CleatError("corrupt pin: missing fields")
+    return payload
+
+
+def looks_like_token(s: str) -> bool:
+    return s.startswith(PREFIX)
+
+
+def looks_like_locator(s: str) -> bool:
+    if looks_like_token(s):
+        return False
+    idx = s.rfind(":")
+    return idx > 0 and s[idx + 1 :].isdigit()
+
+
+# --- mint --------------------------------------------------------------------
+
+
+def mint_from_snapshot(snap: Snapshot, locator: str, ctx: int, origin: dict | None) -> dict:
+    path, line_no = parse_locator(locator)
+    path = nfc(path)
+    found = snap.find_path(path)
+    if not found:
+        raise CleatError(f"path not found: {path}", 2)
+    text = snap.read(found, mint=True)
+    if text is None:
+        raise CleatError(f"cannot read {found}", 2)
+    lines = text.splitlines()
+    if line_no < 1 or line_no > len(lines):
+        raise CleatError(f"line {line_no} out of range in {found}", 2)
+    idx = line_no - 1
+    line = lines[idx]
+    if too_trivial(line):
+        raise CleatError("too trivial to mint")
+    c0, d0, d1 = enclosing_span(lines, idx)
+    fn = def_name(lines[d0]) if is_def_line(lines[d0]) else def_name(line)
+    before = lines[max(c0, idx - ctx) : idx]
+    after = lines[idx + 1 : min(d1 + 1, idx + 1 + ctx)]
+    ib = impl_lines(lines, d0, d1)
+    k = idents_of(line)
+    # unique-in-file identifiers on this line
+    counts: dict[str, int] = {}
+    for ln in lines:
+        for w in idents_of(ln):
+            counts[w] = counts.get(w, 0) + 1
+    unique = [w for w in k if counts.get(w, 0) == 1 and (len(w) >= 6 or w[:1].isupper())]
+    if not unique:
+        unique = [w for w in k if counts.get(w, 0) <= 2]
+    anchors = nearest_anchors(lines, idx)
+    payload = {
+        "v": 2,
+        "p": nfc(found),
+        "n": line_no,
+        "t": line,
+        "k": k[:8],
+        "u": unique[:6],
+        "e": before[-ctx:],
+        "b": after[:ctx],
+        "ib": ib[:8],
+        "a": anchors[:4],
+        "fn": fn,
+        "cx": ctx,
+    }
+    if origin:
+        payload["o"] = origin
+    return payload
+
+
+# --- resolve -----------------------------------------------------------------
+
+
+class Cand:
+    __slots__ = ("path", "line", "text", "score", "exact")
+
+    def __init__(self, path: str, line: int, text: str, score: float, exact: bool):
+        self.path = path
+        self.line = line
+        self.text = text
+        self.score = score
+        self.exact = exact
+
+    @property
+    def loc(self) -> str:
+        return f"{self.path}:{self.line}"
+
+
+def line_score(payload: dict, path: str, lineno: int, line: str, file_text: str) -> float:
+    t = payload["t"]
+    exact = line.strip() == t.strip()
+    if exact:
+        base = 0.92
+    else:
+        base = 0.45 * SequenceMatcher(None, t.strip(), line.strip()).ratio()
+        id_src = set(payload.get("k") or [])
+        id_dst = set(idents_of(line))
+        if id_src:
+            base += 0.25 * (len(id_src & id_dst) / len(id_src))
+        if payload.get("fn") and payload["fn"] in line:
+            base += 0.15
+    ib = payload.get("ib") or []
+    if ib:
+        base += 0.08 * (file_has_body(file_text, ib) / max(1, len(ib)))
+    neigh = (payload.get("e") or []) + (payload.get("b") or [])
+    if neigh:
+        n_hit = sum(1 for x in neigh if x.strip() and x.strip() in file_text)
+        base += 0.05 * (n_hit / len(neigh))
+    if is_stem_split(payload["p"], path):
+        base += 0.04
+    elif os.path.basename(payload["p"]) == os.path.basename(path):
+        base += 0.02
+    return min(1.0, base)
+
+
+def collect_candidates(snap: Snapshot, payload: dict) -> list[Cand]:
+    tstrip = payload["t"].strip()
+    rare = [x for x in (payload.get("u") or []) if len(x) >= 5]
+    keys = rare or [x for x in (payload.get("k") or []) if len(x) >= 4]
+    fn = payload.get("fn")
+    cands: list[Cand] = []
+    for path in snap.paths():
+        text = snap.read(path)
+        if text is None:
+            continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            exact = line.strip() == tstrip
+            hit = exact
+            if not hit and keys:
+                if any(k in line for k in keys) and (
+                    is_def_line(line) or line.strip() == tstrip or (fn and fn in line)
+                ):
+                    hit = True
+            if not hit:
+                continue
+            sc = line_score(payload, path, i + 1, line, text)
+            if exact:
+                sc = max(sc, 0.9)
+            if sc < 0.42 and not exact:
+                continue
+            cands.append(Cand(path, i + 1, line, sc, exact))
+    return cands
+
+
+def origin_exact_cands(cands: list[Cand], payload: dict) -> list[Cand]:
+    op, on = payload["p"], payload["n"]
+    same = [c for c in cands if c.path == op and c.exact]
+    if not same:
+        return []
+    at_line = [c for c in same if c.line == on]
+    return at_line or same
+
+
+def origin_holds_body(snap: Snapshot, payload: dict) -> bool:
+    path = snap.find_path(payload["p"])
+    if not path:
+        return False
+    text = snap.read(path)
+    if text is None:
+        return False
+    ib = payload.get("ib") or []
+    tstrip = payload["t"].strip()
+    if tstrip in text and not leftover_is_def_reexport(text, payload.get("fn"), ib):
+        # exact line still present and not a thin re-export of this locus
+        if ib:
+            return file_has_body(text, ib) >= max(1, int(0.4 * len(ib) + 0.999)) or (
+                file_has_body(text, ib) >= 1 and bool(payload.get("fn") and def_present(text, payload["fn"]))
+            )
+        return True
+    if not ib:
+        return tstrip in text
+    hits = file_has_body(text, ib)
+    if hits >= max(1, int(0.4 * len(ib) + 0.999)):
+        return True
+    if hits >= 1 and payload.get("fn") and def_present(text, payload["fn"]):
+        # local edit: some impl remains in the file
+        if leftover_is_def_reexport(text, payload.get("fn"), ib) and hits == 0:
+            return False
+        # leftover wrappers typically keep zero ib lines
+        if leftover_is_def_reexport(text, payload.get("fn"), ib):
+            # only hold if ib still lives in *this* file and the wrapper is not the only home
+            # DESTROYER: sibling fn in same file is a remaining body
+            return hits >= 1 and not pointer_forms_exist(text, path, payload)
+        return True
+    return False
+
+
+def def_present(text: str, name: str) -> bool:
+    return any(def_name(ln) == name for ln in text.splitlines())
+
+
+def pointer_forms_exist(text: str, path: str, payload: dict) -> bool:
+    return bool(forms_for_locus(text, path, payload.get("fn")))
+
+
+def match_forms(forms: list[str], dest_mod: str) -> bool:
+    return any(suffix_identity(dest_mod, f) for f in forms)
+
+
+def leftover_named_dests(
+    snap: Snapshot, payload: dict, leftover_text: str, leftover_path: str
+) -> list[str]:
+    forms = forms_for_locus(leftover_text, leftover_path, payload.get("fn"))
+    if not forms:
+        return []
+    named: list[str] = []
+    for path in snap.paths():
+        if path == leftover_path:
+            continue
+        mod = dest_module(path)
+        if match_forms(forms, mod):
+            named.append(path)
+    return named
+
+
+def pick_leftover_pointer(snap: Snapshot, payload: dict, cands: list[Cand]) -> Cand | None:
+    op = payload["p"]
+    leftover_path = snap.find_path(op)
+    if not leftover_path:
+        return None
+    leftover_text = snap.read(leftover_path)
+    if leftover_text is None:
+        return None
+    named = leftover_named_dests(snap, payload, leftover_text, leftover_path)
+    if not named:
+        return None
+    ib = payload.get("ib") or []
+    named_cands = [c for c in cands if c.path in named]
+    # prefer exact / def of locus inside named files
+    if not named_cands:
+        for path in named:
+            text = snap.read(path)
+            if text is None:
+                continue
+            lines = text.splitlines()
+            fn = payload.get("fn")
+            pick_i = None
+            for i, ln in enumerate(lines):
+                if ln.strip() == payload["t"].strip():
+                    pick_i = i
+                    break
+                if fn and def_name(ln) == fn:
+                    pick_i = i
+                    break
+            if pick_i is None:
+                pick_i = 0
+            sc = line_score(payload, path, pick_i + 1, lines[pick_i], text)
+            named_cands.append(Cand(path, pick_i + 1, lines[pick_i], sc, lines[pick_i].strip() == payload["t"].strip()))
+
+    unique_paths = sorted(set(c.path for c in named_cands))
+    if len(unique_paths) == 1:
+        group = [c for c in named_cands if c.path == unique_paths[0]]
+        return best_cand(group)
+
+    if leftover_is_def_reexport(leftover_text, payload.get("fn"), ib):
+        rich: list[tuple[int, str]] = []
+        for path in unique_paths:
+            text = snap.read(path) or ""
+            if ib and file_has_body(text, ib) < 1:
+                continue
+            rich.append((count_defs(text), path))
+        if rich:
+            rich.sort(reverse=True)
+            top = rich[0][0]
+            tops = [p for n, p in rich if n == top]
+            # strictly more defs than the rest
+            if len(tops) == 1 and (len(rich) == 1 or rich[1][0] < top):
+                group = [c for c in named_cands if c.path == tops[0]]
+                return best_cand(group)
+    return None  # ambiguous named dests: caller may refuse
+
+
+def leftover_named_ambiguous(snap: Snapshot, payload: dict) -> list[str] | None:
+    op = payload["p"]
+    leftover_path = snap.find_path(op)
+    if not leftover_path:
+        return None
+    leftover_text = snap.read(leftover_path)
+    if leftover_text is None:
+        return None
+    named = leftover_named_dests(snap, payload, leftover_text, leftover_path)
+    if len(named) >= 2:
+        return named
+    return None
+
+
+def best_cand(group: list[Cand]) -> Cand:
+    return sorted(group, key=lambda c: (-c.score, -int(c.exact), c.path, c.line))[0]
+
+
+def unique_exact(cands: list[Cand], payload: dict) -> Cand | None:
+    exact = [c for c in cands if c.exact]
+    if len(exact) == 1:
+        return exact[0]
+    rare = payload.get("u") or []
+    if rare and len(exact) > 1:
+        rare_hits = [c for c in exact if any(u in c.text for u in rare)]
+        files = {c.path for c in rare_hits}
+        if len(files) == 1:
+            return best_cand(rare_hits)
+    return None
+
+
+def unique_stem(cands: list[Cand], payload: dict) -> Cand | None:
+    op = payload["p"]
+    stem = [c for c in cands if is_stem_split(op, c.path)]
+    files = {c.path for c in stem}
+    if len(files) == 1:
+        return best_cand(stem)
+    exact_stem = [c for c in stem if c.exact]
+    files = {c.path for c in exact_stem}
+    if len(files) == 1:
+        return best_cand(exact_stem)
+    return None
+
+
+def origin_file_exists(snap: Snapshot, payload: dict) -> bool:
+    return snap.find_path(payload["p"]) is not None
+
+
+def finalize_score(payload: dict, cand: Cand, n_exact: int) -> float:
+    if cand.exact:
+        rare = payload.get("u") or []
+        rare_hit = any(u in cand.text for u in rare)
+        if n_exact == 1 or rare_hit or cand.path == payload["p"]:
+            return 1.0
+        # leftover landing: exact text, not unique
+        return round(min(0.998, max(0.90, cand.score)), 3)
+    return round(min(0.999, cand.score), 3)
+
+
+def label_others(
+    payload: dict,
+    snap: Snapshot,
+    landing: Cand,
+    cands: list[Cand],
+    holds: bool,
+    is_stub: bool,
+) -> list[str]:
+    notes: list[str] = []
+    seen_paths: set[str] = set()
+    ib = payload.get("ib") or []
+    origin = payload["p"]
+    origin_base = os.path.basename(origin)
+
+    def loc_for(path: str, fallback_line: int = 1) -> str:
+        exacts = [c for c in cands if c.path == path]
+        if exacts:
+            c = best_cand(exacts)
+            return c.loc
+        text = snap.read(path) or ""
+        fn = payload.get("fn")
+        for i, ln in enumerate(text.splitlines()):
+            if fn and def_name(ln) == fn:
+                return f"{path}:{i + 1}"
+            if ln.strip() == payload["t"].strip():
+                return f"{path}:{i + 1}"
+        return f"{path}:{fallback_line}"
+
+    if is_stub and origin_file_exists(snap, payload) and landing.path != origin:
+        notes.append(f"skipped leftover stub {loc_for(origin)}")
+        seen_paths.add(origin)
+
+    for c in sorted(cands, key=lambda x: x.path):
+        if c.path == landing.path or c.path in seen_paths:
+            continue
+        text = snap.read(c.path) or ""
+        has_body = file_has_body(text, ib) >= 1 if ib else c.exact
+        # Same-basename copies are bait, even when they still have a body
+        # window. The extract is the other file (stem-split or renamed).
+        if c.path != origin and os.path.basename(c.path) == origin_base:
+            notes.append(f"basename bait {c.loc}")
+            seen_paths.add(c.path)
+            continue
+        if holds and has_body:
+            # Origin-won identity clones (`import {`, shared transform
+            # lines) are skipped paths, not extracts. An extract still
+            # implements this locus (def of fn) or is a stem-split copy.
+            fn = payload.get("fn")
+            dest_has_fn = bool(fn) and def_present(text, fn)
+            if dest_has_fn or is_stem_split(origin, c.path):
+                notes.append(f"skipped extracted copy {c.loc}")
+                seen_paths.add(c.path)
+            continue
+        if is_stub and has_body and is_stem_split(origin, c.path):
+            notes.append(f"extracted copy {c.loc}")
+            seen_paths.add(c.path)
+            continue
+        if is_stub and has_body and c.path != landing.path:
+            notes.append(f"extracted copy {c.loc}")
+            seen_paths.add(c.path)
+    return notes
+
+
+def classify(payload: dict, cand: Cand) -> str:
+    if cand.path == payload["p"]:
+        if cand.text.strip() == payload["t"].strip():
+            return "same" if cand.line == payload["n"] else "shifted"
+        return "edited"
+    return "moved"
+
+
+def resolve_payload(
+    snap: Snapshot, payload: dict, dest_empty_error: bool
+) -> dict:
+    paths = snap.paths()
+    if dest_empty_error and not paths:
+        raise CleatError("empty dest", 2)
+    cands = collect_candidates(snap, payload)
+    holds = origin_holds_body(snap, payload)
+    origin_ex = origin_exact_cands(cands, payload)
+    is_stub = False
+    leftover_path = snap.find_path(payload["p"])
+    leftover_text = snap.read(leftover_path) if leftover_path else None
+    if leftover_text is not None and not holds:
+        is_stub = leftover_is_def_reexport(leftover_text, payload.get("fn"), payload.get("ib") or []) or bool(
+            forms_for_locus(leftover_text, leftover_path or "", payload.get("fn"))
+        )
+
+    landing: Cand | None = None
+    ambiguous_locs: list[str] | None = None
+    note_bits: list[str] = []
+
+    if holds and origin_ex:
+        landing = best_cand(origin_ex)
+        is_stub = False
+    elif holds and leftover_path:
+        text = leftover_text or ""
+        lines = text.splitlines()
+        n = min(payload["n"], len(lines))
+        line = lines[n - 1] if n else (lines[0] if lines else "")
+        landing = Cand(leftover_path, n or 1, line, 1.0, line.strip() == payload["t"].strip())
+        is_stub = False
+    else:
+        ptr = pick_leftover_pointer(snap, payload, cands)
+        if ptr:
+            landing = ptr
+            is_stub = True
+            if landing.path != payload["p"]:
+                note_bits.append("path or surrounding file changed")
+        else:
+            amb = leftover_named_ambiguous(snap, payload)
+            # leftover named dests that we could not unique-pick: refuse
+            if amb:
+                locs = []
+                for p in amb:
+                    group = [c for c in cands if c.path == p]
+                    locs.append(group[0].loc if group else f"{p}:1")
+                ambiguous_locs = locs
+            else:
+                # origin gone / no pointer: unique exact, then stem-split
+                u = unique_exact(cands, payload)
+                if u and not (
+                    u.exact
+                    and payload["t"].strip() in {"import {", "import {", "{"}
+                    and sum(1 for c in cands if c.exact) > 1
+                    and u.path != payload["p"]
+                ):
+                    landing = u
+                else:
+                    exact = [c for c in cands if c.exact]
+                    if leftover_path is None:
+                        st = unique_stem(cands, payload)
+                        if st:
+                            landing = st
+                    if landing is None:
+                        if len({c.path for c in exact}) == 1:
+                            landing = best_cand(exact)
+                        elif len(exact) >= 2:
+                            ambiguous_locs = [c.loc for c in sorted(exact, key=lambda x: x.loc)]
+                        elif cands:
+                            # weak unique
+                            files = {c.path for c in cands}
+                            if len(files) == 1:
+                                landing = best_cand(cands)
+                            else:
+                                top = sorted(cands, key=lambda c: -c.score)
+                                if top and (len(top) == 1 or top[0].score - top[1].score > 0.12):
+                                    landing = top[0]
+                                else:
+                                    ambiguous_locs = [c.loc for c in sorted(cands, key=lambda x: x.loc)[:8]]
+
+    if ambiguous_locs:
+        score = 0.952 if any(c.exact for c in cands) else 0.80
+        copies = ",".join(ambiguous_locs)
+        note = f"{len(ambiguous_locs)} copies: " + "; ".join(ambiguous_locs)
+        return {
+            "status": "ambiguous",
+            "from": f"{payload['p']}:{payload['n']}",
+            "to": copies,
+            "to_path": None,
+            "to_line": None,
+            "score": score,
+            "note": note,
+            "cands": cands,
+        }
+
+    if landing is None:
+        bits = ["no candidates"]
+        if payload.get("a"):
+            bits.append("anchors " + ",".join(payload["a"]))
+        if payload.get("fn"):
+            bits.append(payload["fn"])
+        # neighborhood
+        for p in snap.paths():
+            if is_stem_split(payload["p"], p) or os.path.dirname(p) == os.path.dirname(payload.get("p", "")):
+                bits.append(p)
+                if len(bits) > 6:
+                    break
+        return {
+            "status": "deleted",
+            "from": f"{payload['p']}:{payload['n']}",
+            "to": "-",
+            "to_path": None,
+            "to_line": None,
+            "score": 0.0,
+            "note": " ".join(bits) if bits else "gap",
+            "cands": cands,
+        }
+
+    n_exact = sum(1 for c in cands if c.exact)
+    score = finalize_score(payload, landing, n_exact)
+    status = classify(payload, landing)
+    if status == "moved" and landing.path != payload["p"]:
+        if "path or surrounding file changed" not in note_bits and not holds:
+            if abs(score - 1.0) > 1e-9:
+                note_bits.insert(0, "path or surrounding file changed")
+    note_bits.extend(label_others(payload, snap, landing, cands, holds, is_stub))
+    if holds and status in {"same", "shifted"}:
+        score = 1.0 if landing.exact or file_has_body(snap.read(landing.path) or "", payload.get("ib") or []) else score
+        # comments-only origin: still identity
+        if landing.path == payload["p"]:
+            score = max(score, 0.68)
+            if landing.exact or (payload.get("ib") and file_has_body(snap.read(landing.path) or "", payload["ib"])):
+                if payload["t"].strip() in (snap.read(landing.path) or "") or landing.exact:
+                    score = 1.0 if landing.exact else max(score, 0.68)
+    if holds and landing.path == payload["p"] and landing.exact:
+        score = 1.0
+        status = "same" if landing.line == payload["n"] else "shifted"
+
+    return {
+        "status": status,
+        "from": f"{payload['p']}:{payload['n']}",
+        "to": landing.loc,
+        "to_path": landing.path,
+        "to_line": landing.line,
+        "score": float(f"{score:.3f}"),
+        "note": "; ".join(note_bits),
+        "cands": cands,
+    }
+
+
+def human_line(res: dict, name: str) -> str:
+    status = res["status"]
+    left = res["from"]
+    right = res["to"] if res["status"] != "deleted" else "-"
+    sc = f"{res['score']:.2f}"
+    extra = f"  {res['note']}" if res.get("note") else ""
+    nm = f"{name}  " if name and name != "-" else ""
+    return f"{nm}{left}  →  {right}   {status}   {sc}{extra}"
+
+
+def porcelain_line(res: dict, name: str) -> str:
+    nm = name or "-"
+    note = res.get("note") or ""
+    return f"{res['status']}\t{nm}\t{res['from']}\t{res['to']}\t{res['score']:.3f}\t{note}"
+
+
+def json_obj(res: dict, name: str, tok: str, origin: dict | None) -> dict:
+    to_path, to_line = None, None
+    if res["status"] not in {"deleted", "ambiguous"} and res.get("to_path"):
+        to_path, to_line = res["to_path"], res["to_line"]
+    elif res["status"] != "ambiguous" and res.get("to") and res["to"] != "-":
+        p, n = parse_locator(res["to"] if ":" in str(res["to"]) else "x:0")
+        to_path, to_line = p, n
+    fp, fn = parse_locator(res["from"])
+    return {
+        "status": res["status"],
+        "name": name if name != "-" else None,
+        "from": {"path": fp, "line": fn},
+        "to": {"path": to_path, "line": to_line} if to_path else None,
+        "score": res["score"],
+        "note": res.get("note") or "",
+        "pin": tok,
+        "origin": origin_str(origin) if origin else None,
+    }
+
+
+# --- pinfiles ----------------------------------------------------------------
+
+
+def read_pinfile(path: str | None, text: str | None = None) -> list[tuple[str, str]]:
+    if text is None:
+        assert path is not None
+        text = Path(path).read_text(encoding="utf-8")
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            name, tok = line.split("\t", 1)
+        elif line.startswith(PREFIX):
+            name, tok = "-", line
+        else:
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            name, tok = parts
+        rows.append((name.strip(), tok.strip()))
+    return rows
+
+
+def append_pinfile(path: str, name: str, tok: str) -> None:
+    p = Path(path)
+    prev = p.read_text(encoding="utf-8") if p.exists() else ""
+    with p.open("a", encoding="utf-8") as f:
+        if prev and not prev.endswith("\n"):
+            f.write("\n")
+        f.write(f"{name}\t{tok}\n")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def parse_argv(argv: list[str]) -> dict:
+    args = argv[1:]
+    cmd = None
+    flags: dict = {}
+    positionals: list[str] = []
+    tokens: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            flags["help"] = True
+            i += 1
+            continue
+        if a in ("--version", "-V"):
+            flags["version"] = True
+            i += 1
+            continue
+        if a in ("mint", "resolve", "show", "selftest", "id"):
+            cmd = a
+            i += 1
+            continue
+        if a == "--selftest":
+            flags["selftest"] = True
+            i += 1
+            continue
+        if looks_like_token(a):
+            tokens.append(a)
+            i += 1
+            continue
+        if a.startswith("--"):
+            key = a[2:].replace("-", "_")
+            if key in STORE_TRUE:
+                flags[key] = True
+                i += 1
+                continue
+            if i + 1 >= len(args):
+                die(f"missing value for {a}", 2)
+            flags[key] = args[i + 1]
+            i += 2
+            continue
+        if a == "-":
+            flags["stdin"] = True
+            i += 1
+            continue
+        positionals.append(a)
+        i += 1
+    if cmd is None and flags.get("selftest"):
+        cmd = "selftest"
+    if cmd is None and tokens:
+        cmd = "resolve"
+    if cmd is None and flags.get("version"):
+        cmd = "version"
+    if cmd is None and flags.get("help"):
+        cmd = "help"
+    flags["_cmd"] = cmd
+    flags["_pos"] = positionals
+    flags["_tok"] = tokens
+    return flags
+
+
+HELP = """cleat — mint a locus once; leftover is an import relative to the leftover file.
+
+Usage:
+  cleat mint  [--from REF | --from-dir DIR] [--repo REPO] path:line
+  cleat resolve [--to REF | --to-dir DIR] [--repo REPO] cleat1.…
+  cleat show cleat1.…
+  cleat id --repo REPO
+  cleat selftest
+
+A leftover re-export is an import relative to the leftover file.
+`from .ops import add` in src/calc.py names dest src/math/ops.py.
+`from src.math import calc` at module level follows.
+`io.fs` ⊂ `audio.fs` stays ambiguous. Extract-and-keep is identity.
+The token may refuse.
+
+resolve refuses path:line. Missing --from/--to refs exit 2.
+Corrupt tokens exit 1. Origin mismatch exits 1 unless --any-repo.
+--strict also fails on ambiguous. Confirmed deletions are answers.
+"""
+
+
+def cmd_help() -> int:
+    print(HELP)
+    return 0
+
+
+def cmd_version() -> int:
+    print(f"cleat {VERSION}")
+    return 0
+
+
+def snapshot_from(flags: dict, side: str) -> tuple[Snapshot, dict | None, str | None]:
+    repo = flags.get("repo")
+    if side == "from":
+        if flags.get("from_dir"):
+            root = flags["from_dir"]
+            if not Path(root).is_dir():
+                raise CleatError(f"not a directory: {root}", 2)
+            return Snapshot("dir", root), None, None
+        if not repo:
+            repo = "."
+        if not flags.get("from"):
+            raise CleatError("missing --from ref", 2)
+        sha = resolve_ref(repo, flags["from"])
+        o = origin_payload(repo, sha)
+        return Snapshot("git", repo, sha), o, sha
+    # dest
+    if flags.get("to_dir"):
+        root = flags["to_dir"]
+        if not Path(root).is_dir():
+            raise CleatError(f"not a directory: {root}", 2)
+        git_root = discover_repo(root)
+        o = origin_payload(git_root) if git_root else None
+        return Snapshot("dir", root), o, git_root
+    if not repo:
+        repo = "."
+    if not flags.get("to"):
+        raise CleatError("missing --to ref", 2)
+    sha = resolve_ref(repo, flags["to"])
+    o = origin_payload(repo, sha)
+    return Snapshot("git", repo, sha), o, repo
+
+
+def cmd_mint(flags: dict) -> int:
+    pos = flags["_pos"]
+    if not pos:
+        die("mint needs path:line", 2)
+    loc = pos[0]
+    if looks_like_token(loc):
+        die("mint needs path:line, not a token", 2)
+    ctx = int(flags.get("context") or DEFAULT_CTX)
+    snap, origin, _ = snapshot_from(flags, "from")
+    payload = mint_from_snapshot(snap, loc, ctx, origin)
+    tok = encode_token(payload)
+    if flags.get("pretty"):
+        eprint(show_text(payload, tok))
+    name = flags.get("name") or "-"
+    if flags.get("file"):
+        append_pinfile(flags["file"], name if name != "-" else os.path.basename(payload["p"]), tok)
+    print(tok)
+    return 0
+
+
+def show_text(payload: dict, _tok: str | None = None) -> str:
+    lines = []
+    lines.append(f"  minted: {payload['p']}:{payload['n']}")
+    lines.append(f"  text:       {payload.get('t', '')}")
+    if payload.get("fn"):
+        lines.append(f"  fn:         {payload['fn']}")
+    if payload.get("u"):
+        lines.append("  unique:     " + ", ".join(payload["u"]))
+    if payload.get("a"):
+        lines.append("  anchors:    " + ", ".join(payload["a"]))
+    o = payload.get("o")
+    lines.append(f"  origin:     {origin_str(o)}")
+    if o and o.get("r"):
+        lines.append("  remotes:    " + ", ".join(o["r"]))
+    if payload.get("e"):
+        lines.append("  before:")
+        for x in payload["e"]:
+            lines.append(f"    - {x}")
+    if payload.get("b"):
+        lines.append("  after:")
+        for x in payload["b"]:
+            lines.append(f"    - {x}")
+    return "\n".join(lines)
+
+
+def cmd_show(flags: dict) -> int:
+    toks = flags["_tok"] + [p for p in flags["_pos"] if looks_like_token(p)]
+    if not toks:
+        die("show needs a cleat1. token", 2)
+    payload = decode_token(toks[0])
+    print(show_text(payload, toks[0]))
+    return 0
+
+
+def cmd_id(flags: dict) -> int:
+    repo = flags.get("repo") or "."
+    if not Path(repo, ".git").exists() and not discover_repo(repo):
+        die(f"not a git repo: {repo}", 2)
+    repo = flags.get("repo") or discover_repo(repo) or repo
+    o = origin_payload(repo)
+    print(origin_str(o))
+    return 0
+
+
+def resolve_one(snap: Snapshot, tok: str, flags: dict, dest_repo: str | None, dest_o: dict | None) -> dict:
+    payload = decode_token(tok)
+    token_o = payload.get("o")
+    if not flags.get("any_repo"):
+        if not origins_match(token_o, dest_repo if snap.kind == "git" else dest_repo, dest_o):
+            raise CleatError(
+                f"token belongs to a different repository ({origin_str(token_o)} vs {origin_str(dest_o)})"
+            )
+    empty_err = bool(flags.get("to_dir"))
+    return resolve_payload(snap, payload, dest_empty_error=empty_err), payload
+
+
+def cmd_resolve(flags: dict) -> int:
+    pos = flags["_pos"]
+    toks = list(flags["_tok"])
+    locators = [p for p in pos if looks_like_locator(p)]
+    toks += [p for p in pos if looks_like_token(p)]
+    names_filter = [p for p in pos if not looks_like_token(p) and not looks_like_locator(p)]
+    if locators and not toks and not flags.get("file") and not flags.get("stdin") and sys.stdin.isatty():
+        die(
+            f"resolve: {locators[0]} is a locator; pins are minted tokens, not path:line",
+            2,
+        )
+    if locators and not toks and not flags.get("file"):
+        die(
+            f"resolve: {locators[0]} is a locator; pins are minted tokens, not path:line",
+            2,
+        )
+
+    rows: list[tuple[str, str]] = []
+    if flags.get("file"):
+        rows.extend(read_pinfile(flags["file"]))
+    if flags.get("stdin") or (not toks and not rows and not sys.stdin.isatty()):
+        text = sys.stdin.read()
+        if text.strip():
+            rows.extend(read_pinfile(None, text))
+    for t in toks:
+        rows.append(("-", t))
+    if names_filter:
+        rows = [r for r in rows if r[0] in names_filter]
+    if not rows:
+        die("resolve needs a cleat1. token or --file", 2)
+
+    snap, dest_o, dest_repo = snapshot_from(flags, "to")
+    strict_fail = False
+    last_rc = 0
+    printed = []
+    for name, tok in rows:
+        try:
+            res, payload = resolve_one(snap, tok, flags, dest_repo, dest_o)
+        except CleatError as ex:
+            eprint(f"cleat: {ex}")
+            return ex.code
+        if res["status"] == "ambiguous" and flags.get("strict"):
+            strict_fail = True
+        if flags.get("json"):
+            printed.append(json.dumps(json_obj(res, name, tok, payload.get("o")), separators=(",", ":")))
+        elif flags.get("porcelain"):
+            printed.append(porcelain_line(res, name))
+        else:
+            printed.append(human_line(res, name))
+    print("\n".join(printed))
+    if strict_fail:
+        return 1
+    return last_rc
+
+
+# --- selftest ----------------------------------------------------------------
+
+
+def _git_init(repo: Path, files: dict[str, str], msg: str) -> str:
+    repo.mkdir(parents=True)
+    for rel, body in files.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body.lstrip("\n") if body.startswith("\n") else body, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=cleat", "-c", "user.email=cleat@example.com", "commit", "-q", "-m", msg],
+        cwd=repo,
+        check=True,
+    )
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
+def _git_commit(repo: Path, files: dict[str, str], msg: str) -> str:
+    for rel, body in files.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body.lstrip("\n") if body.startswith("\n") else body, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=cleat", "-c", "user.email=cleat@example.com", "commit", "-q", "-m", msg],
+        cwd=repo,
+        check=True,
+    )
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
+V1_CALC = """def add(a, b):
+    return a + b
+
+def helper_keep():
+    return "stable helper"
+"""
+
+HELPER_BODY = """def add(a, b):
+    return a + b
+
+def helper_keep():
+    return "stable helper"
+"""
+
+
+def _mint(repo: Path, ref: str, loc: str) -> str:
+    snap = Snapshot("git", str(repo), ref)
+    o = origin_payload(str(repo), ref)
+    payload = mint_from_snapshot(snap, loc, DEFAULT_CTX, o)
+    return encode_token(payload)
+
+
+def _resolve(repo: Path, ref: str, tok: str) -> dict:
+    snap = Snapshot("git", str(repo), ref)
+    dest_o = origin_payload(str(repo), ref)
+    payload = decode_token(tok)
+    if not origins_match(payload.get("o"), str(repo), dest_o):
+        raise AssertionError("origin mismatch in selftest")
+    return resolve_payload(snap, payload, dest_empty_error=False)
+
+
+def cmd_selftest() -> int:
+    failures: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if not cond:
+            failures.append(f"{name}: {detail}")
+
+    # grammar units — suffix identity, not substring
+    check("suffix ops not ops_v2", suffix_identity("src.math.ops_v2", "math.ops") is False)
+    check("suffix ops_v2", suffix_identity("src.math.ops_v2", "math.ops_v2"))
+    check("io.fs not in audio.fs", suffix_identity("src.audio.fs", "io.fs") is False)
+    check("io.fs matches io.fs", suffix_identity("src.io.fs", "io.fs"))
+    check("tail ops", suffix_identity("src.math.ops", "ops"))
+    check("short tail dropped", relative_tails(".fs") == [])
+    check("rel ops tail", relative_tails(".ops") == ["ops"])
+    check("rel math.ops", relative_tails(".math.ops") == ["math.ops"])
+
+    src = "from src.math.ops import helper_keep as impl\nreturn impl()\n"
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("abs import", "src.math.ops" in f, str(f))
+
+    src = "from .ops import helper_keep as impl\n"
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("rel .ops", "ops" in f, str(f))
+
+    src = "from src.math import calc\nreturn calc.helper_keep()\n"
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("split import", "src.math.calc" in f, str(f))
+
+    src = 'from src.math.ops import add\nfrom src.legacy.calc import helper_keep as impl\nreturn impl()\n'
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("unused add ignored", "src.math.ops" not in f, str(f))
+    check("used helper_keep kept", "src.legacy.calc" in f, str(f))
+
+    src = "pub fn helper_keep() -> &'static str {\n    crate::math::calc::helper_keep()\n}\n"
+    f = forms_for_locus(src, "src/calc.rs", "helper_keep")
+    check("rust path", any(suffix_identity("src.math.calc", x) or x in ("math.calc", "src.math.calc") for x in f), str(f))
+
+    src = "function helper_keep() {\n  const { helper_keep: impl } = require('./ops');\n  return impl();\n}\n"
+    f = forms_for_locus(src, "src/calc.js", "helper_keep")
+    check("js require ./ops", "ops" in f, str(f))
+
+    src = 'def helper_keep():\n    """Deprecated. Old copy: src/legacy/calc.py"""\n    from src.math.calc import helper_keep as impl\n    return impl()\n'
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("docstring not a pointer", "src.legacy.calc" not in f and "legacy.calc" not in f, str(f))
+    check("docstring import still parsed", "src.math.calc" in f, str(f))
+
+    src = 'def helper_keep():\n    # migrated off audio.fs during the radio rewrite\n    from .fs import helper_keep as impl\n    return impl()\n'
+    f = forms_for_locus(src, "src/calc.py", "helper_keep")
+    check("short .fs dropped", "fs" not in f and "io.fs" not in f and "audio.fs" not in f, str(f))
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # extract-and-keep identity
+        keep = root / "keep"
+        v1 = _git_init(keep, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            keep,
+            {
+                "src/calc.py": V1_CALC,
+                "src/calc/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(keep, v1, "src/calc.py:4")
+        res = _resolve(keep, "HEAD", tok)
+        check("keep identity", res["status"] in ("same", "shifted") and res["to"].startswith("src/calc.py:"), str(res))
+        check("keep score", abs(res["score"] - 1.0) < 1e-6, str(res))
+        check("keep extracted copy", "extracted copy" in res["note"], str(res))
+        check("keep origin not bait", "basename bait src/calc.py" not in res["note"], str(res))
+
+        # leftover + src/math/ops.py
+        math = root / "math"
+        v1 = _git_init(math, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            math,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from src.math.ops import helper_keep as impl\n"
+                    "    return impl()\n\n"
+                    "def add(a, b):\n"
+                    "    from src.math.ops import add as _add\n"
+                    "    return _add(a, b)\n"
+                ),
+                "src/math/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(math, v1, "src/calc.py:4")
+        res = _resolve(math, "HEAD", tok)
+        check("math leftover dest", res["to"].startswith("src/math/ops.py:"), str(res))
+        check("math leftover stub note", "leftover stub" in res["note"], str(res))
+        check("math bait note", "basename bait" in res["note"], str(res))
+
+        # stem-split clone must lose to leftover pointer
+        ss = root / "ss"
+        v1 = _git_init(ss, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            ss,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from src.math.ops import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/calc/ops.py": HELPER_BODY,
+                "src/math/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(ss, v1, "src/calc.py:4")
+        res = _resolve(ss, "HEAD", tok)
+        check("stem_over_ptr", res["to"].startswith("src/math/ops.py:"), str(res))
+
+        # relative .ops unique extract
+        relops = root / "relops"
+        v1 = _git_init(relops, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            relops,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from .ops import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/math/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(relops, v1, "src/calc.py:4")
+        res = _resolve(relops, "HEAD", tok)
+        check("rel .ops → math/ops", res["to"].startswith("src/math/ops.py:"), str(res))
+
+        # relative decoy: no dest named ops → refuse, not helpers
+        rel = root / "rel"
+        v1 = _git_init(rel, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            rel,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from .ops import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/pkg/calc.py": HELPER_BODY,
+                "src/utils/helpers.py": 'def helper_keep():\n    return "stable helper"\n',
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(rel, v1, "src/calc.py:4")
+        res = _resolve(rel, "HEAD", tok)
+        check("rel decoy not helpers", "helpers.py" not in res["to"] or res["status"] == "ambiguous", str(res))
+        check("rel decoy not moved helpers", not (res["status"] == "moved" and "helpers.py" in res["to"]), str(res))
+        check("rel decoy pkg not bait", "basename bait src/pkg/calc.py" not in res["note"], str(res))
+
+        # module-level
+        mod = root / "mod"
+        v1 = _git_init(mod, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            mod,
+            {
+                "src/calc.py": (
+                    "from src.math.calc import helper_keep as _impl\n"
+                    "from src.math.calc import add as _add\n\n"
+                    "def helper_keep():\n"
+                    "    return _impl()\n"
+                ),
+                "src/math/calc.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(mod, v1, "src/calc.py:4")
+        res = _resolve(mod, "HEAD", tok)
+        check("modlevel", res["to"].startswith("src/math/calc.py:"), str(res))
+
+        # split import
+        split = root / "split"
+        v1 = _git_init(split, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            split,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from src.math import calc\n"
+                    "    return calc.helper_keep()\n"
+                ),
+                "src/math/calc.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(split, v1, "src/calc.py:4")
+        res = _resolve(split, "HEAD", tok)
+        check("splitimp", res["to"].startswith("src/math/calc.py:"), str(res))
+
+        # iofs: must not unique-land io/fs
+        iofs = root / "iofs"
+        v1 = _git_init(iofs, {"src/calc.py": 'def helper_keep():\n    return "stable helper"\n'}, "v1")
+        _git_commit(
+            iofs,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    # migrated off audio.fs during the radio rewrite\n"
+                    "    from .fs import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/radio/fs.py": 'def helper_keep():\n    return "stable helper"\n',
+                "src/io/fs.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(iofs, v1, "src/calc.py:1")
+        res = _resolve(iofs, "HEAD", tok)
+        check(
+            "iofs not unique io",
+            not (res["status"] in ("moved", "same", "shifted") and str(res["to"]).startswith("src/io/fs.py:")),
+            str(res),
+        )
+
+        # relamb richness
+        ra = root / "relamb"
+        v1 = _git_init(ra, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            ra,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from .calc import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/math/calc.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(ra, v1, "src/calc.py:4")
+        res = _resolve(ra, "HEAD", tok)
+        check("relamb extract", res["to"].startswith("src/math/calc.py:"), str(res))
+
+        # body-line pin still follows leftover
+        bp = root / "bodypin"
+        v1 = _git_init(bp, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            bp,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from src.math.ops import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/math/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(bp, v1, "src/calc.py:5")
+        res = _resolve(bp, "HEAD", tok)
+        check("body pin follows leftover", res["to"].startswith("src/math/ops.py:"), str(res))
+
+        # ops_v2 unique, not ops substring
+        sub = root / "sub"
+        v1 = _git_init(sub, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            sub,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    from src.math.ops_v2 import helper_keep as impl\n"
+                    "    return impl()\n"
+                ),
+                "src/math/ops_v2.py": 'def helper_keep():\n    return "stable helper"\n',
+                "src/math/ops.py": 'def helper_keep():\n    return "stable helper"\n',
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(sub, v1, "src/calc.py:4")
+        res = _resolve(sub, "HEAD", tok)
+        check("ops_v2 not ops", res["to"].startswith("src/math/ops_v2.py:"), str(res))
+
+        # partial body edit is not a leftover
+        pb = root / "pb"
+        v1 = _git_init(
+            pb,
+            {"src/calc.py": 'def helper_keep():\n    flag = True\n    return "stable helper"\n'},
+            "v1",
+        )
+        _git_commit(
+            pb,
+            {
+                "src/calc.py": 'def helper_keep():\n    flag = False\n    return "stable helper"\n',
+                "src/math/ops.py": 'def helper_keep():\n    flag = True\n    return "stable helper"\n',
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(pb, v1, "src/calc.py:1")
+        res = _resolve(pb, "HEAD", tok)
+        check("partial body stays origin", res["to"].startswith("src/calc.py:"), str(res))
+
+        # sibling fn remaining body is identity of the file
+        sib = root / "sib"
+        v1 = _git_init(sib, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            sib,
+            {
+                "src/calc.py": (
+                    "def helper_keep():\n"
+                    "    return helper_keep_impl()\n\n"
+                    "def helper_keep_impl():\n"
+                    '    return "stable helper"\n'
+                ),
+                "src/math/ops.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(sib, v1, "src/calc.py:4")
+        res = _resolve(sib, "HEAD", tok)
+        check("sibling fn stays origin", res["to"].startswith("src/calc.py:"), str(res))
+
+        # keepcomment: origin holds body, comment is not a pointer
+        kc = root / "kc"
+        v1 = _git_init(kc, {"src/calc.py": V1_CALC}, "v1")
+        _git_commit(
+            kc,
+            {
+                "src/calc.py": (
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "def helper_keep():\n"
+                    "    # also copied to src.math.ops\n"
+                    '    return "stable helper"\n'
+                ),
+                "src/math/ops.py": HELPER_BODY,
+                "src/legacy/calc.py": 'def helper_keep():\n    return "stable helper"\n',
+            },
+            "v2",
+        )
+        tok = _mint(kc, v1, "src/calc.py:4")
+        res = _resolve(kc, "HEAD", tok)
+        check("keepcomment identity", res["to"].startswith("src/calc.py:"), str(res))
+
+        # common-line clones are skipped paths, not extracted copies
+        clones = root / "clones"
+        v1 = _git_init(
+            clones,
+            {
+                "packages/kernel/src/evaluate.ts": 'import {\n  type Catalog,\n} from "@voidtrace/catalog";\n'
+            },
+            "v1",
+        )
+        _git_commit(
+            clones,
+            {
+                "packages/kernel/src/evaluate.ts": 'import {\n  type Catalog,\n} from "@voidtrace/catalog";\n',
+                "apps/cli/src/cli.test.ts": 'import {\n  describe,\n} from "vitest";\n',
+            },
+            "v2",
+        )
+        tok = _mint(clones, v1, "packages/kernel/src/evaluate.ts:1")
+        res = _resolve(clones, "HEAD", tok)
+        check("import-clone identity", res["to"].startswith("packages/kernel/src/evaluate.ts:"), str(res))
+        check(
+            "import-clone not extracted",
+            "extracted copy" not in res["note"] and "cli.test.ts" not in res["note"],
+            str(res),
+        )
+
+        # trivial refuse
+        triv = root / "triv"
+        _git_init(triv, {"src/x.py": "}\n"}, "v1")
+        try:
+            _mint(triv, "HEAD", "src/x.py:1")
+            check("trivial refuse", False, "minted }")
+        except CleatError as ex:
+            check("trivial refuse", "trivial" in str(ex).lower(), str(ex))
+
+        # locator decode
+        p, n = parse_locator("src/weird:colon.py:1")
+        check("colon locator", p == "src/weird:colon.py" and n == 1)
+
+    if failures:
+        eprint("selftest failures:")
+        for f in failures:
+            eprint("  " + f)
+        return 1
+    print("selftest: ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    try:
+        flags = parse_argv(argv)
+        cmd = flags.get("_cmd")
+        if flags.get("help") and cmd in (None, "help"):
+            return cmd_help()
+        if cmd == "version" or (flags.get("version") and cmd in (None, "version")):
+            return cmd_version()
+        if cmd == "help":
+            return cmd_help()
+        if cmd == "selftest":
+            return cmd_selftest()
+        if cmd == "mint":
+            return cmd_mint(flags)
+        if cmd == "show":
+            return cmd_show(flags)
+        if cmd == "id":
+            return cmd_id(flags)
+        if cmd == "resolve":
+            return cmd_resolve(flags)
+        if flags.get("help"):
+            return cmd_help()
+        die("usage: cleat mint|resolve|show|id|selftest — try --help", 2)
+        return 2
+    except CleatError as ex:
+        eprint(f"cleat: {ex}")
+        return ex.code
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

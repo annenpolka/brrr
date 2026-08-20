@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+"""winnow — partition uncommitted changes by whether they affect a command.
+
+A working tree is wheat + chaff relative to a command. Wheat is a 1-minimal
+subset of uncommitted hunks that reproduces the command's current behavior;
+chaff can be reverted without changing that behavior.
+
+This is git-bisect for the dirty diff, not for commits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+VERSION = "0.2.0"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)")
+TIME_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+DURATION_RE = re.compile(
+    r"\b\d+\.\d+\s*(?:s|ms|sec|secs|seconds)\b|\bin \d+\.\d+ seconds?\b",
+    re.I,
+)
+ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+PID_RE = re.compile(r"\bpid\s*[=:]?\s*\d+\b", re.I)
+TMP_RE = re.compile(r"(?:/private)?(?:/var/folders|/tmp)/[A-Za-z0-9._/-]+")
+PYTEST_DT_RE = re.compile(r"\b\d+\.\d{2}s\b")
+PY_FILELINE_RE = re.compile(r'(File "[^"]+", line )\d+')
+RUSTC_ARROW_RE = re.compile(r"(-->\s+\S+):(\d+):(\d+)")
+PATH_LOC_RE = re.compile(
+    r"((?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+\.[A-Za-z0-9_+-]+):(\d+)(?::(\d+))?"
+)
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+
+GENERATED_DIR_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".eggs",
+    ".git",
+}
+GENERATED_SUFFIXES = (".pyc", ".pyo", ".pyd")
+
+
+class WinnowError(Exception):
+    def __init__(self, message: str, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+class PatchError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Change:
+    path: str
+    kind: str  # modify | add | delete
+    head: bytes | None
+    wip: bytes | None
+    mode: int | None = None
+    hunk_index: int | None = None
+    hunk_header: str | None = None
+    old_start: int = 0
+    old_count: int = 0
+    body: tuple[str, ...] = ()
+
+    @property
+    def id(self) -> str:
+        if self.hunk_index is None:
+            return self.path
+        return f"{self.path}#{self.hunk_index}"
+
+    def label(self) -> str:
+        if self.hunk_index is None or not self.hunk_header:
+            return f"{self.kind:6} {self.path}"
+        header = self.hunk_header.strip()
+        return f"{self.kind:6} {self.path}  #{self.hunk_index} {header}"
+
+
+@dataclass
+class Fingerprint:
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    duration_ms: int = 0
+    unapplicable: bool = False
+
+    def key(self, mode: str) -> str:
+        if self.unapplicable:
+            return "unapplicable"
+        if self.timed_out:
+            return "timeout"
+        if mode == "exit":
+            return f"exit={self.exit_code}"
+        if mode == "stderr":
+            return f"exit={self.exit_code}\nstderr:\n{self.stderr}"
+        return f"exit={self.exit_code}\nstdout:\n{self.stdout}\nstderr:\n{self.stderr}"
+
+    def digest(self, mode: str) -> str:
+        return hashlib.sha256(self.key(mode).encode()).hexdigest()[:10]
+
+    def summary(self, mode: str) -> str:
+        if self.unapplicable:
+            return "hunks did not apply"
+        if self.timed_out:
+            return "timeout"
+        body = self.stderr.strip() or self.stdout.strip()
+        line = first_interesting_line(body)
+        if line:
+            return f"exit={self.exit_code} {line[:120]}"
+        return f"exit={self.exit_code} ({self.digest(mode)})"
+
+
+def first_interesting_line(text: str) -> str:
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(("===", "---", "***", "___")):
+            continue
+        if s.startswith("Traceback (most recent call last)"):
+            continue
+        if s.lower().startswith(("running ", "testing ", "collected ")):
+            continue
+        return s
+    return ""
+
+
+def normalize(data: bytes, mode: str) -> str:
+    if mode == "raw":
+        return data.decode("utf-8", "replace")
+    text = data.decode("utf-8", "replace")
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = TIME_RE.sub("<TIME>", text)
+    text = DURATION_RE.sub("<DT>", text)
+    text = PYTEST_DT_RE.sub("<DT>", text)
+    text = ADDR_RE.sub("<ADDR>", text)
+    text = PID_RE.sub("pid=<PID>", text)
+    text = TMP_RE.sub("<TMP>", text)
+    if mode != "strict":
+        text = PY_FILELINE_RE.sub(r"\1<N>", text)
+        text = RUSTC_ARROW_RE.sub(r"\1:<N>:<N>", text)
+        text = PATH_LOC_RE.sub(_repl_path_loc, text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + ("\n" if text.strip() else "")
+
+
+def _repl_path_loc(m: re.Match[str]) -> str:
+    if m.group(3):
+        return f"{m.group(1)}:<N>:<N>"
+    return f"{m.group(1)}:<N>"
+
+
+def is_generated(path: str) -> bool:
+    parts = Path(path).parts
+    if any(p in GENERATED_DIR_NAMES for p in parts):
+        return True
+    return path.endswith(GENERATED_SUFFIXES)
+
+
+def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=check,
+    )
+
+
+def discover_repo(cwd: Path) -> Path:
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip() or "not a git repository"
+        raise WinnowError(err, 2)
+    return Path(r.stdout.decode().strip())
+
+
+def split_z(data: bytes) -> list[bytes]:
+    return [p for p in data.split(b"\0") if p]
+
+
+def git_blob(repo: Path, rev: str, path: str) -> bytes | None:
+    spec = f"{rev}:{path}"
+    exists = run_git(repo, "cat-file", "-e", spec, check=False)
+    if exists.returncode != 0:
+        return None
+    return run_git(repo, "show", spec).stdout
+
+
+def read_worktree(path: Path) -> tuple[bytes | None, int | None]:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return None, None
+    if not stat.S_ISREG(st.st_mode):
+        return None, st.st_mode
+    return path.read_bytes(), st.st_mode
+
+
+def write_worktree(path: Path, data: bytes | None, mode: int | None, stop: Path | None = None) -> None:
+    if data is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        _rmdir_parents_if_empty(path, stop)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".winnow-tmp-{path.name}-{os.getpid()}")
+    tmp.write_bytes(data)
+    if mode is not None:
+        os.chmod(tmp, stat.S_IMODE(mode))
+    tmp.replace(path)
+
+
+def _rmdir_parents_if_empty(path: Path, stop: Path | None) -> None:
+    parent = path.parent
+    stop_resolved = stop.resolve() if stop is not None else None
+    while True:
+        if stop_resolved is not None and parent.resolve() == stop_resolved:
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def snapshot_paths(repo: Path) -> set[str]:
+    out: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), repo)
+            out.add(rel.replace(os.sep, "/"))
+    return out
+
+
+def scrub_new_files(repo: Path, original: set[str]) -> None:
+    for dirpath, dirnames, filenames in os.walk(repo, topdown=True):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        rel_dir = os.path.relpath(dirpath, repo)
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            rel = rel.replace(os.sep, "/")
+            if rel in original:
+                continue
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+        for name in list(dirnames):
+            if name in GENERATED_DIR_NAMES and name != ".git":
+                full = os.path.join(dirpath, name)
+                rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+                # drop generated dirs created during a trial
+                if not any(p == rel or p.startswith(rel + "/") for p in original):
+                    _rmtree(full)
+                    dirnames.remove(name)
+
+
+def _rmtree(path: str) -> None:
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        for name in filenames:
+            try:
+                os.unlink(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            try:
+                os.rmdir(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def expand_untracked(repo: Path, entries: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if is_generated(entry):
+            continue
+        abs_path = repo / entry
+        if abs_path.is_file():
+            if entry not in seen:
+                out.append(entry)
+                seen.add(entry)
+            continue
+        if not abs_path.is_dir():
+            continue
+        for f in abs_path.rglob("*"):
+            if not f.is_file():
+                continue
+            if ".git" in f.parts:
+                continue
+            rel = str(f.relative_to(repo)).replace(os.sep, "/")
+            if is_generated(rel) or rel in seen:
+                continue
+            out.append(rel)
+            seen.add(rel)
+    return out
+
+
+def parse_u0_hunks(diff_text: str) -> list[tuple[str, int, int, tuple[str, ...]]]:
+    hunks: list[tuple[str, int, int, tuple[str, ...]]] = []
+    header: str | None = None
+    old_start = 0
+    old_count = 0
+    body: list[str] = []
+
+    def flush() -> None:
+        nonlocal header, body
+        if header is None:
+            return
+        hunks.append((header, old_start, old_count, tuple(body)))
+        header = None
+        body = []
+
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            flush()
+            m = HUNK_RE.match(line)
+            if not m:
+                continue
+            header = line
+            old_start = int(m.group(1))
+            old_count = int(m.group(2) if m.group(2) is not None else "1")
+            body = []
+            continue
+        if header is None:
+            continue
+        if line.startswith("diff --git"):
+            flush()
+            continue
+        if line.startswith(("+", "-", " ")):
+            body.append(line)
+    flush()
+    return hunks
+
+
+def apply_hunks(head: bytes, hunks: list[Change]) -> bytes:
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise PatchError("binary") from e
+    ended_nl = text.endswith("\n") or text == ""
+    lines = text.splitlines()
+    ordered = sorted(hunks, key=lambda h: (h.old_start, h.hunk_index or 0), reverse=True)
+    for h in ordered:
+        old = [ln[1:] for ln in h.body if ln[:1] in "- "]
+        new = [ln[1:] for ln in h.body if ln[:1] in "+ "]
+        if h.old_count == 0:
+            idx = h.old_start
+            if idx < 0 or idx > len(lines):
+                raise PatchError(h.hunk_header or h.path)
+            if old:
+                raise PatchError(h.hunk_header or h.path)
+            lines[idx:idx] = new
+            continue
+        idx = h.old_start - 1
+        if idx < 0 or idx + len(old) > len(lines):
+            raise PatchError(h.hunk_header or h.path)
+        if lines[idx : idx + len(old)] != old:
+            raise PatchError(h.hunk_header or h.path)
+        lines[idx : idx + len(old)] = new
+    out = "\n".join(lines)
+    if ended_nl and (out or text):
+        out += "\n"
+    return out.encode("utf-8")
+
+
+def hunks_for_file(
+    repo: Path,
+    base: str,
+    path: str,
+    kind: str,
+    head: bytes | None,
+    wip: bytes | None,
+    mode: int | None,
+    granularity: str,
+) -> list[Change]:
+    whole = Change(path=path, kind=kind, head=head, wip=wip, mode=mode, hunk_index=None, hunk_header="(file)")
+    if granularity == "file":
+        return [whole]
+    if kind in ("add", "delete"):
+        label = "(new file)" if kind == "add" else "(deleted)"
+        return [Change(path=path, kind=kind, head=head, wip=wip, mode=mode, hunk_index=1, hunk_header=label)]
+    if head is None or wip is None or b"\0" in head or b"\0" in wip:
+        return [whole]
+    r = run_git(repo, "diff", "-U0", "--no-color", "--no-renames", base, "--", path, check=False)
+    if r.returncode not in (0, 1):
+        return [whole]
+    parsed = parse_u0_hunks(r.stdout.decode("utf-8", "replace"))
+    if not parsed:
+        return [whole]
+    out: list[Change] = []
+    for i, (header, old_start, old_count, body) in enumerate(parsed, start=1):
+        out.append(
+            Change(
+                path=path,
+                kind=kind,
+                head=head,
+                wip=wip,
+                mode=mode,
+                hunk_index=i,
+                hunk_header=header,
+                old_start=old_start,
+                old_count=old_count,
+                body=body,
+            )
+        )
+    return out
+
+
+def reconstruct(chosen: list[Change], all_hunks: list[Change]) -> tuple[bytes | None, int | None]:
+    proto = all_hunks[0]
+    if proto.kind == "add":
+        return (proto.wip, proto.mode) if chosen else (None, None)
+    if proto.kind == "delete":
+        return (None, None) if chosen else (proto.head, proto.mode)
+    if not chosen:
+        return proto.head, proto.mode
+    if len(chosen) == len(all_hunks):
+        return proto.wip, proto.mode
+    if proto.head is None:
+        raise PatchError(proto.path)
+    return apply_hunks(proto.head, chosen), proto.mode
+
+
+def list_changes(repo: Path, base: str, granularity: str) -> list[Change]:
+    r = run_git(repo, "diff", "--name-status", "--no-renames", "-z", base)
+    raw = split_z(r.stdout)
+    if len(raw) % 2 != 0:
+        raise WinnowError("unexpected git diff --name-status -z output")
+    tracked: list[tuple[str, str]] = []
+    for i in range(0, len(raw), 2):
+        status = raw[i].decode("ascii", "replace")
+        path = os.fsdecode(raw[i + 1])
+        kind = {"M": "modify", "A": "add", "D": "delete", "T": "modify"}.get(status[:1])
+        if kind is None:
+            continue
+        if is_generated(path):
+            continue
+        tracked.append((path, kind))
+
+    r = run_git(repo, "ls-files", "-z", "--others", "--exclude-standard")
+    untracked = expand_untracked(repo, [os.fsdecode(p) for p in split_z(r.stdout)])
+
+    files: list[tuple[str, str, bytes | None, bytes | None, int | None]] = []
+    seen: set[str] = set()
+    for path, kind in tracked:
+        if path in seen:
+            continue
+        seen.add(path)
+        head = git_blob(repo, base, path)
+        wip, mode = read_worktree(repo / path)
+        if kind == "delete":
+            wip = None
+        if kind == "add" and head is not None:
+            kind = "modify"
+        if head == wip:
+            continue
+        files.append((path, kind, head, wip, mode))
+
+    for path in untracked:
+        if path in seen or is_generated(path):
+            continue
+        seen.add(path)
+        wip, mode = read_worktree(repo / path)
+        if wip is None:
+            continue
+        files.append((path, "add", None, wip, mode))
+
+    files.sort(key=lambda t: t[0])
+    changes: list[Change] = []
+    for path, kind, head, wip, mode in files:
+        changes.extend(hunks_for_file(repo, base, path, kind, head, wip, mode, granularity))
+    return changes
+
+
+class TreeGuard:
+    """Apply subsets of changes without touching the git index. Always restore."""
+
+    def __init__(self, repo: Path, changes: list[Change]) -> None:
+        self.repo = repo
+        self.changes = changes
+        self.by_path: dict[str, list[Change]] = {}
+        for c in changes:
+            self.by_path.setdefault(c.path, []).append(c)
+        self.original_paths = snapshot_paths(repo)
+        self._restored = False
+
+    def restore(self) -> None:
+        if self._restored:
+            return
+        for path, hunks in self.by_path.items():
+            proto = hunks[0]
+            write_worktree(self.repo / path, proto.wip, proto.mode, stop=self.repo)
+        self._restored = True
+
+    def apply(self, subset: Iterable[Change]) -> None:
+        wanted = {c.id for c in subset}
+        for path, hunks in self.by_path.items():
+            chosen = [h for h in hunks if h.id in wanted]
+            blob, mode = reconstruct(chosen, hunks)
+            write_worktree(self.repo / path, blob, mode, stop=self.repo)
+        scrub_new_files(self.repo, self.original_paths)
+        self._restored = False
+
+
+def run_command(
+    cmd: list[str],
+    cwd: Path,
+    timeout: float | None,
+    fp_mode: str,
+) -> Fingerprint:
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError as e:
+        raise WinnowError(f"command not found: {cmd[0]}", 127) from e
+    except subprocess.TimeoutExpired:
+        return Fingerprint(exit_code=124, stdout="", stderr="", timed_out=True, duration_ms=int((time.monotonic() - t0) * 1000))
+    dt = int((time.monotonic() - t0) * 1000)
+    norm_mode = "raw" if fp_mode == "raw" else fp_mode
+    return Fingerprint(
+        exit_code=r.returncode,
+        stdout=normalize(r.stdout, norm_mode),
+        stderr=normalize(r.stderr, norm_mode),
+        duration_ms=dt,
+    )
+
+
+def split_n(items: list[Change], n: int) -> list[list[Change]]:
+    n = max(1, min(n, len(items)))
+    size, rem = divmod(len(items), n)
+    out: list[list[Change]] = []
+    i = 0
+    for k in range(n):
+        take = size + (1 if k < rem else 0)
+        out.append(items[i : i + take])
+        i += take
+    return [part for part in out if part]
+
+
+def ddmin(
+    changes: list[Change],
+    interesting: Callable[[list[Change]], bool],
+    log: Callable[[str], None],
+) -> list[Change]:
+    current = list(changes)
+    n = 2
+    while len(current) >= 2:
+        parts = split_n(current, n)
+        found = False
+        for part in parts:
+            log(f"  try {len(part)}/{len(current)} subset {[c.id for c in part]}")
+            if interesting(part):
+                current = part
+                n = 2
+                found = True
+                break
+        if found:
+            continue
+        for part in parts:
+            complement = [c for c in current if c.id not in {x.id for x in part}]
+            if not complement or len(complement) == len(current):
+                continue
+            log(f"  try {len(complement)}/{len(current)} complement {[c.id for c in complement]}")
+            if interesting(complement):
+                current = complement
+                n = max(n - 1, 2)
+                found = True
+                break
+        if found:
+            continue
+        if n >= len(current):
+            break
+        n = min(len(current), n * 2)
+        log(f"  increase granularity n={n}")
+    return current
+
+
+def wheat_patch(wheat: list[Change], by_path: dict[str, list[Change]]) -> str:
+    import difflib
+
+    chunks: list[str] = []
+    wanted = {c.id for c in wheat}
+    for path in sorted(by_path):
+        all_hunks = by_path[path]
+        chosen = [h for h in all_hunks if h.id in wanted]
+        proto = all_hunks[0]
+        try:
+            new_blob, _mode = reconstruct(chosen, all_hunks)
+        except PatchError:
+            new_blob = proto.wip if chosen else proto.head
+        a = "" if proto.head is None else proto.head.decode("utf-8", "replace")
+        b = "" if new_blob is None else new_blob.decode("utf-8", "replace")
+        if a == b:
+            continue
+        a_lines = a.splitlines(keepends=True)
+        b_lines = b.splitlines(keepends=True)
+        if a_lines and not a_lines[-1].endswith("\n"):
+            a_lines[-1] += "\n"
+        if b_lines and not b_lines[-1].endswith("\n"):
+            b_lines[-1] += "\n"
+        from_name = "/dev/null" if proto.head is None else f"a/{path}"
+        to_name = "/dev/null" if new_blob is None else f"b/{path}"
+        text = "".join(difflib.unified_diff(a_lines, b_lines, fromfile=from_name, tofile=to_name))
+        if text:
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="winnow",
+        description="Find the smallest uncommitted change set that reproduces a command's current behavior.",
+        epilog="Example: winnow -- pytest tests/test_foo.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-C", "--repo", type=Path, default=None, help="git repository (default: discover from cwd); also the command cwd unless --cwd is set")
+    p.add_argument("--cwd", type=Path, default=None, help="directory to run the command in (default: -C or current directory)")
+    p.add_argument("--base", default="HEAD", help="baseline ref (default: HEAD)")
+    p.add_argument(
+        "--format",
+        choices=("text", "paths", "json", "patch"),
+        default="text",
+        help="output format (paths/patch are stdout-composable; diagnostics go to stderr)",
+    )
+    p.add_argument(
+        "--granularity",
+        choices=("hunk", "file"),
+        default="hunk",
+        help="isolate hunks (default) or whole files",
+    )
+    p.add_argument(
+        "--fingerprint",
+        choices=("all", "strict", "stderr", "exit", "raw"),
+        default="all",
+        dest="fp_mode",
+        help="what counts as the same behavior (default: exit+stdout+stderr, with line numbers stripped)",
+    )
+    p.add_argument("--timeout", type=float, default=None, help="seconds per command trial")
+    p.add_argument("-v", "--verbose", action="store_true", help="print each trial")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--no-flake-check", action="store_true", help="do not run the WIP command twice")
+    p.add_argument("--max-trials", type=int, default=200)
+    p.add_argument("--version", action="version", version=f"winnow {VERSION}")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="command to run; use -- to disambiguate")
+    return p.parse_args(argv)
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    cmd = list(args.command)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        eprint("winnow: missing command (try: winnow -- pytest)")
+        return 2
+
+    here = Path.cwd()
+    try:
+        repo = args.repo.resolve() if args.repo else discover_repo(here)
+    except WinnowError as e:
+        eprint(f"winnow: {e}")
+        return e.exit_code
+    if args.cwd is not None:
+        cwd = args.cwd.resolve()
+    elif args.repo is not None:
+        cwd = repo
+    else:
+        cwd = here
+
+    try:
+        run_git(repo, "rev-parse", "--verify", args.base)
+    except subprocess.CalledProcessError:
+        eprint(f"winnow: unknown base ref {args.base!r}")
+        return 2
+
+    try:
+        changes = list_changes(repo, args.base, args.granularity)
+    except WinnowError as e:
+        eprint(f"winnow: {e}")
+        return e.exit_code
+
+    if not changes:
+        if args.format == "text":
+            print("winnow: clean working tree (nothing to partition)")
+        elif args.format == "json":
+            print(json.dumps({"wheat": [], "chaff": [], "trials": 0, "clean": True}))
+        return 0
+
+    log = eprint if args.verbose else (lambda _m: None)
+    guard = TreeGuard(repo, changes)
+    trials = 0
+    cache: dict[frozenset[str], Fingerprint] = {}
+    aborted = [False]
+
+    def on_signal(signum: int, _frame: object | None) -> None:
+        aborted[0] = True
+        guard.restore()
+        eprint(f"winnow: restored working tree after signal {signum}")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def trial(subset: list[Change]) -> Fingerprint:
+        nonlocal trials
+        key = frozenset(c.id for c in subset)
+        if key in cache:
+            return cache[key]
+        if trials >= args.max_trials:
+            raise WinnowError(f"exceeded --max-trials {args.max_trials}", 2)
+        trials += 1
+        try:
+            guard.apply(subset)
+        except PatchError as e:
+            fp = Fingerprint(exit_code=-1, stdout="", stderr=str(e), unapplicable=True)
+            cache[key] = fp
+            log(f"  -> {fp.summary(args.fp_mode)}")
+            return fp
+        fp = run_command(cmd, cwd, args.timeout, args.fp_mode)
+        cache[key] = fp
+        log(f"  -> {fp.summary(args.fp_mode)} [{fp.duration_ms}ms]")
+        return fp
+
+    try:
+        log(f"snapshot {len(changes)} uncommitted units ({args.granularity})")
+        wip_fp = trial(changes)
+        if not args.no_flake_check:
+            cache.pop(frozenset(c.id for c in changes), None)
+            wip_fp2 = trial(changes)
+            if wip_fp.key(args.fp_mode) != wip_fp2.key(args.fp_mode):
+                raise WinnowError(
+                    "command is flaky on the working tree (two runs differed). "
+                    "Retry, or pass --fingerprint exit, or --no-flake-check",
+                    3,
+                )
+        head_fp = trial([])
+        if head_fp.key(args.fp_mode) == wip_fp.key(args.fp_mode):
+            guard.restore()
+            return emit(
+                args,
+                wheat=[],
+                chaff=changes,
+                head=head_fp,
+                wip=wip_fp,
+                trials=trials,
+                same=True,
+                by_path=guard.by_path,
+            )
+
+        log(f"HEAD {head_fp.summary(args.fp_mode)}")
+        log(f"WIP  {wip_fp.summary(args.fp_mode)}")
+        target = wip_fp.key(args.fp_mode)
+
+        def interesting(subset: list[Change]) -> bool:
+            return trial(subset).key(args.fp_mode) == target
+
+        wheat = ddmin(changes, interesting, log)
+        confirmed: list[Change] = []
+        for i, c in enumerate(wheat):
+            rest = wheat[:i] + wheat[i + 1 :]
+            if rest and interesting(rest):
+                continue
+            confirmed.append(c)
+        wheat = sorted(confirmed or wheat, key=lambda c: (c.path, c.hunk_index or 0))
+        wheat_ids = {c.id for c in wheat}
+        chaff = [c for c in changes if c.id not in wheat_ids]
+        guard.restore()
+        return emit(
+            args,
+            wheat=wheat,
+            chaff=chaff,
+            head=head_fp,
+            wip=wip_fp,
+            trials=trials,
+            same=False,
+            by_path=guard.by_path,
+        )
+    except WinnowError as e:
+        guard.restore()
+        eprint(f"winnow: {e}")
+        return e.exit_code
+    except Exception:
+        guard.restore()
+        raise
+    finally:
+        if not aborted[0]:
+            guard.restore()
+
+
+def emit(
+    args: argparse.Namespace,
+    wheat: list[Change],
+    chaff: list[Change],
+    head: Fingerprint,
+    wip: Fingerprint,
+    trials: int,
+    same: bool,
+    by_path: dict[str, list[Change]],
+) -> int:
+    if args.format == "paths":
+        seen: set[str] = set()
+        for c in wheat:
+            if c.path in seen:
+                continue
+            seen.add(c.path)
+            print(c.path)
+        if args.verbose:
+            eprint(f"winnow: {len(wheat)} wheat units, {len(chaff)} chaff units, {trials} trials")
+        return 0
+    if args.format == "patch":
+        sys.stdout.write(wheat_patch(wheat, by_path))
+        return 0
+    if args.format == "json":
+        def dump_fp(fp: Fingerprint) -> dict[str, object]:
+            return {
+                "exit": fp.exit_code,
+                "digest": fp.digest(args.fp_mode),
+                "summary": fp.summary(args.fp_mode),
+                "timed_out": fp.timed_out,
+            }
+
+        def dump_c(c: Change) -> dict[str, object]:
+            d: dict[str, object] = {"path": c.path, "kind": c.kind, "id": c.id}
+            if c.hunk_index is not None:
+                d["hunk"] = c.hunk_index
+                d["header"] = c.hunk_header
+            return d
+
+        print(
+            json.dumps(
+                {
+                    "same": same,
+                    "trials": trials,
+                    "granularity": args.granularity,
+                    "head": dump_fp(head),
+                    "wip": dump_fp(wip),
+                    "wheat": [dump_c(c) for c in wheat],
+                    "chaff": [dump_c(c) for c in chaff],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"HEAD: {head.summary(args.fp_mode)}")
+    print(f"WIP:  {wip.summary(args.fp_mode)}")
+    print(f"trials: {trials}  fingerprint: {args.fp_mode}  granularity: {args.granularity}")
+    if same:
+        print()
+        print("working tree does not change this command's behavior")
+        print(f"chaff: {len(chaff)} units (all of them)")
+        return 0
+    nfiles_w = len({c.path for c in wheat})
+    nfiles_c = len({c.path for c in chaff})
+    print()
+    print(f"wheat ({len(wheat)} units / {nfiles_w} files):")
+    if not wheat:
+        print("  (empty)")
+    for c in wheat:
+        print(f"  {c.label()}")
+    if not args.quiet:
+        print(f"chaff ({len(chaff)} units / {nfiles_c} files):")
+        if not chaff:
+            print("  (empty)")
+        for c in chaff:
+            print(f"  {c.label()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1874 @@
+#!/usr/bin/env python3
+"""folk — discover unwritten calling protocols and their breaches.
+
+A folk protocol is a pair of calls that the codebase treats as a unit
+(lock then unlock, begin_tx then commit_tx) without ever writing that
+rule down. folk mines those pairs from path-sensitive call sequences
+and reports the sites that perform only one half.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator
+
+VERSION = "0.2.0"
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".next",
+    ".cache",
+    ".build",
+    "vendor",
+    "coverage",
+    "DerivedData",
+    "Pods",
+    ".gradle",
+    ".idea",
+    ".turbo",
+    "generated",
+}
+
+SKIP_FILE_PARTS = {"generated", "vendor_bundle", "min.js", ".min."}
+
+LANG_BY_EXT = {
+    ".py": "py",
+    ".rs": "rs",
+    ".swift": "swift",
+    ".go": "go",
+    ".ts": "ts",
+    ".tsx": "ts",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".java": "java",
+    ".c": "c",
+    ".h": "c",
+    ".cc": "c",
+    ".cpp": "c",
+    ".hpp": "c",
+    ".rb": "rb",
+}
+
+TEST_FILE_RE = re.compile(
+    r"(?:^test_.*|_test\.(?:py|go|rs)$|\.test\.(?:ts|tsx|js|jsx)$|"
+    r"\.spec\.(?:ts|tsx|js|jsx)$|Tests\.swift$|Test\.java$)",
+    re.I,
+)
+TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs", "e2e"}
+
+MAX_PATHS = 80
+MAX_FILE_BYTES = 1_000_000
+END = object()
+
+# Statistical mining ignores these (too common to be a protocol).
+STOPWORDS = {
+    "print",
+    "println",
+    "eprintln",
+    "dbg",
+    "log",
+    "debug",
+    "info",
+    "warn",
+    "warning",
+    "error",
+    "trace",
+    "fatal",
+    "panic",
+    "assert",
+    "assertEqual",
+    "assertEquals",
+    "assertTrue",
+    "assertFalse",
+    "assertNil",
+    "XCTAssert",
+    "precondition",
+    "preconditionFailure",
+    "fatalError",
+    "expect",
+    "unwrap",
+    "unwrap_or",
+    "unwrap_or_else",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "todo!",
+    "len",
+    "length",
+    "count",
+    "size",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "type",
+    "id",
+    "range",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "sorted",
+    "reversed",
+    "iter",
+    "next",
+    "super",
+    "isinstance",
+    "issubclass",
+    "hasattr",
+    "getattr",
+    "setattr",
+    "callable",
+    "abs",
+    "min",
+    "max",
+    "sum",
+    "any",
+    "all",
+    "format",
+    "repr",
+    "bytes",
+    "object",
+    "clone",
+    "copy",
+    "to_string",
+    "to_owned",
+    "toString",
+    "as_str",
+    "as_ref",
+    "as_mut",
+    "borrow",
+    "deref",
+    "default",
+    "into",
+    "from",
+    "ok",
+    "err",
+    "some",
+    "none",
+    "ok_or",
+    "is_ok",
+    "is_err",
+    "is_some",
+    "is_none",
+    "isEmpty",
+    "is_empty",
+    "append",
+    "extend",
+    "push",
+    "insert",
+    "remove",
+    "get",
+    "set",
+    "items",
+    "keys",
+    "values",
+    "update",
+    "pop",
+    "join",
+    "split",
+    "strip",
+    "replace",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "startswith",
+    "endswith",
+    "trim",
+    "lower",
+    "upper",
+    "write",
+    "writeln",
+    "read",
+    "vec",
+    "vec!",
+    "format!",
+    "write!",
+    "writeln!",
+    "println!",
+    "require",
+    "export",
+    "import",
+    "include",
+    "describe",
+    "it",
+    "test",
+    "beforeEach",
+    "afterEach",
+    "context",
+    "equal",
+    "equals",
+    "true",
+    "false",
+    "nil",
+    "null",
+    "undefined",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "Option",
+    "Result",
+    "String",
+    "Array",
+    "Dictionary",
+    "NSLog",
+    "print",
+}
+
+# Names that look like tests / assertions even with prefixes.
+ASSERT_RE = re.compile(
+    r"^(?:assert|assert_|XCTAssert|XCT|expect|should|requireEqual|fail)",
+    re.I,
+)
+
+# Known inverse verbs. Either exact or as prefixes sharing a remainder.
+PREFIX_PAIRS = (
+    ("start", "stop"),
+    ("begin", "end"),
+    ("begin", "commit"),
+    ("begin", "finish"),
+    ("open", "close"),
+    ("lock", "unlock"),
+    ("acquire", "release"),
+    ("enter", "leave"),
+    ("enter", "exit"),
+    ("push", "pop"),
+    ("connect", "disconnect"),
+    ("create", "destroy"),
+    ("add", "remove"),
+    ("set", "remove"),
+    ("set", "unset"),
+    ("set", "clear"),
+    ("insert", "delete"),
+    ("register", "unregister"),
+    ("subscribe", "unsubscribe"),
+    ("attach", "detach"),
+    ("enable", "disable"),
+    ("load", "unload"),
+    ("load", "save"),
+    ("encode", "decode"),
+    ("serialize", "deserialize"),
+    ("retain", "release"),
+    ("suspend", "resume"),
+    ("pause", "resume"),
+    ("show", "hide"),
+    ("mount", "unmount"),
+    ("bind", "unbind"),
+    ("setup", "teardown"),
+    ("init", "deinit"),
+    ("init", "fini"),
+    ("malloc", "free"),
+    ("alloc", "free"),
+    ("new", "delete"),
+    ("wrap", "unwrap"),
+    ("freeze", "thaw"),
+    ("checkout", "checkin"),
+    ("login", "logout"),
+    ("send", "recv"),
+    ("send", "receive"),
+    ("put", "take"),
+    ("produce", "consume"),
+    ("grant", "revoke"),
+    ("claim", "release"),
+    ("pin", "unpin"),
+    ("ref", "unref"),
+    ("incref", "decref"),
+    ("up", "down"),
+    ("on", "off"),
+    ("play", "stop"),
+    ("play", "pause"),
+    ("read", "write"),
+    ("get", "put"),
+    ("borrow", "return"),
+    ("checkout", "return"),
+    ("capture", "release"),
+    ("capture", "apply"),
+    ("listen", "unlisten"),
+    ("watch", "unwatch"),
+    ("spawn", "join"),
+    ("spawn", "kill"),
+    ("fork", "join"),
+    ("inc", "dec"),
+    ("increment", "decrement"),
+    ("lock", "free"),
+    ("withLock", "unlock"),
+)
+
+EXACT_INVERSES = set(PREFIX_PAIRS) | {(b, a) for a, b in PREFIX_PAIRS}
+
+# Collection / codec inverses that are meaningless without a shared receiver.
+GENERIC_VERB_PAIRS = {
+    ("push", "pop"),
+    ("add", "remove"),
+    ("insert", "delete"),
+    ("get", "put"),
+    ("get", "set"),
+    ("encode", "decode"),
+    ("load", "save"),
+    ("read", "write"),
+    ("send", "recv"),
+    ("send", "receive"),
+}
+GENERIC_VERB_PAIRS |= {(b, a) for a, b in list(GENERIC_VERB_PAIRS)}
+
+DIRECTIONAL_RESTS = {
+    ("back", "front"),
+    ("front", "back"),
+    ("start", "end"),
+    ("end", "start"),
+    ("first", "last"),
+    ("last", "first"),
+}
+
+ALL_PROTOCOL_VERBS = {a for a, _ in PREFIX_PAIRS} | {b for _, b in PREFIX_PAIRS}
+
+UN_PREFIX_RE = re.compile(r"^un")
+
+# Words that must never become CALL tokens even when followed by '('.
+NEVER_CALL = {
+    "if",
+    "else",
+    "for",
+    "while",
+    "loop",
+    "match",
+    "switch",
+    "try",
+    "catch",
+    "except",
+    "finally",
+    "return",
+    "throw",
+    "raise",
+    "guard",
+    "defer",
+    "elif",
+    "let",
+    "var",
+    "const",
+    "mut",
+    "fn",
+    "func",
+    "function",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "impl",
+    "protocol",
+    "extension",
+    "where",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "as",
+    "is",
+    "in",
+    "of",
+    "from",
+    "import",
+    "export",
+    "use",
+    "mod",
+    "pub",
+    "public",
+    "private",
+    "protected",
+    "static",
+    "async",
+    "await",
+    "yield",
+    "typeof",
+    "sizeof",
+    "instanceof",
+    "this",
+    "self",
+    "super",
+    "nil",
+    "null",
+    "true",
+    "false",
+    "undefined",
+    "void",
+    "package",
+    "interface",
+    "implements",
+    "extends",
+    "throws",
+    "rethrows",
+    "override",
+    "required",
+    "convenience",
+    "lazy",
+    "weak",
+    "unowned",
+    "inout",
+    "consuming",
+    "borrowing",
+    "some",
+    "any",
+    "own",
+    "borrowing",
+}
+
+
+@dataclass(frozen=True)
+class CallEvt:
+    name: str
+    recv: str | None
+    lineno: int
+    col: int
+    kind: str = "call"  # call | return | throw
+
+    @property
+    def key(self) -> str:
+        return self.name
+
+    def display(self) -> str:
+        if self.recv:
+            return f"{self.recv}.{self.name}"
+        return self.name
+
+
+@dataclass
+class FunctionTrace:
+    file: str
+    name: str
+    lineno: int
+    lang: str
+    is_test: bool
+    paths: list[list[CallEvt]] = field(default_factory=list)
+
+
+@dataclass
+class PairStat:
+    left: str
+    right: str
+    lang: str = ""
+    together: int = 0
+    only_left: int = 0
+    only_right: int = 0
+    reversed: int = 0
+    same_recv: int = 0
+    funcs: set[str] = field(default_factory=set)
+    langs: set[str] = field(default_factory=set)
+    why: set[str] = field(default_factory=set)
+
+    def score(self) -> float:
+        den = self.together + self.only_left + self.only_right
+        if den <= 0:
+            return 0.0
+        return self.together / den
+
+
+@dataclass
+class Orphan:
+    file: str
+    line: int
+    col: int
+    kind: str
+    left: str
+    right: str
+    site: str
+    func: str
+    note: str
+    recv: str | None = None
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def is_test_path(path: Path) -> bool:
+    if TEST_FILE_RE.search(path.name):
+        return True
+    return any(part.lower() in TEST_DIR_NAMES for part in path.parts)
+
+
+def should_skip_dir(name: str) -> bool:
+    return name in SKIP_DIRS or name.startswith(".")
+
+
+def iter_source_files(roots: list[Path], langs: set[str] | None) -> Iterator[Path]:
+    for root in roots:
+        if root.is_file():
+            yield root
+            continue
+        if not root.exists():
+            eprint(f"folk: no such path: {root}")
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                ext = p.suffix.lower()
+                lang = LANG_BY_EXT.get(ext)
+                if not lang:
+                    continue
+                if langs and lang not in langs:
+                    continue
+                if any(part in p.name for part in (".min.", "vendor_bundle")):
+                    continue
+                yield p
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        eprint(f"folk: skip {path}: {exc}")
+        return None
+    if len(data) > MAX_FILE_BYTES:
+        eprint(f"folk: skip {path}: too large ({len(data)} bytes)")
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def camel_to_words(name: str) -> list[str]:
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    s = s.replace("-", "_")
+    return [w.lower() for w in s.split("_") if w]
+
+
+def stem_split(name: str) -> tuple[str, str]:
+    """Split beginTx / begin_tx / startCapture into (verb, rest)."""
+    words = camel_to_words(name)
+    if not words:
+        return name.lower(), ""
+    return words[0], "".join(words[1:])
+
+
+def is_stopword(name: str) -> bool:
+    if name in STOPWORDS:
+        return True
+    if ASSERT_RE.match(name):
+        return True
+    if name.endswith("!") and name[:-1] in STOPWORDS:
+        return True
+    return False
+
+
+def verbs_inverse(va: str, vb: str) -> bool:
+    if not va or not vb or va == vb:
+        return False
+    if (va, vb) in EXACT_INVERSES:
+        return True
+    if va.startswith("un") and va[2:] == vb:
+        return True
+    if vb.startswith("un") and vb[2:] == va:
+        return True
+    if va.startswith("de") and va[2:] == vb:
+        return True
+    if vb.startswith("de") and vb[2:] == va:
+        return True
+    return False
+
+
+def lexical_inverse(a: str, b: str) -> bool:
+    if a == b:
+        return False
+    la, lb = a.lower(), b.lower()
+    if la == lb:
+        return False
+    if verbs_inverse(la, lb):
+        return True
+    va, ra = stem_split(a)
+    vb, rb = stem_split(b)
+    if not verbs_inverse(va, vb):
+        return False
+    # begin_tx / commit_tx (same remainder) or push_back / pop_front
+    return ra == rb or (ra, rb) in DIRECTIONAL_RESTS
+
+
+def is_generic_inverse(a: str, b: str) -> bool:
+    va, _ = stem_split(a)
+    vb, _ = stem_split(b)
+    return (va, vb) in GENERIC_VERB_PAIRS
+
+
+def is_protocol_move(name: str) -> bool:
+    low = name.lower()
+    if low in ALL_PROTOCOL_VERBS:
+        return True
+    if low.startswith("un") and low[2:] in ALL_PROTOCOL_VERBS:
+        return True
+    v, _ = stem_split(name)
+    return v in ALL_PROTOCOL_VERBS or (v.startswith("un") and v[2:] in ALL_PROTOCOL_VERBS)
+
+
+def is_constructorish(name: str) -> bool:
+    return bool(name) and name[0].isupper() and any(c.islower() for c in name[1:])
+
+
+def concat_paths(paths: list[list], suffixes: list[list], cap: int = MAX_PATHS) -> list[list]:
+    out: list[list] = []
+    for p in paths:
+        if p and p[-1] is END:
+            out.append(p)
+            continue
+        for s in suffixes:
+            out.append(p + s)
+            if len(out) >= cap:
+                return out
+    return out if out else paths
+
+
+# ---------------------------------------------------------------------------
+# Python CFG
+# ---------------------------------------------------------------------------
+
+def py_call_evt(node: ast.Call) -> CallEvt | None:
+    func = node.func
+    name = None
+    recv = None
+    if isinstance(func, ast.Name):
+        name = func.id
+    elif isinstance(func, ast.Attribute):
+        name = func.attr
+        if isinstance(func.value, ast.Name):
+            recv = func.value.id
+        elif isinstance(func.value, ast.Attribute) and isinstance(func.value.value, ast.Name):
+            recv = f"{func.value.value.id}.{func.value.attr}"
+        elif isinstance(func.value, ast.Name) is False and isinstance(func.value, ast.Call):
+            recv = None
+    if not name or name.startswith("__"):
+        return None
+    return CallEvt(name=name, recv=recv, lineno=getattr(node, "lineno", 1), col=getattr(node, "col_offset", 0))
+
+
+def py_calls_in(node: ast.AST | None) -> list[CallEvt]:
+    if node is None:
+        return []
+    out: list[CallEvt] = []
+
+    def walk(n: ast.AST) -> None:
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Attribute):
+                walk(n.func.value)
+            elif not isinstance(n.func, ast.Name):
+                walk(n.func)
+            for a in n.args:
+                walk(a)
+            for k in n.keywords:
+                walk(k.value)
+            ev = py_call_evt(n)
+            if ev:
+                out.append(ev)
+            return
+        for ch in ast.iter_child_nodes(n):
+            walk(ch)
+
+    walk(node)
+    return out
+
+
+class PyCFG:
+    def __init__(self, filename: str) -> None:
+        self.filename = filename
+
+    def stmts(self, body: list[ast.stmt]) -> list[list]:
+        paths: list[list] = [[]]
+        for stmt in body:
+            bits = self.stmt(stmt)
+            paths = concat_paths(paths, bits)
+        return paths or [[]]
+
+    def stmt(self, stmt: ast.stmt) -> list[list]:
+        if isinstance(stmt, ast.If):
+            prefix = py_calls_in(stmt.test)
+            then = self.stmts(stmt.body)
+            els = self.stmts(stmt.orelse) if stmt.orelse else [[]]
+            return [prefix + p for p in then + els]
+        if isinstance(stmt, ast.While):
+            prefix = py_calls_in(stmt.test)
+            body = self.stmts(stmt.body)
+            # 0 or 1 iteration
+            return [prefix] + [prefix + p for p in body]
+        if isinstance(stmt, ast.For):
+            prefix = py_calls_in(stmt.iter) + py_calls_in(stmt.target)
+            body = self.stmts(stmt.body)
+            return [prefix] + [prefix + p for p in body]
+        if isinstance(stmt, ast.Try):
+            try_p = self.stmts(stmt.body)
+            else_p = self.stmts(stmt.orelse) if stmt.orelse else [[]]
+            fin_p = self.stmts(stmt.finalbody) if stmt.finalbody else [[]]
+            success = concat_paths(concat_paths(try_p, else_p), fin_p)
+            handlers: list[list] = []
+            for h in stmt.handlers:
+                hp = self.stmts(h.body)
+                handlers.extend(concat_paths(hp, fin_p))
+            if not stmt.handlers and not stmt.finalbody:
+                return try_p
+            return success + handlers
+        if isinstance(stmt, ast.With):
+            prefix: list[CallEvt] = []
+            synthetic: list[CallEvt] = []
+            for item in stmt.items:
+                prefix.extend(py_calls_in(item.context_expr))
+                # with open(...) as f: imply close at end of block
+                for ev in py_calls_in(item.context_expr):
+                    if ev.name in {"open", "lock", "acquire"}:
+                        inv = {"open": "close", "lock": "unlock", "acquire": "release"}[ev.name]
+                        synthetic.append(
+                            CallEvt(name=inv, recv=ev.recv, lineno=stmt.lineno, col=stmt.col_offset)
+                        )
+            body = self.stmts(stmt.body)
+            return [prefix + p + synthetic for p in body]
+        if isinstance(stmt, ast.Match):
+            prefix = py_calls_in(stmt.subject)
+            cases: list[list] = []
+            for c in stmt.cases:
+                cases.extend(self.stmts(c.body))
+            if not cases:
+                cases = [[]]
+            return [prefix + p for p in cases]
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            value = stmt.value if isinstance(stmt, ast.Return) else (stmt.exc if isinstance(stmt, ast.Raise) else None)
+            calls = py_calls_in(value)
+            kind = "return" if isinstance(stmt, ast.Return) else "throw"
+            marker = CallEvt(name=kind, recv=None, lineno=stmt.lineno, col=stmt.col_offset, kind=kind)
+            return [calls + [marker, END]]
+        if isinstance(stmt, ast.FunctionDef) or isinstance(stmt, ast.AsyncFunctionDef):
+            # nested function: not part of this body's call sequence
+            return [[]]
+        if isinstance(stmt, ast.ClassDef):
+            return [[]]
+        # generic: collect calls in this statement's expressions, not nested bodies
+        return [py_calls_in(stmt)]
+
+
+def extract_python(path: Path, src: str, is_test: bool) -> list[FunctionTrace]:
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError as exc:
+        eprint(f"folk: python parse error {path}:{exc.lineno}: {exc.msg}")
+        return []
+    cfg = PyCFG(str(path))
+    out: list[FunctionTrace] = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._fn(node)
+            self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._fn(node)
+            self.generic_visit(node)
+
+        def _fn(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            raw_paths = cfg.stmts(node.body)
+            paths: list[list[CallEvt]] = []
+            for p in raw_paths:
+                clean = [x for x in p if x is not END and isinstance(x, CallEvt)]
+                paths.append(clean)
+            out.append(
+                FunctionTrace(
+                    file=str(path),
+                    name=node.name,
+                    lineno=node.lineno,
+                    lang="py",
+                    is_test=is_test or node.name.startswith("test"),
+                    paths=paths or [[]],
+                )
+            )
+
+    Visitor().visit(tree)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Brace-language lexer + light CFG (rs/go/swift/js/ts/java/c)
+# ---------------------------------------------------------------------------
+
+BRACE_KW = {
+    "if": "IF",
+    "else": "ELSE",
+    "for": "FOR",
+    "while": "WHILE",
+    "loop": "LOOP",
+    "match": "MATCH",
+    "switch": "SWITCH",
+    "try": "TRY",
+    "catch": "CATCH",
+    "except": "CATCH",
+    "finally": "FINALLY",
+    "return": "RETURN",
+    "throw": "THROW",
+    "raise": "THROW",
+    "guard": "GUARD",
+    "defer": "DEFER",
+    "elif": "ELIF",
+}
+
+FN_HEAD_RE = {
+    "rs": re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{]{0,400}>)?\s*\("),
+    "go": re.compile(r"\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+    "swift": re.compile(r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{]{0,400}>)?\s*\("),
+    "ts": re.compile(
+        r"(?:(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{]{0,200}>)?\s*\()"
+        r"|(?:(?:public|private|protected|static|async|readonly)\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    ),
+    "js": re.compile(
+        r"(?:(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\()"
+        r"|(?:(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\()"
+    ),
+    "java": re.compile(
+        r"(?:public|private|protected|static|final|synchronized|native|abstract)\s+"
+        r".*?\b([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    ),
+    "c": re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]{0,300}\)\s*\{"),
+    "rb": re.compile(r"\bdef\s+([A-Za-z_][A-Za-z0-9_?!]*)"),
+}
+
+NESTED_FN_KWS = {"fn", "func", "function", "def"}
+
+
+def mask_strings_and_comments(src: str, lang: str) -> str:
+    """Replace comments and string contents with spaces; keep newlines and length."""
+    n = len(src)
+    out = list(src)
+    i = 0
+    line_comment = "#" if lang in {"py", "rb"} else "//"
+    if lang == "rb":
+        line_comment = "#"
+
+    def space_range(a: int, b: int) -> None:
+        for j in range(a, b):
+            if out[j] != "\n":
+                out[j] = " "
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        # line comment
+        if lang in {"py", "rb"} and ch == "#":
+            j = i
+            while j < n and src[j] != "\n":
+                j += 1
+            space_range(i, j)
+            i = j
+            continue
+        if ch == "/" and nxt == "/" and lang not in {"py", "rb"}:
+            j = i
+            while j < n and src[j] != "\n":
+                j += 1
+            space_range(i, j)
+            i = j
+            continue
+        if ch == "/" and nxt == "*" and lang not in {"py"}:
+            j = i + 2
+            while j + 1 < n and not (src[j] == "*" and src[j + 1] == "/"):
+                j += 1
+            j = min(n, j + 2)
+            space_range(i, j)
+            i = j
+            continue
+        # strings
+        if ch in {'"', "'", "`"}:
+            quote = ch
+            # rust raw r#"..."#  — approximate: r" or r#"
+            j = i + 1
+            if lang == "rs" and i > 0 and src[i - 1] == "#":
+                pass
+            escaped = False
+            if quote == "'" and lang in {"rs", "c", "java", "go"}:
+                # char literal
+                if j < n:
+                    if src[j] == "\\":
+                        j = min(n, j + 3)
+                    else:
+                        j = min(n, j + 2)
+                space_range(i, min(n, j))
+                i = min(n, j)
+                continue
+            while j < n:
+                if not escaped and src[j] == quote:
+                    j += 1
+                    break
+                if src[j] == "\\" and not escaped and quote != "`":
+                    escaped = True
+                    j += 1
+                    continue
+                escaped = False
+                j += 1
+            space_range(i + 1, min(n, j - 1 if j <= n else j))
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
+def offset_to_linecol(src: str, off: int) -> tuple[int, int]:
+    line = src.count("\n", 0, off) + 1
+    last = src.rfind("\n", 0, off)
+    col = off - (last + 1)
+    return line, col
+
+
+@dataclass
+class Tok:
+    kind: str
+    name: str | None
+    recv: str | None
+    off: int
+    lineno: int
+    col: int
+
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def lex_brace(masked: str, src: str) -> list[Tok]:
+    toks: list[Tok] = []
+    n = len(masked)
+    i = 0
+    while i < n:
+        ch = masked[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "{":
+            ln, col = offset_to_linecol(src, i)
+            toks.append(Tok("LBRACE", None, None, i, ln, col))
+            i += 1
+            continue
+        if ch == "}":
+            ln, col = offset_to_linecol(src, i)
+            toks.append(Tok("RBRACE", None, None, i, ln, col))
+            i += 1
+            continue
+        if ch == "(":
+            ln, col = offset_to_linecol(src, i)
+            toks.append(Tok("LPAREN", None, None, i, ln, col))
+            i += 1
+            continue
+        if ch == ")":
+            ln, col = offset_to_linecol(src, i)
+            toks.append(Tok("RPAREN", None, None, i, ln, col))
+            i += 1
+            continue
+        m = IDENT_RE.match(masked, i)
+        if m:
+            word = m.group(0)
+            ln, col = offset_to_linecol(src, i)
+            j = m.end()
+            # skip turbofish / generics then maybe (
+            k = j
+            while k < n and masked[k].isspace():
+                k += 1
+            if k < n and masked.startswith("::", k):
+                k += 2
+                while k < n and masked[k].isspace():
+                    k += 1
+            if k < n and masked[k] == "<":
+                # skip balanced <>
+                depth = 1
+                k += 1
+                while k < n and depth:
+                    if masked[k] == "<":
+                        depth += 1
+                    elif masked[k] == ">":
+                        depth -= 1
+                    k += 1
+                while k < n and masked[k].isspace():
+                    k += 1
+            if k < n and masked[k] == "!":
+                word = word + "!"
+                k += 1
+                while k < n and masked[k].isspace():
+                    k += 1
+            low = word.lower()
+            kw = BRACE_KW.get(low)
+            if low in NEVER_CALL:
+                if kw:
+                    toks.append(Tok(kw, word, None, i, ln, col))
+                elif low in NESTED_FN_KWS or word in {"fn", "func", "function"}:
+                    toks.append(Tok("FN", word, None, i, ln, col))
+                else:
+                    toks.append(Tok("IDENT", word, None, i, ln, col))
+                i = j
+                continue
+            # look behind for receiver: ident . ident (
+            recv = None
+            if toks and toks[-1].kind == "DOT" and len(toks) >= 2 and toks[-2].kind in {"IDENT", "CALL", "KW"}:
+                recv = toks[-2].name
+            if k < n and masked[k] == "(":
+                if low in NESTED_FN_KWS or word in {"fn", "func", "function"}:
+                    toks.append(Tok("FN", word, None, i, ln, col))
+                    i = j
+                    continue
+                toks.append(Tok("CALL", word, recv, i, ln, col))
+                i = k  # leave LPAREN for skip_paren
+                continue
+            if word.lower() in NESTED_FN_KWS or word in {"fn", "func", "function"}:
+                toks.append(Tok("FN", word, None, i, ln, col))
+                i = j
+                continue
+            if kw:
+                toks.append(Tok(kw, word, None, i, ln, col))
+                i = j
+                continue
+            toks.append(Tok("IDENT", word, None, i, ln, col))
+            i = j
+            continue
+        if ch == ".":
+            ln, col = offset_to_linecol(src, i)
+            toks.append(Tok("DOT", ".", None, i, ln, col))
+            i += 1
+            continue
+        if ch == ":":
+            i += 1
+            continue
+        i += 1
+    return toks
+
+
+def skip_balanced(toks: list[Tok], i: int, left: str, right: str) -> int:
+    if i >= len(toks) or toks[i].kind != left:
+        return i
+    depth = 0
+    while i < len(toks):
+        if toks[i].kind == left:
+            depth += 1
+        elif toks[i].kind == right:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return i
+
+
+def gather_calls_until(toks: list[Tok], i: int, stop: set[str]) -> tuple[list[CallEvt], int]:
+    calls: list[CallEvt] = []
+    while i < len(toks) and toks[i].kind not in stop:
+        t = toks[i]
+        if t.kind == "CALL":
+            calls.append(CallEvt(t.name or "?", t.recv, t.lineno, t.col))
+            i += 1
+            continue
+        if t.kind == "LPAREN":
+            i = skip_balanced(toks, i, "LPAREN", "RPAREN")
+            continue
+        if t.kind == "LBRACE":
+            break
+        i += 1
+    return calls, i
+
+
+class BraceCFG:
+    def __init__(self, toks: list[Tok]) -> None:
+        self.toks = toks
+
+    def parse_block(self, i: int) -> tuple[list[list], int]:
+        """Assume toks[i] is LBRACE; parse until matching RBRACE."""
+        if i >= len(self.toks) or self.toks[i].kind != "LBRACE":
+            return [[]], i
+        i += 1
+        paths, i = self.parse_stmts(i, stop={"RBRACE"})
+        if i < len(self.toks) and self.toks[i].kind == "RBRACE":
+            i += 1
+        return paths, i
+
+    def parse_stmts(self, i: int, stop: set[str]) -> tuple[list[list], int]:
+        paths: list[list] = [[]]
+        toks = self.toks
+        while i < len(toks) and toks[i].kind not in stop:
+            t = toks[i]
+            if t.kind == "RBRACE":
+                break
+            if t.kind == "FN":
+                # skip nested function: find its brace and skip the block
+                i += 1
+                while i < len(toks) and toks[i].kind not in {"LBRACE", "RBRACE"}:
+                    if toks[i].kind == "LPAREN":
+                        i = skip_balanced(toks, i, "LPAREN", "RPAREN")
+                    else:
+                        i += 1
+                if i < len(toks) and toks[i].kind == "LBRACE":
+                    _, i = self.parse_block(i)
+                continue
+            if t.kind == "CALL":
+                ev = CallEvt(t.name or "?", t.recv, t.lineno, t.col)
+                paths = [p + [ev] for p in paths if not (p and p[-1] is END)] + [p for p in paths if p and p[-1] is END]
+                i += 1
+                continue
+            if t.kind == "IF":
+                bits, i = self.parse_if(i)
+                paths = concat_paths(paths, bits)
+                continue
+            if t.kind == "GUARD":
+                # Swift guard ... else { return }; continuation is the other path
+                bits, i = self.parse_guard(i)
+                paths = concat_paths(paths, bits)
+                continue
+            if t.kind in {"FOR", "WHILE", "LOOP"}:
+                bits, i = self.parse_loop(i)
+                paths = concat_paths(paths, bits)
+                continue
+            if t.kind == "TRY":
+                bits, i = self.parse_try(i)
+                paths = concat_paths(paths, bits)
+                continue
+            if t.kind in {"RETURN", "THROW"}:
+                kind = "return" if t.kind == "RETURN" else "throw"
+                extra, i2 = gather_calls_until(toks, i + 1, {"RBRACE", "IF", "ELSE", "FOR", "WHILE", "TRY", "RETURN", "THROW", "GUARD", "FN"})
+                marker = CallEvt(kind, None, t.lineno, t.col, kind=kind)
+                frozen = [extra + [marker, END]]
+                paths = concat_paths(paths, frozen)
+                i = i2
+                continue
+            if t.kind == "DEFER":
+                # defer close() — still a call in source order after the producer, which is correct
+                extra, i = gather_calls_until(toks, i + 1, {"RBRACE", "IF", "ELSE", "FOR", "WHILE", "TRY", "RETURN", "THROW", "GUARD", "FN", "DEFER", "CALL"})
+                if extra:
+                    paths = concat_paths(paths, [extra])
+                if i < len(toks) and toks[i].kind == "CALL":
+                    continue
+                if i < len(toks) and toks[i].kind == "LBRACE":
+                    block, i = self.parse_block(i)
+                    paths = concat_paths(paths, block)
+                continue
+            if t.kind == "LBRACE":
+                block, i = self.parse_block(i - 0) if False else self.parse_block(i)
+                paths = concat_paths(paths, block)
+                continue
+            if t.kind == "LPAREN":
+                inner, i = self._skip_or_collect_paren(i)
+                if inner:
+                    paths = concat_paths(paths, [inner])
+                continue
+            i += 1
+        return paths, i
+
+    def _skip_or_collect_paren(self, i: int) -> tuple[list[CallEvt], int]:
+        calls, _ = gather_calls_until(self.toks, i + 1, {"RPAREN"})
+        return calls, skip_balanced(self.toks, i, "LPAREN", "RPAREN")
+
+    def parse_if(self, i: int) -> tuple[list[list], int]:
+        toks = self.toks
+        # IF [LPAREN cond RPAREN] LBRACE then [ELSE ...]
+        i += 1
+        cond: list[CallEvt] = []
+        if i < len(toks) and toks[i].kind == "LPAREN":
+            cond, i = self._skip_or_collect_paren(i)
+        else:
+            c, i = gather_calls_until(toks, i, {"LBRACE", "RBRACE"})
+            cond.extend(c)
+        then_paths = [[]]
+        if i < len(toks) and toks[i].kind == "LBRACE":
+            then_paths, i = self.parse_block(i)
+        else:
+            # rust: if cond { } or if cond stmt
+            then_paths, i = self.parse_stmts(i, stop={"ELSE", "RBRACE", "IF", "FOR", "WHILE"})
+        else_paths: list[list] = [[]]
+        if i < len(toks) and toks[i].kind == "ELSE":
+            i += 1
+            if i < len(toks) and toks[i].kind == "IF":
+                else_paths, i = self.parse_if(i)
+            elif i < len(toks) and toks[i].kind == "LBRACE":
+                else_paths, i = self.parse_block(i)
+            else:
+                else_paths, i = self.parse_stmts(i, stop={"RBRACE", "IF", "FOR", "WHILE", "ELSE"})
+        branches = then_paths + else_paths
+        return [cond + b for b in branches], i
+
+    def parse_guard(self, i: int) -> tuple[list[list], int]:
+        toks = self.toks
+        i += 1
+        cond, i = gather_calls_until(toks, i, {"ELSE", "LBRACE"})
+        else_paths: list[list] = [[]]
+        if i < len(toks) and toks[i].kind == "ELSE":
+            i += 1
+            if i < len(toks) and toks[i].kind == "LBRACE":
+                else_paths, i = self.parse_block(i)
+        # guard success continues; else is typically return (frozen)
+        success = [cond]
+        fail = [cond + p for p in else_paths]
+        return success + fail, i
+
+    def parse_loop(self, i: int) -> tuple[list[list], int]:
+        toks = self.toks
+        i += 1
+        cond: list[CallEvt] = []
+        if i < len(toks) and toks[i].kind == "LPAREN":
+            cond, i = self._skip_or_collect_paren(i)
+        else:
+            c, i = gather_calls_until(toks, i, {"LBRACE", "RBRACE"})
+            cond.extend(c)
+        body: list[list] = [[]]
+        if i < len(toks) and toks[i].kind == "LBRACE":
+            body, i = self.parse_block(i)
+        zero = [cond]
+        one = [cond + p for p in body]
+        return zero + one, i
+
+    def parse_try(self, i: int) -> tuple[list[list], int]:
+        toks = self.toks
+        i += 1
+        try_paths = [[]]
+        if i < len(toks) and toks[i].kind == "LBRACE":
+            try_paths, i = self.parse_block(i)
+        handlers: list[list] = []
+        fin: list[list] = [[]]
+        while i < len(toks) and toks[i].kind in {"CATCH", "FINALLY"}:
+            kind = toks[i].kind
+            i += 1
+            if i < len(toks) and toks[i].kind == "LPAREN":
+                _, i = self._skip_or_collect_paren(i)
+            block = [[]]
+            if i < len(toks) and toks[i].kind == "LBRACE":
+                block, i = self.parse_block(i)
+            if kind == "FINALLY":
+                fin = block
+            else:
+                handlers.extend(block)
+        success = concat_paths(try_paths, fin)
+        excepts = concat_paths(handlers, fin) if handlers else []
+        return success + excepts, i
+
+
+def find_functions_brace(src: str, masked: str, lang: str) -> list[tuple[str, int, int, int]]:
+    """Return (name, lineno, body_lbrace_off, body_rbrace_off)."""
+    rx = FN_HEAD_RE.get(lang)
+    if not rx:
+        return []
+    out: list[tuple[str, int, int, int]] = []
+    for m in rx.finditer(masked):
+        name = next((g for g in m.groups() if g), None)
+        if not name:
+            continue
+        # find first { after the match, at brace depth considering we may have => or where
+        i = m.end()
+        n = len(masked)
+        # skip remaining signature to { or ; (proto)
+        depth_par = 0
+        while i < n:
+            ch = masked[i]
+            if ch == "(":
+                depth_par += 1
+            elif ch == ")":
+                depth_par -= 1
+            elif ch == "{" and depth_par <= 0:
+                break
+            elif ch == ";" and depth_par <= 0:
+                i = -1
+                break
+            i += 1
+        if i < 0 or i >= n or masked[i] != "{":
+            continue
+        # match braces
+        depth = 0
+        j = i
+        while j < n:
+            if masked[j] == "{":
+                depth += 1
+            elif masked[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= n:
+            continue
+        ln, _ = offset_to_linecol(src, m.start())
+        out.append((name, ln, i, j))
+    return out
+
+
+def extract_brace(path: Path, src: str, lang: str, is_test: bool) -> list[FunctionTrace]:
+    masked = mask_strings_and_comments(src, lang)
+    funcs = find_functions_brace(src, masked, lang)
+    out: list[FunctionTrace] = []
+    for name, lineno, lo, hi in funcs:
+        body_src = src[lo : hi + 1]
+        body_masked = masked[lo : hi + 1]
+        # lex relative, then fix line numbers using absolute offsets
+        toks = lex_brace(body_masked, body_src)
+        # retarget line/col to file
+        base_ln, _ = offset_to_linecol(src, lo)
+        for t in toks:
+            t.lineno = t.lineno + base_ln - 1
+        cfg = BraceCFG(toks)
+        paths, _ = cfg.parse_block(0)
+        clean_paths: list[list[CallEvt]] = []
+        for p in paths:
+            clean = [x for x in p if x is not END and isinstance(x, CallEvt)]
+            clean_paths.append(clean)
+        out.append(
+            FunctionTrace(
+                file=str(path),
+                name=name,
+                lineno=lineno,
+                lang=lang,
+                is_test=is_test or name.startswith("test") or name.startswith("Test"),
+                paths=clean_paths or [[]],
+            )
+        )
+    return out
+
+
+def extract_file(path: Path, langs: set[str] | None) -> list[FunctionTrace]:
+    ext = path.suffix.lower()
+    lang = LANG_BY_EXT.get(ext)
+    if not lang:
+        return []
+    if langs and lang not in langs:
+        return []
+    src = read_text(path)
+    if src is None:
+        return []
+    is_test = is_test_path(path)
+    if lang == "py":
+        return extract_python(path, src, is_test)
+    return extract_brace(path, src, lang, is_test)
+
+
+# ---------------------------------------------------------------------------
+# Pair mining
+# ---------------------------------------------------------------------------
+
+def calls_on_path(path: list[CallEvt]) -> list[CallEvt]:
+    return [c for c in path if c.kind == "call"]
+
+
+def pair_gap(a: str, b: str, max_gap: int) -> int:
+    # Inverse pairs are "same path", not "within N calls". A test can do
+    # set_var → lots of setup → remove_var and still honor the protocol.
+    if lexical_inverse(a, b):
+        return max(max_gap, 128)
+    return max_gap
+
+
+def later_has_B(seq: list[CallEvt], i: int, b: str, max_gap: int, recv: str | None) -> bool:
+    window = seq[i + 1 : i + 1 + max_gap + 1]
+    if recv:
+        return any(x.name == b and x.recv == recv for x in window)
+    return any(x.name == b for x in window)
+
+
+def path_has_A_then_B(path: list[CallEvt], a: str, b: str, max_gap: int, recv: str | None = None) -> bool:
+    names = calls_on_path(path)
+    for i, c in enumerate(names):
+        if c.name != a:
+            continue
+        if recv is not None and c.recv != recv:
+            continue
+        if later_has_B(names, i, b, max_gap, recv):
+            return True
+    return False
+
+
+def is_fast_fail_after(path: list[CallEvt], c: CallEvt, b: str) -> bool:
+    try:
+        idx = path.index(c)
+    except ValueError:
+        return False
+    rest = path[idx + 1 :]
+    rest_calls = [x for x in rest if x.kind == "call"]
+    rest_term = any(x.kind in {"return", "throw"} for x in rest)
+    if rest_term and len(rest_calls) <= 2 and not any(x.name == b for x in rest_calls):
+        return True
+    if rest_term and not rest_calls:
+        return True
+    return False
+
+
+def must_protocol_calls(fn: FunctionTrace) -> list[CallEvt]:
+    """Calls that look like protocol moves and appear on every path."""
+    if not fn.paths:
+        return []
+    inter: set[str] | None = None
+    for p in fn.paths:
+        names = {c.name for c in calls_on_path(p) if is_protocol_move(c.name)}
+        inter = names if inter is None else inter & names
+    if not inter:
+        return []
+    may: set[str] = set()
+    for p in fn.paths:
+        for c in calls_on_path(p):
+            if is_protocol_move(c.name):
+                may.add(c.name)
+    seen: set[str] = set()
+    out: list[CallEvt] = []
+    for c in calls_on_path(fn.paths[0]):
+        if c.name not in inter or c.name in seen:
+            continue
+        # Don't promote A if the callee only sometimes does A's inverse
+        # (LRU: push_back is must, pop_front is overflow-only).
+        if any(other in may and other not in inter and lexical_inverse(c.name, other) for other in may):
+            continue
+        seen.add(c.name)
+        out.append(c)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def inline_one_level(traces: list[FunctionTrace]) -> list[FunctionTrace]:
+    """Splice callee must-protocol-moves into each caller (one level)."""
+    by_file: dict[tuple[str, str], list[FunctionTrace]] = defaultdict(list)
+    by_lang: dict[tuple[str, str], list[FunctionTrace]] = defaultdict(list)
+    for t in traces:
+        by_file[(t.file, t.name)].append(t)
+        by_lang[(t.lang, t.name)].append(t)
+    must = {id(t): must_protocol_calls(t) for t in traces}
+
+    out: list[FunctionTrace] = []
+    for t in traces:
+        new_paths: list[list[CallEvt]] = []
+        for p in t.paths:
+            np: list[CallEvt] = []
+            for c in p:
+                np.append(c)
+                if c.kind != "call":
+                    continue
+                cands = by_file.get((t.file, c.name)) or by_lang.get((t.lang, c.name)) or []
+                if len(cands) != 1 or cands[0] is t:
+                    continue
+                for ev in must[id(cands[0])]:
+                    np.append(CallEvt(ev.name, ev.recv, c.lineno, c.col, ev.kind))
+            new_paths.append(np)
+        out.append(
+            FunctionTrace(
+                file=t.file,
+                name=t.name,
+                lineno=t.lineno,
+                lang=t.lang,
+                is_test=t.is_test,
+                paths=new_paths,
+            )
+        )
+    return out
+
+
+def is_wrapper_for(fn: FunctionTrace, a: str, b: str) -> bool:
+    """True if this function *is* the A-half (definition or thin wrapper), not a consumer."""
+    if fn.name in {a, b}:
+        return True
+    saw_a = False
+    for p in fn.paths:
+        seq = [c.name for c in calls_on_path(p)]
+        if b in seq:
+            return False
+        core = [n for n in seq if n != a and not is_stopword(n) and not is_protocol_move(n)]
+        # allow other protocol moves only if they are a itself
+        extra = [n for n in seq if n != a and is_protocol_move(n)]
+        if extra:
+            return False
+        if core:
+            return False
+        if a in seq:
+            saw_a = True
+    return saw_a
+
+
+def mine_lang(
+    traces: list[FunctionTrace],
+    min_together: int,
+    min_score: float,
+    max_gap: int,
+    skip_test_discover: bool,
+    use_stat: bool,
+) -> tuple[list[PairStat], list[Orphan]]:
+    discover = [t for t in traces if not (skip_test_discover and t.is_test)]
+    lang = traces[0].lang if traces else ""
+
+    together_funcs: dict[tuple[str, str], list[FunctionTrace]] = defaultdict(list)
+    same_recv_funcs: dict[tuple[str, str], int] = defaultdict(int)
+    for fn in discover:
+        names: set[str] = set()
+        for p in fn.paths:
+            for c in calls_on_path(p):
+                names.add(c.name)
+        for a in names:
+            for b in names:
+                if a == b:
+                    continue
+                gap = pair_gap(a, b, max_gap)
+                if not any(path_has_A_then_B(p, a, b, gap) for p in fn.paths):
+                    continue
+                together_funcs[(a, b)].append(fn)
+                if any(
+                    path_has_A_then_B(p, a, b, gap, recv=c.recv)
+                    for p in fn.paths
+                    for c in calls_on_path(p)
+                    if c.name == a and c.recv
+                ):
+                    same_recv_funcs[(a, b)] += 1
+
+    candidates: dict[tuple[str, str], set[str]] = {}
+    for key, fns in together_funcs.items():
+        a, b = key
+        n = len(fns)
+        why: set[str] = set()
+        if lexical_inverse(a, b) and n >= 1 and not is_constructorish(a) and not is_constructorish(b):
+            if is_generic_inverse(a, b) and same_recv_funcs[key] < 1:
+                pass
+            else:
+                why.add("lex")
+        if (
+            use_stat
+            and n >= min_together
+            and not is_stopword(a)
+            and not is_stopword(b)
+            and not is_constructorish(a)
+            and not is_constructorish(b)
+        ):
+            why.add("stat")
+        if why:
+            candidates[key] = why
+
+    stats: dict[tuple[str, str], PairStat] = {}
+    for a, b in candidates:
+        st = PairStat(left=a, right=b, lang=lang, why=set(candidates[(a, b)]))
+        st.langs.add(lang)
+        for fn in discover:
+            names = {c.name for p in fn.paths for c in calls_on_path(p)}
+            has_a = a in names
+            has_b = b in names
+            gap = pair_gap(a, b, max_gap)
+            tog = any(path_has_A_then_B(p, a, b, gap) for p in fn.paths)
+            if tog:
+                st.together += 1
+                st.funcs.add(f"{fn.file}:{fn.name}")
+                if any(
+                    c.name == a and d.name == b and c.recv and c.recv == d.recv
+                    for p in fn.paths
+                    for i, c in enumerate(calls_on_path(p))
+                    for d in calls_on_path(p)[i + 1 : i + 1 + gap + 1]
+                ):
+                    st.same_recv += 1
+            elif has_a and not has_b:
+                st.only_left += 1
+            elif has_b and not has_a:
+                st.only_right += 1
+            elif has_a and has_b:
+                if any(path_has_A_then_B(p, b, a, gap) for p in fn.paths):
+                    st.reversed += 1
+                else:
+                    st.only_left += 1
+        stats[(a, b)] = st
+
+    pairs: list[PairStat] = []
+    for st in stats.values():
+        if st.together <= 0:
+            continue
+        if "lex" in st.why:
+            if is_generic_inverse(st.left, st.right) and st.same_recv < 1:
+                continue
+            # Weak inverses (Vec.push vs pop, enable vs disable in different eras) are noise.
+            if st.score() < 0.35:
+                continue
+            pairs.append(st)
+            continue
+        if st.together >= min_together and st.score() >= min_score:
+            pairs.append(st)
+    pairs.sort(key=lambda s: (-s.score(), -s.together, s.left, s.right))
+
+    pair_recvs: dict[tuple[str, str], set[str]] = {}
+    for st in pairs:
+        a, b = st.left, st.right
+        recvs: set[str] = set()
+        for pfn in traces:
+            for p in pfn.paths:
+                seq = calls_on_path(p)
+                for i, c in enumerate(seq):
+                    if c.name == a and c.recv and later_has_B(seq, i, b, pair_gap(a, b, max_gap), c.recv):
+                        recvs.add(c.recv)
+        pair_recvs[(a, b)] = recvs
+
+    orphans: list[Orphan] = []
+    for fn in traces:
+        for st in pairs:
+            a, b = st.left, st.right
+            if is_wrapper_for(fn, a, b):
+                continue
+            require_recv = is_generic_inverse(a, b)
+            protocol_recvs = pair_recvs[(a, b)]
+            gap = pair_gap(a, b, max_gap)
+            together_here = any(path_has_A_then_B(p, a, b, gap) for p in fn.paths)
+            sites: list[CallEvt] = []
+            for p in fn.paths:
+                seq = calls_on_path(p)
+                for i, c in enumerate(seq):
+                    if c.name != a:
+                        continue
+                    recv = c.recv if (c.recv or require_recv) else None
+                    if require_recv and not c.recv:
+                        continue
+                    if require_recv and protocol_recvs and c.recv not in protocol_recvs:
+                        continue
+                    if later_has_B(seq, i, b, gap, recv):
+                        continue
+                    if is_fast_fail_after(p, c, b):
+                        continue
+                    if recv and any(x.name == b and x.recv == recv for x in seq[i + 1 :]):
+                        continue
+                    if not recv and any(x.name == b for x in seq[i + 1 :]):
+                        continue
+                    sites.append(c)
+            if not sites:
+                continue
+            seen: set[tuple[int, int, str]] = set()
+            for c in sites:
+                key = (c.lineno, c.col, c.name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                kind = "conditional" if together_here else "only_left"
+                # Generic inverses (push/pop) often put B in a loop; 0-iter is not a leak.
+                if kind == "conditional" and is_generic_inverse(a, b):
+                    continue
+                right_disp = f"{c.recv}.{b}" if c.recv else f"{b}()"
+                note = (
+                    f"{fn.name}() has a path with {c.display()} and no later {right_disp}"
+                    + (" (other paths complete the pair)" if together_here else "")
+                )
+                orphans.append(
+                    Orphan(
+                        file=fn.file,
+                        line=c.lineno,
+                        col=c.col,
+                        kind=kind,
+                        left=a,
+                        right=b,
+                        site=c.display(),
+                        func=fn.name,
+                        note=note,
+                        recv=c.recv,
+                    )
+                )
+    orphans.sort(key=lambda o: (o.file, o.line, o.left, o.right))
+    return pairs, orphans
+
+
+def mine(
+    traces: list[FunctionTrace],
+    min_together: int,
+    min_score: float,
+    max_gap: int,
+    skip_test_discover: bool,
+    use_stat: bool = False,
+    do_inline: bool = True,
+) -> tuple[list[PairStat], list[Orphan]]:
+    if do_inline:
+        traces = inline_one_level(traces)
+    by_lang: dict[str, list[FunctionTrace]] = defaultdict(list)
+    for t in traces:
+        by_lang[t.lang].append(t)
+    pairs: list[PairStat] = []
+    orphans: list[Orphan] = []
+    for _lang, ts in sorted(by_lang.items()):
+        p, o = mine_lang(
+            ts,
+            min_together=min_together,
+            min_score=min_score,
+            max_gap=max_gap,
+            skip_test_discover=skip_test_discover,
+            use_stat=use_stat,
+        )
+        pairs.extend(p)
+        orphans.extend(o)
+    pairs.sort(key=lambda s: (-s.score(), -s.together, s.lang, s.left, s.right))
+    orphans.sort(key=lambda o: (o.file, o.line, o.left, o.right))
+    return pairs, orphans
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_pairs(pairs: list[PairStat], as_json: bool) -> None:
+    if as_json:
+        return
+    print("left\tright\ttogether\tonly_left\tonly_right\treversed\tscore\twhy\tsame_recv\tlangs")
+    for p in pairs:
+        why = "+".join(sorted(p.why)) or "stat"
+        langs = ",".join(sorted(p.langs))
+        print(
+            f"{p.left}\t{p.right}\t{p.together}\t{p.only_left}\t{p.only_right}\t"
+            f"{p.reversed}\t{p.score():.3f}\t{why}\t{p.same_recv}\t{langs}"
+        )
+
+
+def print_orphans(orphans: list[Orphan], as_json: bool) -> None:
+    if as_json:
+        return
+    print("file\tline\tcol\tkind\tleft\tright\tsite\tfunc\tnote")
+    for o in orphans:
+        print(f"{o.file}\t{o.line}\t{o.col}\t{o.kind}\t{o.left}\t{o.right}\t{o.site}\t{o.func}\t{o.note}")
+
+
+def emit_json(pairs: list[PairStat], orphans: list[Orphan], want_pairs: bool, want_orphans: bool) -> None:
+    obj: dict = {}
+    if want_pairs:
+        obj["pairs"] = [
+            {
+                "left": p.left,
+                "right": p.right,
+                "together": p.together,
+                "only_left": p.only_left,
+                "only_right": p.only_right,
+                "reversed": p.reversed,
+                "score": round(p.score(), 4),
+                "why": sorted(p.why),
+                "same_recv": p.same_recv,
+                "langs": sorted(p.langs),
+                "funcs": sorted(p.funcs),
+            }
+            for p in pairs
+        ]
+    if want_orphans:
+        obj["orphans"] = [
+            {
+                "file": o.file,
+                "line": o.line,
+                "col": o.col,
+                "kind": o.kind,
+                "left": o.left,
+                "right": o.right,
+                "site": o.site,
+                "func": o.func,
+                "note": o.note,
+                "recv": o.recv,
+            }
+            for o in orphans
+        ]
+    json.dump(obj, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def parse_langs(s: str | None) -> set[str] | None:
+    if not s:
+        return None
+    return {x.strip() for x in s.split(",") if x.strip()}
+
+
+def collect_roots(args_paths: list[str]) -> list[Path]:
+    if not args_paths:
+        return [Path(".")]
+    roots: list[Path] = []
+    for raw in args_paths:
+        if raw == "-":
+            for line in sys.stdin:
+                line = line.strip()
+                if line:
+                    roots.append(Path(line))
+        else:
+            roots.append(Path(raw))
+    return roots
+
+
+def run(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="folk",
+        description="Discover unwritten calling protocols (folk pairs) and their breaches.",
+    )
+    ap.add_argument("paths", nargs="*", help="files or directories (default: .). '-' reads paths from stdin.")
+    ap.add_argument("--pairs", action="store_true", help="print discovered protocols (default)")
+    ap.add_argument("--orphans", action="store_true", help="print protocol breaches")
+    ap.add_argument("--all", action="store_true", help="print pairs then orphans")
+    ap.add_argument("--of", metavar="NAME", help="restrict to protocols involving NAME")
+    ap.add_argument("--min-together", type=int, default=3, help="min functions that perform the pair (stat)")
+    ap.add_argument("--min-score", type=float, default=0.45, help="together/(together+only_left+only_right)")
+    ap.add_argument("--max-gap", type=int, default=8, help="max calls allowed between the two halves")
+    ap.add_argument(
+        "--stat",
+        action="store_true",
+        help="also mine statistical collocated pairs (noisy; off by default)",
+    )
+    ap.add_argument(
+        "--no-inline",
+        action="store_true",
+        help="do not splice one-level callee protocol moves into callers",
+    )
+    ap.add_argument("--skip-tests", action="store_true", help="ignore test files for discovery (orphans still scan them)")
+    ap.add_argument("--include-tests", action="store_true", help="force-include tests in discovery")
+    ap.add_argument("--lang", help="comma-separated language filter: py,rs,swift,go,ts,js,java,c,rb")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument("--check", action="store_true", help="exit 1 if any orphan is found")
+    ap.add_argument("--quiet", "-q", action="store_true", help="no headers; less stderr")
+    ap.add_argument("--version", action="version", version=f"folk {VERSION}")
+    args = ap.parse_args(argv)
+
+    want_pairs = args.pairs or args.all or (not args.orphans and not args.check)
+    want_orphans = args.orphans or args.all or args.check
+    if args.check and not args.pairs and not args.all:
+        want_pairs = False
+        want_orphans = True
+
+    langs = parse_langs(args.lang)
+    roots = collect_roots(args.paths)
+    files = list(iter_source_files(roots, langs))
+    traces: list[FunctionTrace] = []
+    for f in files:
+        try:
+            traces.extend(extract_file(f, langs))
+        except Exception as exc:  # noqa: BLE001 — keep walking
+            eprint(f"folk: error {f}: {exc.__class__.__name__}: {exc}")
+
+    skip_disc = args.skip_tests and not args.include_tests
+    pairs, orphans = mine(
+        traces,
+        min_together=args.min_together,
+        min_score=args.min_score,
+        max_gap=args.max_gap,
+        skip_test_discover=skip_disc,
+        use_stat=args.stat,
+        do_inline=not args.no_inline,
+    )
+
+    if args.of:
+        needle = args.of
+        pairs = [p for p in pairs if p.left == needle or p.right == needle]
+        orphans = [o for o in orphans if o.left == needle or o.right == needle or o.site.endswith(needle)]
+
+    if not args.quiet:
+        eprint(f"folk: {len(files)} files, {len(traces)} functions, {len(pairs)} pairs, {len(orphans)} orphans")
+
+    if args.json:
+        emit_json(pairs if want_pairs else [], orphans if want_orphans else [], want_pairs, want_orphans)
+    else:
+        if want_pairs:
+            print_pairs(pairs, as_json=False)
+        if want_pairs and want_orphans and not args.json:
+            print()
+        if want_orphans:
+            print_orphans(orphans, as_json=False)
+
+    if args.check and orphans:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

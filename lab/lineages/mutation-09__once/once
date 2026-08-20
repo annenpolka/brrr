@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""once — paths that ever held the same git blob, and the merge-base that blob is.
+
+No similarity. No basename heuristics. No copy detection. Kinship is exact
+object identity: if two current paths ever contained blob X, they are kin and
+X is the base for `git merge-file`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from itertools import combinations
+from typing import NoReturn
+
+NUL = b"\0"
+VERSION = "0.2.0"
+EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+# --- git -------------------------------------------------------------------
+
+
+class GitError(Exception):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def git(repo: str, args: list[str], *, check: bool = True, input: bytes | None = None) -> bytes:
+    cmd = ["git", "-C", repo, *args]
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, input=input
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip() or f"git {' '.join(args)} failed"
+        raise GitError(err, proc.returncode)
+    return proc.stdout
+
+
+def git_text(repo: str, args: list[str], check: bool = True) -> str:
+    return git(repo, args, check=check).decode("utf-8", "replace")
+
+
+def toplevel(repo: str) -> str:
+    return git_text(repo, ["rev-parse", "--show-toplevel"]).strip()
+
+
+def resolve_repo_path(repo: str, user: str) -> str:
+    top = toplevel(repo)
+    abs_user = os.path.abspath(user)
+    rel = os.path.relpath(abs_user, top)
+    if rel.startswith(".."):
+        return user.replace("\\", "/").lstrip("./")
+    return rel.replace("\\", "/")
+
+
+# --- scan ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Pair:
+    kind: str  # together | echo
+    a: str
+    b: str
+    base_blob: str
+    base_commit: str
+    base_time: int
+    blob_a: str
+    blob_b: str
+    insertions: int | None
+    deletions: int | None
+    frozen: str  # a | b | both | -
+    a_first: str
+    b_first: str
+    a_last: str
+    b_last: str
+
+    @property
+    def drifted(self) -> bool:
+        return self.blob_a != self.blob_b
+
+
+@dataclass
+class Held:
+    first_sha: str
+    first_time: int
+    last_sha: str
+    last_time: int
+
+
+@dataclass
+class Scan:
+    current: dict[str, str]
+    commits: int
+    ref: str
+    held: dict[tuple[str, str], Held]  # (path, blob) occupancy
+    last_together: dict[tuple[str, str], tuple[str, int, str]]
+    ever_blobs: dict[str, set[str]]
+
+
+def path_wanted(path: str, globs: list[str], excludes: list[str]) -> bool:
+    base = os.path.basename(path)
+    if excludes and any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g) for g in excludes):
+        return False
+    if not globs:
+        return True
+    return any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g) for g in globs)
+
+
+def list_commits(repo: str, ref: str, all_refs: bool) -> list[tuple[str, int, list[str]]]:
+    args = ["rev-list", "--timestamp", "--parents"]
+    args.append("--all" if all_refs else ref)
+    out = git_text(repo, args)
+    rows: list[tuple[str, int, list[str]]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        bits = line.split()
+        rows.append((bits[1], int(bits[0]), bits[2:]))
+    rows.reverse()
+    return rows
+
+
+def ls_tree(repo: str, sha: str) -> dict[str, str]:
+    raw = git(repo, ["ls-tree", "-r", "--full-tree", "-z", sha])
+    tree: dict[str, str] = {}
+    if not raw:
+        return tree
+    for entry in raw.split(NUL):
+        if not entry:
+            continue
+        try:
+            meta, path_b = entry.split(b"\t", 1)
+        except ValueError:
+            continue
+        parts = meta.split(b" ", 2)
+        if len(parts) != 3 or parts[1] != b"blob":
+            continue
+        tree[path_b.decode("utf-8", "surrogateescape")] = parts[2].decode("ascii")
+    return tree
+
+
+def diff_tree_raw(repo: str, parent: str | None, sha: str) -> bytes:
+    args = ["-c", "diff.renames=false", "diff-tree", "-r", "-z", "--no-abbrev"]
+    if parent is None:
+        args.extend(["--root", sha])
+    else:
+        args.extend([parent, sha])
+    return git(repo, args, check=False)
+
+
+def apply_diff(tree: dict[str, str], raw: bytes, wanted: set[str]) -> dict[str, str]:
+    """Apply a NUL-delimited diff-tree to a filtered path→blob map."""
+    out = dict(tree)
+    if not raw:
+        return out
+    parts = raw.split(NUL)
+    i = 0
+    if parts and parts[0] and not parts[0].startswith(b":"):
+        i = 1
+    n = len(parts)
+    while i < n:
+        rec = parts[i]
+        i += 1
+        if not rec or not rec.startswith(b":"):
+            continue
+        try:
+            meta = rec.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        bits = meta[1:].split()
+        if len(bits) < 5:
+            continue
+        new_blob, status = bits[3], bits[4]
+        kind = status[:1]
+        if kind in "CR":
+            if i + 1 >= n:
+                break
+            src = parts[i].decode("utf-8", "surrogateescape")
+            dst = parts[i + 1].decode("utf-8", "surrogateescape")
+            i += 2
+            if kind == "R":
+                out.pop(src, None)
+            if dst in wanted:
+                out[dst] = new_blob
+            continue
+        if i >= n:
+            break
+        path = parts[i].decode("utf-8", "surrogateescape")
+        i += 1
+        if kind == "D":
+            out.pop(path, None)
+        elif path in wanted:
+            out[path] = new_blob
+    return out
+
+
+def scan(repo: str, ref: str, all_refs: bool, globs: list[str], excludes: list[str]) -> Scan:
+    current = {p: b for p, b in ls_tree(repo, ref).items() if path_wanted(p, globs, excludes)}
+    wanted = set(current)
+    commits = list_commits(repo, ref, all_refs)
+    parent_need: dict[str, int] = defaultdict(int)
+    for _sha, _ts, parents in commits:
+        for p in parents:
+            parent_need[p] += 1
+
+    live: dict[str, dict[str, str]] = {}
+    held: dict[tuple[str, str], Held] = {}
+    last_together: dict[tuple[str, str], tuple[str, int, str]] = {}
+    ever_blobs: dict[str, set[str]] = defaultdict(set)
+
+    for sha, ts, parents in commits:
+        parent = parents[0] if parents else None
+        if parent is None:
+            tree = apply_diff({}, diff_tree_raw(repo, None, sha), wanted)
+        elif parent in live:
+            tree = apply_diff(live[parent], diff_tree_raw(repo, parent, sha), wanted)
+        else:
+            tree = {p: b for p, b in ls_tree(repo, sha).items() if p in wanted}
+
+        live[sha] = tree
+        for p in parents:
+            parent_need[p] -= 1
+            if parent_need[p] <= 0:
+                live.pop(p, None)
+        if parent_need[sha] <= 0:
+            # Leaf or otherwise unreferenced later; occupancy already recorded.
+            pass
+
+        by_blob: dict[str, list[str]] = defaultdict(list)
+        for path, blob in tree.items():
+            if blob == EMPTY_BLOB:
+                continue
+            ever_blobs[path].add(blob)
+            key = (path, blob)
+            h = held.get(key)
+            if h is None:
+                held[key] = Held(sha, ts, sha, ts)
+            else:
+                h.last_sha = sha
+                h.last_time = ts
+            by_blob[blob].append(path)
+        for blob, paths in by_blob.items():
+            if len(paths) < 2:
+                continue
+            paths.sort()
+            for a, b in combinations(paths, 2):
+                last_together[(a, b)] = (sha, ts, blob)
+
+        if parent_need[sha] <= 0:
+            live.pop(sha, None)
+
+    return Scan(
+        current=current,
+        commits=len(commits),
+        ref=ref,
+        held=held,
+        last_together=last_together,
+        ever_blobs=dict(ever_blobs),
+    )
+
+
+def frozen_side(blob_a: str, blob_b: str, base: str) -> str:
+    a_f = blob_a == base
+    b_f = blob_b == base
+    if a_f and b_f:
+        return "both"
+    if a_f:
+        return "a"
+    if b_f:
+        return "b"
+    return "-"
+
+
+def numstat(repo: str, blob_a: str, blob_b: str) -> tuple[int | None, int | None]:
+    if blob_a == blob_b:
+        return 0, 0
+    out = git_text(repo, ["diff", "--numstat", blob_a, blob_b], check=False)
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    if not line:
+        return None, None
+    ins, dele, *_rest = line.split("\t", 2)
+    if ins == "-" or dele == "-":
+        return None, None
+    try:
+        return int(ins), int(dele)
+    except ValueError:
+        return None, None
+
+
+def echo_event(held: dict[tuple[str, str], Held], a: str, b: str, blob: str) -> tuple[str, int] | None:
+    ha = held.get((a, blob))
+    hb = held.get((b, blob))
+    if ha is None or hb is None:
+        return None
+    # Kinship event: the later path acquiring this blob.
+    if ha.first_time >= hb.first_time:
+        return ha.first_sha, ha.first_time
+    return hb.first_sha, hb.first_time
+
+
+def pairs_from_scan(repo: str, sc: Scan, *, include_identical: bool) -> list[Pair]:
+    best: dict[tuple[str, str], tuple[str, str, int, str]] = {}
+    # together beats echo; last simultaneous blob is the merge-base.
+    for (a, b), (sha, ts, blob) in sc.last_together.items():
+        best[(a, b)] = ("together", blob, ts, sha)
+
+    blob_paths: dict[str, set[str]] = defaultdict(set)
+    for (path, blob), _h in sc.held.items():
+        if blob == EMPTY_BLOB:
+            continue
+        blob_paths[blob].add(path)
+
+    for blob, paths in blob_paths.items():
+        if len(paths) < 2:
+            continue
+        for a, b in combinations(sorted(paths), 2):
+            if (a, b) in best:
+                continue
+            ev = echo_event(sc.held, a, b, blob)
+            if ev is None:
+                continue
+            sha, ts = ev
+            prev = best.get((a, b))
+            if prev is None or (prev[0] == "echo" and ts > prev[2]):
+                best[(a, b)] = ("echo", blob, ts, sha)
+
+    found: list[Pair] = []
+    for (a, b), (kind, blob, ts, sha) in best.items():
+        ba = sc.current.get(a)
+        bb = sc.current.get(b)
+        if not ba or not bb:
+            continue
+        if ba == bb and not include_identical:
+            continue
+        ha = sc.held.get((a, blob))
+        hb = sc.held.get((b, blob))
+        ins, dele = numstat(repo, ba, bb)
+        found.append(
+            Pair(
+                kind=kind,
+                a=a,
+                b=b,
+                base_blob=blob,
+                base_commit=sha,
+                base_time=ts,
+                blob_a=ba,
+                blob_b=bb,
+                insertions=ins,
+                deletions=dele,
+                frozen=frozen_side(ba, bb, blob),
+                a_first=ha.first_sha if ha else "-",
+                b_first=hb.first_sha if hb else "-",
+                a_last=ha.last_sha if ha else "-",
+                b_last=hb.last_sha if hb else "-",
+            )
+        )
+
+    def sort_key(p: Pair) -> tuple:
+        frozen_rank = 0 if p.frozen in ("a", "b") else 1 if p.frozen == "both" else 2
+        drift = (p.insertions or 0) + (p.deletions or 0)
+        kind_rank = 0 if p.kind == "together" else 1
+        return (frozen_rank, kind_rank, -drift, p.a, p.b)
+
+    found.sort(key=sort_key)
+    return found
+
+
+def filter_paths(ps: list[Pair], paths: list[str]) -> list[Pair]:
+    if not paths:
+        return ps
+    if len(paths) == 1:
+        want = paths[0]
+        return [p for p in ps if p.a == want or p.b == want]
+    x, y = sorted(paths[:2])
+    return [p for p in ps if p.a == x and p.b == y]
+
+
+def pairs_for_blob(ps: list[Pair], blob: str) -> list[Pair]:
+    blob = blob.lower()
+    return [p for p in ps if p.base_blob.startswith(blob) or p.blob_a.startswith(blob) or p.blob_b.startswith(blob)]
+
+
+# --- format ----------------------------------------------------------------
+
+TSV_COLS = (
+    "kind",
+    "a",
+    "b",
+    "base_blob",
+    "base_commit",
+    "base_time",
+    "insertions",
+    "deletions",
+    "frozen",
+    "a_first",
+    "b_first",
+    "a_last",
+    "b_last",
+)
+
+
+def fmt_num(n: int | None) -> str:
+    return "-" if n is None else str(n)
+
+
+def short(sha: str) -> str:
+    if not sha or sha == "-":
+        return "-"
+    return sha[:12]
+
+
+def format_tsv(ps: list[Pair], header: bool) -> str:
+    lines: list[str] = []
+    if header:
+        lines.append("\t".join(TSV_COLS))
+    for p in ps:
+        lines.append(
+            "\t".join(
+                [
+                    p.kind,
+                    p.a,
+                    p.b,
+                    short(p.base_blob),
+                    short(p.base_commit),
+                    str(p.base_time) if p.base_time else "-",
+                    fmt_num(p.insertions),
+                    fmt_num(p.deletions),
+                    p.frozen,
+                    short(p.a_first),
+                    short(p.b_first),
+                    short(p.a_last),
+                    short(p.b_last),
+                ]
+            )
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def short_time(ts: int) -> str:
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def format_pretty(ps: list[Pair]) -> str:
+    if not ps:
+        return "no kin\n"
+    chunks: list[str] = []
+    for p in ps:
+        drift = f"+{p.insertions} -{p.deletions}" if p.insertions is not None else "binary/unknown"
+        frozen = ""
+        if p.frozen == "a":
+            frozen = "  frozen: a (still at base)"
+        elif p.frozen == "b":
+            frozen = "  frozen: b (still at base)"
+        elif p.frozen == "both":
+            frozen = "  identical"
+        chunks.append(
+            f"{p.a}\n"
+            f"  ↔ {p.b}\n"
+            f"  {p.kind}  base {short(p.base_blob)}  {short_time(p.base_time)}  {short(p.base_commit)}\n"
+            f"  held a {short(p.a_first)}..{short(p.a_last)}  b {short(p.b_first)}..{short(p.b_last)}\n"
+            f"  {drift}{frozen}"
+        )
+    return "\n".join(chunks) + "\n"
+
+
+def format_json(ps: list[Pair]) -> str:
+    payload = []
+    for p in ps:
+        payload.append(
+            {
+                "kind": p.kind,
+                "a": p.a,
+                "b": p.b,
+                "base_blob": p.base_blob,
+                "base_commit": p.base_commit,
+                "base_time": p.base_time,
+                "blob_a": p.blob_a,
+                "blob_b": p.blob_b,
+                "insertions": p.insertions,
+                "deletions": p.deletions,
+                "frozen": p.frozen,
+                "drifted": p.drifted,
+                "a_first": p.a_first,
+                "b_first": p.b_first,
+                "a_last": p.a_last,
+                "b_last": p.b_last,
+            }
+        )
+    return json.dumps(payload, indent=2) + "\n"
+
+
+# --- port / diff -----------------------------------------------------------
+
+
+def materialize_blob(repo: str, blob: str, path: str) -> None:
+    data = git(repo, ["cat-file", "-p", blob])
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def cmd_port(repo: str, pair: Pair, write: bool, dest_abs: str | None) -> int:
+    with tempfile.TemporaryDirectory(prefix="once-port-") as td:
+        src_f = os.path.join(td, "src")
+        dst_f = os.path.join(td, "dst")
+        base_f = os.path.join(td, "base")
+        materialize_blob(repo, pair.blob_a, src_f)
+        materialize_blob(repo, pair.blob_b, dst_f)
+        materialize_blob(repo, pair.base_blob, base_f)
+        proc = subprocess.run(
+            [
+                "git",
+                "merge-file",
+                "-p",
+                "-L",
+                pair.b,
+                "-L",
+                f"base {short(pair.base_blob)}",
+                "-L",
+                pair.a,
+                dst_f,
+                base_f,
+                src_f,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = proc.stdout
+        if write:
+            target = dest_abs or pair.b
+            with open(target, "wb") as f:
+                f.write(out)
+        else:
+            sys.stdout.buffer.write(out)
+        if proc.returncode not in (0, 1):
+            err = proc.stderr.decode("utf-8", "replace")
+            print(err, file=sys.stderr)
+            return 2
+        return proc.returncode
+
+
+def frozen_twins_of(repo: str, sc: Scan, from_path: str) -> list[Pair]:
+    """Pairs where FROM drifted and the other path is still the shared blob."""
+    from_r = resolve_repo_path(repo, from_path)
+    if from_r not in sc.current:
+        die(f"not in {sc.ref}: {from_r}")
+    out: list[Pair] = []
+    for p in pairs_from_scan(repo, sc, include_identical=True):
+        if p.a == from_r and p.frozen == "b":
+            out.append(p)
+        elif p.b == from_r and p.frozen == "a":
+            out.append(reorient(p, from_path=from_r, to_path=p.a))
+    out.sort(key=lambda p: p.b)
+    return out
+
+
+def cmd_sync(repo: str, sc: Scan, from_path: str, write: bool) -> int:
+    """Port FROM onto every frozen twin. Safe because TO == base blob."""
+    twins = frozen_twins_of(repo, sc, from_path)
+    if not twins:
+        die(f"no frozen twin: {resolve_repo_path(repo, from_path)}", 1)
+    top = toplevel(repo)
+    rc = 0
+    many = len(twins) > 1
+    for pair in twins:
+        dest_abs = os.path.join(top, pair.b) if write else None
+        if many and not write:
+            header = f"# once sync {pair.b}  {pair.kind}  base {short(pair.base_blob)}\n"
+            sys.stdout.buffer.write(header.encode())
+        r = cmd_port(repo, pair, write=write, dest_abs=dest_abs)
+        if r > rc:
+            rc = r
+        if write:
+            print(f"wrote {pair.b}", file=sys.stderr)
+    return rc
+
+
+def cmd_diff(repo: str, pair: Pair) -> int:
+    print(f"# a vs b  ({pair.a} vs {pair.b})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", "--stat", pair.blob_a, pair.blob_b])
+    print(f"\n# base -> a  ({pair.a})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", pair.base_blob, pair.blob_a])
+    print(f"\n# base -> b  ({pair.b})", file=sys.stderr)
+    subprocess.run(["git", "-C", repo, "diff", pair.base_blob, pair.blob_b])
+    return 0
+
+
+# --- main ------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="once",
+        description="Find current paths that ever held the same git blob and "
+        "treat that blob as the merge-base git never recorded. Exact identity only.",
+    )
+    p.add_argument("-C", dest="repo", default=".", help="git repository (like git -C)")
+    p.add_argument("--ref", default="HEAD", help="ref to treat as current tree (default HEAD)")
+    p.add_argument("--all", action="store_true", help="walk all refs, not only --ref")
+    p.add_argument("--identical", action="store_true", help="include currently-identical copies")
+    p.add_argument("--frozen", action="store_true", help="only pairs where one side is still the base blob")
+    p.add_argument("--check", action="store_true", help="exit 1 if any drifted kin exists")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--pretty", action="store_true", help="human output (default is TSV)")
+    p.add_argument("--no-header", action="store_true", help="omit TSV header")
+    p.add_argument("--glob", action="append", default=[], metavar="GLOB", help="only paths matching (repeatable)")
+    p.add_argument("--exclude", action="append", default=[], metavar="GLOB", help="skip paths matching")
+    p.add_argument("--blob", metavar="SHA", help="restrict to pairs involving this blob (prefix ok)")
+    p.add_argument("--port", nargs=2, metavar=("FROM", "TO"), help="3-way-merge FROM's unique changes onto TO")
+    p.add_argument(
+        "--sync",
+        metavar="FROM",
+        help="port FROM onto every twin that is still the shared blob (the forgotten snapshot)",
+    )
+    p.add_argument("--diff", nargs=2, metavar=("A", "B"), dest="diff_paths", help="show base→A, base→B, A vs B")
+    p.add_argument("--write", action="store_true", help="with --port/--sync, overwrite TO instead of printing")
+    p.add_argument("--version", action="version", version=f"once {VERSION}")
+    p.add_argument("paths", nargs="*", help="restrict to kin of PATH, or inspect PATH PATH")
+    return p.parse_args(argv)
+
+
+def die(msg: str, code: int = 2) -> NoReturn:
+    print(f"once: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_pair(repo: str, sc: Scan, a: str, b: str) -> Pair:
+    a_r = resolve_repo_path(repo, a)
+    b_r = resolve_repo_path(repo, b)
+    ps = pairs_from_scan(repo, sc, include_identical=True)
+    x, y = sorted((a_r, b_r))
+    for p in ps:
+        if p.a == x and p.b == y:
+            return reorient(p, from_path=a_r, to_path=b_r)
+    die(f"not kin: {a_r}  {b_r}  (never shared a blob)")
+
+
+def reorient(p: Pair, from_path: str, to_path: str) -> Pair:
+    """Make pair.a = FROM, pair.b = TO. base_blob stays the ancestor."""
+    if p.a == from_path and p.b == to_path:
+        return p
+    if p.b == from_path and p.a == to_path:
+        frozen = {"a": "b", "b": "a", "both": "both", "-": "-"}[p.frozen]
+        return replace(
+            p,
+            a=p.b,
+            b=p.a,
+            blob_a=p.blob_b,
+            blob_b=p.blob_a,
+            insertions=p.deletions if p.insertions is not None else None,
+            deletions=p.insertions if p.deletions is not None else None,
+            frozen=frozen,
+            a_first=p.b_first,
+            b_first=p.a_first,
+            a_last=p.b_last,
+            b_last=p.a_last,
+        )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    repo = args.repo
+    try:
+        git_text(repo, ["rev-parse", "--is-inside-work-tree"])
+    except GitError as e:
+        die(e.args[0], 2)
+
+    try:
+        sc = scan(repo, args.ref, args.all, args.glob, args.exclude)
+    except GitError as e:
+        die(str(e), 2)
+
+    if args.port:
+        pair = load_pair(repo, sc, args.port[0], args.port[1])
+        dest_abs = os.path.abspath(args.port[1]) if args.write else None
+        return cmd_port(repo, pair, write=args.write, dest_abs=dest_abs)
+
+    if args.sync:
+        return cmd_sync(repo, sc, args.sync, write=args.write)
+
+    if args.diff_paths:
+        pair = load_pair(repo, sc, args.diff_paths[0], args.diff_paths[1])
+        return cmd_diff(repo, pair)
+
+    resolved = [resolve_repo_path(repo, pth) for pth in args.paths]
+    ps = pairs_from_scan(repo, sc, include_identical=args.identical)
+    ps = filter_paths(ps, resolved)
+    if args.blob:
+        ps = pairs_for_blob(ps, args.blob)
+    if args.frozen:
+        ps = [p for p in ps if p.frozen in ("a", "b")]
+
+    if args.json:
+        sys.stdout.write(format_json(ps))
+    elif args.pretty:
+        sys.stdout.write(format_pretty(ps))
+    else:
+        sys.stdout.write(format_tsv(ps, header=not args.no_header))
+
+    if args.check and any(p.drifted for p in ps):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GitError as e:
+        print(f"once: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

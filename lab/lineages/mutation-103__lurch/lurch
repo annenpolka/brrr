@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""lurch — name every adjacent clock-cut, with scarp's sleep=/ntp=.
+
+scarp classifies cuts[0], cuts[1]. A clock log is a stream of adjacent
+cuts. lurch emits SLEEP / DILATE / STEP / REST for every consecutive pair
+and prints the same leftover columns scarp does (sleep=, ntp=) on each
+row. Never wraps a command. Never spawns.
+
+  wall     CLOCK_REALTIME         (NTP can step it)
+  machine  CLOCK_MONOTONIC_RAW    (runs during host sleep; no NTP)
+  awake    CLOCK_UPTIME_RAW       (pauses during host sleep; no NTP)
+  proper   CPU time a process aged
+
+On Darwin, time.monotonic() is CLOCK_UPTIME_RAW: lid-close does not tick it.
+Unlabeled numbers are timestamps of one clock, not a duration bag.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import ctypes
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, TextIO
+
+VERSION = "0.2"
+
+STEP_MIN = 0.05
+STEP_PPM = 50e-6
+SLEEP_MIN = 0.05
+DILATE_GAMMA = 3.0
+EPS = 1e-9
+ORIGIN_MIXED = 1e7
+
+USAGE = """lurch — name every adjacent clock-cut (scarp names on each pair)
+
+Usage:
+  lurch [--explain|--json|--porcelain] [--require NAME] [--forbid NAME]
+  lurch cut [--json] [--boot]
+  lurch selftest
+
+Stdin is a clock log (JSONL / TSV / key=value / unlabeled timestamps).
+Stdout is one named interval per consecutive pair: SLEEP, DILATE, STEP, REST.
+Each row carries scarp's leftover columns: sleep=  ntp=
+Unlabeled numbers are wall ticks, not a bag of duration fields.
+No command wrapping. No spawn. Not a tracer.
+"""
+
+
+def step_min(machine: float) -> float:
+    return max(STEP_MIN, STEP_PPM * max(machine, 0.0))
+
+
+def _has_clock(*names: str) -> bool:
+    return all(hasattr(time, n) for n in names)
+
+
+def clock_backend() -> dict[str, Any]:
+    if _has_clock("CLOCK_REALTIME", "CLOCK_MONOTONIC_RAW", "CLOCK_UPTIME_RAW"):
+        return {
+            "kind": "darwin",
+            "wall": time.CLOCK_REALTIME,
+            "machine": time.CLOCK_MONOTONIC_RAW,
+            "awake": time.CLOCK_UPTIME_RAW,
+            "machine_name": "CLOCK_MONOTONIC_RAW",
+            "awake_name": "CLOCK_UPTIME_RAW",
+            "python_monotonic": "awake",
+        }
+    if _has_clock("CLOCK_REALTIME", "CLOCK_BOOTTIME", "CLOCK_MONOTONIC"):
+        return {
+            "kind": "linux",
+            "wall": time.CLOCK_REALTIME,
+            "machine": time.CLOCK_BOOTTIME,
+            "awake": time.CLOCK_MONOTONIC,
+            "machine_name": "CLOCK_BOOTTIME",
+            "awake_name": "CLOCK_MONOTONIC",
+            "python_monotonic": "awake",
+        }
+    return {
+        "kind": "fallback",
+        "wall": getattr(time, "CLOCK_REALTIME", None),
+        "machine": getattr(time, "CLOCK_MONOTONIC", None),
+        "awake": getattr(time, "CLOCK_MONOTONIC", None),
+        "machine_name": "CLOCK_MONOTONIC",
+        "awake_name": "CLOCK_MONOTONIC",
+        "python_monotonic": "unknown",
+    }
+
+
+BACKEND = clock_backend()
+
+
+def _clock_gettime(clk: int | None) -> float:
+    if clk is None:
+        return time.time()
+    return time.clock_gettime(clk)
+
+
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int64), ("tv_usec", ctypes.c_int32)]
+
+
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL(None)
+        except OSError:
+            _LIBC = False
+    return _LIBC or None
+
+
+def sysctl_timeval(name: str) -> float | None:
+    if sys.platform != "darwin":
+        return None
+    libc = _libc()
+    if libc is None:
+        return None
+    tv = _Timeval()
+    size = ctypes.c_size_t(ctypes.sizeof(tv))
+    libc.sysctlbyname.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    libc.sysctlbyname.restype = ctypes.c_int
+    rc = libc.sysctlbyname(name.encode(), ctypes.byref(tv), ctypes.byref(size), None, 0)
+    if rc != 0:
+        return None
+    return float(tv.tv_sec) + float(tv.tv_usec) / 1_000_000.0
+
+
+def linux_btime() -> float | None:
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+def boottime_now() -> float | None:
+    if BACKEND["kind"] == "darwin":
+        return sysctl_timeval("kern.boottime")
+    if BACKEND["kind"] == "linux":
+        return linux_btime()
+    return None
+
+
+@dataclass
+class Cut:
+    wall: float | None = None
+    machine: float | None = None
+    awake: float | None = None
+    python_monotonic: float | None = None
+    proper: float | None = None
+    boottime: float | None = None
+    sleeptime: float | None = None
+    waketime: float | None = None
+    pid: int | None = None
+    extra: dict[str, float] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        for k in (
+            "wall",
+            "machine",
+            "awake",
+            "python_monotonic",
+            "proper",
+            "boottime",
+            "sleeptime",
+            "waketime",
+            "pid",
+        ):
+            v = getattr(self, k)
+            if v is not None:
+                d[k] = v
+        d.update(self.extra)
+        return d
+
+
+def cut_now() -> Cut:
+    return Cut(
+        wall=_clock_gettime(BACKEND["wall"]),
+        machine=_clock_gettime(BACKEND["machine"]),
+        awake=_clock_gettime(BACKEND["awake"]),
+        python_monotonic=time.monotonic(),
+        proper=time.process_time(),
+        boottime=boottime_now(),
+        sleeptime=sysctl_timeval("kern.sleeptime"),
+        waketime=sysctl_timeval("kern.waketime"),
+        pid=os.getpid(),
+    )
+
+
+def cut_boot() -> Cut:
+    end = cut_now()
+    boot = end.boottime
+    return Cut(
+        wall=boot if boot is not None else (end.wall or 0.0) - (end.machine or 0.0),
+        machine=0.0,
+        awake=0.0,
+        python_monotonic=0.0,
+        proper=0.0,
+        boottime=boot,
+        pid=end.pid,
+    )
+
+
+@dataclass
+class PairSpec:
+    role: str
+    t0: float
+    t1: float
+
+
+@dataclass
+class Gap:
+    wall: float | None = None
+    machine: float | None = None
+    awake: float | None = None
+    proper: float | None = None
+    ntp: float | None = None
+    sleep: float | None = None
+    gamma: float | None = None
+    primary: str = "REST"
+    tags: list[str] = field(default_factory=list)
+    explains: str = ""
+    reason: str = ""
+    kind: str = "interval"
+    missing_proper: bool = False
+    backend: str = field(default_factory=lambda: BACKEND["kind"])
+
+
+@dataclass
+class Interval:
+    i: int
+    a: Cut
+    b: Cut
+    gap: Gap
+
+
+ROLE_ALIASES: dict[str, str] = {
+    "wall": "wall",
+    "realtime": "wall",
+    "clock_realtime": "wall",
+    "time": "wall",
+    "t": "wall",
+    "machine": "machine",
+    "monotonic_raw": "machine",
+    "clock_monotonic_raw": "machine",
+    "clock_boottime": "machine",
+    "boottime_clock": "machine",
+    "awake": "awake",
+    "uptime": "awake",
+    "uptime_raw": "awake",
+    "clock_uptime_raw": "awake",
+    "proper": "proper",
+    "cpu": "proper",
+    "proc_cpu": "proper",
+    "proc-cpu": "proper",
+    "process_time": "proper",
+    "rusage": "proper",
+    "boottime": "boottime",
+    "kern.boottime": "boottime",
+    "kern_boottime": "boottime",
+    "boot": "boottime",
+    "sleeptime": "sleeptime",
+    "kern.sleeptime": "sleeptime",
+    "waketime": "waketime",
+    "kern.waketime": "waketime",
+    "pid": "pid",
+}
+
+MONOTONIC_NAMES = {
+    "monotonic",
+    "python.monotonic",
+    "python_monotonic",
+    "mono",
+    "time.monotonic",
+}
+
+NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+KV_RE = re.compile(
+    r"^\s*(?:(?P<kind>clock|meta|verdict)\s+)?"
+    r"(?P<key>[A-Za-z_.][A-Za-z0-9_.]*)"
+    r"(?:\s*[=:]\s*|\s+)"
+    r"(?P<v1>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    r"(?:\s+(?P<v2>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?))?"
+    r"\s*$"
+)
+
+
+def norm_key(k: str) -> str:
+    return k.strip().lower().replace("-", "_")
+
+
+def role_of(k: str) -> str | None:
+    k = norm_key(k)
+    if k in ("python_monotonic_role", "python.monotonic_role"):
+        return None
+    if k in MONOTONIC_NAMES:
+        return "awake"
+    if k == "clock_monotonic":
+        return "machine" if BACKEND["kind"] == "darwin" else "awake"
+    if k in ROLE_ALIASES:
+        return ROLE_ALIASES[k]
+    if k.startswith("clock_") and k[6:] in ROLE_ALIASES:
+        return ROLE_ALIASES[k[6:]]
+    return None
+
+
+def _get_role(cut: Cut, role: str) -> float | None:
+    if role == "pid":
+        return float(cut.pid) if cut.pid is not None else None
+    if hasattr(cut, role) and role != "extra":
+        v = getattr(cut, role)
+        return float(v) if v is not None else None
+    return cut.extra.get(role)
+
+
+def _set_role(cut: Cut, role: str, val: float, *, overwrite: bool = False) -> None:
+    if role == "pid":
+        if cut.pid is None or overwrite:
+            cut.pid = int(val)
+        return
+    cur = _get_role(cut, role)
+    if cur is not None and not overwrite:
+        return
+    if hasattr(cut, role) and role != "extra":
+        setattr(cut, role, val)
+    else:
+        cut.extra[role] = val
+
+
+def _cut_from_mapping(obj: dict[str, Any]) -> Cut:
+    c = Cut()
+    clock = obj.get("clock") if isinstance(obj.get("clock"), dict) else None
+    src = dict(obj)
+    if clock:
+        src.update(clock)
+    for k, v in src.items():
+        if k in ("clock", "start", "end", "verdict", "worldlines", "argv", "backend"):
+            continue
+        role = role_of(str(k))
+        if role is None:
+            continue
+        try:
+            _set_role(c, role, float(v))
+        except (TypeError, ValueError):
+            continue
+    return c
+
+
+def _cuts_from_json(data: Any) -> list[Cut]:
+    if isinstance(data, list):
+        out: list[Cut] = []
+        for el in data:
+            out.extend(_cuts_from_json(el))
+        return out
+    if not isinstance(data, dict):
+        return []
+    if "start" in data and "end" in data and isinstance(data["start"], dict):
+        return [_cut_from_mapping(data["start"]), _cut_from_mapping(data["end"])]
+    return [_cut_from_mapping(data)]
+
+
+def _parse_json_blob(text: str) -> list[Cut] | None:
+    text = text.strip()
+    if not text or text[0] not in "{[":
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return _cuts_from_json(data)
+
+
+def _parse_jsonl(text: str) -> list[Cut] | None:
+    cuts: list[Cut] = []
+    saw = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s[0] not in "{[":
+            return None
+        try:
+            data = json.loads(s)
+        except json.JSONDecodeError:
+            return None
+        saw = True
+        cuts.extend(_cuts_from_json(data))
+    return cuts if saw else None
+
+
+def _from_bare(nums: list[float]) -> tuple[list[Cut], list[PairSpec]]:
+    # Honest stream: unlabeled numbers are timestamps of one clock.
+    # scarp bags 4 as {wall,machine,awake,proper} and keeps only the first 8.
+    if len(nums) < 2:
+        raise SystemExit(f"lurch: need at least 2 unlabeled timestamps, got {len(nums)}")
+    return [Cut(wall=x) for x in nums], []
+
+
+def parse_input(text: str) -> tuple[list[Cut], list[PairSpec]]:
+    stripped = text.strip()
+    if not stripped:
+        return [], []
+
+    blob = _parse_json_blob(stripped)
+    if blob is not None:
+        return blob, []
+    jl = _parse_jsonl(stripped)
+    if jl is not None:
+        return jl, []
+
+    cuts: list[Cut] = []
+    pairs: list[PairSpec] = []
+    current = Cut()
+    filled = False
+    seen_roles: set[str] = set()
+    bare: list[float] = []
+
+    def push() -> None:
+        nonlocal current, filled, seen_roles
+        if filled:
+            cuts.append(current)
+        current = Cut()
+        filled = False
+        seen_roles = set()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            if filled:
+                push()
+            continue
+        if line in ("---", "--"):
+            push()
+            continue
+        m = KV_RE.match(line)
+        if m:
+            kind = m.group("kind")
+            if kind in ("meta", "verdict"):
+                continue
+            key = m.group("key")
+            v1 = float(m.group("v1"))
+            v2 = m.group("v2")
+            role = role_of(key)
+            if role is None:
+                continue
+            if v2 is not None:
+                pairs.append(PairSpec(role, v1, float(v2)))
+                continue
+            if role in seen_roles:
+                existing = _get_role(current, role)
+                if existing is not None and abs(existing - v1) <= 0.05:
+                    continue
+                if role in ("wall", "machine", "awake", "proper"):
+                    push()
+                else:
+                    continue
+            _set_role(current, role, v1)
+            seen_roles.add(role)
+            filled = True
+            continue
+        nums = [float(x) for x in NUM_RE.findall(line)]
+        if nums:
+            bare.extend(nums)
+            continue
+    if filled:
+        push()
+
+    if bare and not cuts and not pairs:
+        cuts, pairs = _from_bare(bare)
+    elif bare and not pairs:
+        extra, extra_pairs = _from_bare(bare)
+        cuts.extend(extra)
+        pairs.extend(extra_pairs)
+
+    return cuts, pairs
+
+
+def _first(*xs: float | None) -> float | None:
+    for x in xs:
+        if x is not None:
+            return x
+    return None
+
+
+def _delta(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None:
+        return None
+    return b - a
+
+
+def _same_origin(a: float, b: float) -> bool:
+    return abs(a - b) < ORIGIN_MIXED
+
+
+def _looks_absolute(c: Cut) -> bool:
+    if c.wall is not None and c.wall > 1e9:
+        return True
+    if c.boottime is not None and c.machine is not None and c.machine > 60:
+        return True
+    return False
+
+
+def _boot_origin_pair(a: Cut, b: Cut) -> bool:
+    """True for boot→now of a live snapshot. A 61s duration wait from zero is not a host."""
+    if not _looks_absolute(b):
+        return False
+    origin = (a.machine is not None and a.machine <= 0.01) or (
+        a.awake is not None and a.awake <= 0.01
+    )
+    if not origin:
+        return False
+    if a.boottime is not None and a.wall is not None and abs(a.wall - a.boottime) < 2.0:
+        return True
+    if a.wall is not None and a.wall > 1e9 and b.wall is not None and b.wall > 1e9:
+        return True
+    if a.wall is None:
+        return True
+    return False
+
+
+def gap_from_cuts(a: Cut, b: Cut) -> Gap:
+    proper = _delta(a.proper, b.proper)
+    if a.pid is not None and b.pid is not None and a.pid != b.pid:
+        proper = None
+    g = Gap(
+        wall=_delta(a.wall, b.wall),
+        machine=_delta(a.machine, b.machine),
+        awake=_delta(a.awake, b.awake),
+        proper=proper,
+        kind="interval",
+        missing_proper=proper is None,
+    )
+    if _boot_origin_pair(a, b):
+        g.kind = "host"
+        if g.proper is None:
+            g.proper = g.awake
+    return g
+
+
+def gap_from_pairs(pairs: list[PairSpec]) -> Gap:
+    a, b = _cuts_from_pairs(pairs)
+    return gap_from_cuts(a, b)
+
+
+def _cuts_from_pairs(pairs: list[PairSpec]) -> tuple[Cut, Cut]:
+    a = Cut()
+    b = Cut()
+    for p in pairs:
+        _set_role(a, p.role, p.t0, overwrite=True)
+        _set_role(b, p.role, p.t1, overwrite=True)
+    return a, b
+
+
+def gap_from_one(c: Cut) -> Gap:
+    if not _looks_absolute(c):
+        return Gap(
+            wall=c.wall,
+            machine=c.machine,
+            awake=c.awake,
+            proper=c.proper,
+            kind="readings",
+            missing_proper=c.proper is None,
+        )
+    wall = None
+    if c.wall is not None and c.boottime is not None:
+        wall = c.wall - c.boottime
+    return Gap(
+        wall=wall,
+        machine=c.machine,
+        awake=c.awake,
+        proper=c.awake,
+        kind="host",
+        missing_proper=False,
+    )
+
+
+def _origin_cut(c: Cut) -> Cut:
+    boot = c.boottime
+    wall0 = boot if boot is not None else None
+    return Cut(
+        wall=wall0,
+        machine=0.0 if c.machine is not None else None,
+        awake=0.0 if c.awake is not None else None,
+        proper=0.0 if c.proper is not None else None,
+        boottime=boot,
+        pid=c.pid,
+    )
+
+
+def classify(g: Gap) -> Gap:
+    wall, machine, awake, proper = g.wall, g.machine, g.awake, g.proper
+    observed_proper = proper is not None
+
+    ntp: float | None = None
+    if wall is not None and machine is not None and _same_origin(wall, machine):
+        ntp = wall - machine
+    sleep: float | None = None
+    if machine is not None and awake is not None and _same_origin(machine, awake):
+        sleep = machine - awake
+    wall_awake: float | None = None
+    if wall is not None and awake is not None and machine is None and _same_origin(wall, awake):
+        wall_awake = wall - awake
+
+    if g.kind == "host" and proper is None:
+        proper = awake
+        g.proper = proper
+
+    g.ntp = ntp
+    slept = sleep if sleep is not None else (wall_awake if wall_awake is not None else 0.0)
+    if slept is not None and abs(slept) < 0.0005:
+        slept = 0.0
+    g.sleep = slept
+    coord = _first(machine, awake, wall) or 0.0
+    g.gamma = coord / max(abs(proper or 0.0), EPS)
+
+    cands: list[tuple[str, float, str]] = []
+    if ntp is not None and abs(ntp) >= step_min(machine or 0.0):
+        cands.append(("STEP", abs(ntp), "wall"))
+    if sleep is not None and sleep >= SLEEP_MIN:
+        cands.append(("SLEEP", sleep, "machine"))
+    elif wall_awake is not None and wall_awake >= SLEEP_MIN:
+        cands.append(("SLEEP", wall_awake, "awake"))
+
+    # Missing rusage is not DILATE of the whole awake clock. 22 days of
+    # uptime must not beat 1 day of lid-close. {cut; sleep 0.35; cut}
+    # still DILATEs: no SLEEP/STEP candidate, world moved, nobody aged.
+    if g.kind != "host":
+        awake_coord = _first(awake, machine)
+        if awake_coord is not None and awake_coord >= 0.05:
+            if observed_proper:
+                p = proper if proper is not None else 0.0
+                if p < 1e-4 or (awake_coord / max(p, EPS) >= DILATE_GAMMA):
+                    cands.append(("DILATE", awake_coord - p, "awake"))
+            else:
+                named = {n for n, _, _ in cands}
+                if "SLEEP" not in named and "STEP" not in named:
+                    cands.append(("DILATE", awake_coord, "awake"))
+
+    if not cands:
+        g.primary = "REST"
+        g.tags = ["REST"]
+        g.explains = "agree"
+    else:
+        cands.sort(key=lambda x: x[1], reverse=True)
+        seen: set[str] = set()
+        tags: list[str] = []
+        for name, _mag, _clk in cands:
+            if name not in seen:
+                seen.add(name)
+                tags.append(name)
+        g.tags = tags
+        g.primary = tags[0]
+        g.explains = cands[0][2]
+    g.reason = _reason(g)
+    return g
+
+
+def _reason(g: Gap) -> str:
+    if g.primary == "STEP":
+        direction = "forward" if (g.ntp or 0) > 0 else "backward"
+        return f"wall {direction}-stepped {fmt_secs(abs(g.ntp or 0))} vs machine"
+    if g.primary == "SLEEP":
+        slept = g.sleep or 0
+        base = g.machine if (g.machine or 0) > EPS else _first(g.wall, g.awake)
+        if base and base > EPS:
+            return f"host slept {fmt_secs(slept)} ({100 * slept / base:.0f}% of coordinate)"
+        return f"host slept {fmt_secs(slept)}"
+    if g.primary == "DILATE":
+        return (
+            f"world moved {fmt_gamma(g.gamma or 0)}× farther than proper "
+            f"({fmt_secs(g.proper or 0)} / {fmt_secs(g.machine or 0)})"
+        )
+    return "clocks agree (or the interval is too small to split)"
+
+
+def intervals_from_text(text: str) -> list[Interval]:
+    cuts, pairs = parse_input(text)
+    out: list[Interval] = []
+    if pairs and not cuts:
+        g = classify(gap_from_pairs(pairs))
+        a, b = _cuts_from_pairs(pairs)
+        out.append(Interval(0, a, b, g))
+        return out
+    if len(cuts) >= 2:
+        for i, (a, b) in enumerate(zip(cuts, cuts[1:])):
+            out.append(Interval(i, a, b, classify(gap_from_cuts(a, b))))
+        return out
+    if len(cuts) == 1:
+        c = cuts[0]
+        g = classify(gap_from_one(c))
+        out.append(Interval(0, _origin_cut(c), c, g))
+        return out
+    if pairs:
+        g = classify(gap_from_pairs(pairs))
+        a, b = _cuts_from_pairs(pairs)
+        out.append(Interval(0, a, b, g))
+        return out
+    raise SystemExit("lurch: no clock readings on stdin")
+
+
+def stamp(c: Cut) -> float | None:
+    return _first(c.wall, c.machine, c.awake, c.boottime)
+
+
+def fmt_secs(x: float, signed: bool = False) -> str:
+    s = abs(x)
+    sign = "-" if x < 0 else ("+" if signed else "")
+    if s < 0.0005:
+        return "0s"
+    if s < 60:
+        return f"{sign}{s:.3f}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{sign}{int(m)}m{sec:05.2f}s"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{sign}{int(h)}h{int(m):02d}m{sec:04.1f}s"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _sec = divmod(rem, 60)
+    return f"{sign}{int(d)}d{int(h):02d}h{int(m):02d}m"
+
+
+def fmt_gamma(g: float) -> str:
+    if g >= 1e6:
+        return "∞"
+    if g >= 100:
+        return f"{g:.0f}"
+    if g >= 10:
+        return f"{g:.1f}"
+    return f"{g:.2f}"
+
+
+def _fmt_opt(x: float | None, signed: bool = False) -> str:
+    if x is None:
+        return f"{'—':>12}"
+    return f"{fmt_secs(x, signed=signed):>12}"
+
+
+def _ntp_word(g: Gap) -> str:
+    if g.ntp is None:
+        return "ntp=—"
+    return f"ntp={fmt_secs(g.ntp, signed=True)}"
+
+
+def _sleep_word(g: Gap) -> str:
+    return f"sleep={fmt_secs(g.sleep or 0.0)}"
+
+
+def format_word(iv: Interval) -> str:
+    g = iv.gap
+    t0, t1 = stamp(iv.a), stamp(iv.b)
+    t0s = f"{t0:.6f}" if t0 is not None else "-"
+    t1s = f"{t1:.6f}" if t1 is not None else "-"
+    extras = [_sleep_word(g), _ntp_word(g)]
+    if g.kind == "host":
+        extras.append("kind=host")
+    extra = "\t" + "\t".join(extras)
+    return f"{g.primary}\t{t0s}\t{t1s}{extra}\n"
+
+
+def format_explain(iv: Interval) -> str:
+    g = iv.gap
+    t0, t1 = stamp(iv.a), stamp(iv.b)
+    lines = [
+        f"#{iv.i} {g.primary}  explains={g.explains}  kind={g.kind}  t0={t0}  t1={t1}",
+        f"  wall     {_fmt_opt(g.wall)}",
+        f"  machine  {_fmt_opt(g.machine)}   {BACKEND['machine_name']}",
+        f"  awake    {_fmt_opt(g.awake)}   {BACKEND['awake_name']}",
+        f"  sleep    {_fmt_opt(g.sleep)}   machine − awake",
+        f"  ntp      {_fmt_opt(g.ntp, signed=True)}   wall − machine",
+        f"  proper   {_fmt_opt(g.proper)}",
+        f"  γ        {fmt_gamma(g.gamma or 0):>12}",
+        f"reason  {g.reason}",
+    ]
+    if BACKEND["kind"] == "darwin":
+        lines.append(
+            "note    time.monotonic() on Darwin is awake, not machine "
+            "(lid-close does not tick it)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_porcelain(iv: Interval) -> str:
+    g = iv.gap
+    t0, t1 = stamp(iv.a), stamp(iv.b)
+    rows = [
+        ("verdict", "i", str(iv.i)),
+        ("verdict", "primary", g.primary),
+        ("verdict", "explains", g.explains),
+        ("verdict", "tags", " ".join(g.tags)),
+        ("clock", "t0", f"{t0:.6f}" if t0 is not None else ""),
+        ("clock", "t1", f"{t1:.6f}" if t1 is not None else ""),
+        ("clock", "wall", f"{g.wall:.6f}" if g.wall is not None else ""),
+        ("clock", "machine", f"{g.machine:.6f}" if g.machine is not None else ""),
+        ("clock", "awake", f"{g.awake:.6f}" if g.awake is not None else ""),
+        ("clock", "sleep", f"{g.sleep:.6f}" if g.sleep is not None else "0.000000"),
+        ("clock", "ntp", f"{g.ntp:.6f}" if g.ntp is not None else ""),
+        ("clock", "proper", f"{g.proper:.6f}" if g.proper is not None else ""),
+        ("clock", "gamma", f"{g.gamma:.6f}" if g.gamma is not None else ""),
+        ("meta", "backend", BACKEND["kind"]),
+        ("meta", "kind", g.kind),
+        ("meta", "machine_clock", BACKEND["machine_name"]),
+        ("meta", "awake_clock", BACKEND["awake_name"]),
+    ]
+    return "".join(f"{a}\t{b}\t{c}\n" for a, b, c in rows) + "\n"
+
+
+def format_json(iv: Interval) -> str:
+    g = iv.gap
+    t0, t1 = stamp(iv.a), stamp(iv.b)
+    payload = {
+        "version": VERSION,
+        "i": iv.i,
+        "t0": t0,
+        "t1": t1,
+        "kind": g.kind,
+        "backend": BACKEND["kind"],
+        "verdict": {
+            "primary": g.primary,
+            "explains": g.explains,
+            "tags": g.tags,
+            "reason": g.reason,
+        },
+        "clock": {
+            "wall": g.wall,
+            "machine": g.machine,
+            "awake": g.awake,
+            "sleep": g.sleep,
+            "ntp": g.ntp,
+            "proper": g.proper,
+            "gamma": g.gamma,
+        },
+    }
+    return json.dumps(payload) + "\n"
+
+
+def format_cut_tsv(c: Cut) -> str:
+    rows = [
+        ("wall", c.wall),
+        ("machine", c.machine),
+        ("awake", c.awake),
+        ("python.monotonic", c.python_monotonic),
+        ("proper", c.proper),
+        ("boottime", c.boottime),
+        ("sleeptime", c.sleeptime),
+        ("waketime", c.waketime),
+        ("pid", c.pid),
+        ("backend", BACKEND["kind"]),
+        ("machine_clock", BACKEND["machine_name"]),
+        ("awake_clock", BACKEND["awake_name"]),
+        ("python_monotonic_role", BACKEND["python_monotonic"]),
+    ]
+    out = []
+    for k, v in rows:
+        if v is None:
+            continue
+        if isinstance(v, float):
+            out.append(f"{k}\t{v:.9f}")
+        else:
+            out.append(f"{k}\t{v}")
+    return "\n".join(out) + "\n"
+
+
+def format_cut_json(c: Cut) -> str:
+    payload = c.as_dict()
+    payload["backend"] = BACKEND["kind"]
+    payload["machine_clock"] = BACKEND["machine_name"]
+    payload["awake_clock"] = BACKEND["awake_name"]
+    payload["python_monotonic_role"] = BACKEND["python_monotonic"]
+    return json.dumps(payload) + "\n"
+
+
+def emit(iv: Interval, ns: argparse.Namespace, stream: TextIO) -> None:
+    if ns.json:
+        stream.write(format_json(iv))
+    elif ns.porcelain:
+        stream.write(format_porcelain(iv))
+    elif ns.explain:
+        stream.write(format_explain(iv))
+    else:
+        stream.write(format_word(iv))
+
+
+class Fail(Exception):
+    pass
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise Fail(msg)
+
+
+def selftest() -> int:
+    n = 0
+
+    def check(name: str, fn) -> None:
+        nonlocal n
+        fn()
+        n += 1
+        print(f"PASS  {name}")
+
+    def test_no_spawn() -> None:
+        _assert("subprocess" not in sys.modules, "subprocess imported")
+        src = open(__file__, encoding="utf-8").read()
+        tree = ast.parse(src)
+        imported: set[str] = set()
+        called: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Name):
+                    called.add(fn.id)
+                elif isinstance(fn, ast.Attribute):
+                    called.add(fn.attr)
+                    if isinstance(fn.value, ast.Name):
+                        called.add(f"{fn.value.id}.{fn.attr}")
+        _assert("subprocess" not in imported, f"imports {imported}")
+        _assert("Popen" not in called, f"called {called}")
+        _assert("os.system" not in called and "system" not in called, f"called {called}")
+        _assert("posix_spawn" not in called, f"called {called}")
+
+    def test_stream_pairs() -> None:
+        text = "\n".join(
+            [
+                json.dumps({"wall": 1000, "machine": 100, "awake": 80, "proper": 1, "pid": 1}),
+                json.dumps({"wall": 1010, "machine": 110, "awake": 81, "proper": 1, "pid": 1}),
+                json.dumps({"wall": 1012, "machine": 112, "awake": 83, "proper": 0.01, "pid": 1}),
+            ]
+        )
+        ivs = intervals_from_text(text)
+        _assert(len(ivs) == 2, f"2 pairs from 3 cuts, got {len(ivs)}")
+        _assert(ivs[0].gap.primary == "SLEEP", f"pair0 {ivs[0].gap.primary}")
+        _assert(abs((ivs[0].gap.sleep or 0) - 9) < 1e-9, f"sleep {ivs[0].gap.sleep}")
+        _assert(ivs[1].gap.primary == "DILATE", f"pair1 {ivs[1].gap.primary}")
+        line0 = format_word(ivs[0])
+        line1 = format_word(ivs[1])
+        _assert(line0.startswith("SLEEP"), line0)
+        _assert("sleep=" in line0 and "ntp=" in line0, line0)
+        _assert(line1.startswith("DILATE"), line1)
+        _assert("sleep=" in line1 and "ntp=" in line1, line1)
+
+    def test_scarp_one_pair() -> None:
+        sleep = intervals_from_text("wall 10\nmachine 10\nawake 1\nproper 1\n")
+        _assert(len(sleep) == 1 and sleep[0].gap.primary == "SLEEP", "sleep")
+        step = intervals_from_text("wall 5\nmachine 1\nawake 1\nproper 1\n")
+        _assert(step[0].gap.primary == "STEP", f"step {step[0].gap.primary}")
+        dil = intervals_from_text("wall 2\nmachine 2\nawake 2\nproper 0.01\n")
+        _assert(dil[0].gap.primary == "DILATE", f"dilate {dil[0].gap.primary}")
+        rest = intervals_from_text("wall 0.5\nmachine 0.5\nawake 0.5\nproper 0.48\n")
+        _assert(rest[0].gap.primary == "REST", f"rest {rest[0].gap.primary}")
+        two = intervals_from_text("1000 1001\n")
+        _assert(two[0].gap.primary == "REST", f"two timestamps {two[0].gap.primary}")
+        _assert(abs((two[0].gap.wall or 0) - 1) < 1e-9, "1s")
+
+    def test_slew_not_step() -> None:
+        here = os.path.dirname(__file__) or "."
+        path = os.path.join(here, "fixtures", "slew.txt")
+        ivs = intervals_from_text(open(path, encoding="utf-8").read())
+        _assert(ivs[0].gap.primary == "SLEEP", f"slew {ivs[0].gap.primary}")
+        _assert("STEP" not in ivs[0].gap.tags, f"ppm {ivs[0].gap.ntp}")
+
+    def test_folk_monotonic() -> None:
+        ivs = intervals_from_text("wall 0 1955783.6\nmonotonic 0 1851135.7\n")
+        _assert(ivs[0].gap.primary == "SLEEP", f"folk {ivs[0].gap.primary}")
+        _assert("STEP" not in ivs[0].gap.tags, "lid-close is not NTP")
+
+    def test_unlabeled_stream() -> None:
+        ivs = intervals_from_text("1000\n1001\n1005\n1010\n")
+        _assert(len(ivs) == 3, f"3 intervals from 4 ticks, got {len(ivs)}")
+        _assert(all(iv.gap.primary == "REST" for iv in ivs), [iv.gap.primary for iv in ivs])
+        _assert(abs((ivs[0].gap.wall or 0) - 1) < 1e-9, ivs[0].gap.wall)
+        _assert(abs((ivs[1].gap.wall or 0) - 4) < 1e-9, ivs[1].gap.wall)
+        _assert(abs((ivs[2].gap.wall or 0) - 5) < 1e-9, ivs[2].gap.wall)
+
+    def test_dilate_then_sleep() -> None:
+        text = "\n".join(
+            [
+                json.dumps({"wall": 1000, "machine": 100, "awake": 100, "proper": 0.01, "pid": 1}),
+                json.dumps({"wall": 1002, "machine": 102, "awake": 102, "proper": 0.01, "pid": 1}),
+                json.dumps({"wall": 1012, "machine": 112, "awake": 103, "proper": 0.02, "pid": 1}),
+            ]
+        )
+        ivs = intervals_from_text(text)
+        _assert([iv.gap.primary for iv in ivs] == ["DILATE", "SLEEP"], [iv.gap.primary for iv in ivs])
+        _assert("sleep=" in format_word(ivs[0]), format_word(ivs[0]))
+        _assert("ntp=" in format_word(ivs[1]), format_word(ivs[1]))
+
+    def test_boot_pair() -> None:
+        text = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "wall": 1_000_000_000.0,
+                        "machine": 0.0,
+                        "awake": 0.0,
+                        "proper": 0.0,
+                        "pid": 1,
+                        "boottime": 1_000_000_000.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "wall": 1_000_000_000.0 + 1_900_792.5,
+                        "machine": 1_900_800.0,
+                        "awake": 1_814_400.0,
+                        "proper": 1_814_400.0,
+                        "pid": 1,
+                        "boottime": 1_000_000_000.0,
+                    }
+                ),
+            ]
+        )
+        ivs = intervals_from_text(text)
+        _assert(ivs[0].gap.kind == "host", ivs[0].gap.kind)
+        _assert(ivs[0].gap.primary == "SLEEP", ivs[0].gap.primary)
+        _assert("STEP" not in ivs[0].gap.tags, f"ntp={ivs[0].gap.ntp}")
+        _assert("sleep=" in format_word(ivs[0]) and "ntp=" in format_word(ivs[0]), format_word(ivs[0]))
+
+    def test_missing_proper_is_not_world_dilate() -> None:
+        here = os.path.dirname(__file__) or "."
+        path = os.path.join(here, "fixtures", "slew-noproper.txt")
+        ivs = intervals_from_text(open(path, encoding="utf-8").read())
+        _assert(ivs[0].gap.primary == "SLEEP", f"noproper slew {ivs[0].gap.primary} tags={ivs[0].gap.tags}")
+        _assert(abs((ivs[0].gap.sleep or 0) - 86400) < 1e-6, ivs[0].gap.sleep)
+        _assert("DILATE" not in ivs[0].gap.tags, f"22d awake must not beat 1d sleep: {ivs[0].gap.tags}")
+        tiny = intervals_from_text("wall 10\nmachine 10\nawake 1\n")
+        _assert(tiny[0].gap.primary == "SLEEP", tiny[0].gap.primary)
+        idle = intervals_from_text("wall 92\nmachine 92\nawake 62\n")
+        _assert(idle[0].gap.primary == "SLEEP", f"92s/30s sleep {idle[0].gap.primary}")
+        sandwich = intervals_from_text(
+            json.dumps({"wall": 1000, "machine": 100, "awake": 100, "pid": 1})
+            + "\n"
+            + json.dumps({"wall": 1000.35, "machine": 100.35, "awake": 100.35, "pid": 2})
+        )
+        _assert(sandwich[0].gap.primary == "DILATE", f"0.35s no proper {sandwich[0].gap.primary}")
+
+    def test_zero_origin_wait_is_not_host() -> None:
+        here = os.path.dirname(__file__) or "."
+        path = os.path.join(here, "fixtures", "wait61.txt")
+        ivs = intervals_from_text(open(path, encoding="utf-8").read())
+        _assert(ivs[0].gap.kind != "host", f"61s wait kind={ivs[0].gap.kind}")
+        _assert(ivs[0].gap.primary == "DILATE", f"61s wait {ivs[0].gap.primary} γ={ivs[0].gap.gamma}")
+
+    check("no spawn", test_no_spawn)
+    check("3 cuts → SLEEP then DILATE, scarp names on both", test_stream_pairs)
+    check("one-pair fixtures match scarp names", test_scarp_one_pair)
+    check("22-day slew with proper is SLEEP not STEP", test_slew_not_step)
+    check("wall vs python.monotonic is SLEEP", test_folk_monotonic)
+    check("unlabeled timestamps are consecutive REST", test_unlabeled_stream)
+    check("DILATE then SLEEP both survive (not cuts[0],cuts[1])", test_dilate_then_sleep)
+    check("boot → now is host SLEEP, ntp below floor", test_boot_pair)
+    check("missing proper is SLEEP not 22d DILATE", test_missing_proper_is_not_world_dilate)
+    check("61s zero-origin wait is DILATE not kind=host REST", test_zero_origin_wait_is_not_host)
+    print(f"selftest {n}/{n} passed  backend={BACKEND['kind']}  lurch {VERSION}")
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="lurch", add_help=False, usage=USAGE)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--porcelain", action="store_true")
+    p.add_argument("--explain", action="store_true")
+    p.add_argument("--require", metavar="NAME")
+    p.add_argument("--forbid", metavar="NAME")
+    p.add_argument("--boot", action="store_true")
+    p.add_argument("cmd", nargs="?", default="")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ns = parse_args(argv)
+    if ns.help:
+        print(USAGE)
+        return 0
+    if ns.version:
+        print(f"lurch {VERSION} backend={BACKEND['kind']}")
+        return 0
+    cmd = ns.cmd or ""
+    if cmd == "selftest":
+        try:
+            return selftest()
+        except Fail as e:
+            print(f"FAIL  {e}", file=sys.stderr)
+            return 1
+    if cmd == "cut":
+        c = cut_boot() if ns.boot else cut_now()
+        if ns.json:
+            sys.stdout.write(format_cut_json(c))
+        else:
+            sys.stdout.write(format_cut_tsv(c))
+        return 0
+    if cmd:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print("lurch: no clock readings on stdin", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        ivs = intervals_from_text(raw)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    for iv in ivs:
+        emit(iv, ns, sys.stdout)
+    names = [iv.gap.primary for iv in ivs]
+    if ns.require:
+        want = ns.require.strip().upper()
+        if want not in names:
+            return 1
+    if ns.forbid:
+        ban = ns.forbid.strip().upper()
+        if ban in names:
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

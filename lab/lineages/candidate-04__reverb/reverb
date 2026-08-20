@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""reverb — treat the preimage of a diff as a search query.
+
+Given a unified diff (working tree vs HEAD by default), extract the code
+you just changed or deleted and hunt the tree for lingering copies.
+
+Exit codes: 0 none found, 1 lingering preimages, 2 usage/error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator, Sequence
+
+VERSION = "0.2.0"
+
+WEAK_LINES = {
+    "{",
+    "}",
+    "};",
+    "})",
+    "});",
+    "[",
+    "]",
+    "],",
+    "(",
+    ")",
+    ");",
+    ",",
+    ";",
+    ":",
+    "else",
+    "else:",
+    "else {",
+    "pass",
+    "break",
+    "continue",
+    "return",
+    "return;",
+    "fi",
+    "done",
+    "end",
+    "esac",
+    "try:",
+    "try {",
+    "finally:",
+    "finally {",
+}
+
+IMPORT_PREFIXES = (
+    "import ",
+    "from ",
+    "use ",
+    "using ",
+    "require ",
+    "require(",
+    "#include",
+    "package ",
+    "mod ",
+    "extern crate",
+)
+
+SKIP_DIR_NAMES = {
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".build",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "coverage",
+    ".idea",
+    ".next",
+}
+
+SKIP_SUFFIXES = (
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".class",
+    ".so",
+    ".dylib",
+    ".o",
+    ".a",
+    ".pyc",
+    ".wasm",
+)
+
+SKIP_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "cargo.lock",
+    "go.sum",
+    "poetry.lock",
+    "composer.lock",
+}
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+DIFF_GIT_RE = re.compile(r"^diff --git (.+) (.+)$")
+STRING_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)')
+TOKEN_RE = re.compile(
+    r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)'
+    r"|(\d+(?:\.\d+)?)"
+    r"|([A-Za-z_][A-Za-z0-9_]*)"
+    r"|(\S)"
+)
+KEYWORDS = frozenset(
+    """
+    if else elif for while do return def fn func function let var const
+    class struct enum pub public private protected static async await
+    match case switch break continue try catch except finally throw raise
+    import from use using package module type interface trait impl where
+    as in is not and or none null nil true false self this super new
+    delete sizeof typeof instanceof yield with pass lambda pub crate
+    mut ref where usize isize unwrap unwrap_or unwrap_or_else
+    """.split()
+)
+KIND_RANK = {"exact": 0, "indent": 1, "token": 2, "string": 3}
+
+
+# ---------------------------------------------------------------------------
+# Diff parsing
+# ---------------------------------------------------------------------------
+
+
+def unquote_git_path(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return codecs.decode(raw[1:-1], "unicode_escape")
+    return raw
+
+
+def strip_ab_prefix(path: str) -> str:
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+@dataclass
+class Hunk:
+    path: str
+    old_start: int
+    new_start: int
+    # (kind, text) kind in {"context", "delete", "add"}
+    lines: list[tuple[str, str]] = field(default_factory=list)
+
+    def deleted(self) -> list[str]:
+        return [t for k, t in self.lines if k == "delete"]
+
+    def added(self) -> list[str]:
+        return [t for k, t in self.lines if k == "add"]
+
+    def old_file_lines(self) -> list[tuple[int, str, bool]]:
+        """(1-based old line number, text, is_delete) for context + deletions."""
+        out: list[tuple[int, str, bool]] = []
+        ln = self.old_start
+        for kind, text in self.lines:
+            if kind == "context":
+                out.append((ln, text, False))
+                ln += 1
+            elif kind == "delete":
+                out.append((ln, text, True))
+                ln += 1
+        return out
+
+
+def parse_unified_diff(text: str) -> list[Hunk]:
+    """Parse unified diff into one Hunk per @@ region."""
+    hunks: list[Hunk] = []
+    path: str | None = None
+    current: Hunk | None = None
+
+    def finish() -> None:
+        nonlocal current
+        if current is not None:
+            hunks.append(current)
+            current = None
+
+    for raw in text.splitlines():
+        if raw.startswith("diff --git "):
+            finish()
+            m = DIFF_GIT_RE.match(raw)
+            if m:
+                path = strip_ab_prefix(unquote_git_path(m.group(2)))
+            continue
+        if raw.startswith("+++ "):
+            plus = raw[4:]
+            if plus != "/dev/null":
+                path = strip_ab_prefix(unquote_git_path(plus.split("\t")[0]))
+            continue
+        if raw.startswith("--- "):
+            continue
+        if raw.startswith("Binary files ") or raw.startswith("GIT binary patch"):
+            finish()
+            path = None
+            continue
+        hm = HUNK_RE.match(raw)
+        if hm:
+            finish()
+            if not path:
+                continue
+            current = Hunk(path=path, old_start=int(hm.group(1)), new_start=int(hm.group(3)))
+            continue
+        if current is None:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            current.lines.append(("delete", raw[1:]))
+        elif raw.startswith("+"):
+            current.lines.append(("add", raw[1:]))
+        elif raw.startswith(" "):
+            current.lines.append(("context", raw[1:]))
+    finish()
+    return hunks
+
+
+# ---------------------------------------------------------------------------
+# Query extraction
+# ---------------------------------------------------------------------------
+
+
+def is_noise(line: str) -> bool:
+    stripped = line.strip()
+    return (not stripped) or stripped in WEAK_LINES
+
+
+def is_distinctive(line: str, min_chars: int) -> bool:
+    stripped = line.strip()
+    if is_noise(line):
+        return False
+    if len(stripped) < min_chars:
+        return False
+    if stripped.startswith(IMPORT_PREFIXES):
+        return False
+    if stripped.startswith(("//", "#", "/*", "*", "<!--")) and len(stripped) < 40:
+        return False
+    return True
+
+
+def collapse_block(lines: Sequence[str]) -> list[str]:
+    """Trim brace/empty noise from a deleted run; keep short real statements."""
+    body = list(lines)
+    while body and is_noise(body[0]):
+        body.pop(0)
+    while body and is_noise(body[-1]):
+        body.pop()
+    return body
+
+
+@dataclass(frozen=True)
+class Query:
+    path: str
+    start: int  # 1-based in the old file
+    lines: tuple[str, ...]
+    new_lines: tuple[str, ...]
+    qkind: str = "block"  # block | literal
+
+    @property
+    def end(self) -> int:
+        if self.qkind == "literal":
+            return self.start
+        return self.start + len(self.lines) - 1
+
+
+def normalize_line(line: str) -> tuple[str, ...]:
+    toks: list[str] = []
+    for m in TOKEN_RE.finditer(line):
+        if m.group(1) is not None:
+            toks.append("STR")
+        elif m.group(2) is not None:
+            toks.append("NUM")
+        elif m.group(3) is not None:
+            ident = m.group(3)
+            toks.append(ident if ident.lower() in KEYWORDS else "ID")
+        else:
+            toks.append(m.group(4))
+    return tuple(toks)
+
+
+def normalize_block(lines: Sequence[str]) -> tuple[str, ...]:
+    acc: list[str] = []
+    for line in lines:
+        acc.extend(normalize_line(line))
+    return tuple(acc)
+
+
+def extract_literals(line: str, min_inner: int = 10) -> list[str]:
+    out: list[str] = []
+    for m in STRING_RE.finditer(line):
+        raw = m.group(0)
+        inner = raw[1:-1]
+        if len(inner) >= min_inner:
+            out.append(raw)
+    return out
+
+
+def _block_ok(lines: Sequence[str], min_chars: int) -> bool:
+    if not lines:
+        return False
+    total = sum(len(l.strip()) for l in lines)
+    return any(is_distinctive(l, min_chars) for l in lines) or total >= max(min_chars, 20)
+
+
+def queries_from_hunk(hunk: Hunk, min_chars: int, max_block: int) -> list[Query]:
+    if not hunk.deleted():
+        return []
+    old = hunk.old_file_lines()  # (lineno, text, is_delete)
+    new_t = tuple(hunk.added())
+    out: list[Query] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def emit(start: int, lines: Sequence[str]) -> None:
+        trimmed = collapse_block(list(lines)[:max_block])
+        if not _block_ok(trimmed, min_chars):
+            return
+        key = tuple(l.strip() for l in trimmed)
+        if key in seen:
+            return
+        seen.add(key)
+        lead = 0
+        while lead < len(lines) and lead < max_block and lines[lead] != trimmed[0]:
+            lead += 1
+        if lead >= len(lines):
+            lead = 0
+        out.append(
+            Query(
+                path=hunk.path,
+                start=start + lead,
+                lines=tuple(trimmed),
+                new_lines=new_t,
+            )
+        )
+
+    run: list[tuple[int, str]] = []
+
+    def flush_run() -> None:
+        nonlocal run
+        if not run:
+            return
+        start = run[0][0]
+        body = [t for _, t in run]
+        if _block_ok(collapse_block(body), min_chars):
+            emit(start, body)
+        else:
+            idx = next((i for i, (ln, _, _) in enumerate(old) if ln == start), None)
+            if idx is not None:
+                lo, hi = idx, idx + len(run) - 1
+                while hi - lo + 1 < max_block:
+                    grew = False
+                    if lo > 0:
+                        lo -= 1
+                        grew = True
+                    if hi - lo + 1 < max_block and hi + 1 < len(old):
+                        hi += 1
+                        grew = True
+                    window = old[lo : hi + 1]
+                    if _block_ok([t for _, t, _ in window], min_chars):
+                        emit(window[0][0], [t for _, t, _ in window])
+                        break
+                    if not grew:
+                        break
+            else:
+                emit(start, body)
+        for ln, text in run:
+            if is_distinctive(text, max(min_chars, 20)):
+                emit(ln, [text])
+        run = []
+
+    for ln, text, is_del in old:
+        if is_del:
+            run.append((ln, text))
+        else:
+            flush_run()
+    flush_run()
+
+    # Distinctive string literals from deleted lines (same quote text, any shape).
+    seen_lit: set[str] = set()
+    for ln, text, is_del in old:
+        if not is_del:
+            continue
+        for lit in extract_literals(text):
+            if lit in seen_lit:
+                continue
+            seen_lit.add(lit)
+            out.append(
+                Query(
+                    path=hunk.path,
+                    start=ln,
+                    lines=(lit,),
+                    new_lines=new_t,
+                    qkind="literal",
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Match:
+    kind: str
+    query: Query
+    path: str
+    start: int
+    lines: tuple[str, ...]
+
+    @property
+    def end(self) -> int:
+        return self.start + len(self.lines) - 1
+
+
+def should_skip_file(path: Path) -> bool:
+    name = path.name
+    if name in SKIP_NAMES or name.lower() in SKIP_NAMES:
+        return True
+    lower = name.lower()
+    if any(lower.endswith(suf) for suf in SKIP_SUFFIXES):
+        return True
+    if ".generated." in lower or lower.endswith(".generated.ts"):
+        return True
+    return False
+
+
+def is_text_bytes(sample: bytes) -> bool:
+    if not sample:
+        return True
+    if b"\0" in sample:
+        return False
+    return True
+
+
+def git_toplevel(cwd: Path) -> Path | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if out.returncode != 0:
+        return None
+    return Path(out.stdout.strip())
+
+
+def git_diff(cwd: Path, rev_args: list[str], cached: bool) -> str:
+    cmd = ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--no-color", "-U3"]
+    if cached:
+        cmd.append("--cached")
+    cmd.extend(rev_args)
+    out = subprocess.run(cmd, check=False, capture_output=True)
+    if out.returncode not in (0, 1):
+        err = out.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or "git diff failed")
+    return out.stdout.decode("utf-8", "replace")
+
+
+def git_ls_files(cwd: Path) -> list[Path]:
+    out = subprocess.run(
+        ["git", "-C", str(cwd), "ls-files", "-zco", "--exclude-standard"],
+        check=False,
+        capture_output=True,
+    )
+    if out.returncode != 0:
+        return []
+    names = [n for n in out.stdout.split(b"\0") if n]
+    files: list[Path] = []
+    for raw in names:
+        try:
+            rel = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            rel = raw.decode("utf-8", "replace")
+        p = cwd / rel
+        if p.is_file():
+            files.append(p)
+    return files
+
+
+def walk_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.is_file():
+                files.append(p)
+    return files
+
+
+def nested_git_roots(root: Path) -> list[Path]:
+    found: list[Path] = []
+    root_r = root.resolve()
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        p = Path(dirpath)
+        if p.resolve() == root_r:
+            continue
+        if (p / ".git").exists():
+            found.append(p)
+    return found
+
+
+def list_search_files(root: Path, use_git: bool, nested: bool) -> list[Path]:
+    if not use_git:
+        return walk_files(root)
+    files = git_ls_files(root)
+    seen = {p.resolve() for p in files}
+    if nested:
+        for nroot in nested_git_roots(root):
+            for p in git_ls_files(nroot):
+                rp = p.resolve()
+                if rp not in seen:
+                    files.append(p)
+                    seen.add(rp)
+    if files:
+        return files
+    return walk_files(root)
+
+
+def token_query_ok(toks: Sequence[str], nlines: int, min_tokens: int) -> bool:
+    if len(toks) < min_tokens:
+        return False
+    if nlines >= 2:
+        return True
+    # Single-line token clones need a real keyword so `obj.method("a", key: "b")`
+    # does not match every other labelled string call.
+    return any(len(t) > 1 and t not in {"ID", "STR", "NUM"} for t in toks)
+
+
+def windows_equal(window: Sequence[str], query: Sequence[str], kind: str) -> bool:
+    if len(window) != len(query):
+        return False
+    if kind == "exact":
+        return all(w.rstrip("\n\r") == q.rstrip("\n\r") for w, q in zip(window, query))
+    if kind == "indent":
+        return all(w.strip() == q.strip() for w, q in zip(window, query))
+    if kind == "token":
+        return normalize_block(window) == normalize_block(query)
+    return False
+
+
+def _same_origin(rel: str, q: Query, start: int) -> bool:
+    return rel == q.path and start == q.start
+
+
+def search_file(
+    path: Path,
+    rel: str,
+    queries: Sequence[Query],
+    kinds: Sequence[str],
+    min_tokens: int,
+    want_literal: bool,
+) -> Iterator[Match]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    if not is_text_bytes(data[:8192]):
+        return
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            return
+    file_lines = text.splitlines()
+    n = len(file_lines)
+    for q in queries:
+        if q.qkind == "literal":
+            if not want_literal:
+                continue
+            needle = q.lines[0]
+            if not needle:
+                continue
+            for i, line in enumerate(file_lines):
+                if needle not in line:
+                    continue
+                if _same_origin(rel, q, i + 1):
+                    continue
+                yield Match(
+                    kind="string",
+                    query=q,
+                    path=rel,
+                    start=i + 1,
+                    lines=(line,),
+                )
+            continue
+        qn = len(q.lines)
+        if qn == 0 or qn > n:
+            continue
+        qtok = normalize_block(q.lines)
+        for kind in kinds:
+            if kind == "token" and not token_query_ok(qtok, qn, min_tokens):
+                continue
+            for i in range(0, n - qn + 1):
+                window = file_lines[i : i + qn]
+                if not windows_equal(window, q.lines, kind):
+                    continue
+                if _same_origin(rel, q, i + 1):
+                    continue
+                yield Match(
+                    kind=kind,
+                    query=q,
+                    path=rel,
+                    start=i + 1,
+                    lines=tuple(window),
+                )
+
+
+def suppress_contained(matches: list[Match]) -> list[Match]:
+    """Drop matches fully inside a longer match in the same file."""
+    ranked = sorted(matches, key=lambda m: (m.path, m.start, -(m.end)))
+    kept: list[Match] = []
+    for m in ranked:
+        covered = False
+        for k in kept:
+            if k.path != m.path:
+                continue
+            if k.start <= m.start and k.end >= m.end and (k.end - k.start) >= (m.end - m.start):
+                if k.start == m.start and k.end == m.end and k.query.path == m.query.path:
+                    # same span, different query/kind: keep the first (longer query preferred)
+                    covered = True
+                    break
+                if k.start <= m.start and k.end >= m.end and (k.end - k.start) > (m.end - m.start):
+                    covered = True
+                    break
+                if k.start == m.start and k.end == m.end:
+                    covered = True
+                    break
+        if not covered:
+            kept.append(m)
+    return kept
+
+
+def drop_generic(matches: list[Match], max_hits: int) -> list[Match]:
+    """Drop queries that hit too many places — they are boilerplate."""
+    counts: dict[tuple[str, str, tuple[str, ...]], int] = {}
+    for m in matches:
+        key = (m.kind, m.query.qkind, tuple(l.strip() for l in m.query.lines))
+        counts[key] = counts.get(key, 0) + 1
+    kept: list[Match] = []
+    for m in matches:
+        key = (m.kind, m.query.qkind, tuple(l.strip() for l in m.query.lines))
+        if counts[key] <= max_hits:
+            kept.append(m)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+
+def relpath(path: str, start: int, end: int) -> str:
+    if start == end:
+        return f"{path}:{start}"
+    return f"{path}:{start}-{end}"
+
+
+def format_human(matches: list[Match]) -> str:
+    if not matches:
+        return ""
+    groups: dict[tuple[str, int, tuple[str, ...]], list[Match]] = {}
+    order: list[tuple[str, int, tuple[str, ...]]] = []
+    for m in matches:
+        key = (m.query.path, m.query.start, m.query.lines)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(m)
+    parts: list[str] = []
+    for key in order:
+        qpath, qstart, qlines = key
+        qend = qstart + len(qlines) - 1
+        parts.append(f"changed {relpath(qpath, qstart, qend)}")
+        for line in qlines:
+            parts.append(f"  - {line}")
+        for m in groups[key]:
+            parts.append(f"  {m.kind:6} {relpath(m.path, m.start, m.end)}")
+            if m.kind != "exact":
+                for line in m.lines:
+                    parts.append(f"         {line}")
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def format_grep(matches: list[Match]) -> str:
+    lines = []
+    for m in matches:
+        for i, line in enumerate(m.lines):
+            lines.append(f"{m.path}:{m.start + i}:{line}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def format_json(matches: list[Match]) -> str:
+    payload = {
+        "version": VERSION,
+        "count": len(matches),
+        "matches": [
+            {
+                "kind": m.kind,
+                "source": {
+                    "path": m.query.path,
+                    "start": m.query.start,
+                    "end": m.query.end,
+                    "lines": list(m.query.lines),
+                    "new_lines": list(m.query.new_lines),
+                },
+                "match": {
+                    "path": m.path,
+                    "start": m.start,
+                    "end": m.end,
+                    "lines": list(m.lines),
+                },
+            }
+            for m in matches
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="reverb",
+        description=(
+            "Find lingering copies of code you just changed. "
+            "The deleted/old side of a diff becomes the search query."
+        ),
+    )
+    p.add_argument(
+        "revs",
+        nargs="*",
+        help="git diff revision args (default: working tree + index vs HEAD)",
+    )
+    p.add_argument("-C", "--root", default=None, help="repository / search root")
+    p.add_argument("--stdin", action="store_true", help="read a unified diff from stdin")
+    p.add_argument("--cached", action="store_true", help="use staged diff only")
+    p.add_argument("--json", action="store_true", help="JSON on stdout")
+    p.add_argument("--grep", action="store_true", help="grep-like path:line:text")
+    p.add_argument("-q", "--quiet", action="store_true", help="no output; exit code only")
+    p.add_argument("--min-chars", type=int, default=12, help="minimum significant line length")
+    p.add_argument("--max-block", type=int, default=8, help="max deleted lines per query block")
+    p.add_argument("--max-hits", type=int, default=25, help="drop queries that match more than N times")
+    p.add_argument("--all-files", action="store_true", help="walk the tree instead of git ls-files")
+    p.add_argument("--exact-only", action="store_true", help="disable indent/token/string matching")
+    p.add_argument("--no-token", action="store_true", help="disable identifier-normalized matching")
+    p.add_argument("--no-nested", action="store_true", help="do not search nested git repositories")
+    p.add_argument("--min-tokens", type=int, default=12, help="minimum tokens for a token-clone query")
+    p.add_argument("--version", action="version", version=f"reverb {VERSION}")
+    return p.parse_args(argv)
+
+
+def collect_queries(hunks: list[Hunk], min_chars: int, max_block: int) -> list[Query]:
+    queries: list[Query] = []
+    for h in hunks:
+        queries.extend(queries_from_hunk(h, min_chars, max_block))
+    # Longest first so suppression keeps the most useful span.
+    queries.sort(key=lambda q: (-len(q.lines), -sum(len(l) for l in q.lines)))
+    return queries
+
+
+def run(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+
+    stdin_is_pipe = not sys.stdin.isatty()
+    use_stdin = args.stdin or (stdin_is_pipe and not args.revs and args.root is None and not args.cached)
+    if use_stdin:
+        diff_text = sys.stdin.read()
+    else:
+        top = git_toplevel(root)
+        if top is None:
+            print("reverb: not a git repository (use --stdin with a unified diff)", file=sys.stderr)
+            return 2
+        root = top
+        try:
+            diff_text = git_diff(root, list(args.revs), args.cached)
+        except RuntimeError as e:
+            print(f"reverb: {e}", file=sys.stderr)
+            return 2
+
+    hunks = parse_unified_diff(diff_text)
+    queries = collect_queries(hunks, args.min_chars, args.max_block)
+    if not queries:
+        if not args.quiet and not args.json:
+            print("reverb: no significant preimages in diff", file=sys.stderr)
+        if args.json and not args.quiet:
+            sys.stdout.write(format_json([]))
+        return 0
+
+    use_git = not args.all_files and git_toplevel(root) is not None
+    files = list_search_files(root, use_git=use_git, nested=not args.no_nested)
+    if args.exact_only:
+        kinds: tuple[str, ...] = ("exact",)
+    elif args.no_token:
+        kinds = ("exact", "indent")
+    else:
+        kinds = ("exact", "indent", "token")
+
+    matches: list[Match] = []
+    root_s = str(root)
+    for path in files:
+        if should_skip_file(path):
+            continue
+        try:
+            rel = os.path.relpath(str(path), root_s)
+        except ValueError:
+            rel = str(path)
+        if rel.startswith(".." + os.sep):
+            continue
+        matches.extend(
+            search_file(
+                path,
+                rel.replace(os.sep, "/"),
+                queries,
+                kinds,
+                min_tokens=args.min_tokens,
+                want_literal=not args.exact_only,
+            )
+        )
+
+    matches = drop_generic(matches, args.max_hits)
+    matches = suppress_contained(matches)
+    # Prefer more precise kinds for the same span.
+    dedup: dict[tuple[str, int, int], Match] = {}
+    for m in matches:
+        key = (m.path, m.start, m.end)
+        prev = dedup.get(key)
+        if prev is None or KIND_RANK.get(m.kind, 9) < KIND_RANK.get(prev.kind, 9):
+            dedup[key] = m
+    matches = list(dedup.values())
+    matches.sort(key=lambda m: (m.query.path, m.query.start, m.path, m.start))
+
+    if args.quiet:
+        return 1 if matches else 0
+
+    if args.json:
+        sys.stdout.write(format_json(matches))
+    elif args.grep:
+        sys.stdout.write(format_grep(matches))
+    else:
+        body = format_human(matches)
+        if body:
+            sys.stdout.write(body)
+        print(
+            f"reverb: {len(matches)} lingering preimage{'s' if len(matches) != 1 else ''} "
+            f"from {len(queries)} quer{'ies' if len(queries) != 1 else 'y'}",
+            file=sys.stderr,
+        )
+    return 1 if matches else 0
+
+
+def main() -> None:
+    try:
+        sys.exit(run())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

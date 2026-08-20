@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+"""pinch — name who waited for whom in a pipeline.
+
+A Unix pipeline is a conversation of blocking. pv tells you throughput.
+pinch tells you the blocking relationship: which stage sat on a full pipe
+(downstream was slow) and which stage sat on an empty pipe (upstream was
+slow). The pinch point is the stage the others waited for.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Optional
+
+VERSION = "0.2.0"
+DEFAULT_BUF = 65536
+DEFAULT_SAMPLE_MS = 20
+# Process-group samples include our meters/wraps and a login shell.
+# Inner-pinch analysis drops these so a wait-bound wrapper can name
+# the child that actually held the CPU (pkl, rustc, swift-frontend).
+WRAPPER_COMMS = frozenset({"bash", "sh", "tee", "pinch", "dash", "zsh"})
+
+# ---------------------------------------------------------------------------
+# meter: copy stdin → stdout, measure poll stalls
+# ---------------------------------------------------------------------------
+
+
+def run_meter(log_path: str, bufsize: int) -> int:
+    infd, outfd = 0, 1
+    os.set_blocking(infd, False)
+    os.set_blocking(outfd, False)
+
+    buf = bytearray()
+    stats = {
+        "bytes": 0,
+        "read_stall_ns": 0,
+        "write_stall_ns": 0,
+        "both_stall_ns": 0,
+        "copy_ns": 0,
+        "reads": 0,
+        "writes": 0,
+        "read_eof": False,
+        "epipe": False,
+    }
+    t_start = time.monotonic_ns()
+
+    def _flush_log() -> None:
+        stats["wall_ns"] = time.monotonic_ns() - t_start
+        payload = json.dumps(stats, separators=(",", ":"))
+        tmp = log_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, log_path)
+
+    def _handle_stop(_signum: int, _frame: Any) -> None:
+        _flush_log()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    try:
+        while True:
+            want_read = (not stats["read_eof"]) and (len(buf) < bufsize)
+            want_write = len(buf) > 0
+            if not want_read and not want_write:
+                break
+
+            poller = select.poll()
+            if want_read:
+                poller.register(infd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            if want_write:
+                poller.register(outfd, select.POLLOUT | select.POLLERR | select.POLLHUP)
+
+            t0 = time.monotonic_ns()
+            try:
+                evlist = poller.poll(1000)
+            except InterruptedError:
+                continue
+            waited = time.monotonic_ns() - t0
+            ev = {fd: flags for fd, flags in evlist}
+
+            in_ready = bool(ev.get(infd, 0) & (select.POLLIN | select.POLLHUP | select.POLLERR))
+            out_ready = bool(ev.get(outfd, 0) & (select.POLLOUT | select.POLLERR | select.POLLHUP))
+
+            # Time inside poll() is stall for the events we registered.
+            # Tiny wakes are scheduler noise, not a blocking relationship.
+            if waited >= 50_000:
+                if want_read and want_write:
+                    stats["both_stall_ns"] += waited
+                elif want_write:
+                    stats["write_stall_ns"] += waited
+                elif want_read:
+                    stats["read_stall_ns"] += waited
+
+            if want_read and in_ready:
+                t2 = time.monotonic_ns()
+                try:
+                    chunk = os.read(infd, bufsize - len(buf) or bufsize)
+                except BlockingIOError:
+                    chunk = None
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        chunk = None
+                    else:
+                        raise
+                stats["copy_ns"] += time.monotonic_ns() - t2
+                if chunk is None:
+                    pass
+                elif chunk == b"":
+                    stats["read_eof"] = True
+                else:
+                    buf.extend(chunk)
+                    stats["reads"] += 1
+
+            if want_write and (out_ready or ev.get(outfd, 0) & select.POLLERR):
+                t2 = time.monotonic_ns()
+                try:
+                    n = os.write(outfd, buf)
+                except BlockingIOError:
+                    n = 0
+                except OSError as exc:
+                    if exc.errno == errno.EPIPE:
+                        stats["epipe"] = True
+                        stats["copy_ns"] += time.monotonic_ns() - t2
+                        break
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        n = 0
+                    else:
+                        raise
+                stats["copy_ns"] += time.monotonic_ns() - t2
+                if n:
+                    del buf[:n]
+                    stats["bytes"] += n
+                    stats["writes"] += 1
+    finally:
+        try:
+            _flush_log()
+        except OSError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# wrap: exec a stage, record rusage
+# ---------------------------------------------------------------------------
+
+
+def run_wrap(log_path: str, argv: list[str]) -> int:
+    if not argv:
+        print("pinch --wrap: missing command", file=sys.stderr)
+        return 2
+    t0 = time.monotonic_ns()
+    try:
+        proc = subprocess.Popen(argv)
+    except OSError as exc:
+        with open(log_path, "w", encoding="utf-8") as fh:
+            json.dump({"error": str(exc), "argv": argv, "exit": 127}, fh)
+        return 127
+    pid = proc.pid
+    _pid, status, ru = os.wait4(pid, 0)
+    if os.WIFSIGNALED(status):
+        exit_code = 128 + os.WTERMSIG(status)
+        term_sig = os.WTERMSIG(status)
+    else:
+        exit_code = os.WEXITSTATUS(status)
+        term_sig = None
+    proc.returncode = exit_code
+    wall_ns = time.monotonic_ns() - t0
+    payload = {
+        "argv": argv,
+        "pid": pid,
+        "exit": exit_code,
+        "term_sig": term_sig,
+        "wall_ns": wall_ns,
+        "ru_utime": ru.ru_utime,
+        "ru_stime": ru.ru_stime,
+        "ru_maxrss": ru.ru_maxrss,
+        "ru_inblock": getattr(ru, "ru_inblock", 0),
+        "ru_oublock": getattr(ru, "ru_oublock", 0),
+        "ru_nvcsw": getattr(ru, "ru_nvcsw", 0),
+        "ru_nivcsw": getattr(ru, "ru_nivcsw", 0),
+    }
+    tmp = log_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    os.replace(tmp, log_path)
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# pipeline parse
+# ---------------------------------------------------------------------------
+
+
+def split_pipeline(script: str) -> list[str]:
+    """Quote-aware split on `|` that is not `||` or `|&`."""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    i = 0
+    n = len(script)
+    while i < n:
+        c = script[i]
+        if quote:
+            buf.append(c)
+            if c == quote:
+                if quote == "'" or (i > 0 and script[i - 1] != "\\"):
+                    quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "|" and i + 1 < n and script[i + 1] in "|":
+            buf.append(c)
+            buf.append(script[i + 1])
+            i += 2
+            continue
+        if c == "|":
+            # treat |& as a pipe too, swallow the &
+            if i + 1 < n and script[i + 1] == "&":
+                i += 1
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return [p for p in parts if p]
+
+
+def shell_quote(arg: str) -> str:
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
+_SHELLY = ("&&", "||", ";", "\n", "`", "$(", "${", ">", "<", "2>", "&>", "if ", "for ", "while ")
+
+
+def stage_from_sh(part: str) -> list[str]:
+    """Prefer argv so wrap rusage is the real stage, not a wrapper bash."""
+    if any(tok in part for tok in _SHELLY):
+        return ["bash", "-lc", part]
+    try:
+        argv = shlex.split(part)
+    except ValueError:
+        return ["bash", "-lc", part]
+    if not argv:
+        return ["bash", "-lc", part]
+    return argv
+
+
+def pinch_self() -> list[str]:
+    return [sys.executable, os.path.realpath(__file__)]
+
+
+def shorten_argv(argv: list[str], limit: int = 56) -> str:
+    if not argv:
+        return "?"
+    bits = [os.path.basename(argv[0])] + argv[1:]
+    text = " ".join(bits)
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def default_label(argv: list[str]) -> str:
+    if (
+        len(argv) >= 3
+        and os.path.basename(argv[0]) in {"bash", "sh", "zsh"}
+        and argv[1] in {"-c", "-lc"}
+    ):
+        return shorten_argv(["sh", argv[2]])
+    return shorten_argv(argv)
+
+
+# ---------------------------------------------------------------------------
+# sampling
+# ---------------------------------------------------------------------------
+
+
+def _ps_snapshot() -> list[dict[str, Any]]:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-ax", "-o", "pid=,ppid=,pgid=,state=,%cpu=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        try:
+            command = parts[5]
+            comm = os.path.basename(command.split(None, 1)[0])
+            rows.append(
+                {
+                    "pid": int(parts[0]),
+                    "ppid": int(parts[1]),
+                    "pgid": int(parts[2]),
+                    "state": parts[3],
+                    "cpu": float(parts[4]),
+                    "command": command,
+                    "comm": comm,
+                    "wrapper": is_wrapper_command(command, comm),
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def is_wrapper_command(command: str, comm: str) -> bool:
+    if "--meter" in command or "--wrap" in command:
+        return True
+    if comm in WRAPPER_COMMS:
+        return True
+    if _noise_comm(comm):
+        return True
+    return False
+
+
+def _noise_comm(comm: str) -> bool:
+    # macOS ps prints "(Python)" when it cannot recover argv — usually our
+    # meter/wrap. It is not a user-facing inner pinch.
+    return bool(comm) and comm.startswith("(") and comm.endswith(")")
+
+
+def sample_loop(pgid: int, interval_s: float, sink: list[dict[str, Any]], stop: list[bool]) -> None:
+    self_pid = os.getpid()
+    while not stop[0]:
+        now = time.monotonic()
+        busy = 0
+        sleep = 0
+        other = 0
+        children: dict[str, dict[str, int]] = {}
+        for row in _ps_snapshot():
+            if row["pgid"] != pgid:
+                continue
+            if row["pid"] == self_pid:
+                continue
+            comm = row["comm"]
+            st = row["state"][:1]
+            bucket = "run" if st == "R" else ("sleep" if st in {"S", "I", "U", "D"} else "other")
+            if not row.get("wrapper"):
+                if bucket == "run":
+                    busy += 1
+                elif bucket == "sleep":
+                    sleep += 1
+                else:
+                    other += 1
+            slot = children.setdefault(
+                comm, {"run": 0, "sleep": 0, "other": 0, "wrapper": bool(row.get("wrapper"))}
+            )
+            slot[bucket] += 1
+            if row.get("wrapper"):
+                slot["wrapper"] = True
+        sink.append(
+            {
+                "t": now,
+                "busy": busy,
+                "sleep": sleep,
+                "other": other,
+                "children": children,
+            }
+        )
+        time.sleep(interval_s)
+
+
+# ---------------------------------------------------------------------------
+# classify
+# ---------------------------------------------------------------------------
+
+
+def ns_to_s(ns: int | float | None) -> float:
+    if not ns:
+        return 0.0
+    return float(ns) / 1e9
+
+
+def classify(stages: list[dict[str, Any]], links: list[dict[str, Any]], wall_s: float) -> dict[str, Any]:
+    n = len(stages)
+    blame = [0.0] * n
+    wait_for: list[dict[str, Any]] = []
+    for i, link in enumerate(links):
+        rs = link["read_stall_s"]
+        ws = link["write_stall_s"]
+        blame[i] += rs
+        if i + 1 < n:
+            blame[i + 1] += ws
+        if ws >= rs and ws > 0.005:
+            relation = "blocked-on-write"
+            toward = i + 1
+        elif rs > ws and rs > 0.005:
+            relation = "blocked-on-read"
+            toward = i
+        else:
+            relation = "flowing"
+            toward = None
+        link["relation"] = relation
+        link["toward"] = toward
+        if toward is not None:
+            wait_for.append(
+                {
+                    "waiter": i if relation == "blocked-on-write" else i + 1,
+                    "waited_s": ws if relation == "blocked-on-write" else rs,
+                    "reason": relation,
+                    "on": toward,
+                }
+            )
+
+    if n == 0:
+        return {"stage": None, "kind": "none", "reason": "no stages", "blame": [], "wait_for": []}
+
+    if n == 1:
+        st = stages[0]
+        cpu = (st.get("ru_utime") or 0) + (st.get("ru_stime") or 0)
+        busy = (cpu / wall_s) if wall_s > 0 else 0.0
+        # sample-based busy wins when present
+        if st.get("sample_busy_frac") is not None:
+            busy = st["sample_busy_frac"]
+        kind = "compute" if busy >= 0.35 else "wait"
+        return {
+            "stage": 0,
+            "kind": kind,
+            "reason": (
+                f"single command is {kind}-bound "
+                f"({busy:.0%} busy, cpu {cpu:.3f}s / wall {wall_s:.3f}s)"
+            ),
+            "blame": [wall_s],
+            "wait_for": [],
+            "busy_frac": busy,
+        }
+
+    total_stall = sum(blame)
+    pinch_i = max(range(n), key=lambda i: (blame[i], -i))
+    threshold = max(0.02, 0.05 * wall_s)
+    if total_stall < threshold:
+        return {
+            "stage": None,
+            "kind": "balanced",
+            "reason": f"no stage absorbed a meaningful stall (total stall {total_stall:.3f}s)",
+            "blame": blame,
+            "wait_for": wait_for,
+        }
+
+    st = stages[pinch_i]
+    cpu = (st.get("ru_utime") or 0) + (st.get("ru_stime") or 0)
+    busy = st.get("cpu_frac")
+    if busy is None:
+        swall = st.get("wall_s") or wall_s
+        busy = (cpu / swall) if swall else 0.0
+    kind = "compute" if busy >= 0.35 else "wait"
+    waited = blame[pinch_i]
+    return {
+        "stage": pinch_i,
+        "kind": kind,
+        "reason": (
+            f"stage {pinch_i} ({st.get('label', '?')}) absorbed {waited:.3f}s of neighbor stall "
+            f"and looks {kind}-bound"
+        ),
+        "blame": blame,
+        "wait_for": wait_for,
+        "busy_frac": busy,
+    }
+
+
+def fold_samples(samples: list[dict[str, Any]], wall_s: float) -> dict[str, Any]:
+    if not samples:
+        return {"n": 0, "busy_frac": None, "by_comm": {}}
+    t0 = samples[0]["t"]
+    t1 = samples[-1]["t"]
+    span = max(t1 - t0, 1e-9)
+    run = sum(s["busy"] for s in samples)
+    slp = sum(s["sleep"] for s in samples)
+    tot = run + slp + sum(s["other"] for s in samples)
+    by: dict[str, dict[str, int]] = {}
+    for s in samples:
+        for comm, slot in s["children"].items():
+            acc = by.setdefault(comm, {"run": 0, "sleep": 0, "other": 0})
+            for k in acc:
+                acc[k] += slot.get(k, 0)
+    return {
+        "n": len(samples),
+        "span_s": span,
+        "busy_frac": (run / tot) if tot else None,
+        "run_slots": run,
+        "sleep_slots": slp,
+        "by_comm": by,
+        "wall_s": wall_s,
+    }
+
+
+def analyze_inner(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Turn process-group samples into an inner wait-for graph.
+
+    A single user stage (just spec-check, bun spec-gen, swift build) is
+    often a hidden pipeline: the wrapper sleeps while pkl/rustc/swift-frontend
+    runs. That child is the inner pinch.
+    """
+    empty = {
+        "workers": {},
+        "inner_pinch": None,
+        "inner_kind": None,
+        "reason": "no worker samples",
+        "phases": [],
+        "busy_frac": None,
+        "waited_on_inner": [],
+    }
+    if not samples:
+        return empty
+
+    workers: dict[str, dict[str, int]] = {}
+    for s in samples:
+        for comm, slot in s["children"].items():
+            if slot.get("wrapper") or comm in WRAPPER_COMMS or _noise_comm(comm):
+                continue
+            acc = workers.setdefault(comm, {"run": 0, "sleep": 0, "other": 0})
+            for k in acc:
+                acc[k] += slot.get(k, 0)
+
+    if not workers:
+        empty["reason"] = "only wrapper processes sampled"
+        return empty
+
+    scored: list[dict[str, Any]] = []
+    run_all = 0
+    sleep_all = 0
+    for comm, slot in workers.items():
+        tot = slot["run"] + slot["sleep"] + slot["other"]
+        run_all += slot["run"]
+        sleep_all += slot["sleep"]
+        scored.append(
+            {
+                "comm": comm,
+                "run": slot["run"],
+                "sleep": slot["sleep"],
+                "other": slot["other"],
+                "run_frac": (slot["run"] / tot) if tot else 0.0,
+            }
+        )
+    scored.sort(key=lambda w: (w["run"], w["run_frac"]), reverse=True)
+    top = scored[0]
+    tot_slots = run_all + sleep_all
+    busy_frac = (run_all / tot_slots) if tot_slots else None
+    inner_kind = "compute" if top["run_frac"] >= 0.35 or top["run"] >= 3 else "wait"
+
+    # Phases: consecutive samples sharing the same set of running workers.
+    phases: list[dict[str, Any]] = []
+    t_origin = samples[0]["t"]
+    cur_key: Optional[tuple[str, ...]] = None
+    cur_sleep: set[str] = set()
+    cur_t0 = 0.0
+    last_t = 0.0
+    for s in samples:
+        t = s["t"] - t_origin
+        runners = tuple(
+            sorted(
+                c
+                for c, slot in s["children"].items()
+                if slot.get("run", 0) > 0
+                and not slot.get("wrapper")
+                and c not in WRAPPER_COMMS
+                and not _noise_comm(c)
+            )
+        )
+        sleepers = {
+            c
+            for c, slot in s["children"].items()
+            if slot.get("sleep", 0) > 0
+            and not slot.get("wrapper")
+            and c not in WRAPPER_COMMS
+            and not _noise_comm(c)
+        }
+        if runners != cur_key:
+            if cur_key is not None:
+                phases.append(
+                    {
+                        "t0": round(cur_t0, 4),
+                        "t1": round(t, 4),
+                        "run": list(cur_key),
+                        "sleep": sorted(cur_sleep - set(cur_key)),
+                    }
+                )
+            cur_key = runners
+            cur_sleep = set(sleepers)
+            cur_t0 = t
+        else:
+            cur_sleep |= sleepers
+        last_t = t
+    if cur_key is not None:
+        phases.append(
+            {
+                "t0": round(cur_t0, 4),
+                "t1": round(last_t, 4),
+                "run": list(cur_key),
+                "sleep": sorted(cur_sleep - set(cur_key)),
+            }
+        )
+
+    waited: list[str] = []
+    for ph in phases:
+        if top["comm"] in ph.get("run", []):
+            for sl in ph.get("sleep", []):
+                if sl != top["comm"] and sl not in waited:
+                    waited.append(sl)
+
+    reason = (
+        f"inner pinch is {top['comm']} ({inner_kind}, "
+        f"{top['run']} run / {top['sleep']} sleep samples"
+        + (f"; {', '.join(waited)} slept while it ran" if waited else "")
+        + ")"
+    )
+    return {
+        "workers": {w["comm"]: w for w in scored},
+        "inner_pinch": top["comm"],
+        "inner_kind": inner_kind,
+        "reason": reason,
+        "phases": phases,
+        "busy_frac": busy_frac,
+        "waited_on_inner": waited,
+    }
+
+
+def apply_inner(pinch: dict[str, Any], inner: dict[str, Any], stages: list[dict[str, Any]]) -> None:
+    """Fold inner-tree pinch into the user-facing verdict when it adds a name."""
+    pinch["inner"] = {
+        "comm": inner.get("inner_pinch"),
+        "kind": inner.get("inner_kind"),
+        "reason": inner.get("reason"),
+        "waited_on_inner": inner.get("waited_on_inner") or [],
+    }
+    comm = inner.get("inner_pinch")
+    if not comm:
+        return
+    labels = " ".join(st.get("label") or "" for st in stages)
+    already_named = comm.lower() in labels.lower()
+    wrapper_wait = pinch.get("kind") == "wait"
+    single = len(stages) == 1
+    if already_named and not wrapper_wait:
+        return
+    if not (wrapper_wait or single or not already_named):
+        return
+    extra = inner["reason"]
+    base = pinch.get("reason") or ""
+    if extra and extra not in base:
+        pinch["reason"] = f"{base}; {extra}" if base else extra
+    if wrapper_wait and inner.get("inner_kind") == "compute":
+        pinch["kind"] = "wait/compute"
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+def build_pipeline_script(
+    stages: list[list[str]],
+    meter_logs: list[str],
+    wrap_logs: list[str],
+    bufsize: int,
+) -> str:
+    self = pinch_self()
+    chunks: list[str] = []
+    for i, argv in enumerate(stages):
+        wrap = (
+            self
+            + ["--wrap", "--log", wrap_logs[i], "--"]
+            + argv
+        )
+        chunks.append(" ".join(shell_quote(a) for a in wrap))
+        if i < len(stages) - 1:
+            meter = self + [
+                "--meter",
+                "--log",
+                meter_logs[i],
+                "--buf-size",
+                str(bufsize),
+            ]
+            chunks.append(" ".join(shell_quote(a) for a in meter))
+    return "set -o pipefail; " + " | ".join(chunks)
+
+
+def load_json(path: str) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def run_pipeline(
+    stages: list[list[str]],
+    *,
+    json_out: bool,
+    report_path: Optional[str],
+    sample_ms: int,
+    bufsize: int,
+    labels: dict[int, str],
+) -> int:
+    if not stages:
+        print("pinch: no command", file=sys.stderr)
+        return 2
+
+    tmp = tempfile.mkdtemp(prefix="pinch-")
+    meter_logs = [os.path.join(tmp, f"m{i}.json") for i in range(max(0, len(stages) - 1))]
+    wrap_logs = [os.path.join(tmp, f"s{i}.json") for i in range(len(stages))]
+    script = build_pipeline_script(stages, meter_logs, wrap_logs, bufsize)
+
+    samples: list[dict[str, Any]] = []
+    stop = [False]
+    sampler = None
+
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+
+    if sample_ms > 0:
+        import threading
+
+        sampler = threading.Thread(
+            target=sample_loop,
+            args=(pgid, sample_ms / 1000.0, samples, stop),
+            daemon=True,
+        )
+        sampler.start()
+
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        rc = 130
+    finally:
+        stop[0] = True
+        if sampler is not None:
+            sampler.join(timeout=0.5)
+    wall_s = time.monotonic() - t0
+
+    # harvest
+    harvested_stages: list[dict[str, Any]] = []
+    for i, argv in enumerate(stages):
+        wrap = load_json(wrap_logs[i])
+        label = labels.get(i) or default_label(argv)
+        cpu = float(wrap.get("ru_utime") or 0) + float(wrap.get("ru_stime") or 0)
+        st_wall = ns_to_s(wrap.get("wall_ns"))
+        harvested_stages.append(
+            {
+                "i": i,
+                "argv": argv,
+                "label": label,
+                "exit": wrap.get("exit"),
+                "pid": wrap.get("pid"),
+                "wall_s": st_wall,
+                "ru_utime": wrap.get("ru_utime"),
+                "ru_stime": wrap.get("ru_stime"),
+                "ru_maxrss": wrap.get("ru_maxrss"),
+                "cpu_s": cpu,
+                "cpu_frac": (cpu / st_wall) if st_wall > 0 else None,
+            }
+        )
+
+    links: list[dict[str, Any]] = []
+    for i, path in enumerate(meter_logs):
+        m = load_json(path)
+        wall = ns_to_s(m.get("wall_ns"))
+        rs = ns_to_s(m.get("read_stall_ns"))
+        ws = ns_to_s(m.get("write_stall_ns"))
+        bs = ns_to_s(m.get("both_stall_ns"))
+        links.append(
+            {
+                "from": i,
+                "to": i + 1,
+                "bytes": int(m.get("bytes") or 0),
+                "reads": int(m.get("reads") or 0),
+                "writes": int(m.get("writes") or 0),
+                "read_stall_s": rs,
+                "write_stall_s": ws,
+                "both_stall_s": bs,
+                "copy_s": ns_to_s(m.get("copy_ns")),
+                "wall_s": wall,
+                "epipe": bool(m.get("epipe")),
+                "read_eof": bool(m.get("read_eof")),
+            }
+        )
+
+    sample_summary = fold_samples(samples, wall_s)
+    inner = analyze_inner(samples)
+    sample_summary["inner"] = {
+        "workers": inner.get("workers"),
+        "busy_frac": inner.get("busy_frac"),
+        "phases": inner.get("phases"),
+    }
+    # Single-command busy should ignore meter/wrap sleepers.
+    if inner.get("busy_frac") is not None and len(harvested_stages) == 1:
+        harvested_stages[0]["sample_busy_frac"] = inner["busy_frac"]
+
+    pinch = classify(harvested_stages, links, wall_s)
+    apply_inner(pinch, inner, harvested_stages)
+    report = {
+        "tool": "pinch",
+        "version": VERSION,
+        "wall_s": wall_s,
+        "exit": rc,
+        "stages": harvested_stages,
+        "links": links,
+        "pinch": pinch,
+        "samples": sample_summary,
+        "tmpdir": tmp,
+    }
+
+    text = render_report(report)
+    raw = json.dumps(report, indent=2, sort_keys=False) + "\n" if json_out else text
+    write_report(raw if json_out else text, report_path)
+    if json_out and report_path is None:
+        # already written to stderr via write_report
+        pass
+    return rc if rc is not None else 1
+
+
+def write_report(text: str, report_path: Optional[str]) -> None:
+    if report_path is None:
+        sys.stderr.write(text)
+        if not text.endswith("\n"):
+            sys.stderr.write("\n")
+        return
+    if report_path == "-":
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    with open(report_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        if not text.endswith("\n"):
+            fh.write("\n")
+
+
+def fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 ** 2:
+        return f" {n / 1024:.1f}KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.2f}MB"
+    return f"{n / 1024 ** 3:.2f}GB"
+
+
+def bar(frac: float, width: int = 12) -> str:
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def render_report(report: dict[str, Any]) -> str:
+    wall = report["wall_s"]
+    rc = report["exit"]
+    stages = report["stages"]
+    links = report["links"]
+    pinch = report["pinch"]
+    lines: list[str] = []
+    lines.append(f"pinch {VERSION}   wall {wall:.3f}s   exit {rc}   stages {len(stages)}")
+    lines.append("")
+    for i, st in enumerate(stages):
+        cpu = st.get("cpu_s") or 0.0
+        cpu_frac = st.get("cpu_frac")
+        if cpu_frac is None and st.get("wall_s"):
+            cpu_frac = cpu / st["wall_s"]
+        cpu_frac = cpu_frac or 0.0
+        mark = ""
+        if pinch.get("stage") == i and pinch.get("kind") not in {"balanced", "none"}:
+            mark = f"   ◀ PINCH ({pinch.get('kind')})"
+        lines.append(
+            f"  [{i}] {st['label']:<42} cpu {cpu:6.3f}s  {bar(cpu_frac)} {cpu_frac:5.0%}{mark}"
+        )
+        if i < len(links):
+            lk = links[i]
+            rel = lk.get("relation") or "?"
+            rs, ws = lk["read_stall_s"], lk["write_stall_s"]
+            who = ""
+            if rel == "blocked-on-write":
+                who = f"  stage {i} waited on stage {i + 1}"
+            elif rel == "blocked-on-read":
+                who = f"  stage {i + 1} waited on stage {i}"
+            lines.append(
+                f"       │ {fmt_bytes(lk['bytes']):>8}   "
+                f"read-stall {rs:6.3f}s   write-stall {ws:6.3f}s   {rel}{who}"
+            )
+            lines.append("       ▼")
+    if links:
+        # drop trailing arrow visual: last ▼ sits under last non-final stage, ok
+        if lines[-1].strip() == "▼":
+            lines.pop()
+    lines.append("")
+    lines.append("who waited for whom:")
+    waits = pinch.get("wait_for") or []
+    if not waits:
+        lines.append("  (no blocking relationship above noise)")
+    else:
+        for w in sorted(waits, key=lambda x: -x["waited_s"]):
+            a, b = w["waiter"], w["on"]
+            la = stages[a]["label"] if a < len(stages) else str(a)
+            lb = stages[b]["label"] if b < len(stages) else str(b)
+            lines.append(f"  [{a}] {la}  waited {w['waited_s']:.3f}s  ({w['reason']})  on  [{b}] {lb}")
+    lines.append("")
+    reason = pinch.get("reason") or ""
+    if pinch.get("kind") == "balanced":
+        lines.append(f"verdict: balanced — {reason}")
+    elif pinch.get("stage") is None:
+        lines.append(f"verdict: {reason}")
+    else:
+        i = pinch["stage"]
+        lines.append(f"verdict: pinch is [{i}] {stages[i]['label']} ({pinch.get('kind')}) — {reason}")
+    samp = report.get("samples") or {}
+    inner = (samp.get("inner") or {})
+    workers = inner.get("workers") or {}
+    if workers:
+        lines.append("inner tree (wrappers omitted):")
+        named = (pinch.get("inner") or {}).get("comm")
+        for comm, w in sorted(workers.items(), key=lambda kv: -kv[1].get("run", 0)):
+            tot = (w.get("run") or 0) + (w.get("sleep") or 0) + (w.get("other") or 0)
+            frac = w.get("run_frac") or 0.0
+            mark = "   ◀ inner pinch" if comm == named else ""
+            lines.append(
+                f"  {comm:<22} {bar(frac)} {frac:5.0%} run  "
+                f"{w.get('run', 0)}/{tot}{mark}"
+            )
+        phases = inner.get("phases") or []
+        shown = [p for p in phases if (p.get("t1", 0) - p.get("t0", 0)) >= 0.04][:8]
+        if shown:
+            lines.append("phases:")
+            for p in shown:
+                run = ",".join(p.get("run") or ["(idle)"])
+                sl = ",".join(p.get("sleep") or [])
+                extra = f"   {sl} SLEEP" if sl else ""
+                lines.append(f"  {p['t0']:5.2f}-{p['t1']:5.2f}s  {run} RUN{extra}")
+    elif samp.get("n"):
+        bf = samp.get("busy_frac")
+        bf_s = f"{bf:.0%}" if bf is not None else "?"
+        lines.append(
+            f"tree samples: {samp['n']} over {samp.get('span_s', 0):.2f}s   "
+            f"slots busy {bf_s}   run={samp.get('run_slots')} sleep={samp.get('sleep_slots')}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# argv
+# ---------------------------------------------------------------------------
+
+
+def parse_label_opt(values: list[str] | None) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise SystemExit(f"pinch: --label expects I=NAME, got {raw!r}")
+        idx, name = raw.split("=", 1)
+        try:
+            out[int(idx)] = name
+        except ValueError:
+            raise SystemExit(f"pinch: --label index must be int, got {idx!r}") from None
+    return out
+
+
+def split_stages_from_argv(rest: list[str]) -> list[list[str]]:
+    """Split remaining args on standalone `+` into stages.
+
+    `--` is reserved for end-of-options (so `cargo test -- --list` stays
+    one command). A lone `+` is the stage separator.
+    """
+    stages: list[list[str]] = []
+    cur: list[str] = []
+    for tok in rest:
+        if tok == "+":
+            if cur:
+                stages.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        stages.append(cur)
+    return stages
+
+
+HELP = """pinch — name who waited for whom in a Unix pipeline
+
+USAGE
+  pinch [opts] --sh 'cmd1 | cmd2 | cmd3'
+  pinch [opts] -- cmd1 + cmd2 + cmd3
+  pinch [opts] cmd [args...]              single command: wait vs work
+
+OPTIONS
+  --json              report as JSON
+  --report PATH       write report to PATH ('-' = stdout). default: stderr
+  --sample-ms N       process-group sample interval (default 20; 0=off)
+  --buf-size N        meter buffer bytes (default 65536)
+  --label I=NAME      name stage I in the report (repeatable)
+  --sh SCRIPT         quote-aware split SCRIPT on |
+  --meter / --wrap    internal; inserted into the pipeline
+  -h, --help          this help
+  --version           print version
+
+PRIMITIVE
+  A pipeline is a conversation of blocking. Each inserted meter times
+  poll() waits on an empty pipe (upstream slow) vs a full pipe
+  (downstream slow). The pinch point is the stage that neighbors
+  waited for. A single command is also a pipeline: process-group
+  samples name the inner child the wrapper waited on (pkl, rustc).
+
+EXAMPLES
+  pinch --sh 'cat big | gzip | wc -c'
+  pinch -- python3 prod.py + python3 cons.py
+  pinch --json --report pinch.json -- cargo test -- --list
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # internal modes first, so they don't go through argparse
+    if argv and argv[0] == "--meter":
+        p = argparse.ArgumentParser(add_help=False)
+        p.add_argument("--meter", action="store_true")
+        p.add_argument("--log", required=True)
+        p.add_argument("--buf-size", type=int, default=DEFAULT_BUF)
+        ns, _ = p.parse_known_args(argv)
+        return run_meter(ns.log, ns.buf_size)
+
+    if argv and argv[0] == "--wrap":
+        p = argparse.ArgumentParser(add_help=False)
+        p.add_argument("--wrap", action="store_true")
+        p.add_argument("--log", required=True)
+        p.add_argument("--buf-size", type=int, default=DEFAULT_BUF)
+        ns, rest = p.parse_known_args(argv)
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        return run_wrap(ns.log, rest)
+
+    if not argv or argv[0] in {"-h", "--help"}:
+        sys.stdout.write(HELP)
+        return 0
+    if argv[0] == "--version":
+        print(VERSION)
+        return 0
+
+    json_out = False
+    report_path: Optional[str] = None
+    sample_ms = DEFAULT_SAMPLE_MS
+    bufsize = DEFAULT_BUF
+    labels: dict[int, str] = {}
+    sh_script: Optional[str] = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            json_out = True
+        elif a == "--report":
+            i += 1
+            if i >= len(argv):
+                print("pinch: --report needs a path", file=sys.stderr)
+                return 2
+            report_path = argv[i]
+        elif a.startswith("--report="):
+            report_path = a.split("=", 1)[1]
+        elif a == "--sample-ms":
+            i += 1
+            sample_ms = int(argv[i])
+        elif a.startswith("--sample-ms="):
+            sample_ms = int(a.split("=", 1)[1])
+        elif a == "--buf-size":
+            i += 1
+            bufsize = int(argv[i])
+        elif a.startswith("--buf-size="):
+            bufsize = int(a.split("=", 1)[1])
+        elif a == "--label":
+            i += 1
+            labels.update(parse_label_opt([argv[i]]))
+        elif a.startswith("--label="):
+            labels.update(parse_label_opt([a.split("=", 1)[1]]))
+        elif a == "--sh":
+            i += 1
+            if i >= len(argv):
+                print("pinch: --sh needs a script", file=sys.stderr)
+                return 2
+            sh_script = argv[i]
+        elif a.startswith("--sh="):
+            sh_script = a.split("=", 1)[1]
+        elif a == "--":
+            rest.extend(argv[i:])
+            break
+        elif a.startswith("-"):
+            print(f"pinch: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            rest.extend(argv[i:])
+            break
+        i += 1
+
+    if sh_script is not None:
+        parts = split_pipeline(sh_script)
+        if not parts:
+            print("pinch: empty --sh script", file=sys.stderr)
+            return 2
+        stages = [stage_from_sh(p) for p in parts]
+        return run_pipeline(
+            stages,
+            json_out=json_out,
+            report_path=report_path,
+            sample_ms=sample_ms,
+            bufsize=bufsize,
+            labels=labels,
+        )
+
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    stages = split_stages_from_argv(rest)
+    if not stages:
+        print("pinch: no command", file=sys.stderr)
+        return 2
+    return run_pipeline(
+        stages,
+        json_out=json_out,
+        report_path=report_path,
+        sample_ms=sample_ms,
+        bufsize=bufsize,
+        labels=labels,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.exit(0)

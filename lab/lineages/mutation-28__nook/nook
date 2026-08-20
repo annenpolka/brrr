@@ -1,0 +1,2230 @@
+#!/usr/bin/env python3
+"""nook — a token is the key *path*, not the bare wire key.
+
+`pagination.has_more` and `meta.has_more` are different identities.
+Two `has_more` in different objects are not one leftover.
+`has_more` and `hasMore` at the *same* path are still a fork.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator, Sequence
+
+VERSION = "0.2.0"
+
+SKIP_DIR_PARTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "vendor",
+    ".cache",
+    ".idea",
+    ".vscode",
+    "Pods",
+    "Carthage",
+    ".app",
+}
+
+SKIP_SUFFIXES = {
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".wasm",
+    ".so",
+    ".dylib",
+    ".a",
+    ".o",
+    ".class",
+    ".jar",
+    ".pyc",
+    ".pyo",
+    ".svg",
+    ".mp4",
+}
+
+SKIP_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    ".DS_Store",
+}
+
+DQ_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+SQ_RE = re.compile(r"'(?:\\.|[^'\\])*'")
+JSON_KEY_RE = re.compile(r'"(?P<key>(?:\\.|[^"\\]){1,80})"\s*:')
+SUBSCRIPT_RE = re.compile(
+    r"""\[\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)\s*\]"""
+)
+GET_RE = re.compile(
+    r"""\.get\(\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)"""
+)
+ASSIGN_STR_RE = re.compile(
+    r"""=\s*(?P<q>["'])(?P<key>(?:\\.|[^"'\\]){1,80})(?P=q)"""
+)
+CHAIN_RE = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*)?(?P<body>(?:\s*\[\s*['\"](?:\\.|[^'\"\\]+)['\"]\s*\]){2,})"
+)
+CHAIN_SEG_RE = re.compile(r"""\[\s*(['"])((?:\\.|[^'\"\\])+)\1\s*\]""")
+BACKTICK_RE = re.compile(r"`([A-Za-z_$][A-Za-z0-9_.$\[\]-]{1,80})`")
+
+YAML_MAP_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<dash>-[ \t]+)?"
+    r"(?:"
+    r'["\'](?P<quoted>[^"\']{1,80})["\']'
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_.-]{0,80})"
+    r")[ \t]*:(?!/)(?P<rest>.*)$"
+)
+
+TOML_TABLE_RE = re.compile(
+    r"^[ \t]*\[(?P<arr>\[)?[ \t]*(?P<body>[^\]\n]{1,160})[ \t]*\](?P=arr)?[ \t]*$"
+)
+TOML_KEY_RE = re.compile(
+    r"^[ \t]*(?:"
+    r'["\'](?P<quoted>[^"\']{1,80})["\']'
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_.-]{0,80})"
+    r")[ \t]*="
+)
+
+HEADER_LINE_RE = re.compile(
+    r"^[ \t]*(?P<h>[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+)[ \t]*:",
+    re.MULTILINE,
+)
+
+CAMEL_RE = re.compile(r"^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]+$")
+PASCAL_RE = re.compile(r"^[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]+$")
+SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*_[a-z0-9_]+$")
+CONST_RE = re.compile(r"^[A-Z][A-Z0-9]*_[A-Z0-9_]+$")
+KEBAB_RE = re.compile(r"^[a-z][a-z0-9]*-[a-z0-9-]+$")
+DOTTED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*[.][A-Za-z0-9._\[\]-]+$")
+URN_RE = re.compile(r"^urn:[A-Za-z0-9][A-Za-z0-9:._/-]{2,80}$")
+DOLLAR_RE = re.compile(r"^\$[A-Za-z][A-Za-z0-9_-]{1,40}$")
+SPLIT_CAMEL_1 = re.compile(r"([a-z0-9])([A-Z])")
+SPLIT_CAMEL_2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
+SEP_RE = re.compile(r"[_\-./:]+")
+
+SINGLE_QUOTE_EXTS = {".py", ".rb", ".yaml", ".yml", ".toml", ".sh", ".bash", ".zsh"}
+YAML_SKIP_KEYS = {"http", "https", "mailto", "ftp", "file", "ws", "wss"}
+
+WELL_KNOWN_HEADERS = {
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "authorization",
+    "cache-control",
+    "connection",
+    "content-disposition",
+    "content-encoding",
+    "content-length",
+    "content-type",
+    "cookie",
+    "date",
+    "etag",
+    "expect",
+    "forwarded",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "location",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "retry-after",
+    "server",
+    "set-cookie",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "user-agent",
+    "vary",
+    "via",
+    "warning",
+    "www-authenticate",
+    "access-control-allow-origin",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "strict-transport-security",
+    "x-request-id",
+    "x-correlation-id",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-api-key",
+}
+
+BORING_EXACT = {
+    "id",
+    "ids",
+    "name",
+    "type",
+    "kind",
+    "key",
+    "val",
+    "value",
+    "values",
+    "data",
+    "item",
+    "items",
+    "error",
+    "errors",
+    "message",
+    "status",
+    "code",
+    "ok",
+    "err",
+    "true",
+    "false",
+    "null",
+    "none",
+    "nil",
+    "undefined",
+    "self",
+    "this",
+    "title",
+    "text",
+    "body",
+    "head",
+    "header",
+    "headers",
+    "footer",
+    "content",
+    "description",
+    "desc",
+    "version",
+    "default",
+    "options",
+    "option",
+    "config",
+    "result",
+    "results",
+    "output",
+    "input",
+    "path",
+    "paths",
+    "file",
+    "files",
+    "url",
+    "uri",
+    "href",
+    "src",
+    "dst",
+    "index",
+    "count",
+    "size",
+    "length",
+    "width",
+    "height",
+    "time",
+    "date",
+    "year",
+    "day",
+    "user",
+    "users",
+    "test",
+    "tests",
+    "spec",
+    "main",
+    "init",
+    "info",
+    "meta",
+    "object",
+    "array",
+    "list",
+    "map",
+    "set",
+    "string",
+    "number",
+    "boolean",
+    "integer",
+    "properties",
+    "required",
+    "additionalproperties",
+    "definitions",
+    "enum",
+    "const",
+    "allof",
+    "anyof",
+    "oneof",
+    "not",
+    "if",
+    "then",
+    "else",
+    "minimum",
+    "maximum",
+    "pattern",
+    "format",
+    "examples",
+    "example",
+    "nullable",
+    "readonly",
+    "writeonly",
+    "uniqueitems",
+    "minlength",
+    "maxlength",
+    "minitems",
+    "maxitems",
+    "minproperties",
+    "maxproperties",
+    "dependencies",
+    "devdependencies",
+    "peerdependencies",
+    "scripts",
+    "license",
+    "author",
+    "repository",
+    "private",
+    "package",
+    "module",
+    "export",
+    "import",
+    "from",
+    "class",
+    "struct",
+    "func",
+    "function",
+    "return",
+    "public",
+    "static",
+    "async",
+    "await",
+    "command",
+    "args",
+    "argv",
+    "env",
+    "os",
+    "linux",
+    "darwin",
+    "windows",
+    "todo",
+    "fixme",
+    "note",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "as",
+    "at",
+    "by",
+    "is",
+    "it",
+    "be",
+    "a",
+    "an",
+    "the",
+}
+
+CODE_EXTS = {
+    ".rs",
+    ".go",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".swift",
+    ".m",
+    ".mm",
+    ".java",
+    ".kt",
+    ".kts",
+    ".rb",
+    ".php",
+    ".cs",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".scala",
+    ".hs",
+    ".lua",
+    ".r",
+    ".jl",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    ".pkl",
+    ".proto",
+    ".graphql",
+    ".vue",
+    ".svelte",
+    ".elm",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".clj",
+    ".cljs",
+    ".nim",
+    ".zig",
+    ".dart",
+}
+CONFIG_EXTS = {
+    ".json",
+    ".jsonc",
+    ".json5",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+}
+DOC_EXTS = {".md", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm"}
+JSON_EXTS = {".json", ".jsonc", ".json5"}
+YAML_EXTS = {".yaml", ".yml"}
+TOML_EXTS = {".toml"}
+HEADER_EXTS = {".http", ".eml", ".msg"}
+TEST_HINTS = (
+    "/test/",
+    "/tests/",
+    "/__tests__/",
+    "_test.",
+    ".test.",
+    ".spec.",
+    "test_",
+    "_spec.",
+)
+GENERATED_HINTS = (".generated.", "_generated.", "generated/", "oraclesgenerated")
+
+ARRAY_MARK = "[]"
+
+
+@dataclass(frozen=True)
+class Hit:
+    path: str
+    line: int
+    surface: str
+    kind: str  # json | yaml | toml | header | quoted
+    token: str  # dotted path identity
+    leaf: str
+
+
+@dataclass
+class Pact:
+    token: str
+    hits: list[Hit] = field(default_factory=list)
+
+    @property
+    def files(self) -> list[str]:
+        return sorted({h.path for h in self.hits})
+
+    @property
+    def surfaces(self) -> list[str]:
+        return sorted({h.surface for h in self.hits})
+
+    @property
+    def kinds(self) -> set[str]:
+        return {h.kind for h in self.hits}
+
+    @property
+    def exts(self) -> set[str]:
+        return {Path(h.path).suffix.lower() for h in self.hits}
+
+    @property
+    def leaf(self) -> str:
+        return self.hits[0].leaf if self.hits else leaf_of(self.token)
+
+
+@dataclass(frozen=True)
+class Split:
+    token: str
+    changed_files: tuple[str, ...]
+    leftover_files: tuple[str, ...]
+    leftover_surfaces: tuple[str, ...]
+    new_surfaces: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Fork:
+    canon: tuple[str, ...]
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Homonym:
+    leaf: str
+    tokens: tuple[str, ...]
+
+
+def layer_of(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    low = "/" + path.replace("\\", "/").lower()
+    if any(h in low for h in TEST_HINTS):
+        return "test"
+    if ext in DOC_EXTS:
+        return "doc"
+    if ext in CODE_EXTS:
+        return "code"
+    if ext in CONFIG_EXTS:
+        return "config"
+    return "other"
+
+
+def generated_path(rel: str) -> bool:
+    low = rel.replace("\\", "/").lower()
+    return any(h in low for h in GENERATED_HINTS)
+
+
+def should_skip_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(p in SKIP_DIR_PARTS for p in parts):
+        return True
+    if any(p.endswith(".app") for p in parts):
+        return True
+    if Path(rel).name in SKIP_NAMES:
+        return True
+    lower = rel.lower()
+    return any(lower.endswith(suf) for suf in SKIP_SUFFIXES)
+
+
+def looks_binary(data: bytes) -> bool:
+    return b"\x00" in data[:8192]
+
+
+_SIMPLE_UNESCAPE = {
+    r"\\": "\\",
+    r"\"": '"',
+    r"\'": "'",
+    r"\n": "\n",
+    r"\t": "\t",
+    r"\r": "\r",
+    r"\0": "\0",
+}
+
+
+def unescape_quoted(q: str) -> str:
+    body = q[1:-1] if len(q) >= 2 and q[0] in "\"'" else q
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body):
+            pair = body[i : i + 2]
+            out.append(_SIMPLE_UNESCAPE.get(pair, body[i + 1]))
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def unescape_json_key(raw: str) -> str:
+    return unescape_quoted('"' + raw + '"')
+
+
+def is_header_name(surface: str) -> bool:
+    s = surface.strip()
+    if not re.match(r"^[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+$", s):
+        return False
+    low = s.lower()
+    if low.startswith("x-") or low in WELL_KNOWN_HEADERS:
+        return True
+    parts = s.split("-")
+    return all(p and p[0].isupper() for p in parts)
+
+
+def format_path(parts: Sequence[str]) -> str:
+    out: list[str] = []
+    for p in parts:
+        if p == ARRAY_MARK:
+            if out:
+                out[-1] = out[-1] + ARRAY_MARK
+            else:
+                out.append(ARRAY_MARK)
+        else:
+            out.append(p)
+    return ".".join(out)
+
+
+def parse_path(token: str) -> tuple[str, ...]:
+    """Inverse of format_path. `units[].id` → ('units', '[]', 'id')."""
+    if not token:
+        return ()
+    parts: list[str] = []
+    for seg in token.split("."):
+        if seg == ARRAY_MARK:
+            parts.append(ARRAY_MARK)
+            continue
+        arrs = 0
+        core = seg
+        while core.endswith(ARRAY_MARK) and len(core) > len(ARRAY_MARK):
+            arrs += 1
+            core = core[: -len(ARRAY_MARK)]
+        if core:
+            parts.append(core)
+        for _ in range(arrs):
+            parts.append(ARRAY_MARK)
+    return tuple(parts)
+
+
+def leaf_of(token: str) -> str:
+    parts = parse_path(token)
+    for p in reversed(parts):
+        if p != ARRAY_MARK:
+            return p
+    return token
+
+
+def parent_of(token: str) -> str:
+    parts = [p for p in parse_path(token)]
+    while parts and parts[-1] == ARRAY_MARK:
+        parts.pop()
+    if parts:
+        parts.pop()
+    return format_path(parts)
+
+
+def fold_parts(parts: Sequence[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    for p in parts:
+        if p != ARRAY_MARK and is_header_name(p):
+            out.append(p.lower())
+        else:
+            out.append(p)
+    return tuple(out)
+
+
+def identity_of_parts(parts: Sequence[str]) -> str:
+    return format_path(fold_parts(parts))
+
+
+def inflection_canon(token: str) -> tuple[str, ...] | None:
+    raw = token.strip().strip("`'\"")
+    if not raw or len(raw) > 80 or " " in raw or "\t" in raw:
+        return None
+    tmp = SPLIT_CAMEL_1.sub(r"\1 \2", raw)
+    tmp = SPLIT_CAMEL_2.sub(r"\1 \2", tmp)
+    tmp = SEP_RE.sub(" ", tmp)
+    parts = tuple(p.lower() for p in tmp.split() if p and p.isalnum())
+    if len(parts) < 2 or len(parts) > 8 or any(len(p) > 32 for p in parts):
+        return None
+    return parts
+
+
+def path_fork_canon(token: str) -> tuple[str, ...] | None:
+    leaf = leaf_of(token)
+    c = inflection_canon(leaf)
+    if c is None:
+        return None
+    return (parent_of(token), *c)
+
+
+def looks_like_url(s: str) -> bool:
+    low = s.lower()
+    return low.startswith(("http://", "https://", "ftp://", "file://", "ws://", "wss://"))
+
+
+def looks_like_path(s: str) -> bool:
+    if s.startswith("./") or s.startswith("../") or s.startswith("/"):
+        return True
+    if "\\" in s:
+        return True
+    if re.search(
+        r"\.(?:rs|py|ts|tsx|js|jsx|swift|json|ya?ml|toml|md|go|html|txt|lock)$",
+        s,
+        re.I,
+    ):
+        return True
+    if re.search(r"\.(?:com|org|net|io|dev|app|jp|edu|gov)$", s, re.I):
+        return True
+    if s.count("/") >= 2 and re.match(r"^[A-Za-z0-9_./+-]+$", s):
+        return True
+    return False
+
+
+def looks_like_hash(s: str) -> bool:
+    if re.fullmatch(r"[0-9a-fA-F]{32,}", s):
+        return True
+    return bool(re.fullmatch(r"sha256:[0-9a-f]{32,}", s))
+
+
+def accept_structured_key(s: str) -> bool:
+    if not s or len(s) > 80:
+        return False
+    if " " in s or "\t" in s or "\n" in s:
+        return False
+    if looks_like_url(s) or looks_like_path(s) or looks_like_hash(s):
+        return False
+    if s.lower() in YAML_SKIP_KEYS:
+        return False
+    if s.startswith("-") or s[0].isdigit():
+        return False
+    return bool(
+        re.match(r"^[A-Za-z_$][A-Za-z0-9_.:$/@+-]{0,79}$", s)
+        or DOLLAR_RE.match(s)
+        or is_header_name(s)
+    )
+
+
+def is_keyish_protocol(s: str) -> bool:
+    if not s or len(s) < 3 or len(s) > 80:
+        return False
+    if " " in s or "\t" in s:
+        return False
+    if looks_like_url(s) or looks_like_path(s) or looks_like_hash(s):
+        return False
+    if s.lower() in BORING_EXACT:
+        return False
+    return bool(
+        SNAKE_RE.match(s)
+        or CONST_RE.match(s)
+        or KEBAB_RE.match(s)
+        or DOTTED_RE.match(s)
+        or CAMEL_RE.match(s)
+        or DOLLAR_RE.match(s)
+        or URN_RE.match(s)
+        or is_header_name(s)
+        or (s.startswith("@") and re.match(r"^@[A-Za-z][A-Za-z0-9_-]*$", s))
+    )
+
+
+def boring_leaf(s: str) -> bool:
+    if s.lower() in BORING_EXACT:
+        return True
+    return bool(len(s) <= 2 and not is_header_name(s))
+
+
+def line_index(text: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def line_of(starts: list[int], idx: int) -> int:
+    lo, hi = 0, len(starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return hi + 1
+
+
+class JsonPathScanner:
+    """Brace walker that records object-key paths and line offsets.
+
+    Values may be JSON or identifier atoms (Python/TS dict literals). The
+    walker always advances so a stray `[` in Swift cannot hang the scan.
+    """
+
+    def __init__(self, text: str):
+        self.text = text
+        self.n = len(text)
+        self.i = 0
+        self.hits: list[tuple[int, tuple[str, ...]]] = []
+        self.steps = 0
+        self.max_steps = min(len(text) * 4 + 64, 2_000_000)
+
+    def alive(self) -> bool:
+        self.steps += 1
+        return self.steps <= self.max_steps and self.i < self.n
+
+    def skip_ws(self) -> None:
+        t, n = self.text, self.n
+        i = self.i
+        while i < n:
+            c = t[i]
+            if c in " \t\r\n":
+                i += 1
+                continue
+            if c == "/" and i + 1 < n and t[i + 1] == "/":
+                i += 2
+                while i < n and t[i] != "\n":
+                    i += 1
+                continue
+            if c == "/" and i + 1 < n and t[i + 1] == "*":
+                i += 2
+                while i + 1 < n and not (t[i] == "*" and t[i + 1] == "/"):
+                    i += 1
+                i = min(n, i + 2)
+                continue
+            break
+        self.i = i
+
+    def parse_string(self) -> str | None:
+        t, n = self.text, self.n
+        if self.i >= n or t[self.i] != '"':
+            return None
+        i = self.i + 1
+        out: list[str] = []
+        while i < n:
+            c = t[i]
+            if c == "\\":
+                if i + 1 < n:
+                    nxt = t[i + 1]
+                    out.append({"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(nxt, nxt))
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if c == '"':
+                self.i = i + 1
+                return "".join(out)
+            out.append(c)
+            i += 1
+        self.i = i
+        return None
+
+    def parse_number(self) -> None:
+        t, n = self.text, self.n
+        i = self.i
+        if i < n and t[i] in "-+":
+            i += 1
+        while i < n and (t[i].isdigit() or t[i] in ".eE+-"):
+            i += 1
+        self.i = max(i, self.i + 1)
+
+    def skip_ident(self) -> bool:
+        if self.i >= self.n:
+            return False
+        c = self.text[self.i]
+        if not (c.isalpha() or c in "_$"):
+            return False
+        self.i += 1
+        while self.i < self.n and (self.text[self.i].isalnum() or self.text[self.i] in "_$"):
+            self.i += 1
+        return True
+
+    def parse_value(self, path: tuple[str, ...]) -> None:
+        if not self.alive():
+            return
+        self.skip_ws()
+        if self.i >= self.n:
+            return
+        start = self.i
+        c = self.text[self.i]
+        if c == "{":
+            self.parse_object(path)
+        elif c == "[":
+            self.parse_array(path)
+        elif c == '"':
+            self.parse_string()
+        elif c in "-+0123456789":
+            self.parse_number()
+        elif self.text.startswith("true", self.i) and self._atom_end(4):
+            self.i += 4
+        elif self.text.startswith("false", self.i) and self._atom_end(5):
+            self.i += 5
+        elif self.text.startswith("null", self.i) and self._atom_end(4):
+            self.i += 4
+        elif self.text.startswith("True", self.i) and self._atom_end(4):
+            self.i += 4
+        elif self.text.startswith("False", self.i) and self._atom_end(5):
+            self.i += 5
+        elif self.text.startswith("None", self.i) and self._atom_end(4):
+            self.i += 4
+        elif self.skip_ident():
+            pass
+        else:
+            self.i += 1
+        if self.i <= start:
+            self.i = start + 1
+
+    def _atom_end(self, n: int) -> bool:
+        j = self.i + n
+        if j >= self.n:
+            return True
+        return not (self.text[j].isalnum() or self.text[j] == "_")
+
+    def parse_object(self, path: tuple[str, ...]) -> bool:
+        if self.i >= self.n or self.text[self.i] != "{":
+            return False
+        self.i += 1
+        found = False
+        closed = False
+        while self.alive():
+            self.skip_ws()
+            if self.i >= self.n:
+                break
+            c = self.text[self.i]
+            if c == "}":
+                self.i += 1
+                closed = True
+                break
+            if c == ",":
+                self.i += 1
+                continue
+            if c != '"':
+                break
+            key_idx = self.i
+            key = self.parse_string()
+            if key is None:
+                break
+            self.skip_ws()
+            if self.i < self.n and self.text[self.i] == ":":
+                self.i += 1
+            if accept_structured_key(key) and len(path) < 12:
+                new_path = path + (key,)
+                self.hits.append((key_idx, new_path))
+                found = True
+                self.parse_value(new_path)
+            else:
+                self.parse_value(path)
+        return closed and found
+
+    def parse_array(self, path: tuple[str, ...]) -> None:
+        if self.i >= self.n or self.text[self.i] != "[":
+            return
+        self.i += 1
+        child = path + (ARRAY_MARK,) if len(path) < 12 else path
+        while self.alive():
+            self.skip_ws()
+            if self.i >= self.n:
+                return
+            c = self.text[self.i]
+            if c == "]":
+                self.i += 1
+                return
+            if c == ",":
+                self.i += 1
+                continue
+            before = self.i
+            self.parse_value(child)
+            if self.i <= before:
+                self.i = before + 1
+
+
+def looks_like_json_object(text: str, i: int) -> bool:
+    j = i + 1
+    n = len(text)
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    return j < n and text[j] == '"'
+
+
+def match_brace(text: str, start: int) -> int:
+    """Index after the matching `}` of `text[start]=='{'`, or start+1."""
+    n = len(text)
+    depth = 0
+    i = start
+    in_str = False
+    esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return start + 1
+
+
+def scan_json_paths(text: str, *, whole_file: bool = False) -> list[tuple[int, tuple[str, ...]]]:
+    sc = JsonPathScanner(text)
+    n = len(text)
+    if whole_file:
+        sc.skip_ws()
+        if sc.i < n and text[sc.i] == "{":
+            sc.parse_object(())
+        elif sc.i < n and text[sc.i] == "[":
+            sc.parse_array(())
+        return sc.hits
+    i = 0
+    while i < n:
+        j = text.find("{", i)
+        if j < 0:
+            break
+        if not looks_like_json_object(text, j):
+            i = j + 1
+            continue
+        sc.i = j
+        before = len(sc.hits)
+        ok = sc.parse_object(())
+        if not ok:
+            del sc.hits[before:]
+            i = j + 1
+            continue
+        end = match_brace(text, j)
+        i = max(end, sc.i, j + 1)
+    return sc.hits
+
+
+def extract_yaml_paths(text: str) -> list[tuple[int, tuple[str, ...]]]:
+    hits: list[tuple[int, tuple[str, ...]]] = []
+    stack: list[tuple[int, str]] = []  # (indent, segment)
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        raw = line.rstrip("\n")
+        stripped = raw.lstrip(" ")
+        indent = len(raw) - len(stripped)
+        if not stripped or stripped.startswith("#"):
+            offset += len(line)
+            continue
+        m = YAML_MAP_RE.match(raw)
+        if not m:
+            offset += len(line)
+            continue
+        key = m.group("quoted") or m.group("bare") or ""
+        if not accept_structured_key(key):
+            offset += len(line)
+            continue
+        dash = bool(m.group("dash"))
+        key_idx = offset + raw.find(key)
+        if dash:
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            stack.append((indent, ARRAY_MARK))
+            key_indent = indent + 2
+        else:
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            key_indent = indent
+        parts = tuple(seg for _ind, seg in stack) + (key,)
+        hits.append((key_idx, parts))
+        stack.append((key_indent, key))
+        offset += len(line)
+    return hits
+
+
+def extract_toml_paths(text: str) -> list[tuple[int, tuple[str, ...]]]:
+    hits: list[tuple[int, tuple[str, ...]]] = []
+    table: tuple[str, ...] = ()
+    array_table = False
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        raw = line.rstrip("\n")
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            offset += len(line)
+            continue
+        tm = TOML_TABLE_RE.match(raw)
+        if tm:
+            body = tm.group("body").strip()
+            segs: list[str] = []
+            for seg in body.split("."):
+                seg = seg.strip().strip("'\"")
+                if seg:
+                    segs.append(seg)
+            table = tuple(segs)
+            array_table = bool(tm.group("arr"))
+            if table:
+                parts = table + ((ARRAY_MARK,) if array_table else ())
+                hits.append((offset + raw.find("["), parts if not array_table else table + (ARRAY_MARK,)))
+            offset += len(line)
+            continue
+        km = TOML_KEY_RE.match(raw)
+        if km:
+            key = km.group("quoted") or km.group("bare") or ""
+            if accept_structured_key(key):
+                key_parts = tuple(p for p in key.split(".") if p)
+                if array_table:
+                    parts = table + (ARRAY_MARK,) + key_parts
+                else:
+                    parts = table + key_parts
+                key_idx = offset + raw.find(key_parts[0] if key_parts else key)
+                hits.append((key_idx, parts))
+        offset += len(line)
+    return hits
+
+
+TYPE_HEAD_RE = re.compile(
+    r"(?:struct|class|enum|interface|actor|extension|trait)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+ADAPTER_TYPE_NAMES = {"CodingKeys", "Keys", "RawKeys", "CodingKey"}
+ADAPTER_HINT_RE = re.compile(
+    r"CodingKeys|CodingKey|#\s*\[\s*serde|serde\s*\(\s*(?:rename|alias)"
+)
+
+
+def type_name_by_line(text: str) -> list[str]:
+    """Innermost non-adapter type per 1-based line. CodingKeys yields its parent."""
+    lines = text.splitlines(keepends=True)
+    names = [""] * (len(lines) + 2)
+    stack: list[tuple[int, str]] = []
+    pending: str | None = None
+    depth = 0
+    for li, line in enumerate(lines, 1):
+        m = TYPE_HEAD_RE.search(line)
+        if m:
+            pending = m.group(1)
+        for ch in line:
+            if ch == "{":
+                depth += 1
+                if pending:
+                    stack.append((depth, pending))
+                    pending = None
+            elif ch == "}":
+                while stack and stack[-1][0] == depth:
+                    stack.pop()
+                depth = max(0, depth - 1)
+        name = ""
+        for _d, n in reversed(stack):
+            if n not in ADAPTER_TYPE_NAMES:
+                name = n
+                break
+        names[li] = name
+    return names
+
+
+def adapter_object_name(text: str, idx: int, names: list[str], starts: list[int]) -> str | None:
+    window = text[max(0, idx - 500) : idx + 80]
+    if not ADAPTER_HINT_RE.search(window):
+        return None
+    ln = line_of(starts, idx)
+    if ln >= len(names):
+        return None
+    name = names[ln]
+    if not name or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        return None
+    return name
+
+
+def extract_chain_paths(text: str) -> list[tuple[int, tuple[str, ...]]]:
+    hits: list[tuple[int, tuple[str, ...]]] = []
+    for m in CHAIN_RE.finditer(text):
+        segs = [unescape_json_key(k) for _q, k in CHAIN_SEG_RE.findall(m.group("body"))]
+        segs = [s for s in segs if accept_structured_key(s)]
+        if len(segs) < 2:
+            continue
+        hits.append((m.start(), tuple(segs)))
+    return hits
+
+
+def extract_hits(rel: str, text: str) -> list[Hit]:
+    hits: list[Hit] = []
+    starts = line_index(text)
+    ext = Path(rel).suffix.lower()
+    covered: set[tuple[int, str]] = set()
+
+    def add_parts(parts: Sequence[str], kind: str, idx: int, surface: str | None = None) -> None:
+        if not parts:
+            return
+        leaf = next((p for p in reversed(parts) if p != ARRAY_MARK), "")
+        if not leaf:
+            return
+        if kind in {"json", "yaml", "toml"} and not accept_structured_key(leaf):
+            return
+        if kind == "header" and not is_header_name(leaf):
+            return
+        tok = identity_of_parts(parts)
+        surf = surface if surface is not None else leaf
+        ln = line_of(starts, idx)
+        hits.append(Hit(rel, ln, surf, kind, tok, leaf_of(tok)))
+        covered.add((ln, leaf))
+
+    if ext in JSON_EXTS:
+        for idx, parts in scan_json_paths(text, whole_file=True):
+            add_parts(parts, "json", idx)
+    elif ext in YAML_EXTS:
+        for idx, parts in extract_yaml_paths(text):
+            add_parts(parts, "yaml", idx)
+    elif ext in TOML_EXTS:
+        for idx, parts in extract_toml_paths(text):
+            add_parts(parts, "toml", idx)
+    else:
+        for idx, parts in scan_json_paths(text, whole_file=False):
+            add_parts(parts, "json", idx)
+
+    for idx, parts in extract_chain_paths(text):
+        add_parts(parts, "quoted", idx)
+
+    names_by_line = type_name_by_line(text) if ext in CODE_EXTS else []
+
+    def accept_quoted_witness(s: str) -> bool:
+        if is_keyish_protocol(s) or is_header_name(s):
+            return True
+        return bool(re.fullmatch(r"[A-Za-z][0-9]{1,3}", s))
+
+    def add_unrooted(surface: str, idx: int, kind: str | None = None) -> None:
+        if not accept_quoted_witness(surface) and not (
+            kind in {"json", "yaml", "toml"} and accept_structured_key(surface)
+        ):
+            return
+        ln = line_of(starts, idx)
+        if (ln, surface) in covered:
+            return
+        k = kind or ("header" if is_header_name(surface) else "quoted")
+        if k == "header":
+            tok = surface.lower() if is_header_name(surface) else surface
+        else:
+            prefix = adapter_object_name(text, idx, names_by_line, starts) if names_by_line else None
+            parts = (prefix, surface) if prefix else (surface,)
+            tok = identity_of_parts(parts)
+        hits.append(Hit(rel, ln, surface, k, tok, leaf_of(tok)))
+        covered.add((ln, surface))
+
+    for m in SUBSCRIPT_RE.finditer(text):
+        add_unrooted(unescape_json_key(m.group("key")), m.start("key"))
+    for m in GET_RE.finditer(text):
+        add_unrooted(unescape_json_key(m.group("key")), m.start("key"))
+    for m in ASSIGN_STR_RE.finditer(text):
+        add_unrooted(unescape_json_key(m.group("key")), m.start("key"))
+
+    if ext not in JSON_EXTS:
+        quote_res = [DQ_RE]
+        if ext in SINGLE_QUOTE_EXTS:
+            quote_res.append(SQ_RE)
+        for qre in quote_res:
+            for m in qre.finditer(text):
+                raw = m.group(0)
+                if len(raw) < 5:
+                    continue
+                surface = unescape_quoted(raw)
+                add_unrooted(surface, m.start())
+
+    if ext in YAML_EXTS or ext in HEADER_EXTS or ext in DOC_EXTS:
+        for m in HEADER_LINE_RE.finditer(text):
+            h = m.group("h")
+            if is_header_name(h):
+                add_parts((h,), "header", m.start("h"), h)
+
+    if ext in DOC_EXTS:
+        for m in BACKTICK_RE.finditer(text):
+            surface = m.group(1)
+            add_unrooted(surface, m.start())
+
+    # Bare `"key":` leftovers in code that the JSON walker could not parent.
+    if ext not in JSON_EXTS and ext not in YAML_EXTS:
+        for m in JSON_KEY_RE.finditer(text):
+            key = unescape_json_key(m.group("key"))
+            add_unrooted(key, m.start(), "json")
+
+    uniq: list[Hit] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    for h in hits:
+        k = (h.path, h.line, h.token, h.kind)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(h)
+    return uniq
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except (OSError, PermissionError):
+        return None
+    if len(data) > 1_500_000 or looks_binary(data):
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def iter_repo_files(root: Path, walk: bool) -> Iterator[str]:
+    if not walk and (root / ".git").exists():
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", str(root), "ls-files", "-zco", "--exclude-standard"],
+                stderr=subprocess.DEVNULL,
+            )
+            for raw in out.split(b"\0"):
+                if not raw:
+                    continue
+                rel = raw.decode("utf-8", "surrogateescape")
+                if not should_skip_path(rel):
+                    yield rel
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_PARTS and not d.endswith(".app")]
+        for name in filenames:
+            full = Path(dirpath) / name
+            try:
+                rel = str(full.relative_to(root))
+            except ValueError:
+                continue
+            if not should_skip_path(rel):
+                yield rel
+
+
+def build_index(root: Path, walk: bool) -> dict[str, list[Hit]]:
+    index: dict[str, list[Hit]] = defaultdict(list)
+    for rel in iter_repo_files(root, walk):
+        text = read_text(root / rel)
+        if text is None:
+            continue
+        for hit in extract_hits(rel, text):
+            index[hit.token].append(hit)
+    return index
+
+
+def score_pact(p: Pact) -> float:
+    nfiles = len(p.files)
+    layers = {layer_of(f) for f in p.files}
+    kinds = p.kinds
+    segs = [s for s in parse_path(p.token) if s != ARRAY_MARK]
+    score = 0.0
+    score += min(nfiles, 8) * 1.5
+    score += min(len(p.exts), 5) * 1.2
+    score += min(len(layers), 4) * 1.6
+    score += min(len(segs), 6) * 1.8  # deeper path = more specific identity
+    if ARRAY_MARK in parse_path(p.token):
+        score += 1.4
+    if "json" in kinds:
+        score += 2.4
+    if "yaml" in kinds:
+        score += 2.0
+    if "toml" in kinds:
+        score += 1.6
+    if "header" in kinds:
+        score += 2.2
+    if "quoted" in kinds and (kinds & {"json", "yaml", "toml"}):
+        score += 2.0
+    leaf = p.leaf
+    if "_" in leaf or "-" in leaf:
+        score += 2.0
+    if CAMEL_RE.match(leaf) or PASCAL_RE.match(leaf):
+        score += 1.0
+    if layers <= {"doc"}:
+        score -= 4.5
+    if layers <= {"test"}:
+        score -= 1.0
+    if nfiles > 16:
+        score -= (nfiles - 16) * 0.4
+    if boring_leaf(leaf):
+        score -= 8.0
+    if generated_path(p.files[0]) and all(generated_path(f) for f in p.files):
+        score -= 3.0
+    if kinds <= {"quoted"} and layers <= {"doc"}:
+        score -= 3.0
+    if kinds <= {"quoted"} and len(segs) == 1:
+        score -= 1.2
+    return score
+
+
+def select_pacts(
+    index: dict[str, list[Hit]],
+    min_files: int,
+    max_files: int,
+    code_only: bool,
+) -> list[Pact]:
+    pacts: list[Pact] = []
+    for token, hits in index.items():
+        if boring_leaf(leaf_of(token)):
+            continue
+        if code_only:
+            hits = [h for h in hits if layer_of(h.path) in {"code", "config", "test"}]
+            if not hits:
+                continue
+        files = {h.path for h in hits}
+        if len(files) < min_files or len(files) > max_files:
+            continue
+        pacts.append(Pact(token, hits))
+    pacts.sort(key=lambda p: (-score_pact(p), p.token.lower()))
+    return pacts
+
+
+def lookup(index: dict[str, list[Hit]], query: str) -> Pact | None:
+    q = query.strip().strip("'\"")
+    if not q:
+        return None
+    if q.startswith("."):
+        q = q[1:]
+    hits = index.get(q)
+    if not hits and is_header_name(q):
+        hits = index.get(q.lower())
+    if not hits:
+        hits = index.get(q.lower())
+    if not hits:
+        return None
+    return Pact(hits[0].token, hits)
+
+
+def leaf_neighbors(index: dict[str, list[Hit]]) -> dict[str, list[str]]:
+    by_leaf: dict[str, set[str]] = defaultdict(set)
+    for token in index:
+        by_leaf[leaf_of(token)].add(token)
+    near: dict[str, list[str]] = {}
+    for _leaf, toks in by_leaf.items():
+        if len(toks) < 2:
+            continue
+        for t in toks:
+            near[t] = sorted(x for x in toks if x != t)
+    return near
+
+
+def fork_worthy(token: str, hits: list[Hit]) -> bool:
+    if any(h.kind in {"json", "yaml", "toml", "header"} for h in hits):
+        return True
+    leaf = leaf_of(token)
+    return bool(
+        SNAKE_RE.match(leaf)
+        or CONST_RE.match(leaf)
+        or KEBAB_RE.match(leaf)
+        or CAMEL_RE.match(leaf)
+        or is_header_name(leaf)
+    )
+
+
+def fork_neighbors(index: dict[str, list[Hit]]) -> dict[str, list[str]]:
+    groups: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for token, hits in index.items():
+        if not fork_worthy(token, hits):
+            continue
+        c = path_fork_canon(token)
+        if c is None:
+            continue
+        groups[c].add(token)
+    near: dict[str, list[str]] = {}
+    for _c, toks in groups.items():
+        if len(toks) < 2:
+            continue
+        for t in toks:
+            near[t] = sorted(x for x in toks if x != t)
+    return near
+
+
+def find_forks(index: dict[str, list[Hit]], min_files: int) -> list[Fork]:
+    groups: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for token, hits in index.items():
+        files = {h.path for h in hits if not should_skip_path(h.path)}
+        if not files or not fork_worthy(token, hits):
+            continue
+        c = path_fork_canon(token)
+        if c is None:
+            continue
+        groups[c].add(token)
+    forks: list[Fork] = []
+    for c, toks in groups.items():
+        if len(toks) < 2:
+            continue
+        all_files: set[str] = set()
+        for t in toks:
+            all_files |= {h.path for h in index[t]}
+        if len(all_files) < min_files and len(toks) < 2:
+            continue
+        ordered = tuple(sorted(toks, key=lambda t: (-len({h.path for h in index[t]}), t)))
+        forks.append(Fork(c, ordered))
+    forks.sort(key=lambda f: (-len(f.tokens), ".".join(f.canon)))
+    return forks
+
+
+def find_homonyms(
+    index: dict[str, list[Hit]],
+    min_files: int,
+    skip_boring: bool = True,
+) -> list[Homonym]:
+    groups: dict[str, set[str]] = defaultdict(set)
+    for token, hits in index.items():
+        files = {h.path for h in hits if not should_skip_path(h.path)}
+        if not files:
+            continue
+        if not any(h.kind in {"json", "yaml", "toml", "quoted", "header"} for h in hits):
+            continue
+        groups[leaf_of(token)].add(token)
+    out: list[Homonym] = []
+    for leaf, toks in groups.items():
+        if len(toks) < 2:
+            continue
+        if skip_boring and boring_leaf(leaf):
+            continue
+        all_files: set[str] = set()
+        for t in toks:
+            all_files |= {h.path for h in index[t]}
+        if len(all_files) < min_files:
+            continue
+        ordered = tuple(sorted(toks, key=lambda t: (-len({h.path for h in index[t]}), t)))
+        out.append(Homonym(leaf, ordered))
+
+    def ghaish(h: Homonym) -> bool:
+        return bool(h.tokens) and all(t.startswith("jobs.") for t in h.tokens)
+
+    def shaped(h: Homonym) -> int:
+        leaf = h.leaf
+        if SNAKE_RE.match(leaf) or CAMEL_RE.match(leaf) or CONST_RE.match(leaf):
+            return 0
+        if KEBAB_RE.match(leaf) and not leaf.startswith("jobs"):
+            return 1
+        return 2
+
+    out.sort(key=lambda h: (ghaish(h), shaped(h), -len(h.tokens), h.leaf.lower()))
+    return out
+
+
+DIFF_FILE_RE = re.compile(r"^\+\+\+ [ab]/(.+)$")
+DIFF_DEVNULL = re.compile(r"^\+\+\+ /dev/null$")
+HUNK_RE = re.compile(r"^@@ ")
+
+
+def parse_unified_diff(text: str) -> dict[str, dict[str, set[str]]]:
+    current: str | None = None
+    acc: dict[str, dict[str, set[str]]] = {}
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+            continue
+        m = DIFF_FILE_RE.match(line)
+        if m:
+            current = m.group(1)
+            acc.setdefault(current, {"removed": set(), "added": set()})
+            continue
+        if DIFF_DEVNULL.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("+++ ") or line.startswith("--- ") or HUNK_RE.match(line):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["added"].add(hit.token)
+        elif line.startswith("-") and not line.startswith("---"):
+            for hit in extract_hits(current, line[1:] + "\n"):
+                acc[current]["removed"].add(hit.token)
+    return acc
+
+
+def working_tree_diff(root: Path) -> str:
+    try:
+        staged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "--cached", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        unstaged = subprocess.check_output(
+            ["git", "-C", str(root), "diff", "-U0", "--no-color", "--"],
+            stderr=subprocess.DEVNULL,
+        )
+        return (staged + unstaged).decode("utf-8", "replace")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def git_show(root: Path, spec: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(root), "show", spec],
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if looks_binary(out) or len(out) > 1_500_000:
+        return None
+    return out.decode("utf-8", "replace")
+
+
+def tokens_in(rel: str, text: str | None) -> set[str]:
+    if not text:
+        return set()
+    return {h.token for h in extract_hits(rel, text)}
+
+
+def find_splits(
+    root: Path,
+    index: dict[str, list[Hit]],
+    diffmap: dict[str, dict[str, set[str]]],
+    min_files: int,
+) -> list[Split]:
+    files_by_tok: dict[str, set[str]] = defaultdict(set)
+    surf_by_tok_file: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for tok, hits in index.items():
+        for h in hits:
+            if should_skip_path(h.path):
+                continue
+            files_by_tok[tok].add(h.path)
+            surf_by_tok_file[(tok, h.path)].add(h.surface)
+
+    removed: dict[str, set[str]] = defaultdict(set)
+    added: dict[str, set[str]] = defaultdict(set)
+    for rel, sides in diffmap.items():
+        if should_skip_path(rel):
+            continue
+        old_text = git_show(root, f"HEAD:{rel}")
+        new_path = root / rel
+        new_text = read_text(new_path) if new_path.is_file() else ""
+        if old_text is not None:
+            old_toks = tokens_in(rel, old_text)
+            new_toks = tokens_in(rel, new_text)
+        else:
+            # Piped / foreign patch: trust hunk tokens, which may be unrooted.
+            old_toks = set(sides["removed"])
+            new_toks = set(sides["added"])
+        for t in old_toks - new_toks:
+            removed[t].add(rel)
+        for t in new_toks - old_toks:
+            added[t].add(rel)
+
+    splits: list[Split] = []
+    for tok, gone_files in removed.items():
+        if boring_leaf(leaf_of(tok)):
+            continue
+        still = files_by_tok.get(tok, set())
+        occupied = still | gone_files
+        if len(occupied) < min_files:
+            continue
+        leftover = still - gone_files
+        if not leftover:
+            continue
+        leftover_surfaces = sorted(
+            {form for f in leftover for form in surf_by_tok_file.get((tok, f), ())}
+        )
+        new_surfaces = tuple(sorted(added.get(tok, ())))
+        splits.append(
+            Split(
+                token=tok,
+                changed_files=tuple(sorted(gone_files)),
+                leftover_files=tuple(sorted(leftover)),
+                leftover_surfaces=tuple(leftover_surfaces),
+                new_surfaces=new_surfaces,
+            )
+        )
+    splits.sort(key=lambda s: (-len(s.leftover_files), s.token.lower()))
+    return splits
+
+
+def format_pact_human(p: Pact, why: bool, homonyms: Sequence[str] | None, forks: Sequence[str] | None) -> str:
+    kinds = ",".join(sorted(p.kinds))
+    layers = ",".join(sorted({layer_of(f) for f in p.files}))
+    extra = ""
+    if len(p.surfaces) > 1:
+        extra = f"  surfaces: {', '.join(p.surfaces)}"
+    lines = [f"{p.token}  files: {len(p.files)}  kinds: {kinds}  layers: {layers}{extra}"]
+    if homonyms:
+        lines.append("  ~homonyms: " + ", ".join(homonyms))
+    if forks:
+        lines.append("  ~forks: " + ", ".join(forks))
+    shown = 0
+    per_file: dict[str, int] = defaultdict(int)
+    cap = 6 if why else 2
+    total_cap = 40 if why else 16
+    for h in sorted(p.hits, key=lambda x: (x.path, x.line, x.kind)):
+        if per_file[h.path] >= cap:
+            continue
+        per_file[h.path] += 1
+        surf = "" if h.surface == p.leaf else f"  {h.surface}"
+        lines.append(f"  {h.path}:{h.line}  {h.kind:<7}{surf}")
+        shown += 1
+        if not why and shown >= total_cap:
+            extra_n = len(p.hits) - shown
+            if extra_n > 0:
+                lines.append(f"  … {extra_n} more hits")
+            break
+    return "\n".join(lines)
+
+
+def format_split_human(s: Split, homonyms: Sequence[str] | None, forks: Sequence[str] | None) -> str:
+    lines = [f"SPLIT  {s.token}"]
+    lines.append("  changed:   " + ", ".join(s.changed_files))
+    lines.append("  leftover:  " + ", ".join(s.leftover_files))
+    if s.leftover_surfaces and set(s.leftover_surfaces) != {leaf_of(s.token)}:
+        lines.append("  still as:  " + ", ".join(s.leftover_surfaces))
+    if s.new_surfaces:
+        lines.append("  became:    " + ", ".join(s.new_surfaces))
+    if homonyms:
+        lines.append("  ~homonyms: " + ", ".join(homonyms))
+    if forks:
+        lines.append("  ~forks:    " + ", ".join(forks))
+    return "\n".join(lines)
+
+
+def format_fork_human(f: Fork, index: dict[str, list[Hit]]) -> str:
+    label = ".".join(p for p in f.canon if p)
+    lines = [f"FORK  {label}"]
+    for t in f.tokens:
+        hits = index[t]
+        files = sorted({h.path for h in hits})
+        kinds = ",".join(sorted({h.kind for h in hits}))
+        lines.append(f"  {t}  files: {len(files)}  kinds: {kinds}")
+        for path in files[:4]:
+            lines.append(f"    {path}")
+        if len(files) > 4:
+            lines.append(f"    … {len(files) - 4} more files")
+    return "\n".join(lines)
+
+
+def format_homonym_human(h: Homonym, index: dict[str, list[Hit]]) -> str:
+    lines = [f"HOMONYM  {h.leaf}"]
+    for t in h.tokens:
+        hits = index[t]
+        files = sorted({h_.path for h_ in hits})
+        kinds = ",".join(sorted({h_.kind for h_ in hits}))
+        parent = parent_of(t) or "∅"
+        lines.append(f"  {t}  parent: {parent}  files: {len(files)}  kinds: {kinds}")
+        for path in files[:4]:
+            lines.append(f"    {path}")
+        if len(files) > 4:
+            lines.append(f"    … {len(files) - 4} more files")
+    return "\n".join(lines)
+
+
+def pact_to_json(p: Pact, homonyms: Sequence[str] | None, forks: Sequence[str] | None) -> dict:
+    return {
+        "token": p.token,
+        "leaf": p.leaf,
+        "parent": parent_of(p.token),
+        "surfaces": p.surfaces,
+        "files": p.files,
+        "kinds": sorted(p.kinds),
+        "score": round(score_pact(p), 3),
+        "homonyms": list(homonyms or ()),
+        "forks": list(forks or ()),
+        "hits": [
+            {
+                "path": h.path,
+                "line": h.line,
+                "surface": h.surface,
+                "kind": h.kind,
+                "leaf": h.leaf,
+            }
+            for h in p.hits
+        ],
+    }
+
+
+def split_to_json(s: Split, homonyms: Sequence[str] | None, forks: Sequence[str] | None) -> dict:
+    return {
+        "token": s.token,
+        "leaf": leaf_of(s.token),
+        "parent": parent_of(s.token),
+        "changed_files": list(s.changed_files),
+        "leftover_files": list(s.leftover_files),
+        "leftover_surfaces": list(s.leftover_surfaces),
+        "new_surfaces": list(s.new_surfaces),
+        "homonyms": list(homonyms or ()),
+        "forks": list(forks or ()),
+    }
+
+
+def stdin_is_diff(text: str) -> bool:
+    head = text.lstrip()
+    return (
+        head.startswith("diff --git ")
+        or head.startswith("--- ")
+        or head.startswith("+++ ")
+        or head.startswith("@@ ")
+    )
+
+
+def find_root(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).resolve()
+    here = Path.cwd()
+    for p in [here, *here.parents]:
+        if (p / ".git").exists():
+            return p
+    return here
+
+
+def emit_pacts(
+    pacts: Sequence[Pact],
+    args: argparse.Namespace,
+    leaves: dict[str, list[str]],
+    near: dict[str, list[str]],
+) -> None:
+    if args.json:
+        json.dump(
+            [pact_to_json(p, leaves.get(p.token), near.get(p.token)) for p in pacts],
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for p in pacts:
+            for h in p.hits:
+                sys.stdout.write(
+                    f"{p.token}\t{h.kind}\t{h.path}\t{h.line}\t{h.leaf}\t{h.surface}\n"
+                )
+        return
+    if not pacts:
+        print("nook: no shared key paths")
+        return
+    print(
+        "\n\n".join(
+            format_pact_human(p, args.why, leaves.get(p.token), near.get(p.token))
+            for p in pacts
+        )
+    )
+
+
+def emit_splits(
+    splits: Sequence[Split],
+    args: argparse.Namespace,
+    leaves: dict[str, list[str]],
+    near: dict[str, list[str]],
+) -> None:
+    if args.json:
+        json.dump(
+            [split_to_json(s, leaves.get(s.token), near.get(s.token)) for s in splits],
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for s in splits:
+            sys.stdout.write(
+                "split\t" + s.token + "\t" + ",".join(s.changed_files) + "\t" + ",".join(s.leftover_files) + "\n"
+            )
+        return
+    if not splits:
+        print("nook: no one-sided key-path edits")
+        return
+    print(
+        "\n\n".join(
+            format_split_human(s, leaves.get(s.token), near.get(s.token)) for s in splits
+        )
+    )
+
+
+def emit_forks(forks: Sequence[Fork], index: dict[str, list[Hit]], args: argparse.Namespace) -> None:
+    if args.json:
+        payload = []
+        for f in forks:
+            payload.append(
+                {
+                    "canon": ".".join(p for p in f.canon if p),
+                    "tokens": [
+                        {
+                            "token": t,
+                            "leaf": leaf_of(t),
+                            "parent": parent_of(t),
+                            "files": sorted({h.path for h in index[t]}),
+                            "kinds": sorted({h.kind for h in index[t]}),
+                        }
+                        for t in f.tokens
+                    ],
+                }
+            )
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for f in forks:
+            sys.stdout.write("fork\t" + ".".join(p for p in f.canon if p) + "\t" + ",".join(f.tokens) + "\n")
+        return
+    if not forks:
+        print("nook: no same-path wire forks")
+        return
+    print("\n\n".join(format_fork_human(f, index) for f in forks))
+
+
+def emit_homonyms(items: Sequence[Homonym], index: dict[str, list[Hit]], args: argparse.Namespace) -> None:
+    if args.json:
+        payload = []
+        for h in items:
+            payload.append(
+                {
+                    "leaf": h.leaf,
+                    "tokens": [
+                        {
+                            "token": t,
+                            "parent": parent_of(t),
+                            "files": sorted({hit.path for hit in index[t]}),
+                            "kinds": sorted({hit.kind for hit in index[t]}),
+                        }
+                        for t in h.tokens
+                    ],
+                }
+            )
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if args.porcelain:
+        for h in items:
+            sys.stdout.write("homonym\t" + h.leaf + "\t" + ",".join(h.tokens) + "\n")
+        return
+    if not items:
+        print("nook: no leaf homonyms")
+        return
+    print("\n\n".join(format_homonym_human(h, index) for h in items))
+
+
+def run_selftest() -> int:
+    failures = 0
+
+    def expect(name: str, cond: bool) -> None:
+        nonlocal failures
+        if not cond:
+            print(f"FAIL {name}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"ok   {name}")
+
+    expect("format units[].id", format_path(("units", ARRAY_MARK, "id")) == "units[].id")
+    expect("parse units[].id", parse_path("units[].id") == ("units", ARRAY_MARK, "id"))
+    expect("leaf of path", leaf_of("pagination.has_more") == "has_more")
+    expect("leaf of array path", leaf_of("units[].source_text") == "source_text")
+    expect("parent of path", parent_of("pagination.has_more") == "pagination")
+    expect("parent of root", parent_of("has_more") == "")
+    expect(
+        "same leaf different parent is not same identity",
+        identity_of_parts(("pagination", "has_more")) != identity_of_parts(("meta", "has_more")),
+    )
+    expect(
+        "header segment folds",
+        identity_of_parts(("headers", "X-Request-Id")) == identity_of_parts(("headers", "x-request-id")),
+    )
+    expect(
+        "path fork groups same parent",
+        path_fork_canon("pagination.has_more") == path_fork_canon("pagination.hasMore"),
+    )
+    expect(
+        "path fork does not group different parents",
+        path_fork_canon("pagination.has_more") != path_fork_canon("meta.has_more"),
+    )
+
+    blob = '{"pagination":{"has_more":true},"meta":{"has_more":false,"source_text":"x"}}'
+    jhits = extract_hits("a.json", blob)
+    jtoks = {h.token for h in jhits}
+    expect("json pagination.has_more", "pagination.has_more" in jtoks)
+    expect("json meta.has_more", "meta.has_more" in jtoks)
+    expect("json does not collapse to bare has_more", "has_more" not in jtoks)
+    expect("json meta.source_text", "meta.source_text" in jtoks)
+
+    arr = '{"units":[{"id":"u","source_text":"hi"},{"id":"v","source_text":"ho"}]}'
+    ahits = extract_hits("b.json", arr)
+    atoks = {h.token for h in ahits}
+    expect("array collapse units[].source_text", "units[].source_text" in atoks)
+    expect("no per-index path", not any(re.search(r"units\.\d", t) for t in atoks))
+
+    yaml = (
+        "pagination:\n"
+        "  has_more: true\n"
+        "meta:\n"
+        "  has_more: false\n"
+        "  source_text: hi\n"
+        "units:\n"
+        "  - id: u\n"
+        "    source_text: x\n"
+    )
+    yhits = extract_hits("api.yaml", yaml)
+    ytoks = {h.token for h in yhits}
+    expect("yaml pagination.has_more", "pagination.has_more" in ytoks)
+    expect("yaml meta.has_more", "meta.has_more" in ytoks)
+    expect("yaml units[].source_text", "units[].source_text" in ytoks)
+
+    toml = "[pagination]\nhas_more = true\n\n[meta]\nhas_more = false\n"
+    thits = extract_hits("cfg.toml", toml)
+    ttoks = {h.token for h in thits}
+    expect("toml pagination.has_more", "pagination.has_more" in ttoks)
+    expect("toml meta.has_more", "meta.has_more" in ttoks)
+
+    chain = 'return data["pagination"]["has_more"] + extra["meta"]["has_more"]\n'
+    chits = extract_hits("c.ts", chain)
+    ctoks = {h.token for h in chits}
+    expect("chain pagination.has_more", "pagination.has_more" in ctoks)
+    expect("chain meta.has_more", "meta.has_more" in ctoks)
+
+    ident = "let backgroundColor = 1\nfunc hasMore() {}\n"
+    expect("identifiers are not paths", extract_hits("a.swift", ident) == [])
+
+    swift = (
+        'enum CodingKeys: String, CodingKey { case hasMore = "has_more" }\n'
+        'let awayRec = (dict["lifetimeAwayRecovered"] as? Int) ?? 0\n'
+    )
+    shits = extract_hits("Core.swift", swift)
+    stoks = {h.token for h in shits}
+    expect("unrooted CodingKeys without parent type", "has_more" in stoks)
+    expect("subscript unrooted", "lifetimeAwayRecovered" in stoks)
+
+    two_types = (
+        "public struct WirePlan {\n"
+        '    enum CodingKeys: String, CodingKey { case hasMore = "has_more" }\n'
+        "}\n"
+        "public struct Batch {\n"
+        '    enum CodingKeys: String, CodingKey { case hasMore = "has_more" }\n'
+        "}\n"
+    )
+    two_toks = {h.token for h in extract_hits("Log.swift", two_types)}
+    expect("WirePlan.has_more adapter path", "WirePlan.has_more" in two_toks)
+    expect("Batch.has_more adapter path", "Batch.has_more" in two_toks)
+    expect("two objects do not share one leftover", "has_more" not in two_toks)
+
+    rust = (
+        "pub struct Hook {\n"
+        '    #[serde(rename = "file_path")]\n'
+        "    path: PathBuf,\n"
+        "}\n"
+    )
+    rtoks = {h.token for h in extract_hits("input.rs", rust)}
+    expect("serde rename takes enclosing type", "Hook.file_path" in rtoks)
+
+    broken = 'const x = {"units":[{"id":"u"\n'
+    btoks = {h.token for h in extract_hits("p.ts", broken)}
+    expect("unclosed object dropped", "units[].id" not in btoks)
+    closed = 'const y = {"units":[{"id":"u"}]}\n'
+    ctoks = {h.token for h in extract_hits("q.ts", closed)}
+    expect("closed object keeps units[].id", "units[].id" in ctoks)
+
+    embedded = 'const raw = \'{"schema_version":1,"has_more":false,"units":[]}\'\n'
+    ehits = extract_hits("t.py", embedded)
+    etoks = {h.token for h in ehits}
+    expect("embedded plan has_more is root of that object", "has_more" in etoks)
+    expect("embedded does not invent mock_plan", "mock_plan.has_more" not in etoks)
+
+    fixture = '{"id":"EPF-001","mock_plan":{"schema_version":1,"has_more":false,"units":[]}}'
+    fhits = extract_hits("EPF-001.json", fixture)
+    ftoks = {h.token for h in fhits}
+    expect("fixture mock_plan.has_more", "mock_plan.has_more" in ftoks)
+    expect("fixture root id is not has_more", "has_more" not in ftoks)
+
+    expect("skip dist min.js", should_skip_path("dist/app.min.js"))
+    expect("keep EditPlan.swift", not should_skip_path("Engine/Sources/TenaoshiEngine/EditPlan.swift"))
+
+    # Path-set split: renaming pagination.has_more must not leftover meta.has_more.
+    idx = {
+        "pagination.has_more": [
+            Hit("src/a.py", 1, "has_more", "json", "pagination.has_more", "has_more"),
+            Hit("spec/api.yaml", 3, "has_more", "yaml", "pagination.has_more", "has_more"),
+        ],
+        "meta.has_more": [
+            Hit("spec/api.yaml", 6, "has_more", "yaml", "meta.has_more", "has_more"),
+            Hit("spec/meta.json", 2, "has_more", "json", "meta.has_more", "has_more"),
+        ],
+    }
+    # Simulate via find_splits internals: gone pagination path from a.py, still in yaml.
+    # Use a temp repo-less fallback (diffmap tokens).
+    dm = {
+        "src/a.py": {"removed": {"pagination.has_more"}, "added": {"pagination.has_extra"}},
+    }
+    # Without git HEAD, find_splits uses hunk tokens.
+    splits = find_splits(Path("/nonexistent"), idx, dm, min_files=2)
+    expect("split is the path", len(splits) == 1 and splits[0].token == "pagination.has_more")
+    expect("leftover is same-path yaml", splits[0].leftover_files == ("spec/api.yaml",))
+    expect(
+        "meta.has_more is not leftover of pagination.has_more",
+        "spec/meta.json" not in splits[0].leftover_files,
+    )
+
+    hom = find_homonyms(idx, min_files=2)
+    expect(
+        "homonym groups the two has_more paths",
+        any(h.leaf == "has_more" and set(h.tokens) >= {"pagination.has_more", "meta.has_more"} for h in hom),
+    )
+    forks = find_forks(
+        {
+            "pagination.has_more": idx["pagination.has_more"],
+            "pagination.hasMore": [
+                Hit("legacy.json", 1, "hasMore", "json", "pagination.hasMore", "hasMore"),
+            ],
+            "meta.has_more": idx["meta.has_more"],
+        },
+        min_files=2,
+    )
+    expect(
+        "fork is same-parent inflection",
+        any(set(f.tokens) >= {"pagination.has_more", "pagination.hasMore"} for f in forks),
+    )
+    expect(
+        "different parents are not a fork",
+        not any(set(f.tokens) >= {"pagination.has_more", "meta.has_more"} for f in forks),
+    )
+
+    return 1 if failures else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="nook",
+        description=(
+            "Find serialized key *paths* (pagination.has_more vs meta.has_more). "
+            "A leftover is the same path still spoken in another file, not the same leaf "
+            "in a different object."
+        ),
+    )
+    ap.add_argument("token", nargs="?", help="lookup one exact key path (or a leaf with --leaf)")
+    ap.add_argument("-C", "--repo", help="repository root")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument(
+        "--porcelain",
+        action="store_true",
+        help="stable TSV: path<TAB>kind<TAB>file<TAB>line<TAB>leaf<TAB>surface",
+    )
+    ap.add_argument("--min-files", type=int, default=2)
+    ap.add_argument("--max-files", type=int, default=48)
+    ap.add_argument("--limit", type=int, default=40, help="max pacts to print")
+    ap.add_argument("--all", action="store_true", help="do not apply --limit")
+    ap.add_argument("--code", action="store_true", help="ignore markdown/text files")
+    ap.add_argument("--walk", action="store_true", help="walk the tree instead of git ls-files")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if a patch updates a key path on only some of its files",
+    )
+    ap.add_argument(
+        "--forks",
+        action="store_true",
+        help="list same-path inflection forks (pagination.has_more vs pagination.hasMore)",
+    )
+    ap.add_argument(
+        "--homonyms",
+        action="store_true",
+        help="list same leaf under different parents (pagination.has_more vs meta.has_more)",
+    )
+    ap.add_argument(
+        "--leaf",
+        action="store_true",
+        help="treat TOKEN as a leaf name and show every path that ends with it",
+    )
+    ap.add_argument("--diff", metavar="FILE", help="patch file to check ('-' = stdin)")
+    ap.add_argument("--why", action="store_true", help="show more hit sites")
+    ap.add_argument("--selftest", action="store_true", help="run built-in tests")
+    ap.add_argument("--version", action="version", version=f"nook {VERSION}")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return run_selftest()
+
+    root = find_root(args.repo)
+    stdin_data = ""
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+
+    want_check = args.check or args.diff is not None
+    if stdin_data and stdin_is_diff(stdin_data):
+        want_check = True
+
+    index = build_index(root, walk=args.walk)
+    leaves = leaf_neighbors(index)
+    near = fork_neighbors(index)
+
+    if want_check:
+        if args.diff and args.diff != "-":
+            patch = Path(args.diff).read_text(encoding="utf-8", errors="replace")
+        elif stdin_data and stdin_is_diff(stdin_data):
+            patch = stdin_data
+        else:
+            patch = working_tree_diff(root)
+        diffmap = parse_unified_diff(patch)
+        splits = find_splits(root, index, diffmap, min_files=args.min_files)
+        emit_splits(splits, args, leaves, near)
+        return 1 if splits else 0
+
+    if args.homonyms or args.leaf:
+        items = find_homonyms(
+            index,
+            min_files=args.min_files,
+            skip_boring=not args.leaf,
+        )
+        if args.token:
+            q = args.token.strip().strip("'\"").lstrip(".")
+            qleaf = leaf_of(q) if "." in q or q.endswith(ARRAY_MARK) else q
+            items = [h for h in items if h.leaf == qleaf or q in h.tokens]
+            if not items:
+                # Still show every path with that leaf even if only one.
+                toks = sorted(t for t in index if leaf_of(t) == qleaf)
+                if toks:
+                    items = [Homonym(qleaf, tuple(toks))]
+                else:
+                    print(f"nook: no key path with leaf {qleaf!r}", file=sys.stderr)
+                    return 1
+        if not args.all:
+            items = items[: max(0, args.limit)]
+        emit_homonyms(items, index, args)
+        return 0
+
+    if args.forks:
+        forks = find_forks(index, min_files=args.min_files)
+        if args.token:
+            q = args.token.strip().strip("'\"")
+            forks = [f for f in forks if q in f.tokens or any(leaf_of(t) == q for t in f.tokens)]
+            if not forks:
+                print(f"nook: no same-path fork involving {q!r}", file=sys.stderr)
+                return 1
+        if not args.all:
+            forks = forks[: max(0, args.limit)]
+        emit_forks(forks, index, args)
+        return 0
+
+    if args.token:
+        p = lookup(index, args.token)
+        if not p:
+            q = args.token.strip().strip("'\"")
+            qleaf = leaf_of(q)
+            cousins = [t for t in index if leaf_of(t) == qleaf]
+            hint = ""
+            if cousins:
+                hint = "\n  leaf homonyms: " + ", ".join(sorted(cousins)[:12])
+            else:
+                c = path_fork_canon(q)
+                if c:
+                    forks = [t for t in index if path_fork_canon(t) == c]
+                    if forks:
+                        hint = "\n  path forks: " + ", ".join(sorted(forks))
+            print(f"nook: no key path {q!r}{hint}", file=sys.stderr)
+            return 1
+        emit_pacts([p], args, leaves, near)
+        return 0
+
+    if stdin_data and not stdin_is_diff(stdin_data):
+        wanted = {line.strip() for line in stdin_data.splitlines() if line.strip()}
+        pacts = select_pacts(index, args.min_files, args.max_files, args.code)
+        pacts = [p for p in pacts if wanted & set(p.files)]
+    else:
+        pacts = select_pacts(index, args.min_files, args.max_files, args.code)
+
+    if not args.all:
+        pacts = pacts[: max(0, args.limit)]
+    emit_pacts(pacts, args, leaves, near)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise SystemExit(0) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

@@ -1,0 +1,16 @@
+pinch 0.2.0   wall 0.227s   exit 127   stages 2
+
+  [0] cargo test --lib --offline                 cpu  0.183s  ████████████  144%   ◀ PINCH (compute)
+       │       0B   read-stall  0.108s   write-stall  0.000s   blocked-on-read  stage 1 waited on stage 0
+       ▼
+  [1] --list                                     cpu  0.000s  ░░░░░░░░░░░░    0%
+
+who waited for whom:
+  [1] --list  waited 0.108s  (blocked-on-read)  on  [0] cargo test --lib --offline
+
+verdict: pinch is [0] cargo test --lib --offline (compute) — stage 0 (cargo test --lib --offline) absorbed 0.108s of neighbor stall and looks compute-bound
+inner tree (wrappers omitted):
+  cargo                  ████████████  100% run  2/2   ◀ inner pinch
+phases:
+   0.00- 0.06s  (idle) RUN
+   0.06- 0.17s  cargo RUN

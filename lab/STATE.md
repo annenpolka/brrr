@@ -2,10 +2,10 @@
 
 - Start: 2026-08-19 23:45 JST
 - Hard end: 2026-08-20 09:00 JST
-- Clock: 2026-08-20 08:58 JST
-- Phase: Preservation — EVOLUTION_REPORT.md written; stop spawning; delete scheduler at 09:00
+- Clock: 2026-08-20 09:01 JST
+- Phase: Closed — EVOLUTION_REPORT.md written; scheduler deleted
 - Parent role: coordinator only
-- Heartbeat scheduler: `01a01b54e731` every 15m (harvest-only if live ≥ 12; IDs start at mutation-79)
+- Heartbeat scheduler: `01a01b54e731` cancelled at 09:01 JST
 
 ## Number collision (04:32)
 

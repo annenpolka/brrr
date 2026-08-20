@@ -69,3 +69,4 @@
 - 2026-08-20 08:18 JST — Jury fire (7m early). Gen3 idle 10–31m all Keep. Harvested lurch/holt/noun/preen/innard/shim/stile/shoal/rune/proxy/binom/hydra/tilde/seed/badge/solder. Spawned 16 judges (FINAL_UNIX/TOOLSMITH/HERETIC/SKEPTIC + empiricist/composer/tomorrow/kill/converge/weird/vehicles/gen3/lineage/extinct/novelty/disagree). live=16. No REPORT yet (08:40). Loop kept.
 - 2026-08-20 08:45 JST — Preservation. Jury idle 13–22m. Harvested 16 FINAL_*.md. Wrote EVOLUTION_REPORT.md. live=0. spawned=none — REPORT window, stop spawning. Loop kept until 09:00 then scheduler_delete.
 - 2026-08-20 08:58 JST — Hard end −2m. REPORT exists (8/8 sections). live=0. harvested=none. spawned=none — stop spawning. Loop kept; next fire ≥09:00 deletes 01a01b54e731.
+- 2026-08-20 09:01 JST — Hard end. `scheduler_delete 01a01b54e731`. REPORT on disk. live=0. spawned=none. Experiment closed.

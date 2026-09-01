@@ -1,4 +1,6 @@
-# Reality-Stripped classifications (pre-00:00, still Cambrian)
+# Reality-Stripped classifications
+
+Stamped **2026-09-02 00:00 JST**. Every continuing lineage has a classification. THIN_WRAPPER / NO_SURVIVOR were not sent back to R1 to “be more novel”.
 
 Every continuing lineage has a classification. THIN_WRAPPER / NO_SURVIVOR were not sent back to R1 to “be more novel”.
 

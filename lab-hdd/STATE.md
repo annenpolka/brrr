@@ -2,8 +2,8 @@
 
 - Start: 2026-09-01 22:00 JST
 - Hard end: 2026-09-02 09:00 JST
-- Clock: 2026-09-01 22:39 JST
-- Phase: HDD Cambrian Explosion (22:00–00:00)
+- Clock: 2026-09-02 00:00 JST
+- Phase: Reality Gate + Embodiment (00:00–01:15)
 - Parent role: coordinator only
 - Previous brrr: SEALED (`lab-hdd/SEAL.md`)
 - Heartbeat scheduler: `01a05d01751a7e50b363750dcac94179` every 15m (durable, foreground)

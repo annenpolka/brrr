@@ -58,3 +58,10 @@
 - hdd-partial killed NO_SURVIVOR (feasibility essay).
 - Observed R1 ≈ $0.40. Stop casual new HDD unless an unresolved pressure appears.
 - Seven real CLIs ready for First Selection at 01:15. Seal still in force.
+
+## 2026-09-02 00:00 JST — Reality Gate stamp
+
+- All continuing lineages classified. Fossils recorded. No THIN_WRAPPER sent back to R1 for novelty.
+- 00:00 budget prune: observed ~$0.40 of $10 effective / $50 hard. No weak R1 consumers left. Casual R1 stopped.
+- Seven embodiments already satisfy the candidate contract (CLI, README, CANDIDATE, demo, tests, commits, transcripts, dogfood, origin).
+- Seal still in force until First Selection.

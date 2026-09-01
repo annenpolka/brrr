@@ -1,0 +1,82 @@
+$ git -C /Users/annenpolka/.grok/worktrees/annenpolka-brrr/mutation-04-capdiff-json log --oneline -2
+14a13f9 capdiff: JSON extra/missing as objects, not text lines
+3a25110 capdiff: copy CLI and add --json env/files buckets
+
+$ python3 -m unittest discover -s tests -v
+test_bad_name (test_capdiff.CapdiffCLITests.test_bad_name) ... ok
+test_capture_diff_shows_api_key_and_extra_file (test_capdiff.CapdiffCLITests.test_capture_diff_shows_api_key_and_extra_file) ... ok
+test_files_flag_writes_dotenv (test_capdiff.CapdiffCLITests.test_files_flag_writes_dotenv) ... ok
+test_help (test_capdiff.CapdiffCLITests.test_help) ... ok
+test_identical_captures_exit_0 (test_capdiff.CapdiffCLITests.test_identical_captures_exit_0) ... ok
+test_json_diff_a_b_objects (test_capdiff.CapdiffCLITests.test_json_diff_a_b_objects) ... ok
+test_json_does_not_change_default_text (test_capdiff.CapdiffCLITests.test_json_does_not_change_default_text) ... ok
+test_json_env_extra_value_keeps_embedded_equals (test_capdiff.CapdiffCLITests.test_json_env_extra_value_keeps_embedded_equals) ... ok
+test_json_identical_empty_arrays_exit_0 (test_capdiff.CapdiffCLITests.test_json_identical_empty_arrays_exit_0) ... ok
+test_json_missing_capture_still_exits_1 (test_capdiff.CapdiffCLITests.test_json_missing_capture_still_exits_1) ... ok
+test_json_missing_env_is_object_not_text_line (test_capdiff.CapdiffCLITests.test_json_missing_env_is_object_not_text_line) ... ok
+test_missing_capture_diff (test_capdiff.CapdiffCLITests.test_missing_capture_diff) ... ok
+test_missing_env_is_empty_not_crash (test_capdiff.CapdiffCLITests.test_missing_env_is_empty_not_crash) ... ok
+test_no_args_is_usage (test_capdiff.CapdiffCLITests.test_no_args_is_usage) ... ok
+test_replay_does_not_require_host_env (test_capdiff.CapdiffCLITests.test_replay_does_not_require_host_env) ... ok
+test_replay_env_only_prints_api_key (test_capdiff.CapdiffCLITests.test_replay_env_only_prints_api_key) ... ok
+test_replay_remote_key (test_capdiff.CapdiffCLITests.test_replay_remote_key) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.966s
+
+OK
+
+$ ./demo.sh
+== capture a (local) ==
+captured a -> .capdiff/a (2 files, 1 env vars)
+== capture b (remote) ==
+captured b -> .capdiff/b (3 files, 1 env vars)
+== diff a b (expect exit 2) ==
+ENV modified:
+  API_KEY
+    A: local-ci-key
+    B: remote-ci-key
+ENV extra:
+  (none)
+ENV missing:
+  (none)
+FILES modified:
+  .env
+    A: 1f7a9a2f63027fbc9c8c175fd741638d7ccec817ee7fdd6133b6acd1f6a3a306
+    B: cec6ea94dca1d4594c66a30a65ad3de3750c1f3353f41a0b970d6ef3dc6fab86
+FILES extra:
+  extra.txt
+FILES missing:
+  (none)
+diff exit: 2
+== replay a (env-only) ==
+local-ci-key
+== replay b (env-only) ==
+remote-ci-key
+== capture none (no .env) ==
+captured none -> .capdiff/none (1 files, 0 env vars)
+== diff a none (expect exit 2, API_KEY missing on none) ==
+ENV modified:
+  (none)
+ENV extra:
+  (none)
+ENV missing:
+  API_KEY=local-ci-key
+FILES modified:
+  (none)
+FILES extra:
+  readme.txt
+FILES missing:
+  .env
+  app.txt
+diff exit: 2
+== diff a b --json (expect exit 2) ==
+{"a": "a", "b": "b", "env": {"extra": [], "missing": [], "modified": [{"a": "local-ci-key", "b": "remote-ci-key", "key": "API_KEY"}]}, "files": {"extra": [{"hash": "67985e4bbe56ba7c83837e3fdc1bfa0ece762b040f19f68d091cf5402251cb98", "path": "extra.txt"}], "missing": [], "modified": [{"a": "1f7a9a2f63027fbc9c8c175fd741638d7ccec817ee7fdd6133b6acd1f6a3a306", "b": "cec6ea94dca1d4594c66a30a65ad3de3750c1f3353f41a0b970d6ef3dc6fab86", "path": ".env"}]}}
+json exit: 2
+== diff a none --json (expect exit 2) ==
+{"a": "a", "b": "none", "env": {"extra": [], "missing": [{"key": "API_KEY", "value": "local-ci-key"}], "modified": []}, "files": {"extra": [{"hash": "23c54a5ec19281dc438187204a7de0703402d42eb1a916e501429e9bae83d7b3", "path": "readme.txt"}], "missing": [{"hash": "1f7a9a2f63027fbc9c8c175fd741638d7ccec817ee7fdd6133b6acd1f6a3a306", "path": ".env"}, {"hash": "be2d377d8d8b117822739d072afed71c19487f7236d8bfbd5a02d6769d55d1aa", "path": "app.txt"}], "modified": []}}
+json exit: 2
+== diff a a --json (expect exit 0) ==
+{"a": "a", "b": "a", "env": {"extra": [], "missing": [], "modified": []}, "files": {"extra": [], "missing": [], "modified": []}}
+json exit: 0
+demo ok

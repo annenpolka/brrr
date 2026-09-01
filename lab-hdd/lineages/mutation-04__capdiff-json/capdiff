@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""capdiff: named captures of a directory's .env + file hashes.
+
+Commands:
+  capdiff capture NAME DIR
+  capdiff diff A B [--json]
+  capdiff replay NAME [--files] -- DIR CMD...
+"""
+
+from __future__ import print_function
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+STORE_DIRNAME = ".capdiff"
+MANIFEST_NAME = "manifest.json"
+ENV_COPY_NAME = ".env"
+MAX_FILES = 5000
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SKIP_DIRS = {
+    ".capdiff",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "dist",
+    "build",
+}
+SKIP_FILES = {".DS_Store"}
+
+USAGE = """usage:
+  capdiff capture NAME DIR
+  capdiff diff A B [--json]
+  capdiff replay NAME [--files] -- DIR CMD...
+  capdiff -h | --help
+
+capture stores DIR/.env (if present; missing .env is an empty env map)
+and a sha256 manifest of files under .capdiff/NAME in the current
+directory. It does not dump file bodies.
+
+diff prints ENV and FILES sections (modified / extra / missing).
+Exit 0 if identical, 2 if any delta, 1 on error.
+--json emits {a, b, env, files} with modified/extra/missing object
+arrays instead of text. Default text is unchanged.
+
+replay overlays captured env vars onto the process environment and execs
+CMD in DIR. Pass --files to also write the captured .env into DIR.
+Env-only replay is the core; file bodies are not restored.
+"""
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def store_root(cwd=None):
+    if cwd is None:
+        cwd = os.getcwd()
+    return os.path.join(cwd, STORE_DIRNAME)
+
+
+def capture_path(name, cwd=None):
+    return os.path.join(store_root(cwd), name)
+
+
+def validate_name(name):
+    if not NAME_RE.match(name):
+        eprint("capdiff: NAME must match %s" % NAME_RE.pattern)
+        return False
+    return True
+
+
+def parse_env_text(text):
+    env = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        env[key] = val
+    return env
+
+
+def parse_env_file(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return parse_env_text(fh.read())
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def list_files(root):
+    files = {}
+    truncated = False
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".":
+            rel_dir = ""
+        rel_dir_posix = rel_dir.replace(os.sep, "/")
+        top = rel_dir_posix.split("/", 1)[0] if rel_dir_posix else ""
+        if top in SKIP_DIRS:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d))
+        )
+        for name in sorted(filenames):
+            if name in SKIP_FILES:
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            files[rel] = sha256_file(full)
+            count += 1
+            if count >= MAX_FILES:
+                truncated = True
+                return files, truncated
+    return files, truncated
+
+
+def load_manifest(name, cwd=None):
+    path = os.path.join(capture_path(name, cwd), MANIFEST_NAME)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("capdiff: capture not found: %s" % name)
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def cmd_capture(name, src):
+    if not validate_name(name):
+        return 1
+    src = os.path.abspath(src)
+    if not os.path.isdir(src):
+        eprint("capdiff: not a directory: %s" % src)
+        return 1
+    env_path = os.path.join(src, ".env")
+    had_env = os.path.isfile(env_path)
+    env = parse_env_file(env_path) if had_env else {}
+    files, truncated = list_files(src)
+    dest = capture_path(name)
+    tmp = dest + ".tmp"
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    if had_env:
+        shutil.copy2(env_path, os.path.join(tmp, ENV_COPY_NAME))
+    manifest = {
+        "name": name,
+        "source": src,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "env": env,
+        "files": files,
+        "truncated": truncated,
+        "had_env": had_env,
+    }
+    with open(os.path.join(tmp, MANIFEST_NAME), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    parent = os.path.dirname(dest)
+    os.makedirs(parent, exist_ok=True)
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.rename(tmp, dest)
+    print(
+        "captured %s -> %s (%d files, %d env vars%s)"
+        % (
+            name,
+            os.path.relpath(dest) if os.path.isabs(dest) else dest,
+            len(files),
+            len(env),
+            ", truncated" if truncated else "",
+        )
+    )
+    return 0
+
+
+def _section(title, rows):
+    print("%s:" % title)
+    if not rows:
+        print("  (none)")
+        return
+    for row in rows:
+        print(row)
+
+
+def compute_delta(manifest_a, manifest_b):
+    env_a = manifest_a.get("env") or {}
+    env_b = manifest_b.get("env") or {}
+    files_a = manifest_a.get("files") or {}
+    files_b = manifest_b.get("files") or {}
+
+    env_modified = []
+    env_extra = []
+    env_missing = []
+    for key in sorted(set(env_a) | set(env_b)):
+        in_a = key in env_a
+        in_b = key in env_b
+        if in_a and in_b and env_a[key] != env_b[key]:
+            env_modified.append({"key": key, "a": env_a[key], "b": env_b[key]})
+        elif in_b and not in_a:
+            env_extra.append({"key": key, "value": env_b[key]})
+        elif in_a and not in_b:
+            env_missing.append({"key": key, "value": env_a[key]})
+
+    files_modified = []
+    files_extra = []
+    files_missing = []
+    for path in sorted(set(files_a) | set(files_b)):
+        in_a = path in files_a
+        in_b = path in files_b
+        if in_a and in_b and files_a[path] != files_b[path]:
+            files_modified.append(
+                {"path": path, "a": files_a[path], "b": files_b[path]}
+            )
+        elif in_b and not in_a:
+            files_extra.append({"path": path, "hash": files_b[path]})
+        elif in_a and not in_b:
+            files_missing.append({"path": path, "hash": files_a[path]})
+
+    return {
+        "env": {
+            "modified": env_modified,
+            "extra": env_extra,
+            "missing": env_missing,
+        },
+        "files": {
+            "modified": files_modified,
+            "extra": files_extra,
+            "missing": files_missing,
+        },
+    }
+
+
+def delta_has_changes(delta):
+    env = delta["env"]
+    files = delta["files"]
+    return bool(
+        env["modified"]
+        or env["extra"]
+        or env["missing"]
+        or files["modified"]
+        or files["extra"]
+        or files["missing"]
+    )
+
+
+def render_text(delta):
+    env_modified = []
+    for row in delta["env"]["modified"]:
+        env_modified.extend(
+            [
+                "  %s" % row["key"],
+                "    A: %s" % row["a"],
+                "    B: %s" % row["b"],
+            ]
+        )
+    env_extra = [
+        "  %s=%s" % (row["key"], row["value"]) for row in delta["env"]["extra"]
+    ]
+    env_missing = [
+        "  %s=%s" % (row["key"], row["value"]) for row in delta["env"]["missing"]
+    ]
+    files_modified = []
+    for row in delta["files"]["modified"]:
+        files_modified.extend(
+            [
+                "  %s" % row["path"],
+                "    A: %s" % row["a"],
+                "    B: %s" % row["b"],
+            ]
+        )
+    files_extra = ["  %s" % row["path"] for row in delta["files"]["extra"]]
+    files_missing = ["  %s" % row["path"] for row in delta["files"]["missing"]]
+
+    _section("ENV modified", env_modified)
+    _section("ENV extra", env_extra)
+    _section("ENV missing", env_missing)
+    _section("FILES modified", files_modified)
+    _section("FILES extra", files_extra)
+    _section("FILES missing", files_missing)
+
+
+def render_json(name_a, name_b, delta):
+    """Machine record. extra/missing are objects, never the text-mode KEY=value line."""
+    payload = {
+        "a": name_a,
+        "b": name_b,
+        "env": {
+            "modified": [
+                {"key": row["key"], "a": row["a"], "b": row["b"]}
+                for row in delta["env"]["modified"]
+            ],
+            "extra": [
+                {"key": row["key"], "value": row["value"]}
+                for row in delta["env"]["extra"]
+            ],
+            "missing": [
+                {"key": row["key"], "value": row["value"]}
+                for row in delta["env"]["missing"]
+            ],
+        },
+        "files": {
+            "modified": [
+                {"path": row["path"], "a": row["a"], "b": row["b"]}
+                for row in delta["files"]["modified"]
+            ],
+            "extra": [
+                {"path": row["path"], "hash": row["hash"]}
+                for row in delta["files"]["extra"]
+            ],
+            "missing": [
+                {"path": row["path"], "hash": row["hash"]}
+                for row in delta["files"]["missing"]
+            ],
+        },
+    }
+    print(json.dumps(payload, sort_keys=True))
+
+
+def parse_diff_args(rest):
+    json_mode = False
+    names = []
+    for arg in rest:
+        if arg == "--json":
+            json_mode = True
+            continue
+        if arg.startswith("-"):
+            eprint("capdiff: unknown option: %s" % arg)
+            return None
+        names.append(arg)
+    if len(names) != 2:
+        eprint("capdiff: diff A B [--json]")
+        return None
+    return names[0], names[1], json_mode
+
+
+def cmd_diff(name_a, name_b, json_mode=False):
+    if not validate_name(name_a) or not validate_name(name_b):
+        return 1
+    try:
+        a = load_manifest(name_a)
+        b = load_manifest(name_b)
+    except FileNotFoundError as exc:
+        eprint(str(exc))
+        return 1
+    delta = compute_delta(a, b)
+    if json_mode:
+        render_json(name_a, name_b, delta)
+    else:
+        render_text(delta)
+    return 2 if delta_has_changes(delta) else 0
+
+
+def cmd_replay(argv):
+    copy_files = False
+    parts = []
+    for arg in argv:
+        if arg == "--files":
+            copy_files = True
+        else:
+            parts.append(arg)
+    if "--" not in parts:
+        eprint("capdiff: replay requires `-- DIR CMD...`")
+        return 1
+    split_at = parts.index("--")
+    before = parts[:split_at]
+    after = parts[split_at + 1 :]
+    if len(before) != 1:
+        eprint("capdiff: replay NAME -- DIR CMD...")
+        return 1
+    name = before[0]
+    if not validate_name(name):
+        return 1
+    if len(after) < 2:
+        eprint("capdiff: replay needs DIR and CMD")
+        return 1
+    directory = os.path.abspath(after[0])
+    cmd = after[1:]
+    if not os.path.isdir(directory):
+        eprint("capdiff: not a directory: %s" % directory)
+        return 1
+    try:
+        manifest = load_manifest(name)
+    except FileNotFoundError as exc:
+        eprint(str(exc))
+        return 1
+    if copy_files:
+        src_env = os.path.join(capture_path(name), ENV_COPY_NAME)
+        if os.path.isfile(src_env):
+            shutil.copy2(src_env, os.path.join(directory, ".env"))
+        else:
+            eprint("capdiff: capture has no .env to restore")
+    new_env = os.environ.copy()
+    captured = manifest.get("env") or {}
+    for key, val in captured.items():
+        new_env[str(key)] = str(val)
+    try:
+        os.chdir(directory)
+    except OSError as exc:
+        eprint("capdiff: chdir failed: %s" % exc)
+        return 1
+    try:
+        os.execvpe(cmd[0], cmd, new_env)
+    except OSError as exc:
+        eprint("capdiff: exec failed: %s: %s" % (cmd[0], exc))
+        return 127
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE.strip())
+        return 0 if argv else 1
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "capture":
+        if len(rest) != 2:
+            eprint("capdiff: capture NAME DIR")
+            return 1
+        return cmd_capture(rest[0], rest[1])
+    if cmd == "diff":
+        parsed = parse_diff_args(rest)
+        if parsed is None:
+            return 1
+        name_a, name_b, json_mode = parsed
+        return cmd_diff(name_a, name_b, json_mode)
+    if cmd == "replay":
+        return cmd_replay(rest)
+    eprint("capdiff: unknown command: %s" % cmd)
+    eprint(USAGE.strip())
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

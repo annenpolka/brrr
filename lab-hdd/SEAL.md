@@ -1,6 +1,6 @@
 # Previous-brrr contamination seal
 
-**Status: SEALED until First Selection is on disk as `lab-hdd/FIRST_SELECTION.md`.**
+**Status: UNLOCKED 2026-09-02 01:26 JST after `lab-hdd/FIRST_SELECTION.md`.**
 
 Until that file exists and names multiple survivors, workers MUST NOT read or quote:
 

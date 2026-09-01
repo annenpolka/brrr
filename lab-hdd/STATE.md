@@ -2,8 +2,8 @@
 
 - Start: 2026-09-01 22:00 JST
 - Hard end: 2026-09-02 09:00 JST
-- Clock: 2026-09-02 00:00 JST
-- Phase: Reality Gate + Embodiment (00:00–01:15)
+- Clock: 2026-09-02 01:15 JST
+- Phase: First Selection (01:15–02:00)
 - Parent role: coordinator only
 - Previous brrr: SEALED (`lab-hdd/SEAL.md`)
 - Heartbeat scheduler: `01a05d01751a7e50b363750dcac94179` every 15m (durable, foreground)

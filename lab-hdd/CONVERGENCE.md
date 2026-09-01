@@ -13,7 +13,13 @@ Until First Selection, previous-brrr comparisons are sealed. HDD∥HDD pairs may
 
 ## HDD lineage ∥ previous brrr lineage
 
-SEALED until `lab-hdd/FIRST_SELECTION.md` exists.
+Unlocked after First Selection. See `PRIOR_RUN_COMPARISON.md`.
+
+- **owes ∥ zanei** — leftover obligations/claims a change made false (cross-method).
+- **stated/envfrom ∥ due/xref** — effective configuration neighborhood, different first-class questions (adjacent).
+- **same ∥ akin/pin** — identity, different object (adjacent).
+- **whence ∥ sate** — merge/patch as more than a blob (adjacent).
+- **hits ∥ grep/winnow** — empty-search exit contract; weaker than previous partition verbs (regression).
 
 ## Grounder ∥ clean-room Grounder
 

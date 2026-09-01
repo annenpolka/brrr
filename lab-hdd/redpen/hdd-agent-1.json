@@ -1,0 +1,38 @@
+{
+  "summary": "dx trace/resolve claims to reconstruct an automated assistant's edits and their rationale (CVE, GHSA, ticket). The rationale is invented knowledge. The interesting residue is asking what an automated edit did, from the tree alone, without a hidden agent log.",
+  "preserve_add": [
+    "The operator's problem was a working tree changed by an automated assistant.",
+    "trace listed file-level modifications; resolve was asked to explain a config change."
+  ],
+  "established_add": [
+    "Commands: dx --help, state, trace --init, trace --source=auto, resolve --target, config, trace --dependencies."
+  ],
+  "rejected_add": [
+    "Invented CVE-2024-1234, GHSA-abc1-xyz9, ticket SEC-789, libseccheck 3.1.0→3.2.1, and timestamps.",
+    "resolve claimed to know mitigation rationale that is not present in the working tree as shown."
+  ],
+  "constraints_add": [
+    "There is no hidden assistant transcript, ticket tracker, or vulnerability database.",
+    "The CLI cannot invent why a change happened. It may only observe the working tree, diffs, and files actually present.",
+    "Do not require a .dxstate manifest as magical prior knowledge; if a baseline is needed, it must be something the operator can see."
+  ],
+  "open_questions_add": [
+    "Without an agent log, what query still reconstructs 'what did the automated edit do' better than git diff?"
+  ],
+  "harvest_candidates_add": [
+    "Reconstruct an automated working-tree edit as a structured trace of added/removed behavior, not only a hunk list."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "summarize what an automated edit changed in a working tree and what behavior disappeared",
+    "nearest_existing_operation": "git diff / git status / reading the assistant's own chat log",
+    "observable_delta": "not yet shown: a trace of removed behavior (validate_input gone with no wrapper) as a first-class object rather than a hunk",
+    "reason": "rationale-from-CVE is magic; a behavioral trace of an uncommitted automated edit may still be a composition worth testing"
+  },
+  "pressure": [
+    "There is no assistant transcript, CVE database, or ticket system. Continue using the same CLI on a real working tree that an editor or script just changed.",
+    "The CLI cannot explain intent. Show only added, removed, or rewritten observable behavior.",
+    "Do not create a hidden manifest that already knows the answer. If a baseline is required, the operator must be able to point at it."
+  ],
+  "redpen_markdown": "Continue one turn with provenance/capability removal. If the tool collapses to git diff, kill as THIN_WRAPPER."
+}

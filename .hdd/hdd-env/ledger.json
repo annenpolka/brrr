@@ -1,14 +1,74 @@
 {
-  "iteration": 0,
-  "preserve": [],
-  "established": [],
-  "rejected": [],
-  "constraints": [],
-  "open_questions": [],
+  "iteration": 2,
+  "preserve": [
+    "A command failure was attributed to a specific file line that overrode a variable, not to a missing compiler.",
+    "run --capture printed OVERRIDE_SOURCE: .env (line 2).",
+    "DIAGNOSTIC listed LIBRARY_PATH empty, OVERRIDE_SOURCE .env:2, SYSTEM DEFAULT not applied.",
+    "env --filter showed the active override without claiming a live runtime."
+  ],
+  "established": [
+    "Commands: devcli env, state scan, state inspect, run --capture, state edit.",
+    "state inspect, run --diagnose, run --env, env --filter."
+  ],
+  "rejected": [
+    "Invented checksum 4f6e21a, commit a1b2c3d, and a successful rebuild after edit.",
+    "Successful make build after --env is unverified fiction; grounding must run a real command."
+  ],
+  "constraints": [
+    "The CLI cannot edit files to 'fix' the environment. Report only.",
+    "No hidden env parser beyond reading files and the process environment actually present.",
+    "Operate on a real command that fails because of env/files in this tree."
+  ],
+  "open_questions": [
+    "Can a one-shot CLI print, for a failed command, which file or parent environment supplied each relevant variable?"
+  ],
   "human_pressure": [],
-  "harvest_candidates": [],
-  "affordance_assessment": null,
-  "history": [],
+  "harvest_candidates": [
+    "For a command invocation, show the provenance of effective environment variables (file, line, inherited, unset).",
+    "For selected variables, show provenance: file:line override, inherited, unset."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "show where effective environment variables come from (file, inherited, unset) possibly at a command invocation",
+    "nearest_existing_operation": "env, bash -x, direnv status",
+    "observable_delta": "per-variable source, not only the value",
+    "reason": "composition of reading .env/files plus process env; harvestable",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-01T22:15:17+09:00",
+      "summary": "devcli env/state/run --capture found an empty LIBRARY_PATH override in .env and named OVERRIDE_SOURCE. Adjacent to hdd-config. The interesting residue is provenance of the effective environment at failure time.",
+      "pressure": [
+        "The CLI cannot edit or repair anything. Continue using it on a real command in this environment.",
+        "Show only variables actually present in files or the process environment. No invented checksums.",
+        "A useful one-shot result names override provenance for the variables implicated in the failure."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "run a command and report which file or parent env supplied the variables that were in force, especially at failure",
+        "nearest_existing_operation": "env, bash -x, direnv status, systemd EnvironmentFile",
+        "observable_delta": "per-variable override source at the failing invocation, not a dump of all env",
+        "reason": "binding invocation + override provenance is a composition; not yet shown on a real failing command",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-01T22:23:21+09:00",
+      "summary": "run --diagnose names OVERRIDE_SOURCE file:line and a blocked system default. Harvest env-var provenance at invocation. Stop R1.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "show where effective environment variables come from (file, inherited, unset) possibly at a command invocation",
+        "nearest_existing_operation": "env, bash -x, direnv status",
+        "observable_delta": "per-variable source, not only the value",
+        "reason": "composition of reading .env/files plus process env; harvestable",
+        "iteration": 2
+      }
+    }
+  ],
   "last_pressure": [],
   "pending": null
 }

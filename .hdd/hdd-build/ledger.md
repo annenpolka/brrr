@@ -1,18 +1,18 @@
 # HDD Ledger
 
-Iteration: 0
+Iteration: 1
 
 ## Preserve
 
-- (none)
+- The Dreamer started from a compile error and inspected the two types involved.
 
 ## Established
 
-- (none)
+- Commands: tool build, explain, symbol, config get, edit, diff, audit register, task create.
 
 ## Rejected
 
-- (none)
+- Invented struct layouts, QUIC enum member, type_compat config keys, 4.11s build time, and a successful type-punning workaround presented as observation.
 
 ## Constraints
 
@@ -32,7 +32,12 @@ Iteration: 0
 
 ## Affordance Assessment
 
-(none)
+Classification: THIN_WRAPPER
+Core operation: explain a type-mismatch compile error and edit the source until the build passes
+Nearest existing operation: compiler diagnostics, ctags/LSP go-to-definition, and a text editor
+Observable delta: none beyond bundling explain+symbol+edit
+Reason: the session is a conventional compile-fix loop
+Assessed at iteration: 1
 
 ## Latest Red Pen Pressure
 

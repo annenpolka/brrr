@@ -1,14 +1,75 @@
 {
-  "iteration": 0,
-  "preserve": [],
-  "established": [],
-  "rejected": [],
-  "constraints": [],
-  "open_questions": [],
+  "iteration": 2,
+  "preserve": [
+    "The problem was a job that passed locally and failed remotely.",
+    "The CLI's verbs were capture, diff, and replay rather than 'debug the test'.",
+    "Two local working directories were the objects of capture.",
+    "diff reported a modified env var and a file hash mismatch as separate sections.",
+    "Replay applied env vars without starting extra services."
+  ],
+  "established": [
+    "Commands: ci-debug --version, --help, capture --label, capture --from-tar, diff, replay --command.",
+    "capture --label --cwd --output plain, diff, replay --command, replay --target-dir."
+  ],
+  "rejected": [
+    "Invented snapshot IDs, API_KEY values, security-daemon PID 204, and a successful replay after a fictional config modify.",
+    "Invented file counts, core dump path, and a passing npm test after swapping API_KEY."
+  ],
+  "constraints": [
+    "There is no CI artifact tarball, vault, or remote daemon in this environment.",
+    "Replay cannot magically reconstruct Postgres+TLS. It may only export and apply environment variables and files that were actually captured.",
+    "Operate on two real local directories or processes."
+  ],
+  "open_questions": [
+    "After removing tar-import and fictional replay success, is capture+diff of two local environments still a distinct verb from env|sort and diff?"
+  ],
   "human_pressure": [],
-  "harvest_candidates": [],
-  "affordance_assessment": null,
-  "history": [],
+  "harvest_candidates": [
+    "Capture two execution environments and diff them as first-class objects; optionally re-run a command under one capture's exported env.",
+    "Snapshot two directories' environment files and selected metadata, then diff them as first-class captures."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "capture two execution environments (files+env) and diff them; optionally run a command with one capture's env",
+    "nearest_existing_operation": "diff -ru two trees; env; direnv; docker",
+    "observable_delta": "environment is the compared object (labeled captures) rather than ad hoc dumps",
+    "reason": "primitives exist; the bound capture/diff/replay CLI is enough to ground; further dreaming is adding CI lore",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-01T22:09:17+09:00",
+      "summary": "ci-debug capture/diff/replay compares two environment snapshots and replays a command. Invented CI artifacts, vault refs, and a passing replay. The surviving operation is snapshot-diff-replay of environments, a composition of env dumps plus a subprocess.",
+      "pressure": [
+        "There is no CI tarball and no vault. Continue using the same CLI on two real local working trees or two real command invocations.",
+        "Replay may only apply captured environment variables and files; it cannot invent services.",
+        "Show a non-interactive capture and diff whose output is ordinary text or JSON."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "snapshot two environments and diff them, then rerun a command under one snapshot's variables",
+        "nearest_existing_operation": "printing env, diffing two dumps, direnv, docker, or act",
+        "observable_delta": "environment is the object of comparison rather than log lines; replay is still unproven without magic",
+        "reason": "the primitives exist; binding capture/diff/replay into one CLI may be useful but is not a new foundational capability",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-01T22:23:21+09:00",
+      "summary": "Second turn captured two local directories and diffed env/files, then replayed env onto a command. Remaining magic is a fictional npm test. The capture/diff of two execution environments is harvestable.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "capture two execution environments (files+env) and diff them; optionally run a command with one capture's env",
+        "nearest_existing_operation": "diff -ru two trees; env; direnv; docker",
+        "observable_delta": "environment is the compared object (labeled captures) rather than ad hoc dumps",
+        "reason": "primitives exist; the bound capture/diff/replay CLI is enough to ground; further dreaming is adding CI lore",
+        "iteration": 2
+      }
+    }
+  ],
   "last_pressure": [],
   "pending": null
 }

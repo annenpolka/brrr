@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""owes — list obligations a working-tree change appears to break.
+
+Given a diff (or before/after snapshots) and the remaining tree, report:
+
+* identifiers removed by the change that are still mentioned in the tree
+* files that remaining docs say MUST exist, but that are absent
+
+Exit 0 if nothing is unkept, 2 if any unkept obligation, 1 on usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import re
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable, Iterator, Sequence
+
+DEFINE_RE = re.compile(
+    r"\b(?:(?:async|pub|export|static|public|private|protected)\s+)*"
+    r"(?:async\s+)?"
+    r"(?:def|class|function|fn|func|const|let|var|val)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
+CONST_ASSIGN_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s*=")
+MUST_EXIST_RE = re.compile(r"MUST exist:\s*([^\s`]+)", re.IGNORECASE)
+REQUIRED_FILE_RE = re.compile(r"required file:\s*([^\s`]+)", re.IGNORECASE)
+MUST_BACKTICK_RE = re.compile(
+    r"\bmust\b[^`\n]{0,80}`([^`]+)`",
+    re.IGNORECASE,
+)
+SKIP_DIR_NAMES = {".git", "__pycache__", "node_modules", ".hg", ".svn"}
+KEYWORDS = {
+    "None",
+    "True",
+    "False",
+    "and",
+    "as",
+    "async",
+    "await",
+    "break",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "default",
+    "elif",
+    "else",
+    "except",
+    "export",
+    "false",
+    "finally",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "if",
+    "import",
+    "in",
+    "is",
+    "lambda",
+    "let",
+    "new",
+    "not",
+    "null",
+    "or",
+    "pass",
+    "private",
+    "protected",
+    "public",
+    "raise",
+    "return",
+    "self",
+    "static",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "undefined",
+    "val",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+}
+
+
+@dataclass(frozen=True)
+class UnkeptReference:
+    identifier: str
+    path: str
+    line: int
+    text: str
+
+
+@dataclass(frozen=True)
+class MissingCompanion:
+    path: str
+    named_in: str
+    line: int
+    phrase: str
+
+
+@dataclass
+class Report:
+    unkept_references: list[UnkeptReference]
+    missing_companions: list[MissingCompanion]
+
+    def has_obligations(self) -> bool:
+        return bool(self.unkept_references or self.missing_companions)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        tree, diff_text = resolve_inputs(args)
+    except UsageError as exc:
+        print(exc, file=sys.stderr)
+        parser.print_usage(sys.stderr)
+        return 1
+
+    report = scan(tree, diff_text)
+    emit(report, json_out=args.json)
+    return 2 if report.has_obligations() else 0
+
+
+class UsageError(Exception):
+    pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="owes",
+        description=(
+            "List obligations a working-tree change appears to break: "
+            "removed identifiers still mentioned, and required files that "
+            "remaining docs name but that do not exist."
+        ),
+    )
+    parser.add_argument(
+        "dir",
+        nargs="?",
+        help=(
+            "Snapshot directory: DIR/before + DIR/after, or "
+            "DIR/change.diff + DIR/tree"
+        ),
+    )
+    parser.add_argument("--tree", help="Remaining tree after the change")
+    parser.add_argument("--diff", help="Unified diff of the change")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    return parser
+
+
+def resolve_inputs(args: argparse.Namespace) -> tuple[Path, str]:
+    if args.tree and not args.diff:
+        raise UsageError("owes: --tree requires --diff")
+    if args.diff:
+        diff_path = Path(args.diff)
+        if not diff_path.is_file():
+            raise UsageError(f"owes: diff not found: {diff_path}")
+        if args.tree:
+            tree = Path(args.tree)
+        elif args.dir:
+            tree = Path(args.dir)
+        else:
+            tree = Path.cwd()
+        if not tree.is_dir():
+            raise UsageError(f"owes: tree not found: {tree}")
+        return tree.resolve(), diff_path.read_text(encoding="utf-8", errors="replace")
+
+    if not args.dir:
+        raise UsageError("owes: provide DIR, or --tree TREE --diff DIFF")
+
+    root = Path(args.dir)
+    if not root.is_dir():
+        raise UsageError(f"owes: directory not found: {root}")
+
+    before = root / "before"
+    after = root / "after"
+    if before.is_dir() and after.is_dir():
+        return after.resolve(), diff_trees(before, after)
+
+    change = root / "change.diff"
+    tree = root / "tree"
+    if change.is_file() and tree.is_dir():
+        return tree.resolve(), change.read_text(encoding="utf-8", errors="replace")
+
+    raise UsageError(
+        "owes: DIR must contain before/ and after/, or change.diff and tree/"
+    )
+
+
+def diff_trees(before: Path, after: Path) -> str:
+    before_files = {p.relative_to(before) for p in iter_files(before)}
+    after_files = {p.relative_to(after) for p in iter_files(after)}
+    chunks: list[str] = []
+    for rel in sorted(before_files | after_files, key=lambda p: p.as_posix()):
+        old_path = before / rel
+        new_path = after / rel
+        old_lines = read_lines(old_path)
+        new_lines = read_lines(new_path)
+        if old_lines == new_lines:
+            continue
+        hunk = difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{rel.as_posix()}",
+            tofile=f"b/{rel.as_posix()}",
+            lineterm="\n",
+        )
+        text = "".join(hunk)
+        if text and not text.endswith("\n"):
+            text += "\n"
+        chunks.append(text)
+    return "".join(chunks)
+
+
+def read_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    text = read_text(path)
+    if text is None:
+        return []
+    return text.splitlines(keepends=True)
+
+
+def iter_files(root: Path) -> Iterator[Path]:
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIR_NAMES for part in path.parts):
+            continue
+        yield path
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def scan(tree: Path, diff_text: str) -> Report:
+    removed = removed_identifiers(diff_text)
+    plus = plus_lines_by_file(diff_text)
+    refs = find_unkept_references(tree, removed, plus)
+    missing = find_missing_companions(tree)
+    refs.sort(key=lambda r: (r.identifier, r.path, r.line))
+    missing.sort(key=lambda m: (m.path, m.named_in, m.line))
+    return Report(unkept_references=refs, missing_companions=missing)
+
+
+def removed_identifiers(diff_text: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in minus_lines(diff_text):
+        for name in identifiers_on_line(line):
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+    return found
+
+
+def minus_lines(diff_text: str) -> Iterator[str]:
+    for line in diff_text.splitlines():
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("-"):
+            yield line[1:]
+
+
+def plus_lines_by_file(diff_text: str) -> dict[str, set[str]]:
+    """Map remaining-tree paths to stripped texts added by the diff."""
+    current: str | None = None
+    mapping: dict[str, set[str]] = {}
+    for line in diff_text.splitlines():
+        if line.startswith("+++"):
+            current = path_from_diff_header(line)
+            if current:
+                mapping.setdefault(current, set())
+            continue
+        if line.startswith("---") or line.startswith("@@"):
+            continue
+        if current and line.startswith("+"):
+            mapping[current].add(line[1:].strip())
+    return mapping
+
+
+def path_from_diff_header(line: str) -> str | None:
+    body = line[4:].strip() if line.startswith(("+++", "---")) else ""
+    if not body or body == "/dev/null":
+        return None
+    path = body.split("\t", 1)[0]
+    if path.startswith("a/") or path.startswith("b/"):
+        path = path[2:]
+    return path or None
+
+
+def identifiers_on_line(line: str) -> Iterable[str]:
+    names = [m.group(1) for m in DEFINE_RE.finditer(line)]
+    names.extend(m.group(1) for m in CONST_ASSIGN_RE.finditer(line))
+    for name in names:
+        if is_identifier(name):
+            yield name
+
+
+def is_identifier(name: str) -> bool:
+    if len(name) < 3:
+        return False
+    if name in KEYWORDS:
+        return False
+    return True
+
+
+def find_unkept_references(
+    tree: Path,
+    identifiers: Sequence[str],
+    plus_lines: dict[str, set[str]] | None = None,
+) -> list[UnkeptReference]:
+    if not identifiers:
+        return []
+    plus_lines = plus_lines or {}
+    patterns = [
+        (name, re.compile(r"\b" + re.escape(name) + r"\b"))
+        for name in identifiers
+    ]
+    hits: list[UnkeptReference] = []
+    for path in iter_files(tree):
+        text = read_text(path)
+        if text is None:
+            continue
+        rel = path.relative_to(tree).as_posix()
+        added = plus_texts_for(rel, plus_lines)
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            stripped = raw.strip()
+            if stripped in added:
+                # Mention was introduced by the change itself (changelog, etc.).
+                continue
+            for name, pat in patterns:
+                if pat.search(raw):
+                    hits.append(
+                        UnkeptReference(
+                            identifier=name,
+                            path=rel,
+                            line=lineno,
+                            text=stripped,
+                        )
+                    )
+    return hits
+
+
+def plus_texts_for(rel: str, plus_lines: dict[str, set[str]]) -> set[str]:
+    texts: set[str] = set()
+    texts.update(plus_lines.get(rel, ()))
+    texts.update(plus_lines.get(Path(rel).name, ()))
+    for diff_path, lines in plus_lines.items():
+        if diff_path.endswith("/" + rel):
+            texts.update(lines)
+    return texts
+
+
+def find_missing_companions(tree: Path) -> list[MissingCompanion]:
+    hits: list[MissingCompanion] = []
+    for path in iter_files(tree):
+        if path.suffix.lower() != ".md":
+            continue
+        text = read_text(path)
+        if text is None:
+            continue
+        rel = path.relative_to(tree).as_posix()
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            for named, phrase in required_paths_on_line(raw):
+                if companion_exists(tree, named):
+                    continue
+                hits.append(
+                    MissingCompanion(
+                        path=named,
+                        named_in=rel,
+                        line=lineno,
+                        phrase=phrase.strip(),
+                    )
+                )
+    return hits
+
+
+def required_paths_on_line(line: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for pat in (MUST_EXIST_RE, REQUIRED_FILE_RE):
+        for match in pat.finditer(line):
+            named = clean_required_path(match.group(1))
+            if named:
+                found.append((named, match.group(0)))
+    for match in MUST_BACKTICK_RE.finditer(line):
+        named = clean_required_path(match.group(1))
+        if named and looks_like_filename(named):
+            found.append((named, match.group(0)))
+    return found
+
+
+def clean_required_path(raw: str) -> str:
+    named = raw.strip().strip("`\"'")
+    named = named.rstrip(".,;:")
+    return named
+
+
+def looks_like_filename(named: str) -> bool:
+    """Backtick-after-must is noisy; keep only path-like tokens."""
+    if not named or any(ch.isspace() for ch in named):
+        return False
+    if named in {".", ".."}:
+        return False
+    if named.startswith("-"):
+        return False
+    return ("/" in named) or ("\\" in named) or ("." in named)
+
+
+def companion_exists(tree: Path, named: str) -> bool:
+    candidate = Path(named)
+    if candidate.is_absolute():
+        return candidate.exists()
+    return (tree / named).exists()
+
+
+def emit(report: Report, json_out: bool) -> None:
+    if json_out:
+        payload = {
+            "unkept_references": [asdict(item) for item in report.unkept_references],
+            "missing_companions": [asdict(item) for item in report.missing_companions],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=False))
+        return
+
+    if not report.has_obligations():
+        print("no unkept obligations")
+        return
+
+    if report.unkept_references:
+        print("unkept references:")
+        current = None
+        for item in report.unkept_references:
+            if item.identifier != current:
+                current = item.identifier
+                print(f"  {item.identifier}")
+            print(f"    {item.path}:{item.line}: {item.text}")
+
+    if report.missing_companions:
+        if report.unkept_references:
+            print()
+        print("missing companions:")
+        current = None
+        for item in report.missing_companions:
+            if item.path != current:
+                current = item.path
+                print(f"  {item.path}")
+            print(f"    named in {item.named_in}:{item.line}: {item.phrase}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

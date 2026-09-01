@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-01 21:44:19 JST
+Updated: 2026-09-01 22:26:44 JST
 
 ## Caps
 
@@ -12,11 +12,11 @@ Updated: 2026-09-01 21:44:19 JST
 
 ## Totals
 
-- Total R1 calls: **0**
-- Observed spend (OpenRouter usage delta): **$0.000000**
-- Conservative transcript estimate (sum): **$0.000000**
-- Remaining effective budget: **$10.000000**
-- Remaining vs $50 experiment cap: **$50.000000**
+- Total R1 calls: **29**
+- Observed spend (OpenRouter usage delta): **$0.272361**
+- Conservative transcript estimate (sum): **$0.757761**
+- Remaining effective budget: **$9.727639**
+- Remaining vs $50 experiment cap: **$49.727639**
 
 ## Pricing used for estimates
 
@@ -26,15 +26,69 @@ Updated: 2026-09-01 21:44:19 JST
 
 ## Calls by trial
 
-(no calls yet)
+| Trial | Calls | Observed USD | Estimated USD |
+| --- | ---: | ---: | ---: |
+| hdd-agent | 3 | 0.052133 | 0.080802 |
+| hdd-build | 1 | 0.059711 | 0.025966 |
+| hdd-ci | 2 | 0.038736 | 0.052578 |
+| hdd-config | 2 | 0.065822 | 0.051765 |
+| hdd-cross | 1 | 0.034579 | 0.027378 |
+| hdd-debug | 2 | 0.073979 | 0.050014 |
+| hdd-docs | 1 | 0.044843 | 0.026205 |
+| hdd-env | 2 | 0.044036 | 0.051316 |
+| hdd-flake | 1 | 0.018459 | 0.025190 |
+| hdd-history | 2 | 0.002857 | 0.054577 |
+| hdd-log | 1 | 0.038052 | 0.026376 |
+| hdd-merge | 2 | 0.099901 | 0.053648 |
+| hdd-patch | 1 | 0.021350 | 0.026027 |
+| hdd-perf | 1 | 0.021350 | 0.025247 |
+| hdd-pipe | 1 | 0.060584 | 0.025461 |
+| hdd-review | 1 | 0.010590 | 0.026240 |
+| hdd-test | 1 | 0.063164 | 0.025605 |
+| hdd-type | 1 | 0.074918 | 0.024946 |
+| hdd-wait | 2 | 0.034579 | 0.053091 |
+| unfamiliar-cli | 1 | 0.010590 | 0.025329 |
 
 ## Calls by experiment phase
 
-(no calls yet)
+| Phase | Calls | Observed USD | Estimated USD |
+| --- | ---: | ---: | ---: |
+| cambrian | 20 | 0.589637 | 0.515030 |
+| deepen | 9 | 0.280598 | 0.242731 |
 
 ## Call log
 
-(none)
+| When JST | Trial | Iter | Phase | Status | Observed USD | Estimated USD |
+| --- | --- | ---: | --- | --- | ---: | ---: |
+| 2026-09-01 22:00:06 JST | hdd-history | 1 | cambrian | ok | 0.000000 | 0.026398 |
+| 2026-09-01 22:00:06 JST | hdd-debug | 1 | cambrian | ok | 0.003452 | 0.024528 |
+| 2026-09-01 22:00:06 JST | hdd-agent | 1 | cambrian | ok | 0.010590 | 0.025937 |
+| 2026-09-01 22:00:06 JST | unfamiliar-cli | 1 | cambrian | ok | 0.010590 | 0.025329 |
+| 2026-09-01 22:00:06 JST | hdd-review | 1 | cambrian | ok | 0.010590 | 0.02624 |
+| 2026-09-01 22:00:06 JST | hdd-merge | 1 | cambrian | ok | 0.029374 | 0.026856 |
+| 2026-09-01 22:00:06 JST | hdd-log | 1 | cambrian | ok | 0.038052 | 0.026376 |
+| 2026-09-01 22:03:09 JST | hdd-build | 1 | cambrian | ok | 0.059711 | 0.025966 |
+| 2026-09-01 22:00:06 JST | hdd-test | 1 | cambrian | ok | 0.063164 | 0.025605 |
+| 2026-09-01 22:06:21 JST | hdd-config | 1 | cambrian | ok | 0.016050 | 0.025118 |
+| 2026-09-01 22:06:21 JST | hdd-ci | 1 | cambrian | ok | 0.016050 | 0.025329 |
+| 2026-09-01 22:06:21 JST | hdd-perf | 1 | cambrian | ok | 0.021350 | 0.025247 |
+| 2026-09-01 22:08:31 JST | hdd-history | 2 | deepen | ok | 0.002857 | 0.028179 |
+| 2026-09-01 22:06:21 JST | hdd-env | 1 | cambrian | ok | 0.021350 | 0.025081 |
+| 2026-09-01 22:06:21 JST | hdd-patch | 1 | cambrian | ok | 0.021350 | 0.026027 |
+| 2026-09-01 22:06:21 JST | hdd-docs | 1 | cambrian | ok | 0.044843 | 0.026205 |
+| 2026-09-01 22:08:31 JST | hdd-agent | 2 | deepen | ok | 0.026350 | 0.027085 |
+| 2026-09-01 22:06:21 JST | hdd-type | 1 | cambrian | ok | 0.074918 | 0.024946 |
+| 2026-09-01 22:08:31 JST | hdd-merge | 2 | deepen | ok | 0.070527 | 0.026792 |
+| 2026-09-01 22:08:31 JST | hdd-debug | 2 | deepen | ok | 0.070527 | 0.025486 |
+| 2026-09-01 22:15:17 JST | hdd-agent | 3 | deepen | ok | 0.015193 | 0.02778 |
+| 2026-09-01 22:15:17 JST | hdd-env | 2 | deepen | ok | 0.022686 | 0.026235 |
+| 2026-09-01 22:15:17 JST | hdd-ci | 2 | deepen | ok | 0.022686 | 0.027249 |
+| 2026-09-01 22:18:03 JST | hdd-flake | 1 | cambrian | ok | 0.018459 | 0.02519 |
+| 2026-09-01 22:18:03 JST | hdd-wait | 1 | cambrian | ok | 0.034579 | 0.025813 |
+| 2026-09-01 22:15:17 JST | hdd-config | 2 | deepen | ok | 0.049772 | 0.026647 |
+| 2026-09-01 22:18:03 JST | hdd-cross | 1 | cambrian | ok | 0.034579 | 0.027378 |
+| 2026-09-01 22:18:03 JST | hdd-pipe | 1 | cambrian | ok | 0.060584 | 0.025461 |
+| 2026-09-01 22:23:21 JST | hdd-wait | 2 | deepen | ok | 0.000000 | 0.027278 |
 
 ## Notes
 

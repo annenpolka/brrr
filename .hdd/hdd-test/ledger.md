@@ -1,18 +1,18 @@
 # HDD Ledger
 
-Iteration: 0
+Iteration: 1
 
 ## Preserve
 
-- (none)
+- The Dreamer used the tool through a failing test rather than proposing a product.
 
 ## Established
 
-- (none)
+- Commands: mystery-cli test --filter, debug-test --breakpoint, then print/step/break/continue/eval/exec.
 
 ## Rejected
 
-- (none)
+- Fabricated runtime values: 512MB vs 0MB, user-7f3a, timings 0.42s/0.39s, cache.IsConnected() false.
 
 ## Constraints
 
@@ -32,7 +32,12 @@ Iteration: 0
 
 ## Affordance Assessment
 
-(none)
+Classification: THIN_WRAPPER
+Core operation: step through a failing test in an interactive debugger until a sentinel value appears
+Nearest existing operation: gdb, lldb, delve, pdb, or an IDE test debugger
+Observable delta: none beyond renamed debugger verbs
+Reason: removing the fictional cache and quota story leaves ordinary interactive debugging
+Assessed at iteration: 1
 
 ## Latest Red Pen Pressure
 

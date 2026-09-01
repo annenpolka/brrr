@@ -2,28 +2,27 @@
 
 - Start: 2026-09-01 22:00 JST
 - Hard end: 2026-09-02 09:00 JST
-- Clock: 2026-09-01 21:47 JST
-- Phase: Bootstrap (pre-Cambrian); Cambrian Dreamer wave armed for 22:00 JST
+- Clock: 2026-09-01 22:39 JST
+- Phase: HDD Cambrian Explosion (22:00–00:00)
 - Parent role: coordinator only
 - Previous brrr: SEALED (`lab-hdd/SEAL.md`)
 - Heartbeat scheduler: `01a05d01751a7e50b363750dcac94179` every 15m (durable, foreground)
 - R1: DeepSeek R1 via OpenRouter through `hdd.py`; critic transport manual (host Red Pen)
-- Effective R1 cap: **$10.00** (OpenRouter remaining ~$11.16 at 21:40 JST; experiment hard cap $50)
+- Effective R1 cap: **$10.00** (OpenRouter remaining ~$11.16 at start; experiment hard cap $50)
+- Observed R1 spend: **~$0.29** (OpenRouter usage delta)
 
 ## Active workers
 
-| Slot | Kind | Trial / assignment | status |
+| Slot | Kind | assignment | status |
 | --- | --- | --- | --- |
-| (empty) | | | waiting for 22:00 JST |
-
-## Population (initialized, not yet dreamed except as noted)
-
-See `lab-hdd/POPULATION.json`.
-
-Existing `.hdd/unfamiliar-cli` is iteration 0 (canonical weak seed) and is one Cambrian trial.
+| G1 | Grounder | candidate-01 whence | worktree live; demo/tests OK; archive present; subagent may still dogfood |
+| — | — | candidate-02 stated | DONE HEAD 3cc7bcd |
+| — | — | candidate-03 owes | DONE HEAD 2e29625 |
+| — | — | candidate-04 capdiff | DONE HEAD fd75f04 |
+| — | — | candidate-05 envfrom | DONE HEAD 7cad6b3 |
 
 ## Notes
 
 - Do not merge candidate product code onto `main`.
 - Do not edit `EVOLUTION_REPORT.md`, `lab/`, or the previous master prompt.
-- Do not fire R1 before 22:00 JST.
+- Product lives in `~/.grok/worktrees/annenpolka-brrr/candidate-*` and archives under `lab-hdd/lineages/`.

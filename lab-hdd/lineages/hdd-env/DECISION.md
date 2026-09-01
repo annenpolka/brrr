@@ -1,0 +1,7 @@
+# hdd-env
+
+DECISION: HARVEST_NOW
+
+USEFUL_COMPOSITION: envfrom provenance.
+
+At: 2026-09-01 22:23:21.219737+09:00

@@ -40,7 +40,32 @@ def main() -> None:
             found = True
             break
     if not found:
-        raise SystemExit(f"unknown trial {trial}")
+        pop.setdefault("trials", []).append(
+            {
+                "trial": trial,
+                "seed_file": f"lab-hdd/seeds/{trial}.md",
+                "workspace": f".hdd/{trial}",
+                "initialized_before": False,
+                "stage": "seeded",
+                "decision": None,
+                "dreams": 0,
+            }
+        )
+        for row in pop["trials"]:
+            if row["trial"] == trial:
+                row["decision"] = decision
+                row["decision_at_jst"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S %Z")
+                row["decision_note"] = note
+                if decision == "KILL":
+                    row["stage"] = "killed"
+                elif decision == "PARK_WEIRD":
+                    row["stage"] = "parked"
+                elif decision == "HARVEST_NOW":
+                    row["stage"] = "harvest"
+                elif decision == "CONTINUE_DREAMING":
+                    row["stage"] = "deepen"
+                found = True
+                break
     POP.write_text(json.dumps(pop, indent=2) + "\n", encoding="utf-8")
     dest = ROOT / "lab-hdd" / "lineages" / trial
     dest.mkdir(parents=True, exist_ok=True)

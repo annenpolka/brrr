@@ -1,18 +1,18 @@
 # HDD Ledger
 
-Iteration: 0
+Iteration: 1
 
 ## Preserve
 
-- (none)
+- The Dreamer fed diffs whose hunk headers were unhelpful, which matched the seed.
 
 ## Established
 
-- (none)
+- Commands: analyze, analyze --verbose, --help, explain via pipe, index.
 
 ## Rejected
 
-- (none)
+- Call-site counts, related logger.py/config_loader.py changes not present in the supplied diff, 'ETL convention' motivation, 4712-symbol index stats.
 
 ## Constraints
 
@@ -32,7 +32,12 @@ Iteration: 0
 
 ## Affordance Assessment
 
-(none)
+Classification: THIN_WRAPPER
+Core operation: summarize a patch as a rename or config change
+Nearest existing operation: git diff, git log -S, an IDE rename preview
+Observable delta: asserted extra files and motives that were not in the patch
+Reason: without invented semantics, the session is ordinary patch reading
+Assessed at iteration: 1
 
 ## Latest Red Pen Pressure
 

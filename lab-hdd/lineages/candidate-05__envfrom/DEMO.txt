@@ -1,0 +1,98 @@
+$ git -C /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom log --oneline -2
+7cad6b3 envfrom: parse export prefix, quotes, and inline comments
+d753140 envfrom: report per-variable source including file empty override
+
+$ python3 -m unittest tests.test_envfrom
+..............
+----------------------------------------------------------------------
+Ran 14 tests in 0.502s
+
+OK
+
+$ ./demo.sh
+=== envfrom LIBRARY_PATH APP_ENV PATH NOT_A_REAL_VAR ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:3
+INHERITED: from-shell
+
+PATH
+VALUE=/Users/annenpolka/.grok/bin:/Users/annenpolka/.local/bin:/Users/annenpolka/.opencode/bin:/Users/annenpolka/.moon/bin:/Users/annenpolka/.bun/bin:/Users/annenpolka/.antigravity/antigravity/bin:/opt/homebrew/opt/libpq/bin:/Users/annenpolka/.local/share/mise/installs/ruby/3/bin:/Users/annenpolka/.volta/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/Users/annenpolka/.ghcup/bin:/Users/annenpolka/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/:/Users/annenpolka/.cargo/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/usr/local/share/dotnet:~/.dotnet/tools:/Users/annenpolka/.deno/bin:/Applications/Ghostty.app/Contents/MacOS:/Users/annenpolka/.orbstack/bin:/Applications/Obsidian.app/Contents/MacOS:/Users/annenpolka/go/bin:/Users/annenpolka/Library/pnpm/bin:/Users/annenpolka/.cache/lm-studio/bin
+SOURCE: env
+
+NOT_A_REAL_VAR
+VALUE=
+SOURCE: unset
+
+=== --fail-empty LIBRARY_PATH (expect exit 2) ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+exit=2
+
+=== --run without --load: child keeps inherited LIBRARY_PATH ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:3
+INHERITED: from-shell
+child LIBRARY_PATH=/usr/local/lib:/usr/lib
+
+=== --run --load: child sees file empty override ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/empty-override/.env:3
+INHERITED: from-shell
+child LIBRARY_PATH=''
+child APP_ENV=dev
+
+=== quoted values, inline comments, export PREFIX ===
+PREFIX
+VALUE=app
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:2
+INHERITED: (unset)
+
+GREETING
+VALUE=hello world
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:3
+INHERITED: (unset)
+
+NAME
+VALUE=Ada Lovelace
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:4
+INHERITED: (unset)
+
+COLOR
+VALUE=red
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:5
+INHERITED: (unset)
+
+EMPTY_QUOTED
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:6
+EMPTY_OVERRIDE: yes
+INHERITED: (unset)
+
+HASH_IN_QUOTES
+VALUE=# not a comment
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-05-envfrom/fixtures/quoted-export/.env:7
+INHERITED: (unset)

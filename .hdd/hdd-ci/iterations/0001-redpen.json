@@ -1,0 +1,37 @@
+{
+  "summary": "ci-debug capture/diff/replay compares two environment snapshots and replays a command. Invented CI artifacts, vault refs, and a passing replay. The surviving operation is snapshot-diff-replay of environments, a composition of env dumps plus a subprocess.",
+  "preserve_add": [
+    "The problem was a job that passed locally and failed remotely.",
+    "The CLI's verbs were capture, diff, and replay rather than 'debug the test'."
+  ],
+  "established_add": [
+    "Commands: ci-debug --version, --help, capture --label, capture --from-tar, diff, replay --command."
+  ],
+  "rejected_add": [
+    "Invented snapshot IDs, API_KEY values, security-daemon PID 204, and a successful replay after a fictional config modify."
+  ],
+  "constraints_add": [
+    "There is no CI artifact tarball, vault, or remote daemon in this environment.",
+    "Replay cannot magically reconstruct Postgres+TLS. It may only export and apply environment variables and files that were actually captured.",
+    "Operate on two real local directories or processes."
+  ],
+  "open_questions_add": [
+    "After removing tar-import and fictional replay success, is capture+diff of two local environments still a distinct verb from env|sort and diff?"
+  ],
+  "harvest_candidates_add": [
+    "Capture two execution environments and diff them as first-class objects; optionally re-run a command under one capture's exported env."
+  ],
+  "pressure": [
+    "There is no CI tarball and no vault. Continue using the same CLI on two real local working trees or two real command invocations.",
+    "Replay may only apply captured environment variables and files; it cannot invent services.",
+    "Show a non-interactive capture and diff whose output is ordinary text or JSON."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "snapshot two environments and diff them, then rerun a command under one snapshot's variables",
+    "nearest_existing_operation": "printing env, diffing two dumps, direnv, docker, or act",
+    "observable_delta": "environment is the object of comparison rather than log lines; replay is still unproven without magic",
+    "reason": "the primitives exist; binding capture/diff/replay into one CLI may be useful but is not a new foundational capability"
+  },
+  "redpen_markdown": "Continue one turn on real local captures. If it collapses to env|sort | diff, kill as THIN_WRAPPER. Independent of hdd-debug's config-vs-actual question, but adjacent."
+}

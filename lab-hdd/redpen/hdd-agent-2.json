@@ -1,0 +1,37 @@
+{
+  "summary": "Second turn: resolve no longer invents CVEs. It now fails unless in-tree rationale artifacts exist (RFC 2119 comments, commit messages, *.decision.md). The surviving question is whether a change violates obligations that are already written in the tree, including missing companion files.",
+  "preserve_add": [
+    "resolve refused to invent intent when no rationale artifacts were present.",
+    "trace --diff showed a removed function whose remaining docs/RFC required a companion decision file that was absent."
+  ],
+  "established_add": [
+    "resolve --help lists required artifact classes; resolve --target=config.yaml --with-context reported missing SECURITY.decision.md; find located docs/validation_rfc_v3.md."
+  ],
+  "rejected_add": [
+    "The RFC file and RFC 2119 contract look like they were created to satisfy the tool's own newly stated requirements; they were not shown to pre-exist independently of this session."
+  ],
+  "constraints_add": [
+    "The CLI has no private catalog of required artifacts and no RFC 2119 special mode unless those words actually occur in files.",
+    "Do not create missing decision logs. Report absence.",
+    "Operate on a real git diff in a real tree."
+  ],
+  "open_questions_add": [
+    "On a real diff, can the tool list in-tree obligations (tests, comments, docs) that the change fails to keep, without a hidden policy language?"
+  ],
+  "harvest_candidates_add": [
+    "Given a working-tree change, list obligations written elsewhere in the tree that the change appears to break, including required files that are absent."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "ask which in-tree obligations a change fails to keep, including missing companion files",
+    "nearest_existing_operation": "git diff plus grep/rg through docs and tests; a linter with custom rules",
+    "observable_delta": "the missing companion artifact is a first-class miss, not only a hunk; still needs a real-tree demonstration",
+    "reason": "not a new foundational logic engine; binding diff vs in-tree obligations may still be a harvestable verb"
+  },
+  "pressure": [
+    "There is no private policy language. Continue on a real git diff in this repository.",
+    "The CLI must not write decision files. If an obligation is missing, say so and stop.",
+    "Show concrete file:line evidence for each claimed obligation."
+  ],
+  "redpen_markdown": "Continue to turn 3 on a real diff. If it becomes grep, harvest as USEFUL_COMPOSITION or kill as THIN_WRAPPER honestly."
+}

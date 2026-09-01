@@ -1,18 +1,18 @@
 # HDD Ledger
 
-Iteration: 0
+Iteration: 1
 
 ## Preserve
 
-- (none)
+- The Dreamer probed errors and followed hints.
 
 ## Established
 
-- (none)
+- Commands: devcli, init, inspect dir, build, config set, run --port-auto.
 
 ## Rejected
 
-- (none)
+- Invented .manifest v2.3, 14.7MB dist, port 6093, process 28491.
 
 ## Constraints
 
@@ -32,7 +32,12 @@ Iteration: 0
 
 ## Affordance Assessment
 
-(none)
+Classification: THIN_WRAPPER
+Core operation: scaffold, configure, build, and run a web project
+Nearest existing operation: npm init / vite / a task runner
+Observable delta: none; the docs-drift question was never posed
+Reason: renamed project toolchain; seed question unused
+Assessed at iteration: 1
 
 ## Latest Red Pen Pressure
 

@@ -1,0 +1,40 @@
+{
+  "summary": "First use traces a fictional repo-tool that reports local-vs-remote manifest desync and then auto-repairs dependencies. The interesting question is 'why did this project stop matching its last-known-good state?'; most of the session is renamed package-sync plus a bolted-on security scanner with fabricated checksums and timestamps.",
+  "preserve_add": [
+    "The operator was trying to understand a repository that used to work and now does not.",
+    "The tool's first output was a project-level mismatch status rather than a file list."
+  ],
+  "established_add": [
+    "An installed CLI named repo-tool answered repo-tool, inspect, logs --since=24h, resolve, and inspect validation.",
+    "The session claimed a SYNC_FAILURE (code 409), a local/remote engine checksum mismatch, a dependency_integrity failure, and a SECURE_BINDINGS finding in core/auth.gw."
+  ],
+  "rejected_add": [
+    "Unsupported precise values: version v3.7.2, sha256 prefixes aa74/cfd3, timestamps 2024-06-10 08:12:03 and 08:15:22, and 'report generated at 2024-06-10T09:03:17Z' were asserted without an observable source.",
+    "resolve claimed to re-acquire a valid checksum because 'source verified' with no shown verification procedure."
+  ],
+  "constraints_add": [
+    "This environment has no hidden product registry and no checksum oracle. Continue using the same CLI on a real local working tree.",
+    "The CLI cannot automatically repair, re-download, or semantically verify dependencies. Use it anyway.",
+    "Do not invent a security-policy scanner to explain the breakage."
+  ],
+  "open_questions_add": [
+    "After stripping registry/checksum/auto-repair, what single query still answers why the project used to work and now does not?",
+    "Is the object of inquiry a manifest, a working-tree, a test outcome, or something else?"
+  ],
+  "harvest_candidates_add": [
+    "Ask why a project that previously satisfied some implicit last-known-good state no longer does, as one operation."
+  ],
+  "affordance_assessment": {
+    "classification": "THIN_WRAPPER",
+    "core_operation": "report that a local project no longer matches an expected remote or last-good snapshot, then attempt repair",
+    "nearest_existing_operation": "git status / git fetch plus a lockfile or image-digest mismatch from npm, cargo, or docker pull",
+    "observable_delta": "so far only renamed sync/inspect/resolve verbs; the 'used to work' question is not yet a distinct query object",
+    "reason": "once checksum oracles, registries, and auto-repair are removed, the demonstrated session is ordinary package/manifest reconciliation"
+  },
+  "pressure": [
+    "There is no product registry and no checksum oracle on this machine. Continue using the same CLI to investigate a real local tree that used to work and now does not.",
+    "The CLI cannot automatically repair or re-download anything. Show only what it can observe, including failures.",
+    "Do not add a security-policy or validation-rule engine. Stay with the original mismatch question."
+  ],
+  "redpen_markdown": "The Dreamer used the CLI, which is good. The named commands look like a package-manager/registry client with a security scanner glued on. Precise checksums and timestamps are unsupported. Next turn must survive without a registry, without auto-repair, and without a new policy engine. Classification is THIN_WRAPPER on current evidence; one more turn is justified only to test whether a non-manifest 'used to work' query remains."
+}

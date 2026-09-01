@@ -1,0 +1,37 @@
+{
+  "summary": "dev status/test/log/config/deploy told a story in which declared config, observed runtime, and a recent change disagree. Fabricated hotfix IDs, protocol versions, and timestamps. The interesting residue is a three-way mismatch query, not a deploy tool.",
+  "preserve_add": [
+    "The session treated environment state, config, and a recent change as comparable objects.",
+    "A conflict was found: config claims runtime 3.2, a test log shows 3.0, status says hybrid runtime disabled."
+  ],
+  "established_add": [
+    "Commands used: dev status --full, test --suite=runtime, log show, config get, deploy --dry-run."
+  ],
+  "rejected_add": [
+    "Unsupported precision: v1.5.0, dates 2023-10-05/07, hotfix #8821, protocol 3.2 vs 3.0, log id XR8821-7."
+  ],
+  "constraints_add": [
+    "There is no deployment system, hotfix tracker, or remote runtime in this environment.",
+    "The CLI has no hidden knowledge of protocol versions. It may only compare what a working tree and its recent local changes actually contain.",
+    "Do not invent log IDs or ticket numbers."
+  ],
+  "open_questions_add": [
+    "Can a single non-interactive command answer: what does config declare, what does the tree actually do, and which recent change split them?"
+  ],
+  "harvest_candidates_add": [
+    "Compare declared configuration, observed local behavior, and the change that opened the gap, as one query."
+  ],
+  "pressure": [
+    "There is no deploy system and no hotfix tracker. Continue using the same CLI on a real local working tree.",
+    "The CLI cannot know protocol versions or remote runtimes. Show only facts present in files, tests, or recent local changes.",
+    "Produce a one-shot non-interactive invocation, not a dashboard of invented IDs."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "show that declared config, observed behavior, and a recent change are not the same fact",
+    "nearest_existing_operation": "read config files, run tests, and git log/blame separately",
+    "observable_delta": "the mismatch is presented as one status rather than three manual investigations; not yet shown on a real tree without invented IDs",
+    "reason": "binding config vs actual vs recent-change is a composition with a possible first-class question; evidence is still fictional"
+  },
+  "redpen_markdown": "Continue one turn. Strip deploy/hotfix/version oracles. If the three-way mismatch cannot be observed on a real tree, harvest or kill."
+}

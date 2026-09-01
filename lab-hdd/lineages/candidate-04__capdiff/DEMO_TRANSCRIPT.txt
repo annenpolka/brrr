@@ -1,0 +1,47 @@
+# Real ./demo.sh from archived copy, 2026-09-01
+# python3 -m unittest discover -s tests -v → 11 tests OK (0.976s)
+
+== capture a (local) ==
+captured a -> .capdiff/a (2 files, 1 env vars)
+== capture b (remote) ==
+captured b -> .capdiff/b (3 files, 1 env vars)
+== diff a b (expect exit 2) ==
+ENV modified:
+  API_KEY
+    A: local-ci-key
+    B: remote-ci-key
+ENV extra:
+  (none)
+ENV missing:
+  (none)
+FILES modified:
+  .env
+    A: 1f7a9a2f63027fbc9c8c175fd741638d7ccec817ee7fdd6133b6acd1f6a3a306
+    B: cec6ea94dca1d4594c66a30a65ad3de3750c1f3353f41a0b970d6ef3dc6fab86
+FILES extra:
+  extra.txt
+FILES missing:
+  (none)
+diff exit: 2
+== replay a (env-only) ==
+local-ci-key
+== replay b (env-only) ==
+remote-ci-key
+== capture none (no .env) ==
+captured none -> .capdiff/none (1 files, 0 env vars)
+== diff a none (expect exit 2, API_KEY missing on none) ==
+ENV modified:
+  (none)
+ENV extra:
+  (none)
+ENV missing:
+  API_KEY=local-ci-key
+FILES modified:
+  (none)
+FILES extra:
+  readme.txt
+FILES missing:
+  .env
+  app.txt
+diff exit: 2
+demo ok

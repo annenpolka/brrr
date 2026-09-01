@@ -1,0 +1,72 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "The object of inquiry was a waiting process, not a log file.",
+    "trace output named a blocking external condition rather than only CPU.",
+    "The Dreamer used ps wchan and /proc/fd rather than a mock-service."
+  ],
+  "established": [
+    "list, trace, resume, mock-service, logs --follow.",
+    "attach PID, trace, resume refused to inject into a kernel pipe."
+  ],
+  "rejected": [
+    "Session IDs, correlation IDs, 300s timeout, and a mock that completes the wait are unverified.",
+    "PID 4712, inode 19388407, 128 bytes, and 5m17s blocked were not observations of this machine."
+  ],
+  "constraints": [
+    "There is no mock-service injector and no hidden session table.",
+    "The CLI may only observe real OS state (process, fds, syscalls it can actually see).",
+    "Operate on a real waiting process in this environment."
+  ],
+  "open_questions": [
+    "Without mocking, can one command say what a given PID is blocked on?"
+  ],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "Ask what a process is waiting for, as a first-class query over observable OS state."
+  ],
+  "affordance_assessment": {
+    "classification": "THIN_WRAPPER",
+    "core_operation": "report a process's wait channel and blocking file descriptor",
+    "nearest_existing_operation": "ps -o wchan, lsof -p, /proc/PID/fd",
+    "observable_delta": "bundled wording; no new query object after removing invented session lore",
+    "reason": "capability removal left ordinary process inspection; no untested delta that would change the class",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-01T22:23:21+09:00",
+      "summary": "devtool list/trace claims to name what a WAITING process is waiting for (HTTP validation). Mock-service then unblocks it. The mock is a crutch. The residue 'what is this process waiting for?' may survive as a real /proc+lsof composition.",
+      "pressure": [
+        "There is no mock-service and no session ID table. Continue using the same CLI on a real process that is actually waiting.",
+        "Show only what the OS can observe (fds, children, wchan, blocking read).",
+        "One-shot CLI: given a PID, print the wait object or honestly unknown."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "report what a process is currently blocked on",
+        "nearest_existing_operation": "lsof, strace, pstree, /proc/PID/wchan",
+        "observable_delta": "one query whose answer is the wait object; not yet shown on a real PID",
+        "reason": "worth one more turn on a real waiter; mock-service must die",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-01T22:31:50+09:00",
+      "summary": "Second turn still invented PID 4712, 128-byte waits, and a pipe writer. Observable residue is ps wchan + lsof of a blocking fd. That is a thin wrapper of existing OS tools.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "THIN_WRAPPER",
+        "core_operation": "report a process's wait channel and blocking file descriptor",
+        "nearest_existing_operation": "ps -o wchan, lsof -p, /proc/PID/fd",
+        "observable_delta": "bundled wording; no new query object after removing invented session lore",
+        "reason": "capability removal left ordinary process inspection; no untested delta that would change the class",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

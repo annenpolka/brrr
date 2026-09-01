@@ -183,6 +183,91 @@ class WhenceCLITests(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         self.assertIn("usage:", proc.stdout.lower() + proc.stderr.lower())
 
+    def test_messy_three_region_hybrid_and_missing_newline(self) -> None:
+        path = self.copy("messy.conflict")
+        self.assertFalse(path.read_bytes().endswith(b"\n"))
+        proc = run_cli(
+            "resolve",
+            str(path),
+            "--hybrid",
+            str(FIXTURES / "messy-hybrid.txt"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        resolved = path.read_bytes()
+        self.assertEqual(
+            resolved.decode("utf-8"),
+            'title = "app"\n'
+            'name = "Alice \\"lead\\""\n'
+            'role = "editor"\n'
+            "timeout = 90\n"
+            "debug = true\n"
+            "# eof",
+        )
+        self.assertFalse(resolved.endswith(b"\n"))
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["region_count"], 3)
+        self.assertFalse(doc["input_trailing_newline"])
+        self.assertFalse(doc["trailing_newline"])
+        self.assertEqual(doc["regions"][0]["mode"], "hybrid")
+        self.assertEqual(
+            [s["parent"] for s in doc["regions"][0]["spans"]],
+            ["ours", "theirs"],
+        )
+        self.assertIn("Alice", doc["regions"][0]["spans"][0]["text"])
+        self.assertEqual(doc["regions"][1]["spans"][0]["parent"], "theirs")
+        self.assertEqual(doc["regions"][2]["spans"][0]["parent"], "ours")
+
+    def test_messy_hybrid_block_mismatch_lists_regions(self) -> None:
+        path = self.copy("messy.conflict")
+        proc = run_cli(
+            "resolve",
+            str(path),
+            "--hybrid",
+            "-",
+            stdin='[ours:name = "Alice \\"lead\\""]\nrole = [theirs:"editor"]\n',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("MISSING tagged block", proc.stderr)
+        self.assertIn("region 2/3", proc.stderr)
+        self.assertIn("region 3/3", proc.stderr)
+        self.assertIn("<<<<<<<", path.read_text(encoding="utf-8"))
+
+    def test_messy_wrong_parent_quoted_name(self) -> None:
+        path = self.copy("messy.conflict")
+        proc = run_cli(
+            "resolve",
+            str(path),
+            "--choice",
+            "hybrid,theirs,ours",
+            "--hybrid",
+            "-",
+            stdin='[ours:name = "Bob \\"staff\\""]\nrole = "owner"\n',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("not in ours", proc.stderr)
+        self.assertIn("did you mean [theirs:...]", proc.stderr)
+        self.assertIn('Bob \\"staff\\"', proc.stderr)
+        self.assertNotIn("\\\\\"lead\\\\\"", proc.stderr)
+
+    def test_messy_untagged_mix_shows_parent_bodies(self) -> None:
+        path = self.copy("messy.conflict")
+        proc = run_cli(
+            "resolve",
+            str(path),
+            "--choice",
+            "hybrid,theirs,ours",
+            "--hybrid",
+            "-",
+            stdin='name = "Alice \\"lead\\""\nrole = "editor"\n',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("unmarked mix", proc.stderr)
+        self.assertIn("region 1/3", proc.stderr)
+        self.assertIn('role = "owner"', proc.stderr)
+        self.assertIn('role = "editor"', proc.stderr)
+        # one JSON escaping pass, not snippet-then-repr
+        self.assertNotIn("\\\\n", proc.stderr)
+
     def test_imported_parser_matches_cli(self) -> None:
         text = (FIXTURES / "simple.conflict").read_text(encoding="utf-8")
         parts = WHENCE.parse_conflicts(text, "simple.conflict")

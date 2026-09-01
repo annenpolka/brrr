@@ -42,7 +42,8 @@ size = [theirs:2]
 - `[ours:...]` must be a substring of the `<<<<<<<` side, consumed in order.
 - `[theirs:...]` must be a substring of the `>>>>>>>` side, consumed in order.
 - Untagged text must appear in **both** sides (common text).
-- A literal `]` inside a tag is written `\]`.
+- A literal `]` inside a tag is written `\]`. Other backslashes stay
+  (`\"` in the file is still `\"` inside a tag; it is not an escape).
 - Multiple hybrid regions are separate sidecar blocks split by a `%%` line.
 
 If you want a whole side, use `--ours` / `--theirs`. Pasting that side into

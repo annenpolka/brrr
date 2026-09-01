@@ -56,14 +56,134 @@ Python 3 stdlib only. `./demo.sh` also needs `git`.
 
 ## Empirical transcript
 
-See `demo-transcript.txt` for a full captured run. Filled after the first
-working execution; updated after dogfood.
+Captured from a real `./demo.sh` on 2026-09-01. Full output: `demo-transcript.txt`.
+zsh builtin `whence` is not used; commands are `python3 ./whence`.
+
+### ours-only
+
+```text
+$ python3 ./whence resolve simple.conflict --ours
+```
+
+Resolved file:
+
+```text
+# palette
+color = red
+size = 1
+# end
+```
+
+Provenance (stdout and `simple.conflict.prov`):
+
+```json
+{
+  "tool": "whence",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [2, 8],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [{"parent": "ours", "text": "color = red\nsize = 1\n"}]
+    }
+  ]
+}
+```
+
+### theirs-only
+
+Resolved file:
+
+```text
+# palette
+color = blue
+size = 2
+# end
+```
+
+mode `theirs`, span parent `theirs`, text `color = blue\nsize = 2\n`.
+
+### hybrid tagged success
+
+```text
+$ python3 ./whence resolve hybrid.conflict --hybrid fixtures/hybrid-tagged.txt
+```
+
+Resolved:
+
+```text
+# palette
+color = red
+size = 2
+# end
+```
+
+spans: `ours` `"color = red"`, `theirs` `"2"`.
+
+### untagged hybrid failure
+
+```text
+$ python3 ./whence resolve untagged.conflict --hybrid fixtures/untagged-mix.txt
+region 1/1 lines 2-8 (HEAD vs feature): untagged text "color = red\nsize = 2\n" is not a substring of ours or theirs (unmarked mix or invented text). Tag each contested span [ours:...] or [theirs:...].
+  ours (HEAD):
+    color = red
+    size = 1
+  theirs (feature):
+    color = blue
+    size = 2
+exit=1
+```
+
+Conflict markers remain in the file. No `.prov` is written.
+
+### nearest existing
+
+```text
+$ git merge-file -p --ours ours.txt base.txt theirs.txt
+color = red
+size = 1
+```
+
+git wrote a blob and stopped; no per-span parent list.
+
+### real two-branch git merge
+
+A throwaway repo with overlapping edits to `config.txt` (`value = 1` vs `value = 2`)
+produced two-parent markers after `merge.conflictStyle=merge`. `whence resolve
+--ours` kept `value = 1\n` and recorded `mode: ours`. This environment's default
+style is diff3; without the local config, git emitted `|||||||` and whence
+refused (see Failures).
+
+18 unittest cases against the shipped `./whence` file: OK.
 
 ## Dogfood
 
-First working commit uses `fixtures/simple.conflict` (one region). After that
-commit, a messier fixture (nested quotes, missing newline, three regions) is
-run for real and error messages are tightened from those failures.
+After the first working commit (`e755291`, simple one-region fixtures),
+`fixtures/messy.conflict` was run for real: three regions, nested `\"` quotes,
+and no trailing newline.
+
+Observed before the second commit:
+
+1. `[ours:name = "Bob \"staff\""]` was reported as not in *either* parent.
+   The tag parser treated every `\X` as an escape, so `\"` became `"`.
+   The file's real bytes are backslash-quote. Only `\]` and `\\` are now
+   escapes.
+2. Untagged-mix errors used `snippet()` then `!r`, so the demo printed
+   `'color = red\\nsize = 2\\n'` (double-escaped). Errors now use one JSON
+   encode and print both parent bodies.
+3. A two-block sidecar for a three-region file said "2 blocks but 3 hybrid
+   regions" without saying *which* region lacked a block. It now lists
+   `region 3/3 ... MISSING tagged block`.
+4. Provenance now records `trailing_newline` / `input_trailing_newline`.
+   The messy resolve keeps `# eof` without a final NL (xxd tail: `23 2065 6f66`).
+
+Successful messy hybrid (ours name + theirs role, theirs timeout, ours debug)
+is in `demo-transcript.txt` and `tests/test_whence.py`.
 
 ## Surprises
 
@@ -72,6 +192,10 @@ run for real and error messages are tightened from those failures.
   `--ours`, not an implicit hybrid.
 - `git merge-file --ours` already implements whole-hunk ours/theirs/union and
   emits no parentage.
+- This machine's git writes diff3 `|||||||` markers unless the repo overrides
+  `merge.conflictStyle`. That is a third hunk, not a second parent, and is
+  refused on purpose.
+- Nested quotes in source (`\"`) look like escapes but are file content.
 
 ## Failures
 
@@ -80,12 +204,15 @@ run for real and error messages are tightened from those failures.
 - Two parents only; octopus and diff3 base hunks are refused.
 - Binaries and non-UTF-8 files are refused.
 - A `]` inside tagged text must be escaped as `\]`.
+- Untagged mixed text is diagnosed as "not a substring of either parent"
+  rather than token-split into the two contributing sides.
 
 ## Suggested mutations
 
 - git mergetool / `merge` driver that writes `.prov` beside the worktree file.
 - Record provenance in a git note instead of a sidecar.
 - Align hybrid text with `difflib.SequenceMatcher` and propose tags.
+- Optionally strip a diff3 ancestor hunk and still track only ours/theirs.
 - Allow `--choice` values as a sidecar JSON of per-region decisions.
 
 ## Kill/keep

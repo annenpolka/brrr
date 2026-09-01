@@ -95,11 +95,50 @@ cat "$repo/config.txt"
 printf '%s\n' '--- whence --ours on the real conflict ---'
 "${WHENCE[@]}" resolve "$repo/config.txt" --ours
 
+banner "messy fixture: nested quotes, three regions, no trailing newline"
+"${WHENCE[@]}" report fixtures/messy.conflict
+copy messy.conflict
+set +e
+"${WHENCE[@]}" resolve "$SCRATCH/messy.conflict" --hybrid - <<'EOF'
+[ours:name = "Alice \"lead\""]
+role = [theirs:"editor"]
+%%
+timeout = [theirs:90]
+EOF
+messy_short_rc=$?
+set -e
+printf 'short sidecar exit=%s (expect nonzero; should name missing region 3)\n' "$messy_short_rc"
+copy messy.conflict
+set +e
+"${WHENCE[@]}" resolve "$SCRATCH/messy.conflict" --choice hybrid,theirs,ours --hybrid - <<'EOF'
+[ours:name = "Bob \"staff\""]
+role = "owner"
+EOF
+messy_wrong_rc=$?
+set -e
+printf 'wrong-parent quoted name exit=%s (expect nonzero; should point at theirs)\n' "$messy_wrong_rc"
+cp fixtures/messy.conflict "$SCRATCH/messy-ok.conflict"
+"${WHENCE[@]}" resolve "$SCRATCH/messy-ok.conflict" --hybrid fixtures/messy-hybrid.txt
+printf '%s\n' '--- messy resolved (no trailing newline) ---'
+cat "$SCRATCH/messy-ok.conflict"
+printf '\n%s\n' '--- xxd tail ---'
+tail -c 20 "$SCRATCH/messy-ok.conflict" | xxd
+
 banner "tests (shipped CLI)"
 "$PYTHON" -m unittest discover -s tests -v
-printf '\nall demo steps finished (untagged hybrid exit=%s)\n' "$untagged_rc"
+printf '\nall demo steps finished (untagged=%s messy-short=%s messy-wrong=%s)\n' \
+  "$untagged_rc" "$messy_short_rc" "$messy_wrong_rc"
+fail=0
 if [ "$untagged_rc" -eq 0 ]; then
   printf 'expected untagged hybrid to fail\n' >&2
-  exit 1
+  fail=1
 fi
-exit 0
+if [ "$messy_short_rc" -eq 0 ]; then
+  printf 'expected short messy sidecar to fail\n' >&2
+  fail=1
+fi
+if [ "$messy_wrong_rc" -eq 0 ]; then
+  printf 'expected wrong-parent quoted name to fail\n' >&2
+  fail=1
+fi
+exit "$fail"

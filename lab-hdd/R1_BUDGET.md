@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-01 22:26:44 JST
+Updated: 2026-09-01 22:45:48 JST
 
 ## Caps
 
@@ -12,11 +12,11 @@ Updated: 2026-09-01 22:26:44 JST
 
 ## Totals
 
-- Total R1 calls: **29**
-- Observed spend (OpenRouter usage delta): **$0.272361**
-- Conservative transcript estimate (sum): **$0.757761**
-- Remaining effective budget: **$9.727639**
-- Remaining vs $50 experiment cap: **$49.727639**
+- Total R1 calls: **32**
+- Observed spend (OpenRouter usage delta): **$0.294741**
+- Conservative transcript estimate (sum): **$0.832996**
+- Remaining effective budget: **$9.705259**
+- Remaining vs $50 experiment cap: **$49.705259**
 
 ## Pricing used for estimates
 
@@ -38,12 +38,15 @@ Updated: 2026-09-01 22:26:44 JST
 | hdd-env | 2 | 0.044036 | 0.051316 |
 | hdd-flake | 1 | 0.018459 | 0.025190 |
 | hdd-history | 2 | 0.002857 | 0.054577 |
+| hdd-ident | 1 | 0.005918 | 0.025044 |
 | hdd-log | 1 | 0.038052 | 0.026376 |
 | hdd-merge | 2 | 0.099901 | 0.053648 |
+| hdd-order | 1 | 0.000000 | 0.024636 |
 | hdd-patch | 1 | 0.021350 | 0.026027 |
 | hdd-perf | 1 | 0.021350 | 0.025247 |
 | hdd-pipe | 1 | 0.060584 | 0.025461 |
 | hdd-review | 1 | 0.010590 | 0.026240 |
+| hdd-silence | 1 | 0.005918 | 0.025555 |
 | hdd-test | 1 | 0.063164 | 0.025605 |
 | hdd-type | 1 | 0.074918 | 0.024946 |
 | hdd-wait | 2 | 0.034579 | 0.053091 |
@@ -53,7 +56,7 @@ Updated: 2026-09-01 22:26:44 JST
 
 | Phase | Calls | Observed USD | Estimated USD |
 | --- | ---: | ---: | ---: |
-| cambrian | 20 | 0.589637 | 0.515030 |
+| cambrian | 23 | 0.601473 | 0.590265 |
 | deepen | 9 | 0.280598 | 0.242731 |
 
 ## Call log
@@ -89,6 +92,9 @@ Updated: 2026-09-01 22:26:44 JST
 | 2026-09-01 22:18:03 JST | hdd-cross | 1 | cambrian | ok | 0.034579 | 0.027378 |
 | 2026-09-01 22:18:03 JST | hdd-pipe | 1 | cambrian | ok | 0.060584 | 0.025461 |
 | 2026-09-01 22:23:21 JST | hdd-wait | 2 | deepen | ok | 0.000000 | 0.027278 |
+| 2026-09-01 22:40:04 JST | hdd-order | 1 | cambrian | ok | 0.000000 | 0.024636 |
+| 2026-09-01 22:40:04 JST | hdd-silence | 1 | cambrian | ok | 0.005918 | 0.025555 |
+| 2026-09-01 22:40:04 JST | hdd-ident | 1 | cambrian | ok | 0.005918 | 0.025044 |
 
 ## Notes
 

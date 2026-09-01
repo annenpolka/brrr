@@ -1,6 +1,6 @@
 # HDD Evolution Report
 
-Experiment window: **2026-09-01 22:00 JST → 2026-09-02 09:00 JST** (this file drafted during Gen3; final jury and Tomorrow Test to be stamped in the 07:40–09:00 window).
+Experiment window: **2026-09-01 22:00 JST → 2026-09-02 09:00 JST**. Final jury stamped 07:40–08:20; preservation 08:20–09:00.
 
 Coordinator tree: `lab-hdd/`. Raw HDD: `.hdd/`. Previous brrr (`EVOLUTION_REPORT.md`, `lab/`) was not overwritten.
 
@@ -40,11 +40,12 @@ Deliberately small. Empty slots allowed.
 Install and try tomorrow:
 
 1. **envfrom** — everyday “why is this var empty?”
-2. **whence** — only if you merge with tagged hybrid, not `--ours`
+2. **whence** — tagged hybrid + provenance (rename on PATH; zsh owns `whence`)
+3–5. empty
 
-Remember without PATH: stated, owes, effect.
+Remember without PATH: stated, effect, owes.
 
-Empty remaining slots.
+Heretic installs nothing. Unix PATH is envfrom only. Disagreement stands. See `lab-hdd/TOMORROW.md`.
 
 ## 4. Weirdest HDD Discoveries
 

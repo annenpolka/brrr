@@ -51,3 +51,10 @@
 - hdd-order killed after turn 2 (THIN_WRAPPER of git+grep).
 - Prior-run hashes unchanged. Observed R1 ≈ $0.34 / $10 effective.
 - Next: keep Cambrian slots modestly full; First Selection 01:15 on real tools only.
+
+## 2026-09-01 23:18 JST — seventh embodiment
+
+- candidate-07 `hits` archived (hdd-empty). Empty search is exit 0; grep contrast documented.
+- hdd-partial killed NO_SURVIVOR (feasibility essay).
+- Observed R1 ≈ $0.40. Stop casual new HDD unless an unresolved pressure appears.
+- Seven real CLIs ready for First Selection at 01:15. Seal still in force.

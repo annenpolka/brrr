@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-01 22:45:48 JST
+Updated: 2026-09-01 22:50:37 JST
 
 ## Caps
 
@@ -12,11 +12,11 @@ Updated: 2026-09-01 22:45:48 JST
 
 ## Totals
 
-- Total R1 calls: **32**
-- Observed spend (OpenRouter usage delta): **$0.294741**
-- Conservative transcript estimate (sum): **$0.832996**
-- Remaining effective budget: **$9.705259**
-- Remaining vs $50 experiment cap: **$49.705259**
+- Total R1 calls: **34**
+- Observed spend (OpenRouter usage delta): **$0.324136**
+- Conservative transcript estimate (sum): **$0.886909**
+- Remaining effective budget: **$9.675864**
+- Remaining vs $50 experiment cap: **$49.675863**
 
 ## Pricing used for estimates
 
@@ -38,10 +38,10 @@ Updated: 2026-09-01 22:45:48 JST
 | hdd-env | 2 | 0.044036 | 0.051316 |
 | hdd-flake | 1 | 0.018459 | 0.025190 |
 | hdd-history | 2 | 0.002857 | 0.054577 |
-| hdd-ident | 1 | 0.005918 | 0.025044 |
+| hdd-ident | 2 | 0.018411 | 0.051766 |
 | hdd-log | 1 | 0.038052 | 0.026376 |
 | hdd-merge | 2 | 0.099901 | 0.053648 |
-| hdd-order | 1 | 0.000000 | 0.024636 |
+| hdd-order | 2 | 0.029395 | 0.051827 |
 | hdd-patch | 1 | 0.021350 | 0.026027 |
 | hdd-perf | 1 | 0.021350 | 0.025247 |
 | hdd-pipe | 1 | 0.060584 | 0.025461 |
@@ -57,7 +57,7 @@ Updated: 2026-09-01 22:45:48 JST
 | Phase | Calls | Observed USD | Estimated USD |
 | --- | ---: | ---: | ---: |
 | cambrian | 23 | 0.601473 | 0.590265 |
-| deepen | 9 | 0.280598 | 0.242731 |
+| deepen | 11 | 0.322487 | 0.296644 |
 
 ## Call log
 
@@ -95,6 +95,8 @@ Updated: 2026-09-01 22:45:48 JST
 | 2026-09-01 22:40:04 JST | hdd-order | 1 | cambrian | ok | 0.000000 | 0.024636 |
 | 2026-09-01 22:40:04 JST | hdd-silence | 1 | cambrian | ok | 0.005918 | 0.025555 |
 | 2026-09-01 22:40:04 JST | hdd-ident | 1 | cambrian | ok | 0.005918 | 0.025044 |
+| 2026-09-01 22:45:33 JST | hdd-ident | 2 | deepen | ok | 0.012493 | 0.026722 |
+| 2026-09-01 22:44:12 JST | hdd-order | 2 | deepen | ok | 0.029395 | 0.027191 |
 
 ## Notes
 

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Compare two local names under exactly one identity kind."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+
+KINDS = ("inode", "bytes", "json")
+USAGE = "usage: same --inode|--bytes|--json A B\navailable kinds: inode, bytes, json"
+
+
+def die_usage(msg: str | None = None) -> None:
+    if msg:
+        print(msg, file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_args(argv: list[str]) -> tuple[str, str, str]:
+    kinds: list[str] = []
+    paths: list[str] = []
+    for arg in argv:
+        if arg in ("-h", "--help"):
+            print(USAGE)
+            raise SystemExit(0)
+        if arg in ("--inode", "--bytes", "--json"):
+            kinds.append(arg[2:])
+        elif arg.startswith("-"):
+            die_usage(f"unknown option: {arg}")
+        else:
+            paths.append(arg)
+    if len(kinds) != 1 or len(paths) != 2:
+        die_usage()
+    return kinds[0], paths[0], paths[1]
+
+
+def inode_id(path: str) -> str:
+    st = os.lstat(path)
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def sha256_bytes(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_json(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+def die_path(path: str, message: str) -> None:
+    print(f"same: {path}: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def discriminator(kind: str, path: str) -> str:
+    try:
+        if kind == "inode":
+            return inode_id(path)
+        if kind == "bytes":
+            return f"sha256:{sha256_bytes(path)}"
+        return canonical_json(path)
+    except FileNotFoundError:
+        die_path(path, "No such file or directory")
+    except UnicodeDecodeError:
+        die_path(path, "not JSON (not UTF-8 text)")
+    except json.JSONDecodeError as exc:
+        die_path(path, f"not JSON ({exc})")
+    except OSError as exc:
+        die_path(path, exc.strerror or str(exc))
+    raise AssertionError("unreachable")
+
+
+def report(identical: bool, kind: str, left: str, right: str) -> int:
+    verdict = "IDENTICAL" if identical else "DISTINCT"
+    if identical:
+        print(f"{verdict} {kind} {left}")
+        return 0
+    print(f"{verdict} {kind} {left} {right}")
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    kind, a, b = parse_args(sys.argv[1:] if argv is None else argv)
+    left, right = discriminator(kind, a), discriminator(kind, b)
+    return report(left == right, kind, left, right)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,7 +3,7 @@
 **Phase:** HDD Cambrian Explosion (22:00–00:00)  
 **JST:** 2026-09-01 22:39  
 **R1 calls:** see `R1_BUDGET.md` (observed spend ~$0.29 of $10 effective / $50 hard)  
-**Embodiments:** 5 archived under `lab-hdd/lineages/candidate-*`  
+**Embodiments:** 6 archived under `lab-hdd/lineages/candidate-*`  
 **First Selection:** not started (seal in force)
 
 ## Harvested (USEFUL_COMPOSITION)
@@ -15,6 +15,7 @@
 | candidate-03 | owes | hdd-agent | in-tree obligations a change fails to keep |
 | candidate-04 | capdiff | hdd-ci | named env+file captures, diff, env replay |
 | candidate-05 | envfrom | hdd-env | per-variable env provenance (file empty override) |
+| candidate-06 | same | hdd-ident | exclusive identity kind: inode / bytes / json |
 
 ## Fossils (no further R1)
 

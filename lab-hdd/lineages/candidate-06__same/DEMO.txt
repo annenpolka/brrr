@@ -1,0 +1,72 @@
+worktree: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same
+branch: hdd/candidate-06-same
+HEAD: dda1292e713128926feea011d979db1f56b09b5c
+
+===== git log =====
+dda1292e713128926feea011d979db1f56b09b5c same: name missing files and reject binary --json
+00d95cb43da80bf1764c647fc19fdc9189365fcd same: compare two names under one required identity kind
+
+===== python3 -m unittest tests.test_same -v =====
+test_binary_vs_json_exit_1_no_traceback (tests.test_same.SameCLITests.test_binary_vs_json_exit_1_no_traceback) ... ok
+test_bytes_json_key_order_distinct (tests.test_same.SameCLITests.test_bytes_json_key_order_distinct) ... ok
+test_bytes_symlink_follows (tests.test_same.SameCLITests.test_bytes_symlink_follows) ... ok
+test_bytes_two_empties_identical (tests.test_same.SameCLITests.test_bytes_two_empties_identical) ... ok
+test_inode_hardlink_identical (tests.test_same.SameCLITests.test_inode_hardlink_identical) ... ok
+test_inode_symlink_vs_file_distinct (tests.test_same.SameCLITests.test_inode_symlink_vs_file_distinct) ... ok
+test_inode_two_empties_distinct (tests.test_same.SameCLITests.test_inode_two_empties_distinct) ... ok
+test_json_distinct_values (tests.test_same.SameCLITests.test_json_distinct_values) ... ok
+test_json_key_order_identical (tests.test_same.SameCLITests.test_json_key_order_identical) ... ok
+test_json_parse_error_exit_1 (tests.test_same.SameCLITests.test_json_parse_error_exit_1) ... ok
+test_missing_file_exit_1_no_traceback (tests.test_same.SameCLITests.test_missing_file_exit_1_no_traceback) ... ok
+test_omit_kind_exits_1_and_lists_kinds (tests.test_same.SameCLITests.test_omit_kind_exits_1_and_lists_kinds) ... ok
+test_two_kinds_exits_1_and_lists_kinds (tests.test_same.SameCLITests.test_two_kinds_exits_1_and_lists_kinds) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.226s
+
+OK
+
+===== ./demo.sh =====
+same demo — identity kind is required
+
+== omit-kind failure ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/a /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/b
+usage: same --inode|--bytes|--json A B
+available kinds: inode, bytes, json
+exit 1
+
+== inode hardlink identical ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --inode /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/hardlink/a /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/hardlink/b
+IDENTICAL inode 16777233:128975122
+exit 0
+
+== inode two empties distinct ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --inode /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/a /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/b
+DISTINCT inode 16777233:128975119 16777233:128975120
+exit 2
+
+== bytes two empties identical ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --bytes /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/a /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/b
+IDENTICAL bytes sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+exit 0
+
+== json key order identical ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --json /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/json/order-ba.json /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/json/order-ab.json
+IDENTICAL json {"a":2,"b":1}
+exit 0
+
+== bytes symlink follows ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --bytes /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/symlink/file /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/symlink/link
+IDENTICAL bytes sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03
+exit 0
+
+== missing file error ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --bytes /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/empty/a /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/no-such
+same: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/no-such: No such file or directory
+exit 1
+
+== binary vs json ==
++ python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/same --json /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/binary.bin /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/json/order-ab.json
+same: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-06-same/fixtures/binary.bin: not JSON (not UTF-8 text)
+exit 1
+

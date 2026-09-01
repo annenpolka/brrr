@@ -44,3 +44,10 @@
 - Archived (tests + demo×2): stated, owes, capdiff, envfrom, whence.
 - Additional fossils: hdd-flake, hdd-pipe, hdd-cross, hdd-wait (THIN_WRAPPER after pressure).
 - Observed spend ≈ $0.29. Seal still in force. No previous-brrr files shown to Dreamers/Grounders.
+
+## 2026-09-01 22:57 JST — six embodiments
+
+- candidate-06 `same` archived (hdd-ident). Tests 13 OK; demo×2 identical.
+- hdd-order killed after turn 2 (THIN_WRAPPER of git+grep).
+- Prior-run hashes unchanged. Observed R1 ≈ $0.34 / $10 effective.
+- Next: keep Cambrian slots modestly full; First Selection 01:15 on real tools only.

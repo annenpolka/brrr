@@ -1,19 +1,23 @@
 # HDD Ledger
 
-Iteration: 1
+Iteration: 2
 
 ## Preserve
 
 - The operator asked whether one development event could have caused another.
 - resolve refused to answer before traces existed, which is at least an honesty gesture inside the fiction.
+- resolve --temporal warned that proximity is not causation.
+- The useful correlation was a shared token (email) across a commit and a failure line.
 
 ## Established
 
 - Commands: inspect, trace, list, resolve.
+- source add, list --filter, inspect, trace, resolve --temporal.
 
 ## Rejected
 
 - Event IDs, timestamps, and parent-child links were generated, not observed.
+- commit a1b2c3d, timestamps, and test_run.log were not this repository.
 
 ## Constraints
 
@@ -36,17 +40,15 @@ Iteration: 1
 ## Affordance Assessment
 
 Classification: THIN_WRAPPER
-Core operation: query a causality graph for whether event A is an ancestor of event B
-Nearest existing operation: distributed tracing, journalctl, git log --follow
-Observable delta: not yet shown without a fictional event store
-Reason: current session is a renamed tracer; one more turn on real git/logs could change this
-Assessed at iteration: 1
+Core operation: ask whether earlier change A could have caused later observation B
+Nearest existing operation: git show plus grep of a log for identifiers from the diff
+Observable delta: none demonstrated beyond what git+rg already do; the CLI did not automate the link
+Reason: no untested delta remains that would change the class; do not send back to R1
+Assessed at iteration: 2
 
 ## Latest Red Pen Pressure
 
-- There is no event ID store. Continue using the same CLI on two real items in this repository (commits, test failures, or log files).
-- Do not invent identifiers or parent links. If evidence is insufficient, say so.
-- A useful answer is more than timestamp order.
+- (none)
 
 ## Pending
 

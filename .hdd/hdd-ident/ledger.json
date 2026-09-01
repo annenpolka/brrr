@@ -1,14 +1,20 @@
 {
-  "iteration": 1,
+  "iteration": 2,
   "preserve": [
     "The CLI takes two entities and reports identical vs distinct with a stated discriminator.",
-    "Hardlink vs distinct file and JSON key-order canonicalization were attempted locally."
+    "Hardlink vs distinct file and JSON key-order canonicalization were attempted locally.",
+    "Omitted kind exits nonzero and lists --inode --bytes --json.",
+    "Kinds are mutually exclusive.",
+    "--bytes follows symlinks; --inode does not treat symlink as the file.",
+    "Empty files: identical under --bytes, distinct under --inode."
   ],
   "established": [
-    "same A B; symlink treated as distinct type; JSON canonical match; schema mismatch error."
+    "same A B; symlink treated as distinct type; JSON canonical match; schema mismatch error.",
+    "same --inode, --bytes, --json on local files; JSON key-order independent; invalid JSON errors."
   ],
   "rejected": [
-    "https ETag, docker digest, postgres vs mongodb schema counts are unsupported."
+    "https ETag, docker digest, postgres vs mongodb schema counts are unsupported.",
+    "Printed sha256 prefixes were not computed in this environment as shown."
   ],
   "constraints": [
     "No network, docker, or database protocols.",
@@ -20,15 +26,16 @@
   ],
   "human_pressure": [],
   "harvest_candidates": [
-    "Ask whether two local names are the same under an explicit identity kind, and refuse if the kind is unspecified."
+    "Ask whether two local names are the same under an explicit identity kind, and refuse if the kind is unspecified.",
+    "Compare two local paths under exactly one explicit identity kind."
   ],
   "affordance_assessment": {
     "classification": "USEFUL_COMPOSITION",
-    "core_operation": "compare two local names under an explicit identity kind and report the discriminator",
-    "nearest_existing_operation": "stat inodes, cmp/shasum, jq -S",
-    "observable_delta": "one command that names the identity kind and refuses mixed kinds; not yet shown without network lore",
-    "reason": "worth one local-only turn; do not add more entity types",
-    "iteration": 1
+    "core_operation": "compare two local names under exactly one explicit identity kind (inode, bytes, or canonical JSON)",
+    "nearest_existing_operation": "stat, cmp, jq -S",
+    "observable_delta": "refuses mixed or omitted identity kind; one verb for three discriminators with named output",
+    "reason": "not a new identity theory; the exclusive-kind contract is harvestable; further dreaming would add directory lore",
+    "iteration": 2
   },
   "history": [
     {
@@ -48,12 +55,22 @@
         "reason": "worth one local-only turn; do not add more entity types",
         "iteration": 1
       }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-01T22:50:13+09:00",
+      "summary": "Second turn: same requires an exclusive --inode/--bytes/--json kind, lists kinds if omitted, and empty files are byte-identical but inode-distinct. Network lore is gone. Harvest. Invented sha256 prefixes are not evidence.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "compare two local names under exactly one explicit identity kind (inode, bytes, or canonical JSON)",
+        "nearest_existing_operation": "stat, cmp, jq -S",
+        "observable_delta": "refuses mixed or omitted identity kind; one verb for three discriminators with named output",
+        "reason": "not a new identity theory; the exclusive-kind contract is harvestable; further dreaming would add directory lore",
+        "iteration": 2
+      }
     }
   ],
-  "last_pressure": [
-    "There is no network and no container registry. Continue on real local files only.",
-    "The identity kind must be an explicit flag. If omitted, list possible kinds and exit nonzero.",
-    "Do not invent ETags, digests, or schemas."
-  ],
+  "last_pressure": [],
   "pending": null
 }

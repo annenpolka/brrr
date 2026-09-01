@@ -1,19 +1,25 @@
 # HDD Ledger
 
-Iteration: 1
+Iteration: 2
 
 ## Preserve
 
 - The CLI takes two entities and reports identical vs distinct with a stated discriminator.
 - Hardlink vs distinct file and JSON key-order canonicalization were attempted locally.
+- Omitted kind exits nonzero and lists --inode --bytes --json.
+- Kinds are mutually exclusive.
+- --bytes follows symlinks; --inode does not treat symlink as the file.
+- Empty files: identical under --bytes, distinct under --inode.
 
 ## Established
 
 - same A B; symlink treated as distinct type; JSON canonical match; schema mismatch error.
+- same --inode, --bytes, --json on local files; JSON key-order independent; invalid JSON errors.
 
 ## Rejected
 
 - https ETag, docker digest, postgres vs mongodb schema counts are unsupported.
+- Printed sha256 prefixes were not computed in this environment as shown.
 
 ## Constraints
 
@@ -32,21 +38,20 @@ Iteration: 1
 ## Harvest Candidates
 
 - Ask whether two local names are the same under an explicit identity kind, and refuse if the kind is unspecified.
+- Compare two local paths under exactly one explicit identity kind.
 
 ## Affordance Assessment
 
 Classification: USEFUL_COMPOSITION
-Core operation: compare two local names under an explicit identity kind and report the discriminator
-Nearest existing operation: stat inodes, cmp/shasum, jq -S
-Observable delta: one command that names the identity kind and refuses mixed kinds; not yet shown without network lore
-Reason: worth one local-only turn; do not add more entity types
-Assessed at iteration: 1
+Core operation: compare two local names under exactly one explicit identity kind (inode, bytes, or canonical JSON)
+Nearest existing operation: stat, cmp, jq -S
+Observable delta: refuses mixed or omitted identity kind; one verb for three discriminators with named output
+Reason: not a new identity theory; the exclusive-kind contract is harvestable; further dreaming would add directory lore
+Assessed at iteration: 2
 
 ## Latest Red Pen Pressure
 
-- There is no network and no container registry. Continue on real local files only.
-- The identity kind must be an explicit flag. If omitted, list possible kinds and exit nonzero.
-- Do not invent ETags, digests, or schemas.
+- (none)
 
 ## Pending
 

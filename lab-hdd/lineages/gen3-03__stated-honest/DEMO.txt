@@ -1,0 +1,163 @@
+======== disagree (config.yaml timeout: 5 vs app.py timeout = 10) ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/disagree
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/disagree
+status: DISAGREE
+disagreement:
+  declared     5	config.yaml:1	timeout: 5	value=5
+  contradicted 10	app.py:3	timeout = 10	value=10
+exit: 2
+
+======== agree (both 5) ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/agree
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/agree
+status: AGREE
+value: 5
+declarations:
+  config.yaml:1	timeout: 5	value=5
+assignments:
+  app.py:3	timeout = 5	value=5
+exit: 0
+
+======== config only ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/config_only
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/config_only
+status: DECLARED_ONLY
+value: 5
+declarations:
+  config.yaml:1	timeout: 5	value=5
+exit: 0
+
+======== unknown (interpolation vs getenv) — honest non-comparison ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/unknown
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/unknown
+status: UNKNOWN
+note: sites found, none statically comparable
+declarations:
+  config.yaml:1	timeout: ${WAIT}	value=${WAIT (not comparable: interpolation)
+assignments:
+  app.py:3	timeout = os.getenv("WAIT")	value=os.getenv("WAIT") (not comparable: call)
+exit: 0
+
+======== comments vs real assignment (docstring/block-comment 99 ignored) ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/comments
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/comments
+status: AGREE
+value: 5
+declarations:
+  config.yaml:1	timeout: 5	value=5
+assignments:
+  app.py:7	timeout = 5	value=5
+  legacy.c:6	int timeout = 5;	value=5
+comments (ignored for comparison):
+  config.yaml:2	# timeout: 99	value=99
+  app.py:4	timeout = 99	value=99
+  app.py:9	# timeout = 99	value=99
+  legacy.c:3	timeout = 99;	value=99
+exit: 0
+
+======== json disagreement pair ========
++ python3 stated --json timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/disagree
+{
+  "key": "timeout",
+  "directory": "/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/disagree",
+  "status": "disagree",
+  "agreed_value": null,
+  "note": null,
+  "declarations": [
+    {
+      "path": "config.yaml",
+      "line": 1,
+      "text": "timeout: 5",
+      "side": "declaration",
+      "raw_value": "5",
+      "comparable": true,
+      "reason": null,
+      "in_comment": false
+    }
+  ],
+  "assignments": [
+    {
+      "path": "app.py",
+      "line": 3,
+      "text": "timeout = 10",
+      "side": "assignment",
+      "raw_value": "10",
+      "comparable": true,
+      "reason": null,
+      "in_comment": false
+    }
+  ],
+  "comments": [],
+  "pairs": [
+    {
+      "declaration": {
+        "path": "config.yaml",
+        "line": 1,
+        "text": "timeout: 5",
+        "side": "declaration",
+        "raw_value": "5",
+        "comparable": true,
+        "reason": null,
+        "in_comment": false
+      },
+      "contradiction": {
+        "path": "app.py",
+        "line": 3,
+        "text": "timeout = 10",
+        "side": "assignment",
+        "raw_value": "10",
+        "comparable": true,
+        "reason": null,
+        "in_comment": false
+      },
+      "declared_value": "5",
+      "contradicted_value": "10"
+    }
+  ]
+}
+exit: 2
+
+======== compact JSON object member (one-line {"timeout": 5}) ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/compact_json
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/compact_json
+status: DISAGREE
+disagreement:
+  declared     5	config.json:1	{"timeout": 5, "host": "localhost"}	value=5
+  contradicted 10	app.py:1	timeout = 10	value=10
+exit: 2
+
+======== dotenv is env-layer not a declaration (timeout vs TIMEOUT=30 / timeout=99) ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/dotenv_not_decl
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/dotenv_not_decl
+status: DISAGREE
+disagreement:
+  declared     5	config.yaml:1	timeout: 5	value=5
+  contradicted 10	app.py:3	timeout = 10	value=10
+exit: 2
+
+======== dotenv TIMEOUT is NONE, not DECLARED_ONLY ========
++ python3 stated TIMEOUT /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/dotenv_not_decl
+key: TIMEOUT
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/dotenv_not_decl
+status: NONE
+note: no declaration or assignment sites
+sites: (none)
+exit: 0
+
+======== string literal timeout = 99 is not an assignment ========
++ python3 stated timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/strlit
+key: timeout
+dir: /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-03-stated-honest/fixtures/strlit
+status: DECLARED_ONLY
+value: 5
+declarations:
+  config.yaml:1	timeout: 5	value=5
+exit: 0
+

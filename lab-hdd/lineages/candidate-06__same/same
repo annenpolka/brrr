@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import stat
 import sys
 
 KINDS = ("inode", "bytes", "json")
@@ -42,7 +44,17 @@ def inode_id(path: str) -> str:
     return f"{st.st_dev}:{st.st_ino}"
 
 
+def require_regular(path: str) -> None:
+    """--bytes/--json hash contents; FIFOs and /dev/zero have no EOF."""
+    st = os.stat(path)
+    if stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.EISDIR, "Is a directory")
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file")
+
+
 def sha256_bytes(path: str) -> str:
+    require_regular(path)
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
@@ -51,6 +63,7 @@ def sha256_bytes(path: str) -> str:
 
 
 def canonical_json(path: str) -> str:
+    require_regular(path)
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     return json.dumps(data, sort_keys=True, separators=(",", ":"))

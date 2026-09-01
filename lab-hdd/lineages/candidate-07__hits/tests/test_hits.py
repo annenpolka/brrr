@@ -162,6 +162,27 @@ class HitsCLITest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("--glob", r.stderr)
 
+    def test_nested_unreadable_dir_exits_3(self):
+        tmp = tempfile.mkdtemp(prefix="hits-nested-eacces-")
+        try:
+            root = Path(tmp)
+            (root / "open").mkdir()
+            (root / "secret").mkdir()
+            (root / "open" / "a.txt").write_text("nothing\n", encoding="utf-8")
+            (root / "secret" / "hidden.txt").write_text("needle hidden\n", encoding="utf-8")
+            os.chmod(root / "secret", 0)
+            r = run("needle", str(root))
+            self.assertEqual(r.returncode, 3)
+            self.assertIn("unreadable", r.stderr)
+            self.assertNotEqual(r.stdout, "0 matches\n")
+        finally:
+            os.chmod(Path(tmp) / "secret", stat.S_IRWXU)
+            (Path(tmp) / "secret" / "hidden.txt").unlink()
+            (Path(tmp) / "secret").rmdir()
+            (Path(tmp) / "open" / "a.txt").unlink()
+            (Path(tmp) / "open").rmdir()
+            os.rmdir(tmp)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,8 @@ CONST_ASSIGN_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s*=")
 MUST_EXIST_RE = re.compile(r"MUST exist:\s*([^\s`]+)", re.IGNORECASE)
 REQUIRED_FILE_RE = re.compile(r"required file:\s*([^\s`]+)", re.IGNORECASE)
 SKIP_DIR_NAMES = {".git", "__pycache__", "node_modules", ".hg", ".svn"}
+# Unified-diff file/hunk headers are "--- ", "+++ ", "@@ " (space/tab required).
+# A deleted line "--def foo():" is encoded as "---def foo():" and is NOT a header.
 KEYWORDS = {
     "None",
     "True",
@@ -271,11 +273,30 @@ def removed_identifiers(diff_text: str) -> list[str]:
     return found
 
 
+def is_diff_meta_line(line: str) -> bool:
+    """True for unified-diff headers, not for hunk content that merely starts with ---."""
+    if line.startswith("@@ ") or line.startswith("@@\t"):
+        return True
+    if line.startswith("diff --git "):
+        return True
+    if line.startswith("--- ") or line.startswith("---\t"):
+        return True
+    if line.startswith("+++ ") or line.startswith("+++\t"):
+        return True
+    if line in ("---", "+++"):
+        return True
+    if line.startswith("index ") or line.startswith("new file mode "):
+        return True
+    if line.startswith("deleted file mode ") or line.startswith("similarity index "):
+        return True
+    if line.startswith("rename from ") or line.startswith("rename to "):
+        return True
+    return False
+
+
 def minus_lines(diff_text: str) -> Iterator[str]:
     for line in diff_text.splitlines():
-        if line.startswith("---") or line.startswith("+++"):
-            continue
-        if line.startswith("@@"):
+        if is_diff_meta_line(line):
             continue
         if line.startswith("-"):
             yield line[1:]
@@ -286,12 +307,12 @@ def plus_lines_by_file(diff_text: str) -> dict[str, set[str]]:
     current: str | None = None
     mapping: dict[str, set[str]] = {}
     for line in diff_text.splitlines():
-        if line.startswith("+++"):
+        if line.startswith("+++ ") or line.startswith("+++\t"):
             current = path_from_diff_header(line)
             if current:
                 mapping.setdefault(current, set())
             continue
-        if line.startswith("---") or line.startswith("@@"):
+        if is_diff_meta_line(line):
             continue
         if current and line.startswith("+"):
             mapping[current].add(line[1:].strip())
@@ -416,8 +437,15 @@ def clean_required_path(raw: str) -> str:
 
 
 def companion_exists(tree: Path, named: str) -> bool:
+    """Companions are paths in the remaining tree, not host absolute paths."""
     candidate = Path(named)
     if candidate.is_absolute():
+        try:
+            tree_res = tree.resolve()
+            cand_res = candidate.resolve()
+            cand_res.relative_to(tree_res)
+        except (OSError, ValueError):
+            return False
         return candidate.exists()
     return (tree / named).exists()
 

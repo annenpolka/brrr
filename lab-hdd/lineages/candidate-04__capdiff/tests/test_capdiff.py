@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests drive the shipped capdiff CLI via subprocess."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -180,6 +181,52 @@ class CapdiffCLITests(unittest.TestCase):
         r = run_cli(["capture", "../x", FIX_A], cwd=self.td)
         self.assertEqual(r.returncode, 1)
         self.assertIn("NAME", r.stderr)
+
+    def test_dot_name_rejected(self):
+        r = run_cli(["capture", ".", FIX_A], cwd=self.td)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NAME", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_dotdot_name_rejected(self):
+        nest = os.path.join(self.td, "nest")
+        os.mkdir(nest)
+        r = run_cli(["capture", "..", FIX_A], cwd=nest)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NAME", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertTrue(os.path.isdir(self.td))
+
+    def test_corrupt_manifest_no_traceback(self):
+        self.assertEqual(run_cli(["capture", "good", FIX_A], cwd=self.td).returncode, 0)
+        bad = os.path.join(self.td, ".capdiff", "bad")
+        os.makedirs(bad)
+        with open(os.path.join(bad, "manifest.json"), "w") as fh:
+            fh.write("{not json")
+        r = run_cli(["diff", "good", "bad"], cwd=self.td)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("corrupt capture", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_truncated_captures_are_not_identical(self):
+        store = os.path.join(self.td, ".capdiff")
+        for name in ("a", "b"):
+            dest = os.path.join(store, name)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "manifest.json"), "w") as fh:
+                json.dump(
+                    {
+                        "name": name,
+                        "env": {},
+                        "files": {"app.txt": "abc"},
+                        "truncated": True,
+                    },
+                    fh,
+                )
+        r = run_cli(["diff", "a", "b"], cwd=self.td)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("truncated", r.stdout.lower())
+        self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

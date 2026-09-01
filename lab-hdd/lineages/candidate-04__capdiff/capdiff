@@ -72,8 +72,13 @@ def capture_path(name, cwd=None):
 
 
 def validate_name(name):
-    if not NAME_RE.match(name):
+    if not NAME_RE.match(name) or name in (".", ".."):
         eprint("capdiff: NAME must match %s" % NAME_RE.pattern)
+        return False
+    dest = os.path.abspath(capture_path(name))
+    root = os.path.abspath(store_root())
+    if os.path.dirname(dest) != root:
+        eprint("capdiff: NAME must be a single path segment")
         return False
     return True
 
@@ -152,8 +157,11 @@ def load_manifest(name, cwd=None):
     path = os.path.join(capture_path(name, cwd), MANIFEST_NAME)
     if not os.path.isfile(path):
         raise FileNotFoundError("capdiff: capture not found: %s" % name)
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError("capdiff: corrupt capture %s: %s" % (name, exc)) from exc
 
 
 def cmd_capture(name, src):
@@ -222,6 +230,9 @@ def cmd_diff(name_a, name_b):
     except FileNotFoundError as exc:
         eprint(str(exc))
         return 1
+    except (ValueError, OSError) as exc:
+        eprint(str(exc))
+        return 1
     env_a = a.get("env") or {}
     env_b = b.get("env") or {}
     files_a = a.get("files") or {}
@@ -272,6 +283,15 @@ def cmd_diff(name_a, name_b):
     _section("FILES extra", files_extra)
     _section("FILES missing", files_missing)
 
+    trunc_a = bool(a.get("truncated"))
+    trunc_b = bool(b.get("truncated"))
+    if trunc_a or trunc_b:
+        print("truncated: comparison incomplete (file cap %d)" % MAX_FILES)
+        if trunc_a:
+            print("  A: %s" % name_a)
+        if trunc_b:
+            print("  B: %s" % name_b)
+
     delta = (
         env_modified
         or env_extra
@@ -279,6 +299,8 @@ def cmd_diff(name_a, name_b):
         or files_modified
         or files_extra
         or files_missing
+        or trunc_a
+        or trunc_b
     )
     return 2 if delta else 0
 
@@ -314,6 +336,9 @@ def cmd_replay(argv):
     try:
         manifest = load_manifest(name)
     except FileNotFoundError as exc:
+        eprint(str(exc))
+        return 1
+    except (ValueError, OSError) as exc:
         eprint(str(exc))
         return 1
     if copy_files:

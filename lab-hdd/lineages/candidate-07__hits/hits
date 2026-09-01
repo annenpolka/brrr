@@ -96,11 +96,17 @@ def glob_ok(path, root, glob_pat):
     return fnmatch.fnmatch(rel, glob_pat) or fnmatch.fnmatch(path.name, glob_pat)
 
 
-def iter_files(root, glob_pat=None):
+def iter_files(root, glob_pat=None, errors=None):
     root = Path(root)
     if is_under_git(root):
         return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    def onerror(exc):
+        if errors is not None:
+            errors.append(exc)
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=onerror
+    ):
         dirnames[:] = sorted(d for d in dirnames if d != ".git")
         for name in sorted(filenames):
             path = Path(dirpath) / name
@@ -143,25 +149,31 @@ def search(pattern, directory, regex=False, glob_pat=None):
     compiled = compile_query(pattern, regex)
     ensure_readable_dir(directory)
     found = []
-    for path in iter_files(directory, glob_pat=glob_pat):
+    errors = []
+    for path in iter_files(directory, glob_pat=glob_pat, errors=errors):
         lines = read_lines(path)
         if lines is None:
             continue
         for n, line in enumerate(lines, 1):
             if line_matches(line, pattern, compiled):
                 found.append(f"{path}:{n}:{line}")
-    return found
+    return found, errors
 
 
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     pattern, directory, regex, glob_pat = parse_argv(argv)
-    found = search(pattern, directory, regex=regex, glob_pat=glob_pat)
+    found, errors = search(pattern, directory, regex=regex, glob_pat=glob_pat)
     if found:
         sys.stdout.write("\n".join(found) + "\n")
-    else:
+    elif not errors:
         print("0 matches")
+    if errors:
+        for exc in errors:
+            name = getattr(exc, "filename", None) or str(exc)
+            print(f"hits: unreadable: {name}", file=sys.stderr)
+        return EXIT_IO
     return 0
 
 

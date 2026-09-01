@@ -304,6 +304,56 @@ class CapdiffCLITests(unittest.TestCase):
         self.assertIn("not found", r.stderr)
         self.assertEqual(r.stdout, "")
 
+    def test_dot_name_rejected(self):
+        r = run_cli(["capture", ".", FIX_A], cwd=self.td)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NAME", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_dotdot_name_rejected(self):
+        nest = os.path.join(self.td, "nest")
+        os.mkdir(nest)
+        r = run_cli(["capture", "..", FIX_A], cwd=nest)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NAME", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertTrue(os.path.isdir(self.td))
+
+    def test_corrupt_manifest_no_traceback(self):
+        self.assertEqual(run_cli(["capture", "good", FIX_A], cwd=self.td).returncode, 0)
+        bad = os.path.join(self.td, ".capdiff", "bad")
+        os.makedirs(bad)
+        with open(os.path.join(bad, "manifest.json"), "w") as fh:
+            fh.write("{not json")
+        r = run_cli(["diff", "good", "bad", "--json"], cwd=self.td)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("corrupt capture", r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_truncated_captures_are_not_identical(self):
+        store = os.path.join(self.td, ".capdiff")
+        for name in ("a", "b"):
+            dest = os.path.join(store, name)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "manifest.json"), "w") as fh:
+                json.dump(
+                    {
+                        "name": name,
+                        "env": {},
+                        "files": {"app.txt": "abc"},
+                        "truncated": True,
+                    },
+                    fh,
+                )
+        text = run_cli(["diff", "a", "b"], cwd=self.td)
+        self.assertEqual(text.returncode, 2, text.stdout + text.stderr)
+        self.assertIn("truncated", text.stdout.lower())
+        js = run_cli(["diff", "a", "b", "--json"], cwd=self.td)
+        self.assertEqual(js.returncode, 2, js.stdout + js.stderr)
+        payload = json.loads(js.stdout)
+        self.assertEqual(payload["truncated"], {"a": True, "b": True})
+
 
 if __name__ == "__main__":
     unittest.main()

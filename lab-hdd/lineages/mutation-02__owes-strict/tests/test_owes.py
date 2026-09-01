@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -113,6 +114,47 @@ class OwesCLITests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["unkept_references"], [])
         self.assertEqual(payload["missing_companions"], [])
+
+    def test_deleted_line_starting_with_dashes_is_still_a_minus_line(self) -> None:
+        """A deleted `--def name():` is encoded `---def name():`, not a --- header."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = root / "tree"
+            tree.mkdir()
+            (tree / "README.md").write_text(
+                "Call `validate_input` please\n", encoding="utf-8"
+            )
+            (tree / "app.py").write_text("def main():\n    print('ok')\n", encoding="utf-8")
+            (root / "change.diff").write_text(
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -1,3 +1,2 @@\n"
+                "---def validate_input(value):\n"
+                " def main():\n"
+                "     print('ok')\n",
+                encoding="utf-8",
+            )
+            result = run_owes(str(root))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("validate_input", result.stdout)
+        self.assertIn("unkept references", result.stdout)
+
+    def test_absolute_host_path_is_not_a_tree_companion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = root / "tree"
+            tree.mkdir()
+            (tree / "guide.md").write_text(
+                "MUST exist: /etc/passwd\nrequired file: /no/such/owes-host-path\n",
+                encoding="utf-8",
+            )
+            (root / "change.diff").write_text("", encoding="utf-8")
+            result = run_owes("--json", str(root))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        paths = {item["path"] for item in payload["missing_companions"]}
+        self.assertIn("/etc/passwd", paths)
+        self.assertIn("/no/such/owes-host-path", paths)
 
 
 if __name__ == "__main__":

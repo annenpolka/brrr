@@ -148,6 +148,33 @@ class SameCLITests(unittest.TestCase):
         self.assertEqual(proc.stderr, f"same: {blob}: not JSON (not UTF-8 text)\n")
         self.assertNotIn("Traceback", proc.stderr + proc.stdout)
 
+    def test_bytes_directory_exit_1(self) -> None:
+        proc = run("--bytes", str(FIX / "empty"), str(FIX / "empty" / "a"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Is a directory", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_bytes_fifo_exit_1_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "pipe"
+            os.mkfifo(fifo)
+            regular = Path(tmp) / "file"
+            regular.write_text("x\n", encoding="utf-8")
+            proc = run("--bytes", str(fifo), str(regular))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not a regular file", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_inode_directories_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            left = Path(tmp) / "a"
+            right = Path(tmp) / "b"
+            left.mkdir()
+            right.mkdir()
+            proc = run("--inode", str(left), str(right))
+        self.assertEqual(proc.returncode, 2)
+        self.assertTrue(proc.stdout.startswith("DISTINCT inode "))
+
 
 if __name__ == "__main__":
     unittest.main()

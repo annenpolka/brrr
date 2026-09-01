@@ -74,8 +74,13 @@ def capture_path(name, cwd=None):
 
 
 def validate_name(name):
-    if not NAME_RE.match(name):
+    if not NAME_RE.match(name) or name in (".", ".."):
         eprint("capdiff: NAME must match %s" % NAME_RE.pattern)
+        return False
+    dest = os.path.abspath(capture_path(name))
+    root = os.path.abspath(store_root())
+    if os.path.dirname(dest) != root:
+        eprint("capdiff: NAME must be a single path segment")
         return False
     return True
 
@@ -154,8 +159,11 @@ def load_manifest(name, cwd=None):
     path = os.path.join(capture_path(name, cwd), MANIFEST_NAME)
     if not os.path.isfile(path):
         raise FileNotFoundError("capdiff: capture not found: %s" % name)
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError("capdiff: corrupt capture %s: %s" % (name, exc)) from exc
 
 
 def cmd_capture(name, src):
@@ -312,7 +320,7 @@ def render_text(delta):
     _section("FILES missing", files_missing)
 
 
-def render_json(name_a, name_b, delta):
+def render_json(name_a, name_b, delta, trunc_a=False, trunc_b=False):
     """Machine record. extra/missing are objects, never the text-mode KEY=value line."""
     payload = {
         "a": name_a,
@@ -346,6 +354,8 @@ def render_json(name_a, name_b, delta):
             ],
         },
     }
+    if trunc_a or trunc_b:
+        payload["truncated"] = {"a": bool(trunc_a), "b": bool(trunc_b)}
     print(json.dumps(payload, sort_keys=True))
 
 
@@ -375,12 +385,23 @@ def cmd_diff(name_a, name_b, json_mode=False):
     except FileNotFoundError as exc:
         eprint(str(exc))
         return 1
+    except (ValueError, OSError) as exc:
+        eprint(str(exc))
+        return 1
     delta = compute_delta(a, b)
+    trunc_a = bool(a.get("truncated"))
+    trunc_b = bool(b.get("truncated"))
     if json_mode:
-        render_json(name_a, name_b, delta)
+        render_json(name_a, name_b, delta, trunc_a, trunc_b)
     else:
         render_text(delta)
-    return 2 if delta_has_changes(delta) else 0
+        if trunc_a or trunc_b:
+            print("truncated: comparison incomplete (file cap %d)" % MAX_FILES)
+            if trunc_a:
+                print("  A: %s" % name_a)
+            if trunc_b:
+                print("  B: %s" % name_b)
+    return 2 if (delta_has_changes(delta) or trunc_a or trunc_b) else 0
 
 
 def cmd_replay(argv):
@@ -414,6 +435,9 @@ def cmd_replay(argv):
     try:
         manifest = load_manifest(name)
     except FileNotFoundError as exc:
+        eprint(str(exc))
+        return 1
+    except (ValueError, OSError) as exc:
         eprint(str(exc))
         return 1
     if copy_files:

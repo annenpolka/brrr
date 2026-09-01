@@ -23,8 +23,9 @@ Unlocked after First Selection. See `PRIOR_RUN_COMPARISON.md`.
 
 ## Grounder ∥ clean-room Grounder
 
-(none yet)
+- **stated ∥ reimpl-01 stated** (2026-09-02 02:16): independent implementation recovered declaration-vs-assignment disagreement (exit 2 pair). CLI hashes differ (`a5dd1050…` vs `a27d4bba…`). Primitive stronger than the original file.
 
 ## Mutation ∥ independent reimplementation
 
-(none yet)
+- **hybrid-01 effect** binds stated’s pair with envfrom provenance as one record (not concatenated CLIs).
+- **mutation-02 owes-strict** independently tightened the companion landmine Skeptic found.

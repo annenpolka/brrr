@@ -1,4 +1,9 @@
-# Snapshot for the next heartbeat (2026-09-01 23:18 JST)
+# Snapshot for the next heartbeat (2026-09-02 01:27 JST)
+
+First Selection complete. KEEP: whence, envfrom, stated, owes, capdiff, same. Park hits.
+Previous brrr unlocked. See FIRST_SELECTION.md and PRIOR_RUN_COMPARISON.md.
+
+At 02:00 start Gen2: ordinary mutation, clean-room stated, hybrid stated×envfrom, optional HDD jump if budget.
 
 Phase: Cambrian until 00:00. Reality classifications already exist for continuing lineages. First Selection 01:15.
 

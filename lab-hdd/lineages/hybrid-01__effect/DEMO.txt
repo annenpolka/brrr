@@ -1,0 +1,191 @@
+======== disagree (config 5 vs source 10; .env TIMEOUT=30 still in ENV_SOURCE) ========
++ python3 effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/disagree
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  app.py:3	timeout = 10	value=10
+ENV_SOURCE:
+  timeout	unset	why=key
+  TIMEOUT	file:.env:2	value=30	INHERITED: (unset)	why=case-variant
+EFFECTIVE:
+  unknown	declared 5 vs assigned 10
+exit: 2
+
+======== disagree with inherited TIMEOUT=from-shell ========
++ env TIMEOUT=from-shell python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/disagree
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  app.py:3	timeout = 10	value=10
+ENV_SOURCE:
+  timeout	unset	why=key
+  TIMEOUT	file:.env:2	value=30	INHERITED: from-shell	why=case-variant
+EFFECTIVE:
+  unknown	declared 5 vs assigned 10
+exit: 2
+
+======== agree (both 5, env unset) ========
++ python3 effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/agree
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  app.py:3	timeout = 5	value=5
+ENV_SOURCE:
+  timeout	unset	why=key
+EFFECTIVE:
+  5
+exit: 0
+
+======== config only ========
++ python3 effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/config_only
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  (none)
+ENV_SOURCE:
+  timeout	unset	why=key
+EFFECTIVE:
+  5
+exit: 0
+
+======== empty override (declared 5, getenv TIMEOUT, file TIMEOUT=) ========
++ env TIMEOUT=/already/set python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/empty-override
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  app.py:3	timeout = os.getenv("TIMEOUT", "5")	value=os.getenv("TIMEOUT", "5") (not comparable: call)
+ENV_SOURCE:
+  timeout	unset	why=key
+  TIMEOUT	file:.env:2	value=(empty)	EMPTY_OVERRIDE: yes	INHERITED: /already/set	why=deferred
+EFFECTIVE:
+  unknown	literal 5 vs env (empty)
+exit: 0
+
+======== deferred WAIT (config ${WAIT} and os.getenv WAIT; file WAIT=10) ========
++ env WAIT=from-shell python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/deferred
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: ${WAIT}	value=${WAIT} (not comparable: interpolation)
+ASSIGNED:
+  app.py:3	timeout = os.getenv("WAIT")	value=os.getenv("WAIT") (not comparable: call)
+ENV_SOURCE:
+  timeout	unset	why=key
+  WAIT	file:.env:1	value=10	INHERITED: from-shell	why=deferred
+EFFECTIVE:
+  10
+exit: 0
+
+======== unknown (interpolation vs getenv, WAIT unset) ========
++ python3 effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/unknown
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: ${WAIT}	value=${WAIT} (not comparable: interpolation)
+ASSIGNED:
+  app.py:3	timeout = os.getenv("WAIT")	value=os.getenv("WAIT") (not comparable: call)
+ENV_SOURCE:
+  timeout	unset	why=key
+  WAIT	unset	why=deferred
+EFFECTIVE:
+  unknown	sites defer to unset env
+exit: 0
+
+======== comments ignored for comparison ========
++ python3 effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/comments
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+  (comment) config.yaml:2	# timeout: 99	value=99
+ASSIGNED:
+  app.py:7	timeout = 5	value=5
+  (comment) app.py:4	timeout = 99	value=99
+  (comment) app.py:9	# timeout = 99	value=99
+ENV_SOURCE:
+  timeout	unset	why=key
+  TIMEOUT	file:.env:2	value=5	INHERITED: (unset)	why=case-variant
+EFFECTIVE:
+  5
+exit: 0
+
+======== environ.get / process.env WAIT (declared 5, file WAIT=10) ========
++ env WAIT=from-shell python3 /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/effect timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/environ-get
+KEY: timeout
+DECLARED:
+  config.yaml:1	timeout: 5	value=5
+ASSIGNED:
+  client.js:1	const timeout = process.env.WAIT;	value=process.env.WAIT (not comparable: identifier)
+  app.py:3	timeout = os.environ.get("WAIT")	value=os.environ.get("WAIT") (not comparable: call)
+  app.py:7	    timeout = os.environ["WAIT"]	value=os.environ["WAIT"] (not comparable: subscript)
+ENV_SOURCE:
+  timeout	unset	why=key
+  WAIT	file:.env:1	value=10	INHERITED: from-shell	why=deferred
+EFFECTIVE:
+  unknown	literal 5 vs env 10
+exit: 0
+
+======== json joint object (disagree) ========
++ python3 effect --json timeout /Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/disagree
+{
+  "key": "timeout",
+  "directory": "/Users/annenpolka/.grok/worktrees/annenpolka-brrr/hybrid-01-effect/fixtures/disagree",
+  "declared": [
+    {
+      "path": "config.yaml",
+      "line": 1,
+      "text": "timeout: 5",
+      "side": "declaration",
+      "raw_value": "5",
+      "comparable": true,
+      "reason": null,
+      "in_comment": false
+    }
+  ],
+  "assigned": [
+    {
+      "path": "app.py",
+      "line": 3,
+      "text": "timeout = 10",
+      "side": "assignment",
+      "raw_value": "10",
+      "comparable": true,
+      "reason": null,
+      "in_comment": false
+    }
+  ],
+  "comments": [],
+  "env_source": [
+    {
+      "key": "timeout",
+      "value": "",
+      "source": "unset",
+      "empty_override": false,
+      "inherited": null,
+      "in_file": false,
+      "in_process": false,
+      "why": "key"
+    },
+    {
+      "key": "TIMEOUT",
+      "value": "30",
+      "source": "file:.env:2",
+      "empty_override": false,
+      "inherited": null,
+      "in_file": true,
+      "in_process": false,
+      "why": "case-variant"
+    }
+  ],
+  "deferred": [],
+  "effective": {
+    "status": "unknown",
+    "value": null,
+    "reason": "declared 5 vs assigned 10"
+  },
+  "disagree": true
+}
+exit: 2
+

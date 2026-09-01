@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""stated: declaration vs assignment for one configuration key.
+
+Scan config-like files for KEY: / KEY= sites and source files for
+assignments of the same identifier. Comparable scalar literals are
+paired. A disagreement pair exits 2; one-sided, agreeing, unknown, or
+absent sites exit 0. Interpolations, calls, and other non-scalars are
+reported rather than forced equal.
+
+Python 3 stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+USAGE = "usage: stated [--json] KEY [DIR]"
+USAGE_BLURB = "Find where KEY is declared in config and where source assigns a different value."
+
+CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".cfg", ".ini", ".json", ".env"}
+SOURCE_SUFFIXES = {".py", ".js", ".ts", ".go", ".rs", ".c"}
+SKIP_DIR_NAMES = {
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "venv",
+}
+
+BOOL_TRUE = {"true", "yes", "on"}
+BOOL_FALSE = {"false", "no", "off"}
+NULLS = {"null", "none"}
+
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+INT_RE = re.compile(r"[+-]?\d+\Z")
+FLOAT_RE = re.compile(
+    r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?\Z"
+)
+
+
+@dataclass
+class Site:
+    path: str
+    line: int
+    text: str
+    side: str
+    raw_value: str
+    comparable: bool
+    reason: str | None
+    in_comment: bool
+    parsed: Any = None
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "line": self.line,
+            "text": self.text,
+            "side": self.side,
+            "raw_value": self.raw_value,
+            "comparable": self.comparable,
+            "reason": self.reason,
+            "in_comment": self.in_comment,
+        }
+
+    def loc(self) -> str:
+        return f"{self.path}:{self.line}"
+
+    def value_field(self) -> str:
+        if self.comparable or self.reason is None:
+            return f"value={self.raw_value}"
+        return f"value={self.raw_value} (not comparable: {self.reason})"
+
+
+def die(msg: str, hint_usage: bool = False) -> None:
+    print(f"stated: {msg}", file=sys.stderr)
+    if hint_usage:
+        print(USAGE, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_argv(argv: list[str]) -> tuple[bool, str, str]:
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        print(USAGE_BLURB)
+        raise SystemExit(0)
+    json_mode = False
+    positionals: list[str] = []
+    for arg in argv:
+        if arg == "--json":
+            json_mode = True
+        elif arg.startswith("-"):
+            die(f"unknown option {arg}", hint_usage=True)
+        else:
+            positionals.append(arg)
+    if not positionals:
+        die("missing KEY", hint_usage=True)
+    if len(positionals) > 2:
+        die("too many arguments", hint_usage=True)
+    key = positionals[0]
+    directory = positionals[1] if len(positionals) == 2 else "."
+    return json_mode, key, directory
+
+
+def file_kind(path: Path) -> str | None:
+    name = path.name
+    if name == ".env" or name.startswith(".env."):
+        return "config"
+    suffix = path.suffix.lower()
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+    if suffix in SOURCE_SUFFIXES:
+        return "source"
+    return None
+
+
+def iter_files(root: Path) -> Iterator[Path]:
+    for dirpath, dirnames, filenames in os_walk_sorted(root):
+        kept = []
+        for name in dirnames:
+            if name.startswith(".") or name in SKIP_DIR_NAMES:
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        base = Path(dirpath)
+        for name in filenames:
+            path = base / name
+            if file_kind(path) is None:
+                continue
+            yield path
+
+
+def os_walk_sorted(root: Path):
+    import os
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        yield dirpath, dirnames, filenames
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+class CommentTracker:
+    """Line-level # // /* */ plus Python triple-quoted spans."""
+
+    def __init__(self, python: bool) -> None:
+        self.python = python
+        self.in_block = False
+        self.in_triple: str | None = None
+
+    def mask_line(self, line: str) -> list[bool]:
+        n = len(line)
+        mask = [False] * n
+        i = 0
+        line_comment = False
+        while i < n:
+            if self.in_block:
+                mask[i] = True
+                if line.startswith("*/", i):
+                    if i + 1 < n:
+                        mask[i + 1] = True
+                    self.in_block = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if self.in_triple is not None:
+                mask[i] = True
+                trip = self.in_triple
+                if line.startswith(trip, i):
+                    for k in range(len(trip)):
+                        if i + k < n:
+                            mask[i + k] = True
+                    i += len(trip)
+                    self.in_triple = None
+                    continue
+                i += 1
+                continue
+            if line_comment:
+                mask[i] = True
+                i += 1
+                continue
+            if self.python and (
+                line.startswith('"""', i) or line.startswith("'''", i)
+            ):
+                self.in_triple = line[i : i + 3]
+                for k in range(3):
+                    if i + k < n:
+                        mask[i + k] = True
+                i += 3
+                continue
+            if line.startswith("/*", i):
+                self.in_block = True
+                mask[i] = True
+                if i + 1 < n:
+                    mask[i + 1] = True
+                i += 2
+                continue
+            if line.startswith("//", i):
+                line_comment = True
+                mask[i] = True
+                if i + 1 < n:
+                    mask[i + 1] = True
+                i += 2
+                continue
+            if line[i] == "#":
+                line_comment = True
+                mask[i] = True
+                i += 1
+                continue
+            i += 1
+        return mask
+
+
+def key_pattern(key: str) -> re.Pattern[str]:
+    escaped = re.escape(key)
+    # Optional type/qualifier/attribute prefixes: `int timeout`, `obj.timeout`,
+    # `let mut timeout`, `export timeout`. Optional `#` / `//` / `*` leaders so
+    # commented-out KEY lines still show up (labeled comments, not compared).
+    # JSON braces/commas so a one-line object `{"timeout": 5, ...}` is still a
+    # declaration site (pretty-printed members already matched as line tokens).
+    leader = r"(?:#\s*|//\s*|\*\s*)?"
+    json_lead = r"(?:[{\[,]\s*)*"
+    prefix = r"(?:[A-Za-z_]\w*[.\s]+)*"
+    return re.compile(
+        rf"^\s*{leader}{json_lead}{prefix}(?P<q>[\"']?){escaped}(?P=q)\s*(?P<op>:=|:|=)\s*(?P<val>.*)$"
+    )
+
+
+def first_value_token(raw: str) -> str:
+    """Cut a trailing JSON sibling (`5, "host": ...}`) without eating calls."""
+    s = raw.lstrip()
+    if not s:
+        return s
+    i = 0
+    quote: str | None = None
+    depth = 0
+    while i < len(s):
+        ch = s[i]
+        if quote:
+            if ch == "\\" and i + 1 < len(s):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return s[:i].rstrip()
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return s[:i].rstrip()
+        i += 1
+    return s.rstrip()
+
+
+def strip_trailing_comment(value: str) -> str:
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    while i < len(value):
+        ch = value[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(value):
+                out.append(value[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if value.startswith("//", i):
+            break
+        if ch == "#":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out).rstrip()
+
+
+def peel_quotes(token: str) -> tuple[str, bool]:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1], True
+    return token, False
+
+
+def try_parse_scalar(token: str) -> Any | None:
+    lowered = token.lower()
+    if lowered in BOOL_TRUE:
+        return True
+    if lowered in BOOL_FALSE:
+        return False
+    if lowered in NULLS:
+        return None
+    if INT_RE.fullmatch(token):
+        return int(token, 10)
+    if FLOAT_RE.fullmatch(token) and any(c in token for c in ".eE"):
+        try:
+            return float(token)
+        except ValueError:
+            return None
+    return "UNPARSED"
+
+
+def classify_value(raw: str) -> tuple[str, bool, str | None, Any]:
+    trimmed = strip_trailing_comment(first_value_token(raw)).strip()
+    if trimmed.endswith((",", ";")):
+        trimmed = trimmed[:-1].rstrip()
+    display, quoted = peel_quotes(trimmed)
+
+    if not quoted:
+        if "${" in trimmed or (trimmed.startswith("$") and len(trimmed) > 1):
+            return display, False, "interpolation", None
+        if trimmed.startswith("[") or trimmed.startswith("{"):
+            return display, False, "non-scalar", None
+        if "(" in trimmed:
+            return display, False, "call", None
+
+    probe = display if quoted else trimmed
+    parsed = try_parse_scalar(probe)
+    if parsed != "UNPARSED":
+        return display, True, None, parsed
+    if quoted:
+        return display, True, None, display
+    if IDENT_RE.fullmatch(trimmed):
+        return display, False, "identifier", None
+    if re.search(r"[=+\-*/<>]", trimmed) or " " in trimmed:
+        return display, False, "expression", None
+    return display, False, "unparsed", None
+
+
+def values_equal(a: Site, b: Site) -> bool:
+    if not a.comparable or not b.comparable:
+        return False
+    return a.parsed == b.parsed
+
+
+def scan_file(path: Path, root: Path, pattern: re.Pattern[str]) -> list[Site]:
+    kind = file_kind(path)
+    if kind is None:
+        return []
+    text = read_text(path)
+    if text is None:
+        return []
+    rel = path.relative_to(root).as_posix()
+    python = path.suffix.lower() == ".py"
+    tracker = CommentTracker(python=python)
+    sites: list[Site] = []
+    for lineno, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.rstrip("\r")
+        mask = tracker.mask_line(line)
+        match = pattern.match(line)
+        if not match:
+            continue
+        in_comment = False
+        if mask:
+            # KEY sits just before the operator; that index is inside a comment
+            # span for hash/block/docstring hits and outside for live code.
+            op_at = match.start("op")
+            probe = max(0, op_at - 1)
+            if probe < len(mask):
+                in_comment = mask[probe]
+            elif mask[0]:
+                in_comment = True
+        raw_value, comparable, reason, parsed = classify_value(match.group("val"))
+        if in_comment:
+            side = "comment"
+        elif kind == "config":
+            side = "declaration"
+        else:
+            side = "assignment"
+        sites.append(
+            Site(
+                path=rel,
+                line=lineno,
+                text=line,
+                side=side,
+                raw_value=raw_value,
+                comparable=comparable,
+                reason=reason,
+                in_comment=in_comment,
+                parsed=parsed,
+            )
+        )
+    return sites
+
+
+def collect_sites(root: Path, key: str) -> list[Site]:
+    pattern = key_pattern(key)
+    files = list(iter_files(root))
+    files.sort(
+        key=lambda p: (
+            0 if file_kind(p) == "config" else 1,
+            p.relative_to(root).as_posix(),
+        )
+    )
+    found: list[Site] = []
+    for path in files:
+        found.extend(scan_file(path, root, pattern))
+    return found
+
+
+def pair_sites(
+    declarations: list[Site], assignments: list[Site]
+) -> list[tuple[Site, Site]]:
+    comp_d = [s for s in declarations if s.comparable]
+    comp_a = [s for s in assignments if s.comparable]
+    pairs: list[tuple[Site, Site]] = []
+    if comp_d and comp_a:
+        for left in comp_d:
+            for right in comp_a:
+                if not values_equal(left, right):
+                    pairs.append((left, right))
+        return pairs
+    pool = comp_d or comp_a
+    for i, left in enumerate(pool):
+        for right in pool[i + 1 :]:
+            if not values_equal(left, right):
+                pairs.append((left, right))
+    return pairs
+
+
+def decide(
+    declarations: list[Site],
+    assignments: list[Site],
+    comments: list[Site],
+    pairs: list[tuple[Site, Site]],
+) -> tuple[str, str | None, str | None]:
+    """Return status, agreed_value, note."""
+    comp_d = [s for s in declarations if s.comparable]
+    comp_a = [s for s in assignments if s.comparable]
+    if pairs:
+        return "disagree", None, None
+    if comp_d and comp_a:
+        return "agree", comp_d[0].raw_value, None
+    if declarations and assignments:
+        if not comp_d and not comp_a:
+            return "unknown", None, "sites found, none statically comparable"
+        return "unknown", None, "both sides exist; at least one value is not statically comparable"
+    if declarations:
+        if comp_d:
+            return "declared_only", comp_d[0].raw_value, None
+        return "unknown", None, "declared, but no comparable scalar"
+    if assignments:
+        if comp_a:
+            return "assigned_only", comp_a[0].raw_value, None
+        return "unknown", None, "assigned, but no comparable scalar"
+    if comments:
+        return "none", None, "only mentioned in comments; ignored for comparison"
+    return "none", None, "no declaration or assignment sites"
+
+
+def render_human(
+    key: str,
+    directory: str,
+    status: str,
+    agreed: str | None,
+    note: str | None,
+    declarations: list[Site],
+    assignments: list[Site],
+    comments: list[Site],
+    pairs: list[tuple[Site, Site]],
+) -> str:
+    lines = [f"key: {key}", f"dir: {directory}", f"status: {status.upper()}"]
+    if status == "disagree":
+        if len(pairs) == 1:
+            lines.append("disagreement:")
+            _append_pair(lines, pairs[0])
+        else:
+            for i, pair in enumerate(pairs, 1):
+                lines.append(f"disagreement {i}:")
+                _append_pair(lines, pair)
+        return "\n".join(lines) + "\n"
+    if agreed is not None and status in {"agree", "declared_only", "assigned_only"}:
+        lines.append(f"value: {agreed}")
+    if note:
+        lines.append(f"note: {note}")
+    if status == "none" and not comments:
+        lines.append("sites: (none)")
+        return "\n".join(lines) + "\n"
+    if declarations:
+        lines.append("declarations:")
+        for site in declarations:
+            lines.append(f"  {site.loc()}\t{site.text}\t{site.value_field()}")
+    if assignments:
+        lines.append("assignments:")
+        for site in assignments:
+            lines.append(f"  {site.loc()}\t{site.text}\t{site.value_field()}")
+    if comments:
+        lines.append("comments (ignored for comparison):")
+        for site in comments:
+            lines.append(f"  {site.loc()}\t{site.text}\t{site.value_field()}")
+    return "\n".join(lines) + "\n"
+
+
+def _append_pair(lines: list[str], pair: tuple[Site, Site]) -> None:
+    left, right = pair
+    lines.append(
+        f"  {'declared':<13}{left.raw_value}\t{left.loc()}\t{left.text}\tvalue={left.raw_value}"
+    )
+    lines.append(
+        f"  {'contradicted':<13}{right.raw_value}\t{right.loc()}\t{right.text}\tvalue={right.raw_value}"
+    )
+
+
+def render_json(
+    key: str,
+    directory: str,
+    status: str,
+    agreed: str | None,
+    note: str | None,
+    declarations: list[Site],
+    assignments: list[Site],
+    comments: list[Site],
+    pairs: list[tuple[Site, Site]],
+) -> str:
+    payload = {
+        "key": key,
+        "directory": directory,
+        "status": status,
+        "agreed_value": agreed,
+        "note": note,
+        "declarations": [s.as_json() for s in declarations],
+        "assignments": [s.as_json() for s in assignments],
+        "comments": [s.as_json() for s in comments],
+        "pairs": [
+            {
+                "declaration": left.as_json(),
+                "contradiction": right.as_json(),
+                "declared_value": left.raw_value,
+                "contradicted_value": right.raw_value,
+            }
+            for left, right in pairs
+        ],
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def run(argv: list[str]) -> int:
+    json_mode, key, directory = parse_argv(argv)
+    raw = Path(directory)
+    if not raw.exists():
+        die(f"directory not found: {directory}")
+    if not raw.is_dir():
+        die(f"not a directory: {directory}")
+    root = raw.resolve()
+    sites = collect_sites(root, key)
+    comments = [s for s in sites if s.in_comment]
+    declarations = [s for s in sites if s.side == "declaration"]
+    assignments = [s for s in sites if s.side == "assignment"]
+    pairs = pair_sites(declarations, assignments)
+    status, agreed, note = decide(declarations, assignments, comments, pairs)
+    directory_s = str(root)
+    if json_mode:
+        sys.stdout.write(
+            render_json(
+                key,
+                directory_s,
+                status,
+                agreed,
+                note,
+                declarations,
+                assignments,
+                comments,
+                pairs,
+            )
+        )
+    else:
+        sys.stdout.write(
+            render_human(
+                key,
+                directory_s,
+                status,
+                agreed,
+                note,
+                declarations,
+                assignments,
+                comments,
+                pairs,
+            )
+        )
+    return 2 if status == "disagree" else 0
+
+
+def main() -> None:
+    raise SystemExit(run(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()

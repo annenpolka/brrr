@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PHASE="${1:?phase}"
 shift
+mkdir -p "$ROOT/lab-hdd/dream-logs"
 if [[ $# -eq 0 ]]; then
   echo "usage: launch_dreams.sh <phase> <trial> [trial...]" >&2
   exit 2
@@ -11,7 +12,7 @@ fi
 PIDS=()
 for trial in "$@"; do
   echo "launching dream trial=$trial phase=$PHASE"
-  "$ROOT/lab-hdd/scripts/dream.sh" "$trial" "$PHASE" \
+  nohup "$ROOT/lab-hdd/scripts/dream.sh" "$trial" "$PHASE" \
     >"$ROOT/lab-hdd/dream-logs/${trial}-wrapper.out" \
     2>"$ROOT/lab-hdd/dream-logs/${trial}-wrapper.err" &
   PIDS+=("$!")

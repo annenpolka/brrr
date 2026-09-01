@@ -2,11 +2,11 @@
 
 - Start: 2026-09-01 22:00 JST
 - Hard end: 2026-09-02 09:00 JST
-- Clock: 2026-09-01 21:42 JST
-- Phase: Bootstrap (pre-Cambrian)
+- Clock: 2026-09-01 21:47 JST
+- Phase: Bootstrap (pre-Cambrian); Cambrian Dreamer wave armed for 22:00 JST
 - Parent role: coordinator only
 - Previous brrr: SEALED (`lab-hdd/SEAL.md`)
-- Heartbeat scheduler: pending create
+- Heartbeat scheduler: `01a05d01751a7e50b363750dcac94179` every 15m (durable, foreground)
 - R1: DeepSeek R1 via OpenRouter through `hdd.py`; critic transport manual (host Red Pen)
 - Effective R1 cap: **$10.00** (OpenRouter remaining ~$11.16 at 21:40 JST; experiment hard cap $50)
 

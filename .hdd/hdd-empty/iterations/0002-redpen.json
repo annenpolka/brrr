@@ -1,0 +1,28 @@
+{
+  "summary": "Second turn: empty stays exit 0; invalid pattern exit 2; permission error exit 3. Invented paths remain. The exit-code contract is harvestable and opposite to grep's empty=1. Stop R1.",
+  "preserve_add": [
+    "Zero matches: exit 0 with an explicit empty message.",
+    "Invalid pattern: exit 2.",
+    "I/O error: exit 3 with an OS error."
+  ],
+  "established_add": [
+    "query empty, query --context /locked_dir, query malformed glob, trace missing id."
+  ],
+  "rejected_add": [
+    "/locked_dir and service-alpha are not this machine."
+  ],
+  "constraints_add": [],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Search files with exit 0 on empty, 2 on bad query, 3 on I/O, 1 unused or matches-found as 0 with nonempty stdout."
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "search a tree where zero hits is success, distinct from query errors and I/O errors",
+    "nearest_existing_operation": "rg/grep (empty is exit 1)",
+    "observable_delta": "empty is not a failure, so `cmd && x` still runs after a legitimate miss",
+    "reason": "small contract difference; enough to ground; further dreaming is traversal lore"
+  },
+  "redpen_markdown": "HARVEST_NOW. Ground a tiny search CLI with the three-way exit contract. Do not build an index."
+}

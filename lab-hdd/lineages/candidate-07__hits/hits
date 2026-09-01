@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""hits — search a tree; zero matches is success."""
+
+import fnmatch
+import os
+import re
+import sys
+from pathlib import Path
+
+USAGE = "hits: usage: hits [--regex] [--glob GLOB] PATTERN [DIR]"
+EXIT_USAGE = 1
+EXIT_BAD_PATTERN = 2
+EXIT_IO = 3
+BINARY_PROBE = 8192
+
+
+def usage():
+    print(USAGE, file=sys.stderr)
+    raise SystemExit(EXIT_USAGE)
+
+
+def parse_argv(argv):
+    regex = False
+    glob_pat = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(
+                "Search a directory tree. Zero matches is success (exit 0).\n"
+                "\n"
+                "  hits [--regex] [--glob GLOB] PATTERN [DIR]\n"
+                "\n"
+                "  --regex       treat PATTERN as a regular expression\n"
+                "  --glob GLOB   only files matching GLOB (fnmatch on relative path or name)\n"
+                "  exit 0        matches printed, or '0 matches'\n"
+                "  exit 1        usage\n"
+                "  exit 2        bad --regex\n"
+                "  exit 3        unreadable DIR\n"
+                "\n"
+                "Files containing a NUL in the first 8KiB are skipped (not an error).\n"
+            )
+            raise SystemExit(0)
+        if arg == "--regex":
+            regex = True
+        elif arg == "--glob":
+            i += 1
+            if i >= len(argv):
+                print("hits: --glob requires a pattern", file=sys.stderr)
+                raise SystemExit(EXIT_USAGE)
+            glob_pat = argv[i]
+        elif arg == "--":
+            rest.extend(argv[i + 1 :])
+            break
+        elif arg.startswith("-") and arg != "-":
+            print(f"hits: unknown option: {arg}", file=sys.stderr)
+            raise SystemExit(EXIT_USAGE)
+        else:
+            rest.append(arg)
+        i += 1
+    if not rest or len(rest) > 2:
+        usage()
+    pattern = rest[0]
+    directory = Path(rest[1]) if len(rest) == 2 else Path(".")
+    return pattern, directory, regex, glob_pat
+
+
+def compile_query(pattern, regex):
+    if not regex:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        print(f"hits: bad regex: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_BAD_PATTERN)
+
+
+def line_matches(line, pattern, compiled):
+    if compiled is not None:
+        return compiled.search(line) is not None
+    return pattern in line
+
+
+def is_under_git(path):
+    return ".git" in Path(path).parts
+
+
+def glob_ok(path, root, glob_pat):
+    if glob_pat is None:
+        return True
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+    return fnmatch.fnmatch(rel, glob_pat) or fnmatch.fnmatch(path.name, glob_pat)
+
+
+def iter_files(root, glob_pat=None):
+    root = Path(root)
+    if is_under_git(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if is_under_git(path):
+                continue
+            if path.is_symlink() or not path.is_file():
+                continue
+            if not glob_ok(path, root, glob_pat):
+                continue
+            yield path
+
+
+def is_binary(data):
+    return b"\0" in data[:BINARY_PROBE]
+
+
+def read_lines(path):
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if is_binary(data):
+        return None
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def ensure_readable_dir(directory):
+    directory = Path(directory)
+    try:
+        if not directory.exists() or not directory.is_dir():
+            print(f"hits: unreadable directory: {directory}", file=sys.stderr)
+            raise SystemExit(EXIT_IO)
+        next(os.scandir(directory), None)
+    except OSError:
+        print(f"hits: unreadable directory: {directory}", file=sys.stderr)
+        raise SystemExit(EXIT_IO)
+
+
+def search(pattern, directory, regex=False, glob_pat=None):
+    compiled = compile_query(pattern, regex)
+    ensure_readable_dir(directory)
+    found = []
+    for path in iter_files(directory, glob_pat=glob_pat):
+        lines = read_lines(path)
+        if lines is None:
+            continue
+        for n, line in enumerate(lines, 1):
+            if line_matches(line, pattern, compiled):
+                found.append(f"{path}:{n}:{line}")
+    return found
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    pattern, directory, regex, glob_pat = parse_argv(argv)
+    found = search(pattern, directory, regex=regex, glob_pat=glob_pat)
+    if found:
+        sys.stdout.write("\n".join(found) + "\n")
+    else:
+        print("0 matches")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

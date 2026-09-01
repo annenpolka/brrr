@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-01 22:50:37 JST
+Updated: 2026-09-01 23:15:20 JST
 
 ## Caps
 
@@ -12,11 +12,11 @@ Updated: 2026-09-01 22:50:37 JST
 
 ## Totals
 
-- Total R1 calls: **34**
-- Observed spend (OpenRouter usage delta): **$0.324136**
-- Conservative transcript estimate (sum): **$0.886909**
-- Remaining effective budget: **$9.675864**
-- Remaining vs $50 experiment cap: **$49.675863**
+- Total R1 calls: **37**
+- Observed spend (OpenRouter usage delta): **$0.358168**
+- Conservative transcript estimate (sum): **$1.019921**
+- Remaining effective budget: **$9.641832**
+- Remaining vs $50 experiment cap: **$49.641832**
 
 ## Pricing used for estimates
 
@@ -35,6 +35,7 @@ Updated: 2026-09-01 22:50:37 JST
 | hdd-cross | 1 | 0.034579 | 0.027378 |
 | hdd-debug | 2 | 0.073979 | 0.050014 |
 | hdd-docs | 1 | 0.044843 | 0.026205 |
+| hdd-empty | 2 | 0.000000 | 0.050743 |
 | hdd-env | 2 | 0.044036 | 0.051316 |
 | hdd-flake | 1 | 0.018459 | 0.025190 |
 | hdd-history | 2 | 0.002857 | 0.054577 |
@@ -42,6 +43,7 @@ Updated: 2026-09-01 22:50:37 JST
 | hdd-log | 1 | 0.038052 | 0.026376 |
 | hdd-merge | 2 | 0.099901 | 0.053648 |
 | hdd-order | 2 | 0.029395 | 0.051827 |
+| hdd-partial | 1 | 0.014263 | 0.082269 |
 | hdd-patch | 1 | 0.021350 | 0.026027 |
 | hdd-perf | 1 | 0.021350 | 0.025247 |
 | hdd-pipe | 1 | 0.060584 | 0.025461 |
@@ -56,8 +58,8 @@ Updated: 2026-09-01 22:50:37 JST
 
 | Phase | Calls | Observed USD | Estimated USD |
 | --- | ---: | ---: | ---: |
-| cambrian | 23 | 0.601473 | 0.590265 |
-| deepen | 11 | 0.322487 | 0.296644 |
+| cambrian | 25 | 0.615736 | 0.697171 |
+| deepen | 12 | 0.322487 | 0.322750 |
 
 ## Call log
 
@@ -97,6 +99,9 @@ Updated: 2026-09-01 22:50:37 JST
 | 2026-09-01 22:40:04 JST | hdd-ident | 1 | cambrian | ok | 0.005918 | 0.025044 |
 | 2026-09-01 22:45:33 JST | hdd-ident | 2 | deepen | ok | 0.012493 | 0.026722 |
 | 2026-09-01 22:44:12 JST | hdd-order | 2 | deepen | ok | 0.029395 | 0.027191 |
+| 2026-09-01 22:57:48 JST | hdd-empty | 1 | cambrian | ok | 0.000000 | 0.024637 |
+| 2026-09-01 23:07:22 JST | hdd-empty | 2 | deepen | ok | 0.000000 | 0.026106 |
+| 2026-09-01 22:57:48 JST | hdd-partial | 1 | cambrian | ok | 0.014263 | 0.082269 |
 
 ## Notes
 

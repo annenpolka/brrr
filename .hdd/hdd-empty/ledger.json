@@ -1,18 +1,75 @@
 {
-  "iteration": 0,
-  "preserve": [],
-  "established": [],
-  "rejected": [],
-  "constraints": [],
-  "open_questions": [],
+  "iteration": 2,
+  "preserve": [
+    "A deliberate non-matching query printed 0 matches and claimed success rather than an error.",
+    "The operator treated empty as a legitimate outcome.",
+    "Zero matches: exit 0 with an explicit empty message.",
+    "Invalid pattern: exit 2.",
+    "I/O error: exit 3 with an OS error."
+  ],
+  "established": [
+    "query, query --context, env.",
+    "query empty, query --context /locked_dir, query malformed glob, trace missing id."
+  ],
+  "rejected": [
+    "847 artifacts, v3.1.0, 30-day index are unsupported.",
+    "/locked_dir and service-alpha are not this machine."
+  ],
+  "constraints": [
+    "No hidden project index. Search real files in this tree.",
+    "Empty, error, and unknown/unindexed must be distinguishable (message and exit code).",
+    "Do not invent scan counts."
+  ],
+  "open_questions": [
+    "On a real tree, is empty-vs-error-vs-unknown a distinct contract from grep/rg?"
+  ],
   "human_pressure": [],
-  "harvest_candidates": [],
-  "affordance_assessment": null,
-  "history": [],
+  "harvest_candidates": [
+    "A search whose empty result is success, with a different exit for errors and for 'this query cannot be answered here'.",
+    "Search files with exit 0 on empty, 2 on bad query, 3 on I/O, 1 unused or matches-found as 0 with nonempty stdout."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "search a tree where zero hits is success, distinct from query errors and I/O errors",
+    "nearest_existing_operation": "rg/grep (empty is exit 1)",
+    "observable_delta": "empty is not a failure, so `cmd && x` still runs after a legitimate miss",
+    "reason": "small contract difference; enough to ground; further dreaming is traversal lore",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-01T23:07:22+09:00",
+      "summary": "dev query returns structured 0 matches with exit 0. Invented 847 artifacts. The interesting residue is distinguishing empty from error from 'out of scope'. grep's exit 1 on no match is a footgun; this might be a composition if those three outcomes are distinct.",
+      "pressure": [
+        "There is no artifact index. Continue using the same CLI on real files in this directory.",
+        "Zero hits must be distinguishable from I/O errors and from 'cannot answer'.",
+        "Do not print invented scan counts."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "search a tree and treat zero hits as a successful empty, distinct from failure",
+        "nearest_existing_operation": "rg (exits 1 on no match) or find",
+        "observable_delta": "empty is not a failure; not yet shown with a third unknown state on a real tree",
+        "reason": "worth one local turn; do not add a tracing index",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-01T23:11:09+09:00",
+      "summary": "Second turn: empty stays exit 0; invalid pattern exit 2; permission error exit 3. Invented paths remain. The exit-code contract is harvestable and opposite to grep's empty=1. Stop R1.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "search a tree where zero hits is success, distinct from query errors and I/O errors",
+        "nearest_existing_operation": "rg/grep (empty is exit 1)",
+        "observable_delta": "empty is not a failure, so `cmd && x` still runs after a legitimate miss",
+        "reason": "small contract difference; enough to ground; further dreaming is traversal lore",
+        "iteration": 2
+      }
+    }
+  ],
   "last_pressure": [],
-  "pending": {
-    "iteration": 1,
-    "stage": "redpen",
-    "dreamer_transport": "openrouter"
-  }
+  "pending": null
 }

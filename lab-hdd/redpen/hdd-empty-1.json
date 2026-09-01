@@ -1,0 +1,37 @@
+{
+  "summary": "dev query returns structured 0 matches with exit 0. Invented 847 artifacts. The interesting residue is distinguishing empty from error from 'out of scope'. grep's exit 1 on no match is a footgun; this might be a composition if those three outcomes are distinct.",
+  "preserve_add": [
+    "A deliberate non-matching query printed 0 matches and claimed success rather than an error.",
+    "The operator treated empty as a legitimate outcome."
+  ],
+  "established_add": [
+    "query, query --context, env."
+  ],
+  "rejected_add": [
+    "847 artifacts, v3.1.0, 30-day index are unsupported."
+  ],
+  "constraints_add": [
+    "No hidden project index. Search real files in this tree.",
+    "Empty, error, and unknown/unindexed must be distinguishable (message and exit code).",
+    "Do not invent scan counts."
+  ],
+  "open_questions_add": [
+    "On a real tree, is empty-vs-error-vs-unknown a distinct contract from grep/rg?"
+  ],
+  "harvest_candidates_add": [
+    "A search whose empty result is success, with a different exit for errors and for 'this query cannot be answered here'."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "search a tree and treat zero hits as a successful empty, distinct from failure",
+    "nearest_existing_operation": "rg (exits 1 on no match) or find",
+    "observable_delta": "empty is not a failure; not yet shown with a third unknown state on a real tree",
+    "reason": "worth one local turn; do not add a tracing index"
+  },
+  "pressure": [
+    "There is no artifact index. Continue using the same CLI on real files in this directory.",
+    "Zero hits must be distinguishable from I/O errors and from 'cannot answer'.",
+    "Do not print invented scan counts."
+  ],
+  "redpen_markdown": "CONTINUE_DREAMING once on a real tree. If it is only grep with exit 0, kill as THIN_WRAPPER."
+}

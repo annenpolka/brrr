@@ -1,0 +1,42 @@
+== hit ==
+fixtures/has/hello.txt:1:hello needle world
+fixtures/has/nested/more.txt:1:another needle here
+exit=0
+
+== miss (must be exit 0 so && still runs) ==
+0 matches
+exit=0
+0 matches
+still-running
+
+== literal is not regex ==
+0 matches
+exit=0
+
+== regex hit ==
+fixtures/regex/sample.txt:1:needle
+exit=0
+
+== bad regex (must be exit 2) ==
+hits: bad regex: unterminated character set at position 0
+exit=2
+
+== usage (must be exit 1) ==
+hits: usage: hits [--regex] [--glob GLOB] PATTERN [DIR]
+exit=1
+
+== mixed tree: skip binary, keep text (exit 0) ==
+fixtures/mixed/note.txt:1:text needle in notes
+exit=0
+
+== --glob '*.txt' on mixed (exit 0) ==
+fixtures/mixed/note.txt:1:text needle in notes
+exit=0
+
+== --glob miss is still success ==
+0 matches
+still-running
+
+== unreadable DIR (must be exit 3) ==
+hits: unreadable directory: /var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/hits-unreadable.LiwZUZ
+exit=3

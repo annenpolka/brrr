@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""envfrom — show where environment variables come from.
+
+Reads the process environment and dotenv-style files in DIR
+(default: .env, then .env.local if present). File assignments are
+overrides that *would* apply if a loader ran. Process env is inherited.
+--load actually applies those overrides onto a child command.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+DEFAULT_FILES = (".env", ".env.local")
+VALID_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class Assignment:
+    key: str
+    value: str
+    path: str
+    line: int
+
+
+@dataclass(frozen=True)
+class Report:
+    key: str
+    value: str
+    source: str
+    empty_override: bool
+    inherited: Optional[str]
+    in_file: bool
+    in_process: bool
+
+
+def strip_export_prefix(stripped: str) -> str:
+    """Accept bash-style `export KEY=value`. `export=value` stays a key named export."""
+    if stripped.startswith("export"):
+        rest = stripped[6:]
+        if rest[:1].isspace():
+            return rest.lstrip()
+    return stripped
+
+
+def parse_value(raw: str) -> str:
+    """Unquote dotenv values and drop unquoted inline comments.
+
+    Double quotes honor \\n \\t \\r \\\\ \\\" \\'. Single quotes are literal.
+    An unquoted `#` starts a comment only when it is at the start of the
+    value or preceded by whitespace.
+    """
+    i = 0
+    n = len(raw)
+    while i < n and raw[i] in " \t":
+        i += 1
+    if i >= n:
+        return ""
+    if raw[i] in "'\"":
+        quote = raw[i]
+        i += 1
+        out: List[str] = []
+        while i < n:
+            c = raw[i]
+            if quote == '"' and c == "\\" and i + 1 < n:
+                nxt = raw[i + 1]
+                escapes = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+                out.append(escapes.get(nxt, nxt))
+                i += 2
+                continue
+            if c == quote:
+                return "".join(out)
+            out.append(c)
+            i += 1
+        return "".join(out)
+    out = []
+    while i < n:
+        c = raw[i]
+        if c == "#" and (not out or out[-1] in " \t"):
+            break
+        out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
+def parse_dotenv(path: str) -> List[Assignment]:
+    """Parse KEY=VALUE lines, including export prefix, quotes, and comments."""
+    out: List[Assignment] = []
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return out
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"envfrom: cannot read {path}: {exc}") from None
+    except OSError as exc:
+        raise SystemExit(f"envfrom: cannot read {path}: {exc}") from None
+
+    for n, raw in enumerate(lines, 1):
+        line = raw.rstrip("\n\r")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stripped = strip_export_prefix(stripped)
+        if "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if not key or not VALID_KEY.match(key):
+            continue
+        out.append(Assignment(key=key, value=parse_value(value), path=path, line=n))
+    return out
+
+
+def require_directory(directory: str) -> None:
+    """Missing or non-directory DIR is an error, not a silent empty tree."""
+    if not os.path.exists(directory):
+        raise SystemExit(f"envfrom: directory not found: {directory}")
+    if not os.path.isdir(directory):
+        raise SystemExit(f"envfrom: not a directory: {directory}")
+
+
+def load_files(directory: str, names: Sequence[str] = DEFAULT_FILES) -> Tuple[Dict[str, Assignment], List[str]]:
+    """Return last-wins assignments and key order (first appearance)."""
+    won: Dict[str, Assignment] = {}
+    order: List[str] = []
+    for name in names:
+        path = os.path.normpath(os.path.join(directory, name))
+        if not os.path.lexists(path):
+            continue
+        if not os.path.isfile(path):
+            raise SystemExit(f"envfrom: not a file: {path}")
+        for assign in parse_dotenv(path):
+            if assign.key not in won:
+                order.append(assign.key)
+            won[assign.key] = assign
+    return won, order
+
+
+def report_key(key: str, files: Dict[str, Assignment], process_env: Dict[str, str]) -> Report:
+    in_process = key in process_env
+    inherited = process_env[key] if in_process else None
+    if key in files:
+        a = files[key]
+        return Report(
+            key=key,
+            value=a.value,
+            source=f"file:{a.path}:{a.line}",
+            empty_override=(a.value == ""),
+            inherited=inherited,
+            in_file=True,
+            in_process=in_process,
+        )
+    if in_process:
+        return Report(
+            key=key,
+            value=inherited or "",
+            source="env",
+            empty_override=False,
+            inherited=inherited,
+            in_file=False,
+            in_process=True,
+        )
+    return Report(
+        key=key,
+        value="",
+        source="unset",
+        empty_override=False,
+        inherited=None,
+        in_file=False,
+        in_process=False,
+    )
+
+
+def format_report(r: Report) -> str:
+    lines = [r.key, f"VALUE={r.value}", f"SOURCE: {r.source}"]
+    if r.in_file:
+        if r.empty_override:
+            lines.append("EMPTY_OVERRIDE: yes")
+        if r.in_process:
+            lines.append(f"INHERITED: {r.inherited}")
+        else:
+            lines.append("INHERITED: (unset)")
+    return "\n".join(lines)
+
+
+def report_to_json(r: Report) -> dict:
+    """Machine record. inherited is the process value or JSON null (never the text '(unset)')."""
+    return {
+        "key": r.key,
+        "value": r.value,
+        "source": r.source,
+        "empty_override": r.empty_override,
+        "inherited": r.inherited,
+    }
+
+
+def split_cmd(argv: List[str]) -> Tuple[List[str], List[str]]:
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1 :]
+    return argv, []
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="envfrom",
+        description="Show where environment variables come from (file:line override, inherited, unset).",
+        epilog="File assignments would apply if a loader ran. Process env is inherited. "
+        "Use --load to apply file overrides onto a child command.",
+    )
+    p.add_argument("keys", nargs="*", help="variable names to report")
+    p.add_argument(
+        "--dir",
+        default=".",
+        help="directory containing dotenv files (default: .)",
+    )
+    p.add_argument(
+        "--run",
+        action="store_true",
+        help="print provenance for .env keys plus KEY args, then exec CMD (after --)",
+    )
+    p.add_argument(
+        "--load",
+        action="store_true",
+        help="apply dotenv assignments onto the child process (requires --run)",
+    )
+    p.add_argument(
+        "--fail-empty",
+        action="store_true",
+        help="exit 2 if a reported key is empty-overridden by a file",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a JSON array of {key, value, source, empty_override, inherited}",
+    )
+    return p
+
+
+def keys_to_report(requested: Sequence[str], file_order: Sequence[str], run: bool) -> List[str]:
+    if run:
+        seen = set()
+        out: List[str] = []
+        for k in list(file_order) + list(requested):
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+    return list(requested)
+
+
+def apply_assignments(process_env: Dict[str, str], files: Dict[str, Assignment]) -> Dict[str, str]:
+    child = dict(process_env)
+    for key, assign in files.items():
+        child[key] = assign.value
+    return child
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    head, cmd = split_cmd(argv_list)
+    args = build_parser().parse_args(head)
+
+    if args.load and not args.run:
+        print("envfrom: --load requires --run", file=sys.stderr)
+        return 1
+    if args.run and not cmd:
+        print("envfrom: --run requires a command after --", file=sys.stderr)
+        return 1
+    if not args.run and not args.keys:
+        print("envfrom: provide KEY... or --run -- CMD", file=sys.stderr)
+        return 1
+
+    process_env = dict(os.environ)
+    require_directory(args.dir)
+    files, file_order = load_files(args.dir)
+    keys = keys_to_report(args.keys, file_order, args.run)
+    if not args.run and not keys:
+        print("envfrom: provide KEY...", file=sys.stderr)
+        return 1
+
+    reports = [report_key(k, files, process_env) for k in keys]
+    if args.json:
+        sys.stdout.write(json.dumps([report_to_json(r) for r in reports]) + "\n")
+    else:
+        blocks = [format_report(r) for r in reports]
+        if blocks:
+            sys.stdout.write("\n\n".join(blocks) + "\n")
+    sys.stdout.flush()
+
+    empty_hit = any(r.empty_override for r in reports)
+    if args.fail_empty and empty_hit:
+        return 2
+
+    if args.run:
+        child_env = apply_assignments(process_env, files) if args.load else process_env
+        try:
+            os.execvpe(cmd[0], cmd, child_env)
+        except OSError as exc:
+            print(f"envfrom: exec {cmd[0]}: {exc}", file=sys.stderr)
+            return 127
+        return 0  # unreachable
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

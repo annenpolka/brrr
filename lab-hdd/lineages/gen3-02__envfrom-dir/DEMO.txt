@@ -1,0 +1,135 @@
+$ git -C /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir log --oneline -2
+1374a38 envfrom: UTF-8 dotenv errors without traceback; keep BOM first key
+1b1c6a1 envfrom: copy CLI and refuse missing --dir
+
+$ python3 -m unittest tests.test_envfrom
+...............................
+----------------------------------------------------------------------
+Ran 31 tests in 1.111s
+
+OK
+
+$ ./demo.sh
+=== envfrom LIBRARY_PATH APP_ENV PATH NOT_A_REAL_VAR ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:3
+INHERITED: from-shell
+
+PATH
+VALUE=/Users/annenpolka/.grok/bin:/Users/annenpolka/.local/bin:/Users/annenpolka/.opencode/bin:/Users/annenpolka/.moon/bin:/Users/annenpolka/.bun/bin:/Users/annenpolka/.antigravity/antigravity/bin:/opt/homebrew/opt/libpq/bin:/Users/annenpolka/.local/share/mise/installs/ruby/3/bin:/Users/annenpolka/.volta/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/Users/annenpolka/.ghcup/bin:/Users/annenpolka/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/:/Users/annenpolka/.cargo/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/usr/local/share/dotnet:~/.dotnet/tools:/Users/annenpolka/.deno/bin:/Applications/Ghostty.app/Contents/MacOS:/Users/annenpolka/.orbstack/bin:/Applications/Obsidian.app/Contents/MacOS:/Users/annenpolka/go/bin:/Users/annenpolka/Library/pnpm/bin:/Users/annenpolka/.cache/lm-studio/bin
+SOURCE: env
+
+NOT_A_REAL_VAR
+VALUE=
+SOURCE: unset
+
+=== --fail-empty LIBRARY_PATH (expect exit 2) ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+exit=2
+
+=== --run without --load: child keeps inherited LIBRARY_PATH ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:3
+INHERITED: from-shell
+child LIBRARY_PATH=/usr/local/lib:/usr/lib
+
+=== --run --load: child sees file empty override ===
+LIBRARY_PATH
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:2
+EMPTY_OVERRIDE: yes
+INHERITED: /usr/local/lib:/usr/lib
+
+APP_ENV
+VALUE=dev
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:3
+INHERITED: from-shell
+child LIBRARY_PATH=''
+child APP_ENV=dev
+
+=== --json LIBRARY_PATH APP_ENV NOT_A_REAL_VAR ===
+[{"key": "LIBRARY_PATH", "value": "", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:2", "empty_override": true, "inherited": "/usr/local/lib:/usr/lib"}, {"key": "APP_ENV", "value": "dev", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/empty-override/.env:3", "empty_override": false, "inherited": "from-shell"}, {"key": "NOT_A_REAL_VAR", "value": "", "source": "unset", "empty_override": false, "inherited": null}]
+
+=== quoted values, inline comments, export PREFIX ===
+PREFIX
+VALUE=app
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:2
+INHERITED: (unset)
+
+GREETING
+VALUE=hello world
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:3
+INHERITED: (unset)
+
+NAME
+VALUE=Ada Lovelace
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:4
+INHERITED: (unset)
+
+COLOR
+VALUE=red
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:5
+INHERITED: (unset)
+
+EMPTY_QUOTED
+VALUE=
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:6
+EMPTY_OVERRIDE: yes
+INHERITED: (unset)
+
+HASH_IN_QUOTES
+VALUE=# not a comment
+SOURCE: file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:7
+INHERITED: (unset)
+
+=== --json quoted-export ===
+[{"key": "PREFIX", "value": "app", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:2", "empty_override": false, "inherited": null}, {"key": "GREETING", "value": "hello world", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:3", "empty_override": false, "inherited": null}, {"key": "NAME", "value": "Ada Lovelace", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:4", "empty_override": false, "inherited": null}, {"key": "COLOR", "value": "red", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:5", "empty_override": false, "inherited": null}, {"key": "EMPTY_QUOTED", "value": "", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:6", "empty_override": true, "inherited": null}, {"key": "HASH_IN_QUOTES", "value": "# not a comment", "source": "file:/Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-02-envfrom-dir/fixtures/quoted-export/.env:7", "empty_override": false, "inherited": null}]
+
+=== --dir reads that tree, not cwd ===
+FOO
+VALUE=from-here
+SOURCE: file:.env:1
+INHERITED: (unset)
+FOO
+VALUE=from-there
+SOURCE: file:/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/tmp.riEuFFL7vy/there/.env:1
+INHERITED: (unset)
+
+=== missing --dir (expect exit 1, not SOURCE: env) ===
+envfrom: directory not found: /no/such/envfrom-dir
+exit=1
+
+=== UTF-8 BOM keeps FOO; invalid UTF-8 exits 1 without traceback ===
+FOO
+VALUE=bom
+SOURCE: file:/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/tmp.lKt9dymywE/.env:1
+INHERITED: (unset)
+
+BAR
+VALUE=
+SOURCE: unset
+
+BAZ
+VALUE=ok
+SOURCE: file:/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/tmp.lKt9dymywE/.env:3
+INHERITED: (unset)
+envfrom: cannot read /var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T/tmp.lKt9dymywE/.env: 'utf-8' codec can't decode byte 0xff in position 11: invalid start byte
+exit=1

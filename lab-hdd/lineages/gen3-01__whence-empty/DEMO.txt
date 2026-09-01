@@ -1,0 +1,564 @@
+$ git -C /Users/annenpolka/.grok/worktrees/annenpolka-brrr/gen3-01-whence-empty log --oneline -2
+a3676ec whence: require --output when FILE is stdin
+b6f9eca whence: refuse empty hybrid from stdin or sidecar
+
+$ python3 -m unittest discover -s tests -v
+test_choice_length_mismatch (test_whence.WhenceCLITests.test_choice_length_mismatch) ... ok
+test_choice_per_region (test_whence.WhenceCLITests.test_choice_per_region) ... ok
+test_diff3_ancestor_refused (test_whence.WhenceCLITests.test_diff3_ancestor_refused) ... ok
+test_hybrid_and_file_both_stdin_refused (test_whence.WhenceCLITests.test_hybrid_and_file_both_stdin_refused) ... ok
+test_hybrid_bom_file_sidecar_still_works (test_whence.WhenceCLITests.test_hybrid_bom_file_sidecar_still_works) ... ok
+test_hybrid_bom_stdin_matches_file_sidecar (test_whence.WhenceCLITests.test_hybrid_bom_stdin_matches_file_sidecar) ... ok
+test_hybrid_crlf_stdin_matches_lf_sidecar (test_whence.WhenceCLITests.test_hybrid_crlf_stdin_matches_lf_sidecar) ... ok
+test_hybrid_empty_file_sidecar_refused (test_whence.WhenceCLITests.test_hybrid_empty_file_sidecar_refused) ... ok
+test_hybrid_empty_stdin_refused (test_whence.WhenceCLITests.test_hybrid_empty_stdin_refused) ... ok
+test_hybrid_generated_tags_on_stdin (test_whence.WhenceCLITests.test_hybrid_generated_tags_on_stdin) ... ok
+test_hybrid_stdin_matches_file_sidecar (test_whence.WhenceCLITests.test_hybrid_stdin_matches_file_sidecar) ... ok
+test_hybrid_stdin_messy_matches_file (test_whence.WhenceCLITests.test_hybrid_stdin_messy_matches_file) ... ok
+test_hybrid_stdin_without_trailing_newline_is_literal (test_whence.WhenceCLITests.test_hybrid_stdin_without_trailing_newline_is_literal) ... ok
+test_hybrid_tagged_success (test_whence.WhenceCLITests.test_hybrid_tagged_success) ... ok
+test_hybrid_tty_stdin_refused (test_whence.WhenceCLITests.test_hybrid_tty_stdin_refused) ... ok
+test_imported_parser_matches_cli (test_whence.WhenceCLITests.test_imported_parser_matches_cli) ... ok
+test_malformed_markers (test_whence.WhenceCLITests.test_malformed_markers) ... ok
+test_messy_hybrid_block_mismatch_lists_regions (test_whence.WhenceCLITests.test_messy_hybrid_block_mismatch_lists_regions) ... ok
+test_messy_three_region_hybrid_and_missing_newline (test_whence.WhenceCLITests.test_messy_three_region_hybrid_and_missing_newline) ... ok
+test_messy_untagged_mix_shows_parent_bodies (test_whence.WhenceCLITests.test_messy_untagged_mix_shows_parent_bodies) ... ok
+test_messy_wrong_parent_quoted_name (test_whence.WhenceCLITests.test_messy_wrong_parent_quoted_name) ... ok
+test_no_markers (test_whence.WhenceCLITests.test_no_markers) ... ok
+test_ours_keeps_ours_and_writes_prov (test_whence.WhenceCLITests.test_ours_keeps_ours_and_writes_prov) ... ok
+test_report_lists_region (test_whence.WhenceCLITests.test_report_lists_region) ... ok
+test_stdin_file_with_output_ok (test_whence.WhenceCLITests.test_stdin_file_with_output_ok) ... ok
+test_stdin_file_without_output_refused (test_whence.WhenceCLITests.test_stdin_file_without_output_refused) ... ok
+test_theirs_keeps_theirs (test_whence.WhenceCLITests.test_theirs_keeps_theirs) ... ok
+test_untagged_hybrid_mix_refused (test_whence.WhenceCLITests.test_untagged_hybrid_mix_refused) ... ok
+test_untagged_ours_copy_refused (test_whence.WhenceCLITests.test_untagged_ours_copy_refused) ... ok
+test_usage_without_command (test_whence.WhenceCLITests.test_usage_without_command) ... ok
+test_wrong_parent_tag_refused (test_whence.WhenceCLITests.test_wrong_parent_tag_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 31 tests in 1.158s
+
+OK
+
+$ ./demo.sh
+
+======== report simple.conflict ========
+file: fixtures/simple.conflict
+conflicts: 1
+--- region 1 lines 2-8 HEAD vs feature ---
+ours:
+color = red
+size = 1
+
+theirs:
+color = blue
+size = 2
+
+
+======== ours-only ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/simple.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red\nsize = 1\n"
+        }
+      ]
+    }
+  ]
+}
+--- resolved ---
+# palette
+color = red
+size = 1
+# end
+--- provenance file ---
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/simple.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red\nsize = 1\n"
+        }
+      ]
+    }
+  ]
+}
+
+======== theirs-only ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/theirs.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "theirs",
+      "spans": [
+        {
+          "parent": "theirs",
+          "text": "color = blue\nsize = 2\n"
+        }
+      ]
+    }
+  ]
+}
+--- resolved ---
+# palette
+color = blue
+size = 2
+# end
+
+======== hybrid tagged success (ours color, theirs size) — file sidecar ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/hybrid.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ],
+  "hybrid": {
+    "source": "file",
+    "path": "fixtures/hybrid-tagged.txt"
+  }
+}
+--- resolved ---
+# palette
+color = red
+size = 2
+# end
+
+======== hybrid tags on stdin (pipe the same sidecar; --hybrid -) ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/stdin-hybrid.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ],
+  "hybrid": {
+    "source": "stdin"
+  }
+}
+--- resolved (must match file sidecar) ---
+# palette
+color = red
+size = 2
+# end
+file sidecar and stdin hybrid produced identical resolved bytes
+
+======== hybrid tags generated on a pipe (python print | --hybrid -) ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/generated.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ],
+  "hybrid": {
+    "source": "stdin"
+  }
+}
+--- generated-pipe resolved ---
+# palette
+color = red
+size = 2
+# end
+
+======== UTF-8 BOM on stdin is ignored (editors/Windows pipes) ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/bom.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ],
+  "hybrid": {
+    "source": "stdin"
+  }
+}
+BOM stdin matched file sidecar
+
+======== empty stdin --hybrid - is refused (markers stay) ========
+--hybrid - got empty stdin; pipe tagged blocks ([ours:...] / [theirs:...], %% between regions) or pass a sidecar file
+exit=3 (expect nonzero)
+
+======== empty file sidecar --hybrid is refused (markers stay) ========
+--hybrid /var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/empty-hybrid.txt is empty; tagged blocks ([ours:...] / [theirs:...], %% between regions) are required. An empty sidecar is not a hybrid and must not wipe the hunk
+exit=3 (expect nonzero)
+
+======== FILE - without --output refused (no file named -) ========
+FILE is '-' (stdin); pass --output PATH (not '-') so the resolved blob is not written to a file named '-'
+exit=3 (expect nonzero)
+no file named -
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/from-stdin.txt",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        1,
+        5
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "x\n"
+        }
+      ]
+    }
+  ]
+}
+--- FILE - --output ---
+x
+
+======== FILE and --hybrid both stdin refused ========
+cannot read both FILE and --hybrid from stdin; pass a path for the conflict file or for the sidecar
+exit=3 (expect nonzero)
+
+======== untagged hybrid failure (mixed red + size 2, no tags) ========
+region 1/1 lines 2-8 (HEAD vs feature): untagged text "color = red\nsize = 2\n" is not a substring of ours or theirs (unmarked mix or invented text). Tag each contested span [ours:...] or [theirs:...].
+  ours (HEAD):
+    color = red
+    size = 1
+  theirs (feature):
+    color = blue
+    size = 2
+exit=1 (expect nonzero)
+--- file left unresolved ---
+2:<<<<<<< HEAD
+3:color = red
+5:=======
+6:color = blue
+8:>>>>>>> feature
+
+======== diff3 ancestor markers refused (two parents only) ========
+fixtures/diff3.conflict:4: diff3 ancestor marker (|||||||) in region starting at line 2. whence tracks two parents only
+exit=2 (expect nonzero)
+
+======== nearest existing: git merge-file --ours has no provenance ========
+git merge-file --ours stdout:
+color = red
+size = 1
+(git wrote a blob and stopped; no per-span parent list)
+
+======== real git merge of two overlapping branches ========
+git merge exit=1
+--- conflicted file ---
+shared
+<<<<<<< HEAD
+value = 1
+=======
+value = 2
+>>>>>>> feature
+shared-end
+--- whence --ours on the real conflict ---
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/repo/config.txt",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        6
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "value = 1\n"
+        }
+      ]
+    }
+  ]
+}
+
+======== messy fixture: nested quotes, three regions, no trailing newline ========
+file: fixtures/messy.conflict
+conflicts: 3
+--- region 1 lines 2-8 HEAD vs feature ---
+ours:
+name = "Alice \"lead\""
+role = "owner"
+
+theirs:
+name = "Bob \"staff\""
+role = "editor"
+
+--- region 2 lines 9-13 HEAD vs feature ---
+ours:
+timeout = 30
+
+theirs:
+timeout = 90
+
+--- region 3 lines 14-18 HEAD vs feature ---
+ours:
+debug = true
+
+theirs:
+debug = false
+
+note: file has no trailing newline
+hybrid sidecar 'stdin' has 2 %% block(s) but 3 hybrid region(s):
+  region 1/3 lines 2-8 HEAD vs feature: block 1 supplied
+  region 2/3 lines 9-13 HEAD vs feature: block 2 supplied
+  region 3/3 lines 14-18 HEAD vs feature: MISSING tagged block
+Put one tagged block per hybrid region, separated by a %% line.
+short sidecar exit=1 (expect nonzero; should name missing region 3)
+region 1/3 lines 2-8 (HEAD vs feature): [ours:...] span "name = \"Bob \\\"staff\\\"\"" is not in ours (HEAD). It does appear in theirs (feature); did you mean [theirs:...]?
+  ours (HEAD):
+    name = "Alice \"lead\""
+    role = "owner"
+  theirs (feature):
+    name = "Bob \"staff\""
+    role = "editor"
+wrong-parent quoted name exit=1 (expect nonzero; should point at theirs)
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.Y22IWq/messy-ok.conflict",
+  "region_count": 3,
+  "trailing_newline": false,
+  "input_trailing_newline": false,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "name = \"Alice \\\"lead\\\"\""
+        },
+        {
+          "parent": "theirs",
+          "text": "\"editor\""
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "lines": [
+        9,
+        13
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "theirs",
+          "text": "90"
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "lines": [
+        14,
+        18
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "debug = true"
+        }
+      ]
+    }
+  ],
+  "hybrid": {
+    "source": "file",
+    "path": "fixtures/messy-hybrid.txt"
+  }
+}
+--- messy resolved (no trailing newline) ---
+title = "app"
+name = "Alice \"lead\""
+role = "editor"
+timeout = 90
+debug = true
+# eof
+--- xxd tail ---
+00000000: 300a 6465 6275 6720 3d20 7472 7565 0a23  0.debug = true.#
+00000010: 2065 6f66                                 eof
+
+======== tests (shipped CLI) ========
+test_choice_length_mismatch (test_whence.WhenceCLITests.test_choice_length_mismatch) ... ok
+test_choice_per_region (test_whence.WhenceCLITests.test_choice_per_region) ... ok
+test_diff3_ancestor_refused (test_whence.WhenceCLITests.test_diff3_ancestor_refused) ... ok
+test_hybrid_and_file_both_stdin_refused (test_whence.WhenceCLITests.test_hybrid_and_file_both_stdin_refused) ... ok
+test_hybrid_bom_file_sidecar_still_works (test_whence.WhenceCLITests.test_hybrid_bom_file_sidecar_still_works) ... ok
+test_hybrid_bom_stdin_matches_file_sidecar (test_whence.WhenceCLITests.test_hybrid_bom_stdin_matches_file_sidecar) ... ok
+test_hybrid_crlf_stdin_matches_lf_sidecar (test_whence.WhenceCLITests.test_hybrid_crlf_stdin_matches_lf_sidecar) ... ok
+test_hybrid_empty_file_sidecar_refused (test_whence.WhenceCLITests.test_hybrid_empty_file_sidecar_refused) ... ok
+test_hybrid_empty_stdin_refused (test_whence.WhenceCLITests.test_hybrid_empty_stdin_refused) ... ok
+test_hybrid_generated_tags_on_stdin (test_whence.WhenceCLITests.test_hybrid_generated_tags_on_stdin) ... ok
+test_hybrid_stdin_matches_file_sidecar (test_whence.WhenceCLITests.test_hybrid_stdin_matches_file_sidecar) ... ok
+test_hybrid_stdin_messy_matches_file (test_whence.WhenceCLITests.test_hybrid_stdin_messy_matches_file) ... ok
+test_hybrid_stdin_without_trailing_newline_is_literal (test_whence.WhenceCLITests.test_hybrid_stdin_without_trailing_newline_is_literal) ... ok
+test_hybrid_tagged_success (test_whence.WhenceCLITests.test_hybrid_tagged_success) ... ok
+test_hybrid_tty_stdin_refused (test_whence.WhenceCLITests.test_hybrid_tty_stdin_refused) ... ok
+test_imported_parser_matches_cli (test_whence.WhenceCLITests.test_imported_parser_matches_cli) ... ok
+test_malformed_markers (test_whence.WhenceCLITests.test_malformed_markers) ... ok
+test_messy_hybrid_block_mismatch_lists_regions (test_whence.WhenceCLITests.test_messy_hybrid_block_mismatch_lists_regions) ... ok
+test_messy_three_region_hybrid_and_missing_newline (test_whence.WhenceCLITests.test_messy_three_region_hybrid_and_missing_newline) ... ok
+test_messy_untagged_mix_shows_parent_bodies (test_whence.WhenceCLITests.test_messy_untagged_mix_shows_parent_bodies) ... ok
+test_messy_wrong_parent_quoted_name (test_whence.WhenceCLITests.test_messy_wrong_parent_quoted_name) ... ok
+test_no_markers (test_whence.WhenceCLITests.test_no_markers) ... ok
+test_ours_keeps_ours_and_writes_prov (test_whence.WhenceCLITests.test_ours_keeps_ours_and_writes_prov) ... ok
+test_report_lists_region (test_whence.WhenceCLITests.test_report_lists_region) ... ok
+test_stdin_file_with_output_ok (test_whence.WhenceCLITests.test_stdin_file_with_output_ok) ... ok
+test_stdin_file_without_output_refused (test_whence.WhenceCLITests.test_stdin_file_without_output_refused) ... ok
+test_theirs_keeps_theirs (test_whence.WhenceCLITests.test_theirs_keeps_theirs) ... ok
+test_untagged_hybrid_mix_refused (test_whence.WhenceCLITests.test_untagged_hybrid_mix_refused) ... ok
+test_untagged_ours_copy_refused (test_whence.WhenceCLITests.test_untagged_ours_copy_refused) ... ok
+test_usage_without_command (test_whence.WhenceCLITests.test_usage_without_command) ... ok
+test_wrong_parent_tag_refused (test_whence.WhenceCLITests.test_wrong_parent_tag_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 31 tests in 1.177s
+
+OK
+
+all demo steps finished (untagged=1 messy-short=1 messy-wrong=1 empty-stdin=3 empty-sidecar=3 dash-file=3 dual-stdin=3)

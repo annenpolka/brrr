@@ -1,0 +1,365 @@
+
+======== report simple.conflict ========
+file: fixtures/simple.conflict
+conflicts: 1
+--- region 1 lines 2-8 HEAD vs feature ---
+ours:
+color = red
+size = 1
+
+theirs:
+color = blue
+size = 2
+
+
+======== ours-only ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/simple.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red\nsize = 1\n"
+        }
+      ]
+    }
+  ]
+}
+--- resolved ---
+# palette
+color = red
+size = 1
+# end
+--- provenance file ---
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/simple.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red\nsize = 1\n"
+        }
+      ]
+    }
+  ]
+}
+
+======== theirs-only ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/theirs.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "theirs",
+      "spans": [
+        {
+          "parent": "theirs",
+          "text": "color = blue\nsize = 2\n"
+        }
+      ]
+    }
+  ]
+}
+--- resolved ---
+# palette
+color = blue
+size = 2
+# end
+
+======== hybrid tagged success (ours color, theirs size) ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/hybrid.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "color = red"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ]
+}
+--- resolved ---
+# palette
+color = red
+size = 2
+# end
+
+======== untagged hybrid failure (mixed red + size 2, no tags) ========
+exit=1 (expect nonzero)
+--- file left unresolved ---
+2:<<<<<<< HEAD
+3:color = red
+5:=======
+6:color = blue
+8:>>>>>>> feature
+
+======== diff3 ancestor markers refused (two parents only) ========
+exit=2 (expect nonzero)
+
+======== nearest existing: git merge-file --ours has no provenance ========
+git merge-file --ours stdout:
+color = red
+size = 1
+(git wrote a blob and stopped; no per-span parent list)
+
+======== real git merge of two overlapping branches ========
+git merge exit=1
+--- conflicted file ---
+shared
+<<<<<<< HEAD
+value = 1
+=======
+value = 2
+>>>>>>> feature
+shared-end
+--- whence --ours on the real conflict ---
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/repo/config.txt",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        6
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "ours",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "value = 1\n"
+        }
+      ]
+    }
+  ]
+}
+
+======== messy fixture: nested quotes, three regions, no trailing newline ========
+file: fixtures/messy.conflict
+conflicts: 3
+--- region 1 lines 2-8 HEAD vs feature ---
+ours:
+name = "Alice \"lead\""
+role = "owner"
+
+theirs:
+name = "Bob \"staff\""
+role = "editor"
+
+--- region 2 lines 9-13 HEAD vs feature ---
+ours:
+timeout = 30
+
+theirs:
+timeout = 90
+
+--- region 3 lines 14-18 HEAD vs feature ---
+ours:
+debug = true
+
+theirs:
+debug = false
+
+note: file has no trailing newline
+short sidecar exit=1 (expect nonzero; should name missing region 3)
+wrong-parent quoted name exit=1 (expect nonzero; should point at theirs)
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/messy-ok.conflict",
+  "region_count": 3,
+  "trailing_newline": false,
+  "input_trailing_newline": false,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "name = \"Alice \\\"lead\\\"\""
+        },
+        {
+          "parent": "theirs",
+          "text": "\"editor\""
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "lines": [
+        9,
+        13
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "theirs",
+          "text": "90"
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "lines": [
+        14,
+        18
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "debug = true"
+        }
+      ]
+    }
+  ]
+}
+--- messy resolved (no trailing newline) ---
+title = "app"
+name = "Alice \"lead\""
+role = "editor"
+timeout = 90
+debug = true
+# eof
+--- xxd tail ---
+00000000: 300a 6465 6275 6720 3d20 7472 7565 0a23  0.debug = true.#
+00000010: 2065 6f66                                 eof
+
+======== json array: tag whole ours object without escaping inner ] ========
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/json-array.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "  \"items\": [\"a\", \"b\"],\n  \"n\": 1"
+        }
+      ]
+    }
+  ]
+}
+--- resolved (ours object, inner ] unescaped) ---
+{
+  "items": ["a", "b"],
+  "n": 1
+}
+{
+  "tool": "whence",
+  "file": "/var/folders/t2/89bbgzfj41q22bwkdyr_sgth0000gn/T//whence-demo.ash3wb/json-array.conflict",
+  "region_count": 1,
+  "trailing_newline": true,
+  "input_trailing_newline": true,
+  "regions": [
+    {
+      "index": 1,
+      "lines": [
+        2,
+        8
+      ],
+      "ours_label": "HEAD",
+      "theirs_label": "feature",
+      "mode": "hybrid",
+      "spans": [
+        {
+          "parent": "ours",
+          "text": "[\"a\", \"b\"]"
+        },
+        {
+          "parent": "theirs",
+          "text": "2"
+        }
+      ]
+    }
+  ]
+}
+--- mixed (ours items, theirs n) ---
+{
+  "items": ["a", "b"],
+  "n": 2
+}
+
+======== tests (shipped CLI) ========
+
+all demo steps finished (untagged=1 messy-short=1 messy-wrong=1)

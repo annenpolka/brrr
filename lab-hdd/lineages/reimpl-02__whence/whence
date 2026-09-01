@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""whence: resolve conflict markers only by named parent, emit provenance.
+
+Parse <<<<<<< / ======= / >>>>>>> regions. Replace each region with --ours,
+--theirs, a per-region --choice, or a tagged hybrid sidecar. Every kept
+contested span is recorded with the parent it came from. Untagged mixed
+text is refused. Two parents only; diff3 ||||||| hunks are refused.
+
+Python 3 stdlib. zsh owns the word `whence`; run as ./whence or python3 whence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+EXIT_OK = 0
+EXIT_REFUSE = 1
+EXIT_PARSE = 2
+EXIT_USAGE = 3
+
+OPEN = "<<<<<<<"
+MID = "======="
+CLOSE = ">>>>>>>"
+BASE = "|||||||"
+TAG_OURS = "[ours:"
+TAG_THEIRS = "[theirs:"
+
+
+class WhenceError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class Region:
+    index: int
+    start_line: int
+    end_line: int
+    ours_label: str
+    theirs_label: str
+    ours: str
+    theirs: str
+
+
+@dataclass
+class Segment:
+    kind: str
+    text: str = ""
+    region: Region | None = None
+
+
+@dataclass
+class Span:
+    parent: str
+    text: str
+
+
+@dataclass
+class RegionRecord:
+    index: int
+    lines: list[int]
+    ours_label: str
+    theirs_label: str
+    mode: str
+    spans: list[Span] = field(default_factory=list)
+
+
+def regions_of(parts: Iterable[Segment]) -> list[Region]:
+    return [p.region for p in parts if p.region is not None]
+
+
+def _without_ending(line: str) -> str:
+    if line.endswith("\n"):
+        line = line[:-1]
+    if line.endswith("\r"):
+        line = line[:-1]
+    return line
+
+
+def _is_open(core: str) -> bool:
+    return core == OPEN or core.startswith(OPEN + " ")
+
+
+def _is_mid(core: str) -> bool:
+    return core == MID
+
+
+def _is_close(core: str) -> bool:
+    return core == CLOSE or core.startswith(CLOSE + " ")
+
+
+def _is_base(core: str) -> bool:
+    return core.startswith(BASE)
+
+
+def _label(core: str, mark: str, default: str) -> str:
+    if core == mark:
+        return default
+    rest = core[len(mark) + 1 :]
+    return rest if rest else default
+
+
+def _at(path: str, line: int, msg: str) -> WhenceError:
+    return WhenceError(EXIT_PARSE, f"{path}:{line}: {msg}")
+
+
+def parse_conflicts(text: str, path: str) -> list[Segment]:
+    lines = text.splitlines(keepends=True)
+    parts: list[Segment] = []
+    buf: list[str] = []
+    i = 0
+    lineno = 1
+    index = 0
+
+    def flush_text() -> None:
+        if buf:
+            parts.append(Segment("text", "".join(buf)))
+            buf.clear()
+
+    while i < len(lines):
+        core = _without_ending(lines[i])
+        if _is_open(core):
+            flush_text()
+            start_line = lineno
+            ours_label = _label(core, OPEN, "ours")
+            i += 1
+            lineno += 1
+            ours_buf: list[str] = []
+            theirs_buf: list[str] = []
+            seen_mid = False
+            closed = False
+            theirs_label = "theirs"
+            end_line = start_line
+            while i < len(lines):
+                core = _without_ending(lines[i])
+                if not seen_mid:
+                    if _is_base(core):
+                        raise _at(
+                            path,
+                            lineno,
+                            f"diff3 ancestor marker ({BASE}) in region starting at line "
+                            f"{start_line}. whence tracks two parents only",
+                        )
+                    if _is_open(core):
+                        raise _at(
+                            path,
+                            lineno,
+                            f"nested {OPEN} inside region starting at line {start_line}",
+                        )
+                    if _is_close(core):
+                        raise _at(
+                            path,
+                            start_line,
+                            f"region has {CLOSE} before {MID}",
+                        )
+                    if _is_mid(core):
+                        seen_mid = True
+                        i += 1
+                        lineno += 1
+                        continue
+                    ours_buf.append(lines[i])
+                else:
+                    if _is_base(core):
+                        raise _at(
+                            path,
+                            lineno,
+                            f"diff3 ancestor marker ({BASE}) after {MID}",
+                        )
+                    if _is_open(core):
+                        raise _at(
+                            path,
+                            lineno,
+                            f"nested {OPEN} before closing region that started at line "
+                            f"{start_line}",
+                        )
+                    if _is_mid(core):
+                        raise _at(
+                            path,
+                            lineno,
+                            f"extra {MID}; whence handles two parents only "
+                            f"(ours / theirs), not a third hunk",
+                        )
+                    if _is_close(core):
+                        theirs_label = _label(core, CLOSE, "theirs")
+                        end_line = lineno
+                        i += 1
+                        lineno += 1
+                        closed = True
+                        break
+                    theirs_buf.append(lines[i])
+                i += 1
+                lineno += 1
+            if not closed:
+                if not seen_mid:
+                    raise _at(path, start_line, f"unclosed {OPEN} (no {MID})")
+                raise _at(
+                    path,
+                    start_line,
+                    f"unclosed region (no {CLOSE} after {MID})",
+                )
+            index += 1
+            parts.append(
+                Segment(
+                    "conflict",
+                    region=Region(
+                        index=index,
+                        start_line=start_line,
+                        end_line=end_line,
+                        ours_label=ours_label,
+                        theirs_label=theirs_label,
+                        ours="".join(ours_buf),
+                        theirs="".join(theirs_buf),
+                    ),
+                )
+            )
+            continue
+        if _is_mid(core):
+            raise _at(path, lineno, f"stray {MID} with no opening {OPEN}")
+        if _is_close(core):
+            raise _at(path, lineno, f"stray {CLOSE} with no opening {OPEN}")
+        buf.append(lines[i])
+        i += 1
+        lineno += 1
+    flush_text()
+    return parts
+
+
+def _json_snippet(text: str, limit: int = 120) -> str:
+    if len(text) > limit:
+        text = text[: limit - 4] + "..."
+    return json.dumps(text)
+
+
+def _indent_parent(text: str) -> str:
+    if text == "":
+        return "    <empty>\n"
+    return "".join("    " + line + "\n" for line in text.splitlines())
+
+
+def _parent_bodies(region: Region) -> str:
+    return (
+        f"  ours ({region.ours_label}):\n{_indent_parent(region.ours)}"
+        f"  theirs ({region.theirs_label}):\n{_indent_parent(region.theirs)}"
+    )
+
+
+def _loc(region: Region, n_regions: int, parens: bool = True) -> str:
+    vs = f"{region.ours_label} vs {region.theirs_label}"
+    if parens:
+        vs = f"({vs})"
+    return (
+        f"region {region.index}/{n_regions} lines "
+        f"{region.start_line}-{region.end_line} {vs}"
+    )
+
+
+def _refuse(msg: str) -> None:
+    raise WhenceError(EXIT_REFUSE, msg)
+
+
+def _hybrid_sections(text: str) -> list[str]:
+    if text == "":
+        return [""]
+    lines = text.splitlines(keepends=True)
+    blocks: list[str] = []
+    cur: list[str] = []
+    for line in lines:
+        if _without_ending(line).strip() == "%%":
+            blocks.append("".join(cur))
+            cur = []
+        else:
+            cur.append(line)
+    blocks.append("".join(cur))
+    return blocks
+
+
+def _tag_closes(text: str, start: int) -> list[tuple[int, str]]:
+    """Unescaped ] positions after start: (index after bracket, decoded inner).
+
+    Each later ] is a longer candidate: the previous closer becomes inner text.
+    """
+    found: list[tuple[int, str]] = []
+    inner: list[str] = []
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "]":
+                inner.append("]")
+                i += 2
+                continue
+            if nxt == "\\":
+                inner.append("\\")
+                i += 2
+                continue
+            inner.append("\\")
+            i += 1
+            continue
+        if ch == "]":
+            found.append((i + 1, "".join(inner)))
+            inner.append("]")
+            i += 1
+            continue
+        inner.append(ch)
+        i += 1
+    return found
+
+
+def _next_tag(text: str, i: int) -> int:
+    n = len(text)
+    cuts = [p for p in (text.find(TAG_OURS, i), text.find(TAG_THEIRS, i)) if p >= i]
+    return min(cuts) if cuts else n
+
+
+def _consume(rest: str, needle: str) -> str | None:
+    pos = rest.find(needle)
+    if pos < 0:
+        return None
+    return rest[pos + len(needle) :]
+
+
+def _stitch_hybrid(
+    region: Region,
+    tagged: str,
+    sidecar_name: str,
+    n_regions: int,
+) -> tuple[str, list[Span], str]:
+    loc = _loc(region, n_regions, parens=True)
+    where = f"{sidecar_name} ({loc})"
+    ours_rest = region.ours
+    theirs_rest = region.theirs
+    chunks: list[str] = []
+    spans: list[Span] = []
+    tagged_any = TAG_OURS in tagged or TAG_THEIRS in tagged
+
+    def fail_untagged(piece: str) -> None:
+        excerpt = _parent_bodies(region)
+        shown = _json_snippet(piece)
+        if not tagged_any:
+            in_ours = piece in region.ours
+            in_theirs = piece in region.theirs
+            if in_ours and not in_theirs:
+                _refuse(
+                    f"{loc}: untagged contested text {shown} appears in ours "
+                    f"({region.ours_label}) only. Tag it [ours:...] or use --ours.\n"
+                    f"{excerpt}"
+                )
+            if in_theirs and not in_ours:
+                _refuse(
+                    f"{loc}: untagged contested text {shown} appears in theirs "
+                    f"({region.theirs_label}) only. Tag it [theirs:...] or use --theirs.\n"
+                    f"{excerpt}"
+                )
+        _refuse(
+            f"{loc}: untagged text {shown} is not a substring of ours or theirs "
+            f"(unmarked mix or invented text). Tag each contested span "
+            f"[ours:...] or [theirs:...].\n{excerpt}"
+        )
+
+    def fail_tag(parent: str, piece: str) -> None:
+        excerpt = _parent_bodies(region)
+        shown = _json_snippet(piece)
+        other = "theirs" if parent == "ours" else "ours"
+        other_body = region.theirs if parent == "ours" else region.ours
+        other_label = region.theirs_label if parent == "ours" else region.ours_label
+        self_label = region.ours_label if parent == "ours" else region.theirs_label
+        if piece in other_body:
+            _refuse(
+                f"{loc}: [{parent}:...] span {shown} is not in {parent} "
+                f"({self_label}). It does appear in {other} ({other_label}); "
+                f"did you mean [{other}:...]?\n{excerpt}"
+            )
+        _refuse(
+            f"{loc}: [{parent}:...] span {shown} is not in {parent} "
+            f"({self_label}). It is not in {other} ({other_label}) either.\n"
+            f"{excerpt}"
+        )
+
+    i = 0
+    n = len(tagged)
+    while i < n:
+        if tagged.startswith(TAG_OURS, i) or tagged.startswith(TAG_THEIRS, i):
+            parent = "ours" if tagged.startswith(TAG_OURS, i) else "theirs"
+            prefix = TAG_OURS if parent == "ours" else TAG_THEIRS
+            closes = _tag_closes(tagged, i + len(prefix))
+            if not closes:
+                _refuse(
+                    f"{where}: unclosed [{parent}: tag (missing ]). "
+                    f"A literal ] inside a tag must be written as \\]. "
+                    f'Backslash is otherwise kept (so \\" in source stays \\").'
+                )
+            rest = ours_rest if parent == "ours" else theirs_rest
+            chosen: tuple[int, str] | None = None
+            for end, inner in closes:
+                if inner in rest:
+                    chosen = (end, inner)
+            if chosen is None:
+                fail_tag(parent, closes[0][1])
+            i, piece = chosen
+            nxt = _consume(rest, piece)
+            assert nxt is not None
+            if parent == "ours":
+                ours_rest = nxt
+            else:
+                theirs_rest = nxt
+            chunks.append(piece)
+            spans.append(Span(parent, piece))
+            continue
+        j = _next_tag(tagged, i)
+        piece = tagged[i:j]
+        i = j
+        if piece == "":
+            continue
+        nxt_ours = _consume(ours_rest, piece)
+        nxt_theirs = _consume(theirs_rest, piece)
+        if nxt_ours is None or nxt_theirs is None:
+            fail_untagged(piece)
+        ours_rest = nxt_ours
+        theirs_rest = nxt_theirs
+        chunks.append(piece)
+
+    rendered = "".join(chunks)
+    if not spans and rendered == "":
+        return rendered, spans, "empty"
+    return rendered, spans, "hybrid"
+
+
+def _side_body(title: str, body: str) -> str:
+    out = f"{title}:\n"
+    if body == "":
+        out += "<empty>\n"
+    else:
+        out += body
+        if not body.endswith("\n"):
+            out += "\n"
+        out += "\n"
+    return out
+
+
+def _format_report(path: str, parts: list[Segment], original: str) -> str:
+    regs = regions_of(parts)
+    out = [f"file: {path}\n", f"conflicts: {len(regs)}\n"]
+    for region in regs:
+        out.append(
+            f"--- region {region.index} lines {region.start_line}-{region.end_line} "
+            f"{region.ours_label} vs {region.theirs_label} ---\n"
+        )
+        out.append(_side_body("ours", region.ours))
+        out.append(_side_body("theirs", region.theirs))
+    if not original.endswith("\n"):
+        out.append("note: file has no trailing newline\n")
+    return "".join(out)
+
+
+def _read_bytes(path: str) -> bytes:
+    try:
+        if path == "-":
+            return sys.stdin.buffer.read()
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise WhenceError(EXIT_PARSE, f"cannot read {path}: {exc}") from exc
+
+
+def _decode(path: str, data: bytes) -> str:
+    if b"\x00" in data:
+        raise WhenceError(EXIT_PARSE, f"{path} contains NUL; whence refuses binaries")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WhenceError(
+            EXIT_PARSE,
+            f"{path} is not utf-8 text; whence does not resolve binaries",
+        ) from exc
+
+
+def read_text(path: str) -> str:
+    return _decode(path, _read_bytes(path))
+
+
+def _replace_file(path: str, data: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd = None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".whence-out-", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fd = None
+            fh.write(data)
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as exc:
+        raise WhenceError(EXIT_PARSE, f"i/o error: {exc}") from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _dump(doc: dict[str, Any]) -> str:
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def _record_doc(
+    path: str,
+    records: list[RegionRecord],
+    *,
+    trailing_newline: bool,
+    input_trailing_newline: bool,
+) -> dict[str, Any]:
+    return {
+        "tool": "whence",
+        "file": path,
+        "region_count": len(records),
+        "trailing_newline": trailing_newline,
+        "input_trailing_newline": input_trailing_newline,
+        "regions": [
+            {
+                "index": rec.index,
+                "lines": rec.lines,
+                "ours_label": rec.ours_label,
+                "theirs_label": rec.theirs_label,
+                "mode": rec.mode,
+                "spans": [{"parent": s.parent, "text": s.text} for s in rec.spans],
+            }
+            for rec in records
+        ],
+    }
+
+
+def _parse_choice_list(raw: str, regs: list[Region]) -> list[str]:
+    items = [item.strip().lower() for item in raw.split(",")]
+    items = [item for item in items if item]
+    n = len(regs)
+    if len(items) != n:
+        word = "entry" if len(items) == 1 else "entries"
+        listing = "\n".join(
+            f"  {_loc(region, n, parens=False)}" for region in regs
+        )
+        raise WhenceError(
+            EXIT_USAGE,
+            f"--choice has {len(items)} {word} but the file has {n} conflict "
+            f"region(s):\n{listing}\n"
+            f"List one of ours,theirs,hybrid per region, in order",
+        )
+    for i, item in enumerate(items, start=1):
+        if item not in ("ours", "theirs", "hybrid"):
+            raise WhenceError(
+                EXIT_USAGE,
+                f"--choice item {i} is {item!r}; expected ours, theirs, or hybrid",
+            )
+    return items
+
+
+def _whole_side(region: Region, parent: str) -> tuple[str, list[Span], str]:
+    body = region.ours if parent == "ours" else region.theirs
+    spans = [Span(parent, body)] if body else []
+    return body, spans, parent
+
+
+def _resolve(
+    parts: list[Segment],
+    choices: list[str],
+    hybrid_blocks: list[str] | None,
+    sidecar_name: str,
+) -> tuple[str, list[RegionRecord]]:
+    regs = regions_of(parts)
+    n = len(regs)
+    rendered: list[str] = []
+    records: list[RegionRecord] = []
+    hybrid_at = 0
+    for part in parts:
+        region = part.region
+        if region is None:
+            rendered.append(part.text)
+            continue
+        mode = choices[region.index - 1]
+        if mode in ("ours", "theirs"):
+            body, spans, mode = _whole_side(region, mode)
+        else:
+            assert hybrid_blocks is not None
+            body, spans, mode = _stitch_hybrid(
+                region,
+                hybrid_blocks[hybrid_at],
+                sidecar_name,
+                n,
+            )
+            hybrid_at += 1
+        rendered.append(body)
+        records.append(
+            RegionRecord(
+                index=region.index,
+                lines=[region.start_line, region.end_line],
+                ours_label=region.ours_label,
+                theirs_label=region.theirs_label,
+                mode=mode,
+                spans=spans,
+            )
+        )
+    return "".join(rendered), records
+
+
+def _check_hybrid_blocks(
+    regs: list[Region],
+    choices: list[str],
+    blocks: list[str],
+    sidecar_name: str,
+) -> None:
+    hybrid_regs = [r for r, c in zip(regs, choices) if c == "hybrid"]
+    n_h = len(hybrid_regs)
+    n_b = len(blocks)
+    n_all = len(regs)
+    if n_b == n_h:
+        return
+    lines = [
+        f"hybrid sidecar {sidecar_name!r} has {n_b} %% block(s) but {n_h} "
+        f"hybrid region(s):"
+    ]
+    for i, region in enumerate(hybrid_regs):
+        loc = _loc(region, n_all, parens=False)
+        if i < n_b:
+            lines.append(f"  {loc}: block {i + 1} supplied")
+        else:
+            lines.append(f"  {loc}: MISSING tagged block")
+    extra = n_b - n_h
+    if extra > 0:
+        lines.append(f"  extra sidecar block(s): {extra}")
+    lines.append(
+        "Put one tagged block per hybrid region, separated by a %% line."
+    )
+    _refuse("\n".join(lines))
+
+
+def cmd_report(path: str) -> int:
+    original = read_text(path)
+    parts = parse_conflicts(original, path)
+    sys.stdout.write(_format_report(path, parts, original))
+    return EXIT_OK
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    src = args.file
+    if args.ours and args.theirs:
+        raise WhenceError(EXIT_USAGE, "use only one of --ours or --theirs")
+    if args.ours and (args.choice or args.hybrid):
+        raise WhenceError(
+            EXIT_USAGE, "--ours cannot be combined with --choice or --hybrid"
+        )
+    if args.theirs and (args.choice or args.hybrid):
+        raise WhenceError(
+            EXIT_USAGE, "--theirs cannot be combined with --choice or --hybrid"
+        )
+    if not args.ours and not args.theirs and not args.choice and not args.hybrid:
+        raise WhenceError(
+            EXIT_USAGE,
+            "one of --ours, --theirs, --choice, or --hybrid is required",
+        )
+
+    src_stdin = src == "-"
+    hyb_stdin = args.hybrid == "-"
+    if src_stdin and hyb_stdin:
+        original = _decode(src, _read_bytes(src))
+        hybrid_text = ""
+    else:
+        original = read_text(src)
+        hybrid_text = ""
+        if args.hybrid:
+            hybrid_text = read_text(args.hybrid)
+
+    parts = parse_conflicts(original, src)
+    regs = regions_of(parts)
+    if not regs:
+        raise WhenceError(EXIT_PARSE, f"no conflict markers in {src}")
+
+    if args.choice:
+        choices = _parse_choice_list(args.choice, regs)
+    elif args.ours:
+        choices = ["ours"] * len(regs)
+    elif args.theirs:
+        choices = ["theirs"] * len(regs)
+    else:
+        choices = ["hybrid"] * len(regs)
+
+    want_hybrid = any(c == "hybrid" for c in choices)
+    if want_hybrid and not args.hybrid:
+        raise WhenceError(
+            EXIT_USAGE,
+            "--choice lists hybrid but no --hybrid sidecar was given",
+        )
+    if args.hybrid and not want_hybrid:
+        raise WhenceError(
+            EXIT_USAGE, "--hybrid given but --choice has no hybrid region"
+        )
+
+    sidecar_name = "stdin" if hyb_stdin else (args.hybrid or "")
+    hybrid_blocks: list[str] | None = None
+    if want_hybrid:
+        hybrid_blocks = _hybrid_sections(hybrid_text)
+        _check_hybrid_blocks(regs, choices, hybrid_blocks, sidecar_name)
+
+    resolved, records = _resolve(parts, choices, hybrid_blocks, sidecar_name)
+    out_path = args.output if args.output is not None else src
+    doc = _record_doc(
+        out_path,
+        records,
+        trailing_newline=resolved.endswith("\n"),
+        input_trailing_newline=original.endswith("\n"),
+    )
+    payload = _dump(doc)
+    _replace_file(out_path, resolved)
+    sys.stdout.write(payload)
+    prov = args.prov
+    if prov is None:
+        prov = out_path + ".prov"
+    if prov != "-":
+        _replace_file(prov, payload)
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="whence",
+        description=(
+            "Resolve <<<<<<< / ======= / >>>>>>> conflict markers only by "
+            "explicit parent choice, and emit a provenance report for every "
+            "kept contested span."
+        ),
+        epilog=(
+            "zsh has a builtin named whence; run this file as ./whence or "
+            "python3 whence.\n"
+            "Hybrid sidecar tags: [ours:text] [theirs:text]. Untagged text "
+            "must be common to both parents. Multiple hybrid regions are "
+            "separated by a %% line."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    report = sub.add_parser("report", help="list conflict regions without resolving")
+    report.add_argument("file", help="file containing conflict markers")
+    resolve = sub.add_parser(
+        "resolve", help="write resolved text and a parentage report"
+    )
+    resolve.add_argument("file", help="file containing conflict markers")
+    resolve.add_argument(
+        "--ours",
+        action="store_true",
+        help="keep the ours side of every region (between <<<<<<< and =======)",
+    )
+    resolve.add_argument(
+        "--theirs",
+        action="store_true",
+        help="keep the theirs side of every region (between ======= and >>>>>>>)",
+    )
+    resolve.add_argument(
+        "--choice",
+        metavar="LIST",
+        help="per-region choices in order, comma-separated: ours,theirs,hybrid",
+    )
+    resolve.add_argument(
+        "--hybrid",
+        metavar="SIDECAR",
+        help='tagged hybrid blocks; "-" reads stdin. Separate regions with a %% line',
+    )
+    resolve.add_argument(
+        "--output",
+        "-o",
+        metavar="PATH",
+        help="write resolved text here (default: overwrite FILE)",
+    )
+    resolve.add_argument(
+        "--prov",
+        metavar="PATH",
+        help="write provenance JSON here (default: OUTPUT.prov). '-' skips the file",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        return EXIT_USAGE
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return EXIT_USAGE
+    try:
+        if args.cmd == "report":
+            return cmd_report(args.file)
+        if args.cmd == "resolve":
+            return cmd_resolve(args)
+        parser.print_help()
+        return EXIT_USAGE
+    except WhenceError as exc:
+        sys.stderr.write(exc.message + "\n")
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

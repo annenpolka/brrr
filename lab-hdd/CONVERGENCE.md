@@ -23,6 +23,7 @@ Unlocked after First Selection. See `PRIOR_RUN_COMPARISON.md`.
 
 ## Grounder ∥ clean-room Grounder
 
+- **whence ∥ reimpl-02 whence** (2026-09-02 ~03:30): independent CLI recovered parent-tagged resolve + provenance. SHA-256 differs from candidate-01.
 - **stated ∥ reimpl-01 stated** (2026-09-02 02:16): independent implementation recovered declaration-vs-assignment disagreement (exit 2 pair). CLI hashes differ (`a5dd1050…` vs `a27d4bba…`). Primitive stronger than the original file.
 
 ## Mutation ∥ independent reimplementation

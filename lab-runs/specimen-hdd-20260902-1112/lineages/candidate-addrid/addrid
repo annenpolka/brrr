@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""addrid: name when a done-set address no longer names the same lock node."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN_FIELDS = ("insert", "worker", "fetched")
+
+
+class Insert:
+    def __init__(self, addr: str, name: str) -> None:
+        self.addr = addr
+        self.name = name
+
+
+class Worker:
+    def __init__(self, addr: str, name: str) -> None:
+        self.addr = addr
+        self.name = name
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def parse_record(text: str, *, source: str = "<input>") -> tuple[list[Insert], list[Worker], list[str]]:
+    inserts: list[Insert] = []
+    workers: list[Worker] = []
+    fetched: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        parts = [p for p in rest.split("\t") if p != ""]
+        if key not in KNOWN_FIELDS:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if key == "insert":
+            if len(parts) < 2:
+                raise ValueError(f"{source}:{lineno}: insert needs addr, name")
+            inserts.append(Insert(parts[0], parts[1]))
+        elif key == "worker":
+            if len(parts) < 2:
+                raise ValueError(f"{source}:{lineno}: worker needs addr, name")
+            workers.append(Worker(parts[0], parts[1]))
+        elif key == "fetched":
+            if not parts:
+                raise ValueError(f"{source}:{lineno}: fetched needs name")
+            fetched.append(parts[0])
+    if not inserts:
+        raise ValueError(f"{source}: missing insert")
+    return inserts, workers, unique(fetched)
+
+
+def inspect(inserts: list[Insert], workers: list[Worker], fetched: list[str]) -> dict:
+    first: dict[str, str] = {}
+    for event in inserts:
+        if event.addr not in first:
+            first[event.addr] = event.name
+    reused = []
+    for event in workers:
+        was = first.get(event.addr)
+        if was is None:
+            reused.append(
+                {
+                    "addr": event.addr,
+                    "was": "none",
+                    "now": event.name,
+                    "kind": "unknown-addr",
+                }
+            )
+        elif was != event.name:
+            reused.append(
+                {
+                    "addr": event.addr,
+                    "was": was,
+                    "now": event.name,
+                    "kind": "reused",
+                }
+            )
+    inserted_names = unique([e.name for e in inserts] + [w.name for w in workers])
+    skipped = [name for name in inserted_names if name not in set(fetched)]
+    return {
+        "reused": reused,
+        "skipped": skipped,
+        "fetched": fetched,
+        "inserted": unique([e.name for e in inserts]),
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = []
+    if result["reused"]:
+        for item in result["reused"]:
+            lines.append(
+                f"reused\t{item['addr']}\twas\t{item['was']}\tnow\t{item['now']}\tkind\t{item['kind']}"
+            )
+    else:
+        lines.append("reused\tnone")
+    lines.append("skipped\t" + ("\t".join(result["skipped"]) if result["skipped"] else "none"))
+    lines.append("fetched\t" + ("\t".join(result["fetched"]) if result["fetched"] else "none"))
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="addrid",
+        description=(
+            "Given insert(addr, name) and later worker(addr, name) events, "
+            "name when a pointer address no longer names the same lock node, "
+            "and which names were never fetched."
+        ),
+    )
+    parser.add_argument("record", nargs="?", metavar="RECORD")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record:
+            path = Path(args.record)
+            text = path.read_text(encoding="utf-8")
+            source = str(path)
+        else:
+            text = sys.stdin.read()
+            source = "<stdin>"
+        inserts, workers, fetched = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"addrid: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(inserts, workers, fetched)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,77 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "Documented timeout 0 means check once; a later default can abort before that check",
+    "The abort can happen without visiting the object",
+    "A wait with timeout 0 can fail before inspecting the object"
+  ],
+  "established": [
+    "Packet: kubectl wait --for=jsonpath={.status.replicas} deploy/test-3 --timeout=0 errors about --wait-for-creation instead of condition met",
+    "Packet is REAL_SOURCE_BACKED kubernetes wait"
+  ],
+  "rejected": [
+    "No cluster was contacted; condition met / wait-for-creation=false transcripts are Dreamer-generated",
+    "Help-text quotes beyond the packet are unverified",
+    "Specific kubectl transcripts in this turn are not host-executed"
+  ],
+  "constraints": [
+    "No kube API, no kubectl binary required",
+    "A tiny owned options fixture (timeout, wait-for-creation, for=delete) is the world",
+    "No cluster",
+    "An owned function that errors on timeout==0 before checking a dict is the world"
+  ],
+  "open_questions": [
+    "Can visit-vs-abort be shown from flags alone without a cluster?"
+  ],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "Ask which default governed timeout 0 and whether the object was visited",
+    "Ask whether wait evaluated the condition or refused before looking"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "distinguish wait that inspected state from wait that failed closed before looking",
+    "nearest_existing_operation": "kubectl wait plus reading the error string",
+    "observable_delta": "one query whose object is evaluated-vs-refused-before-look",
+    "reason": "exit status 1 conflates missing object, false condition, and policy refusal",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:01:31+09:00",
+      "summary": "Preserve timeout=0 one-shot vs wait-for-creation gating, and whether the object is visited. This host has no cluster. Invented kubectl outputs, --wait-for-creation=false, and negative-timeout behavior are Dreamer-generated. Harvest the governance question. Do not ask for more novelty.",
+      "pressure": [
+        "There is no cluster. Continue only on an owned flag/options fixture."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "for wait flags, report whether timeout 0 still visits the object or aborts on a creation-wait default",
+        "nearest_existing_operation": "read kubectl help plus the error string",
+        "observable_delta": "one query that names abort-before-visit vs one-shot check",
+        "reason": "the error looks like a user mistake; the object is whether the one-shot path ran",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:02:02+09:00",
+      "summary": "Preserve timeout=0 wait that errors before evaluating a condition. kubectl outputs here are unverified. Harvest the wait-semantics question if an owned fixture can show error-before-observe vs one-shot check.",
+      "pressure": [
+        "There is no cluster. Continue on a tiny wait(fixture, timeout) function. Show whether timeout 0 looked at the object."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "distinguish wait that inspected state from wait that failed closed before looking",
+        "nearest_existing_operation": "kubectl wait plus reading the error string",
+        "observable_delta": "one query whose object is evaluated-vs-refused-before-look",
+        "reason": "exit status 1 conflates missing object, false condition, and policy refusal",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [
+    "There is no cluster. Continue on a tiny wait(fixture, timeout) function. Show whether timeout 0 looked at the object."
+  ],
+  "pending": null
+}

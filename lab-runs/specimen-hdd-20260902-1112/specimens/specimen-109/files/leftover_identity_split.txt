@@ -1,0 +1,25 @@
+Registry / fixture:
+  foo and bar both dummy = latest
+  both mise.lock pin dummy 1.0.0
+
+Case A (single project upgrade 1.0.0 → 2.0.0):
+  stale lock of this project
+  uninstall intended
+  no sibling leftover
+
+Case B (upgrade only bar to 2.0.0):
+  failing_ref keep-set ignores foo lock
+  leftover: foo pin 1.0.0 vs missing install
+  bar 2.0.0 stays joined
+
+Case C (mise prune, not upgrade):
+  already use_locked_version=true
+  not this leftover
+
+Case D (shared lockfile path):
+  one pin
+  not sibling leftover
+
+Not this packet:
+  uv git vs directory (006/022/023/102)
+  go testcache omits buildid (078)

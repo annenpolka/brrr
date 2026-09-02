@@ -1,0 +1,29 @@
+Registry / fixture:
+  no-deps@1.0.0 and no-deps@2.0.0
+  root workspaces.catalog = { "no-deps": "^1.0.0" }
+  packages/app dependencies = { "no-deps": "catalog:" }
+
+Case A (bun update --latest from workspace root):
+  current file is root package.json
+  catalog object is not a dependency group
+  catalog.no-deps stays ^1.0.0
+  member catalog: literals are not this file
+
+Case B (bun update --latest from packages/app):
+  current file has "no-deps": "catalog:"
+  Tag::Catalog enters updating_packages
+  before install the string can become "latest"
+  after install the string is a caret range
+  root catalog object still ^1.0.0
+  leftover: catalog: join gone; catalog object leftover old version
+
+Case C (interactive bun update -r -i):
+  not this leftover
+
+Case D (bun add no-deps@2.0.0 in the member):
+  explicit pin of a version in that package
+  not the silent leftover
+
+Not this packet:
+  bun optional-peer packages leftover after remove (specimen-082)
+  npm peers/overrides (004/033/095)

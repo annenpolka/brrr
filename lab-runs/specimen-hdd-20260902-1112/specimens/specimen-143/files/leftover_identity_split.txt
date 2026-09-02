@@ -1,0 +1,24 @@
+Registry / fixture:
+  community.general.proxmox cache: true
+  leftover inventory jsonfile after new LXC + refresh_inventory
+
+Case A (second load, Proxmox unchanged):
+  current cache identity
+  not leftover-after-world-change
+
+Case B (new LXC, leftover cache file):
+  leftover: previous proxmox inventory JSON
+  cache keyed by inventory file path
+  new hostname omitted on second run
+
+Case C (cache off / cache dir deleted):
+  fresh inventory identity
+  not leftover previous hosts
+
+Case D (refresh writes _cache[key] = results):
+  new host present on second run
+  not leftover previous inventory
+
+Not this packet:
+  pants leftover vcs_version process cache (specimen-136)
+  ansible-core leftover inventory vs --flush-cache (#73699)

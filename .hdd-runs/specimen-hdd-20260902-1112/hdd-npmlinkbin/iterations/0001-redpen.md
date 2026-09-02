@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover .bin shim vs missing package is two greps. Do not harvest an npmlinkbin TSV. Do not send npm linked theater back to R1. Distinct from 004/082/095 and peerleft. Dreamer used the fixed npm.

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""peerleft: name leftover packages identity vs metadata-only mention."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def parse_lock(text: str, *, source: str) -> dict:
+    packages: list[str] = []
+    mentioned: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        name = rest.split("\t", 1)[0].strip()
+        if key == "packages":
+            packages.append(name)
+        elif key in {"peer", "optionalPeers", "mentioned"}:
+            mentioned.append(name)
+        else:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+    return {"packages": packages, "mentioned": mentioned, "source": source}
+
+
+def inspect(first: dict, second: dict, name: str) -> dict:
+    a_pkg = name in first["packages"]
+    b_pkg = name in second["packages"]
+    a_ment = name in first["mentioned"] or a_pkg
+    b_ment = name in second["mentioned"] or b_pkg
+    leftover = (not a_pkg) and b_pkg
+    return {
+        "name": name,
+        "packages_a": a_pkg,
+        "packages_b": b_pkg,
+        "mentioned_a": a_ment,
+        "mentioned_b": b_ment,
+        "leftover_identity": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"name\t{result['name']}",
+        f"packages_a\t{yn(result['packages_a'])}",
+        f"packages_b\t{yn(result['packages_b'])}",
+        f"mentioned_a\t{yn(result['mentioned_a'])}",
+        f"mentioned_b\t{yn(result['mentioned_b'])}",
+        f"leftover_identity\t{yn(result['leftover_identity'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="peerleft",
+        description=(
+            "Compare two lock excerpts. Name whether a package is a leftover "
+            "packages identity after remove, or only mentioned in peer metadata."
+        ),
+    )
+    parser.add_argument("never")
+    parser.add_argument("after")
+    parser.add_argument("--name", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        first = parse_lock(Path(args.never).read_text(encoding="utf-8"), source=args.never)
+        second = parse_lock(Path(args.after).read_text(encoding="utf-8"), source=args.after)
+    except (OSError, ValueError) as err:
+        print(f"peerleft: {err}", file=sys.stderr)
+        return 1
+    result = inspect(first, second, args.name)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_identity"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

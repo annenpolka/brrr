@@ -1,0 +1,11 @@
+{
+  "id": "specimen-018",
+  "manifest": "\nid: specimen-018\nkind: ADVERSARIAL_SPECIMEN\nrepository: local-fixture\nmechanism_tags:\n  - cache-invalidation\n  - fingerprint\n  - missing-output\n  - adversarial\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2400\nanswer_key_sealed: true\nparent_specimens: [specimen-005, specimen-011]\nmutations: []\n",
+  "task": "# TASK\n\nA cache record is printed as JSON. The record contains a hex `key`, an `inputs` object, and an `outputs` list that includes `out.sbom`. A second build requests `out.sbom` and prints FRESH. `out.sbom` does not exist.\n\nThe developer wants to know whether those listed output names participated in freshness, or only sat next to the identity in the dump.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/cache_dump.py. The printed record lists `out.sbom` under `outputs`. The extra file is still missing on the second call. Keys match.\n\n## Captured host execution (stdlib, no third-party packages)\n```\nrecord {\"inputs\": {\"src\": \"hello\"}, \"key\": \"9280cc7e16e9\", \"outputs\": [\"out.bin\", \"out.sbom\"]}\nsecond FRESH extra_exists False key 9280cc7e16e9\noutputs_listed_in_record True\nsame_key True\n```\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/cache_dump.py\n```\n",
+  "tree": "files/cache_dump.py\n",
+  "source": "ADVERSARIAL_SPECIMEN against the claimed observable \u201ccache key includes outputs\u201d.\nGrounded in specimen-005 (cargo SBOM fingerprint) and specimen-011 (owned missing-output cache).\nThe dump lists output paths beside the key so a reader who greps the record would conclude outputs are part of the identity.\nOwned fixture; executed on lab host.\n",
+  "answer_key": "KNOWN FIX (sealed): listing output paths in a cache record is not membership in the digest; hash the requested output set with the inputs or a miss will still print those names. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\nUgly dump vs missing extra output; tests whether printed output names are treated as identity.\n"
+}

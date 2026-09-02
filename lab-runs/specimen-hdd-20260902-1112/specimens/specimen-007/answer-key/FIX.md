@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): index_existing_and_best discarded computed insertion pos and hardcoded *existing_position = 0 when not found. check_file_directory_collision scanned from 0 and could stop on an earlier sibling. Fix: *existing_position = pos.

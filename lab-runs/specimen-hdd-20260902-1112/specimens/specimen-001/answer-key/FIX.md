@@ -1,0 +1,2 @@
+KNOWN FIX (sealed): pytest PR 14447. Assertion rewriter stored NamedExpr AST nodes in variables_overwrite and substituted them into later reads, _call_reprcompare results, and explanation formatting — each substitution re-evaluated the walrus. Fix: keep walrus in natural evaluation position; snapshot/freeze operands a later walrus would clobber; explanations reference assigned temps rather than re-running NamedExpr.
+Do not show this to Dreamers, initial Red Pen, initial Grounders, or first-selection judges.

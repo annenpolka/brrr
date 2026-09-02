@@ -1,0 +1,26 @@
+Registry / fixture:
+  explicit path wheel pkg-1.0-py2.py3-none-any.whl
+  extra name ext
+  constraint pkg==1
+
+Case A (path without extras + pkg==1):
+  base link candidate
+  no extras wrap
+  install ok
+
+Case B (path with extras + pkg==1):
+  failing_ref extras-wrapped candidate
+  constraint looks up base link with extras empty
+  leftover: wrap is not the base
+
+Case C (pkg2 depends pkg1[ext]==1.0 plus explicit pkg1.whl[ext]):
+  same leftover on the explicit extra link
+
+Case D (pkg[ext]==1.0 from index, no path link):
+  not this leftover
+
+Not this packet:
+  pip empty extra (specimen-031)
+  extra marker fixture (specimen-080)
+  pipmark
+  require-hashes extras (#9644)

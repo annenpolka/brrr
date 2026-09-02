@@ -1,0 +1,25 @@
+Registry / fixture:
+  incremental: true
+  js/MessageablePerson.ts mixin field public/protected message
+  js/main.ts reads person.message
+
+Case A (incremental false, public->protected->public):
+  no leftover tsbuildinfo signature
+  typecheck clean after revert
+
+Case B (incremental true, error then revert, d.ts text unchanged):
+  leftover: .tsbuildinfo file signature = hash(d.ts text)
+  importer still reports TS2445
+
+Case C (first tsc, no prior .tsbuildinfo):
+  no leftover signature
+
+Case D (delete .tsbuildinfo then tsc after revert):
+  fresh identity
+  not leftover reuse
+
+Not this packet:
+  mypy identity-loss / generic-substitution (specimen-067)
+  rustc incremental query identity (specimen-075)
+  vitest leftover-cache-key (specimen-094)
+  TypeScript#30602 / #61717 (open; no merged fixed_ref)

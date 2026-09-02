@@ -1,0 +1,28 @@
+{
+  "summary": "Used packet /proc excerpts (good). Invented live docker inspect. Harvest which probe file decided in-docker and which path went to -v. No docker.",
+  "preserve_add": [
+    "cgroup v2 can lack the docker string while mountinfo still names a docker container path"
+  ],
+  "established_add": [
+    "Packet: _is_in_docker reads /proc/1/cgroup for b'docker'; cgroup v2 is 0::/system.slice/containerd.service"
+  ],
+  "rejected_add": [
+    "Invented live docker inspect of this host is not the packet world"
+  ],
+  "constraints_add": [
+    "No docker. Owned probe records: cgroup text, mountinfo docker path, path used in -v"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Which /proc file decided in-docker, which container id if any, which path ended up in -v"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name the probe file that said not-in-docker while another file still named a container path",
+    "nearest_existing_operation": "cat cgroup plus grep mountinfo",
+    "observable_delta": "cgroup miss vs mountinfo hit vs path used",
+    "reason": "two files, one decision; the join is the object"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Owned probe records. Do not send docker CLI back to R1."
+}

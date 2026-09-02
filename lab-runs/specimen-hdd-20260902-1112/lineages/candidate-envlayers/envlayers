@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""envlayers: one key across inherited, file, skip-empty, assign, and process."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+LAYERS = ("inherited", "file", "skip_empty", "assign", "process")
+KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VALUE_CAP = 256
+
+
+class ParseError(ValueError):
+    """File line is not in the declared dotenv subset."""
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = (
+                inner.replace(r"\\", "\0")
+                .replace(r"\"", '"')
+                .replace(r"\n", "\n")
+                .replace("\0", "\\")
+            )
+        return inner
+    return value
+
+
+def iter_assignments(env_text: str):
+    """Yield KEY, VALUE in file order. Empty VALUE is a present assignment.
+
+    Grammar: optional BOM; strip; skip blanks and `#` comments; optional
+    `export `; KEY=VALUE with optional spaces around `=`; `KEY=""` / `KEY=''`
+    is empty. Other lines are errors, not silent wrong keys.
+    """
+    text = env_text[1:] if env_text.startswith("\ufeff") else env_text
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export") and (len(line) == 6 or line[6].isspace()):
+            line = line[6:].lstrip()
+            if not line:
+                raise ParseError(f"not an assignment: {raw}")
+        if "=" not in line:
+            raise ParseError(f"not an assignment: {raw}")
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = _unquote(value.strip())
+        if not key:
+            raise ParseError(f"empty key in {raw!r}")
+        if not KEY_RE.match(key):
+            raise ParseError(f"bad key: {key!r}")
+        if "\0" in key or "\0" in value:
+            raise ParseError(f"nul in assignment: {raw!r}")
+        yield key, value
+
+
+def parse_assignments(env_text: str) -> dict[str, str]:
+    """Last assignment wins, including empty (`KEY=` / `KEY=""`)."""
+    out: dict[str, str] = {}
+    for key, value in iter_assignments(env_text):
+        out[key] = value
+    return out
+
+
+def load_skip_empty(env_text: str, base: dict[str, str]) -> dict[str, str]:
+    """Last non-empty file assignment wins.
+
+    Empty does not unset an earlier file value and does not fall back to
+    inherited while a non-empty file assignment exists.
+    """
+    out = dict(base)
+    for key, value in iter_assignments(env_text):
+        if value:
+            out[key] = value
+    return out
+
+
+def load_assign(env_text: str, base: dict[str, str]) -> dict[str, str]:
+    """Last assignment wins, including empty string."""
+    out = dict(base)
+    for key, value in iter_assignments(env_text):
+        out[key] = value
+    return out
+
+
+def file_error(path: str, err: BaseException) -> str:
+    """Short --file error; never leak raw Errno N."""
+    if isinstance(err, FileNotFoundError) or (
+        isinstance(err, OSError) and err.errno == 2 and not os.path.exists(path)
+    ):
+        return f"file not found: {path}"
+    if isinstance(err, IsADirectoryError) or os.path.isdir(path):
+        return f"is a directory: {path}"
+    if isinstance(err, UnicodeDecodeError):
+        return f"not utf-8: {path}"
+    if isinstance(err, OSError):
+        reason = err.strerror or err.__class__.__name__
+        return f"cannot read {path}: {reason}"
+    return f"cannot read {path}"
+
+
+def lookup(mapping: dict[str, str] | None, key: str):
+    if mapping is None or key not in mapping:
+        return None
+    return mapping[key]
+
+
+def parse_overlay(item: str, what: str) -> tuple[str, str]:
+    if "=" not in item:
+        raise ValueError(f"{what} must be NAME=VALUE, got {item!r}")
+    key, _, value = item.partition("=")
+    key = key.strip()
+    if not key:
+        raise ValueError(f"empty key in {item!r}")
+    if not KEY_RE.match(key):
+        raise ValueError(f"bad key: {key!r}")
+    value = _unquote(value.strip())
+    if "\0" in value:
+        raise ValueError(f"nul in {what}")
+    return key, value
+
+
+def build_inherited(
+    overlays: list[str], from_process: bool
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Caller overlays on an empty map, unless --from-process-env."""
+    env: dict[str, str] = {}
+    origin: dict[str, str] = {}
+    if from_process:
+        env = dict(os.environ)
+        origin = {key: "process-copy" for key in env}
+    for item in overlays:
+        key, value = parse_overlay(item, "inherited overlay")
+        env[key] = value
+        origin[key] = "caller"
+    return env, origin
+
+
+def display_repr(value: str | None) -> str:
+    if value is None:
+        return "None"
+    shown = value if len(value) <= VALUE_CAP else value[:VALUE_CAP] + "…"
+    return repr(shown)
+
+
+def _map_presence(value: str | None) -> str:
+    if value is None:
+        return "absent"
+    if value == "":
+        return "empty"
+    return "present"
+
+
+def layers_for_key(
+    key: str,
+    *,
+    inherited: dict[str, str],
+    file_text: str | None,
+    process_env: dict[str, str],
+    inherited_origins: dict[str, str] | None = None,
+    process_source: str = "os.environ",
+) -> dict[str, object]:
+    origins = inherited_origins or {name: "caller" for name in inherited}
+    events = [] if file_text is None else list(iter_assignments(file_text))
+    file_map = None if file_text is None else parse_assignments(file_text)
+    text = "" if file_text is None else file_text
+    skip_map = load_skip_empty(text, inherited)
+    assign_map = load_assign(text, inherited)
+    key_events = [(k, v) for k, v in events if k == key]
+    nonempty = [v for _, v in key_events if v]
+    inherited_val = lookup(inherited, key)
+    file_val = lookup(file_map, key)
+    skip_val = lookup(skip_map, key)
+    assign_val = lookup(assign_map, key)
+    if key not in process_env:
+        process_val = None
+        process_presence = "unset"
+    else:
+        process_val = process_env[key]
+        process_presence = "empty" if process_val == "" else "present"
+    if file_text is None:
+        file_presence = "omitted"
+        file_source = "none"
+    elif file_val is None:
+        file_presence = "absent"
+        file_source = "text"
+    elif file_val == "":
+        file_presence = "empty-assignment"
+        file_source = "text"
+    else:
+        file_presence = "value"
+        file_source = "text"
+    if nonempty:
+        skip_source = "file"
+    elif key in inherited:
+        skip_source = "inherited"
+    else:
+        skip_source = "none"
+    if key_events:
+        assign_source = "file-empty" if key_events[-1][1] == "" else "file"
+    elif key in inherited:
+        assign_source = "inherited"
+    else:
+        assign_source = "none"
+    if inherited_val is None:
+        inherited_source = "none"
+    else:
+        inherited_source = origins.get(key, "caller")
+    return {
+        "key": key,
+        "inherited": inherited_val,
+        "file": file_val,
+        "skip_empty": skip_val,
+        "assign": assign_val,
+        "process": process_val,
+        "inherited_presence": _map_presence(inherited_val),
+        "inherited_source": inherited_source,
+        "file_presence": file_presence,
+        "file_source": file_source,
+        "skip_empty_presence": _map_presence(skip_val),
+        "skip_empty_source": skip_source,
+        "assign_presence": _map_presence(assign_val),
+        "assign_source": assign_source,
+        "process_presence": process_presence,
+        "process_source": process_source,
+        "file_n": len(key_events),
+        "policies_disagree": skip_val != assign_val,
+    }
+
+
+def format_layers(result: dict[str, object]) -> str:
+    lines = [f"key\t{result['key']}\tquery\t"]
+    for name in LAYERS:
+        presence = result[f"{name}_presence"]
+        source = result[f"{name}_source"]
+        lines.append(f"{name}\t{display_repr(result[name])}\t{presence}\t{source}")
+    lines.append(f"file_n\t{result['file_n']}\tassignments\t")
+    lines.append(
+        f"policies_disagree\t{str(bool(result['policies_disagree'])).lower()}\t\t"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="envlayers",
+        description=(
+            "For one environment key, print inherited value, file assignment "
+            "(including empty), skip-empty loader result, assign-all loader "
+            "result, and process env, labeled by layer."
+        ),
+    )
+    parser.add_argument("key", metavar="KEY", help="environment key to inspect")
+    parser.add_argument(
+        "--file",
+        dest="file",
+        metavar="PATH",
+        help="dotenv-subset file; KEY= and KEY=\"\" are empty assignments, not unset",
+    )
+    parser.add_argument(
+        "--inherited",
+        "--inherit",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="caller-supplied inherited binding (repeatable); does not copy process env",
+    )
+    parser.add_argument(
+        "--from-process-env",
+        action="store_true",
+        help="copy this process environment into inherited (opt-in; not the default)",
+    )
+    parser.add_argument(
+        "--no-process-env",
+        action="store_true",
+        help="inherited starts empty (default; kept for older invocations)",
+    )
+    parser.add_argument(
+        "--process",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="injected process map for the process column (replaces this CLI os.environ)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not args.key or not KEY_RE.match(args.key):
+        print(f"envlayers: bad key: {args.key!r}", file=sys.stderr)
+        return 2
+
+    from_process = bool(args.from_process_env) and not args.no_process_env
+    try:
+        inherited, origins = build_inherited(
+            args.inherited, from_process=from_process
+        )
+    except ValueError as err:
+        print(f"envlayers: {err}", file=sys.stderr)
+        return 2
+
+    if args.process:
+        try:
+            process_env: dict[str, str] = {}
+            for item in args.process:
+                key, value = parse_overlay(item, "process")
+                process_env[key] = value
+        except ValueError as err:
+            print(f"envlayers: {err}", file=sys.stderr)
+            return 2
+        process_source = "injected"
+    else:
+        process_env = dict(os.environ)
+        process_source = "os.environ"
+
+    file_text = None
+    if args.file is not None:
+        if os.path.isdir(args.file):
+            print(f"envlayers: is a directory: {args.file}", file=sys.stderr)
+            return 1
+        try:
+            with open(args.file, encoding="utf-8") as handle:
+                file_text = handle.read()
+        except (OSError, UnicodeDecodeError) as err:
+            print(f"envlayers: {file_error(args.file, err)}", file=sys.stderr)
+            return 1
+
+    try:
+        result = layers_for_key(
+            args.key,
+            inherited=inherited,
+            file_text=file_text,
+            process_env=process_env,
+            inherited_origins=origins,
+            process_source=process_source,
+        )
+    except ParseError as err:
+        print(f"envlayers: {err}", file=sys.stderr)
+        return 1
+
+    sys.stdout.write(format_layers(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

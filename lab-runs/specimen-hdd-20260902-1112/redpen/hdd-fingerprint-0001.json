@@ -1,0 +1,36 @@
+{
+  "summary": "Preserve the missing-output-from-freshness-identity question. cargo-inspect JSON, sha256 prefixes, rustc 1.78, and unit keys are fabricated precision. Do not request more novelty.",
+  "preserve_add": [
+    "A cache can report FRESH while a newly requested output kind is absent",
+    "Freshness identity may be keyed by inputs while requested outputs sit outside that identity"
+  ],
+  "established_add": [
+    "Packet: first build without extra artifact, second build requests SBOM precursor, cache hit, file missing"
+  ],
+  "rejected_add": [
+    "cargo-inspect is not present; its JSON is Dreamer-generated",
+    "Specific fingerprint hashes and rustc 1.78.0 are unsupported precision"
+  ],
+  "constraints_add": [
+    "No cache-introspection CLI that lists fingerprint components exists",
+    "Observable evidence is build status text and whether named output files exist"
+  ],
+  "open_questions_add": [
+    "Can the tool name the identity mismatch using only FRESH/BUILT and a missing path?"
+  ],
+  "harvest_candidates_add": [
+    "Ask which requested outputs are absent from the freshness identity that just said FRESH"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "given two builds, report whether freshness used an identity that omitted requested outputs",
+    "nearest_existing_operation": "read cargo verbose logs and ls target/",
+    "observable_delta": "one query that states FRESH-but-missing-output as an identity miss rather than a successful cache hit",
+    "reason": "surviving operation is naming the output set as part of cache identity, not a new build engine"
+  },
+  "pressure": [
+    "There is no cargo-inspect and no fingerprint component listing. Continue using the tool with only the two build statuses and whether the extra output file exists.",
+    "A tiny owned cache that keys only on input hash and ignores extra outputs is present. Use the same tool on that fixture."
+  ],
+  "redpen_markdown": "NEXT_ACTION=CONTINUE_WITH_COUNTEREXAMPLE specimen-011."
+}

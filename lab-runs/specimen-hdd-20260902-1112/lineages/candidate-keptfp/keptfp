@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""keptfp: name live vs leftover cache fingerprints vs current lockfile hash."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN_FIELDS = ("current", "entry")
+
+
+class Entry:
+    __slots__ = ("ident", "member", "lockfile_hash", "size")
+
+    def __init__(self, ident: str, member: str, lockfile_hash: str, size: str) -> None:
+        self.ident = ident
+        self.member = member
+        self.lockfile_hash = lockfile_hash
+        self.size = size
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def parse_record(text: str, *, source: str = "<input>") -> tuple[str, list[Entry]]:
+    current: str | None = None
+    entries: list[Entry] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN_FIELDS:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if key == "current":
+            if not rest:
+                raise ValueError(f"{source}:{lineno}: empty current")
+            if current is not None and current != rest:
+                raise ValueError(f"{source}:{lineno}: conflicting current hash")
+            current = rest
+        elif key == "entry":
+            parts = [p for p in rest.split("\t") if p]
+            if len(parts) < 3:
+                raise ValueError(
+                    f"{source}:{lineno}: entry needs id, member, lockfile_hash"
+                )
+            ident, member, lock_hash = parts[0], parts[1], parts[2]
+            size = parts[3] if len(parts) > 3 else "-"
+            entries.append(
+                Entry(
+                    ident=ident,
+                    member=member,
+                    lockfile_hash=lock_hash,
+                    size=size,
+                )
+            )
+    if current is None:
+        raise ValueError(f"{source}: missing current")
+    return current, entries
+
+
+def inspect(current: str, entries: list[Entry]) -> dict:
+    live = [e for e in entries if e.lockfile_hash == current]
+    leftover = [e for e in entries if e.lockfile_hash != current]
+    members = unique([e.member for e in entries])
+    leftover_members = unique([e.member for e in leftover])
+    return {
+        "current": current,
+        "live": live,
+        "leftover": leftover,
+        "live_n": len(live),
+        "leftover_n": len(leftover),
+        "members": members,
+        "leftover_members": leftover_members,
+    }
+
+
+def _fmt_entry(e: Entry) -> str:
+    return f"{e.ident}\t{e.member}\t{e.lockfile_hash}\t{e.size}"
+
+
+def format_report(result: dict) -> str:
+    lines = [f"current\t{result['current']}"]
+    live: list[Entry] = result["live"]
+    leftover: list[Entry] = result["leftover"]
+    if live:
+        for e in live:
+            lines.append(f"live\t{_fmt_entry(e)}")
+    else:
+        lines.append("live\tnone")
+    if leftover:
+        for e in leftover:
+            lines.append(f"leftover\t{_fmt_entry(e)}")
+    else:
+        lines.append("leftover\tnone")
+    lines.append(f"live_n\t{result['live_n']}")
+    lines.append(f"leftover_n\t{result['leftover_n']}")
+    lines.append(
+        "leftover_members\t"
+        + ("\t".join(result["leftover_members"]) if result["leftover_members"] else "none")
+    )
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="keptfp",
+        description=(
+            "Given a current lockfile hash and cache fingerprint entries, "
+            "name which entries still match (live) versus leftover hashes. "
+            "Does not delete anything."
+        ),
+    )
+    parser.add_argument(
+        "record",
+        nargs="?",
+        metavar="RECORD",
+        help="record file (default stdin)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record:
+            path = Path(args.record)
+            text = path.read_text(encoding="utf-8")
+            source = str(path)
+        else:
+            text = sys.stdin.read()
+            source = "<stdin>"
+        current, entries = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"keptfp: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(current, entries)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

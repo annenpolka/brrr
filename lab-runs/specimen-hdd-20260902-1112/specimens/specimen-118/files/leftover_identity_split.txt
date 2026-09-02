@@ -1,0 +1,24 @@
+Registry / fixture:
+  resource test_resource with identity schema {id}
+  prior IdentityJSON {"id":"baz"}
+
+Case A (successful apply, non-null, no error):
+  Identity: resp.NewIdentity written
+  no leftover omitted identity
+
+Case B (destroy apply errors, provider returns NewState+NewIdentity):
+  leftover: Identity omitted from new state object
+  value still present
+  IdentityJSON absent after encode
+
+Case C (mark-only sensitivity update, values equal):
+  leftover: Identity omitted from copied state object
+  provider not called
+
+Case D (apply error, provider returns null new value):
+  state.DeepCopy()
+  prior identity kept
+  not this leftover
+
+Not this packet:
+  leftover IdentityJSON vs nil schema Decode (specimen-081)

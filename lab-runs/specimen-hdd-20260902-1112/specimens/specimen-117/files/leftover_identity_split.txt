@@ -1,0 +1,26 @@
+Registry / fixture:
+  sbt 2.x analysis gz path
+  MixedAnalyzingCompiler.staticCachedStore cacheLast=true
+  scripted cache/discoveredMainClasses
+
+Case A (first compile, write through this store):
+  last-write Analysis identity matches file
+  no leftover extra Analysis
+
+Case B (sbt 2.x cache restores a different gz under same path):
+  leftover: extra last-write Analysis identity
+  current file identity is size+mtime of restored gz
+
+Case C (delete src then restore Main.scala):
+  leftover extra Analysis identity
+  checkDiscoveredMainClasses fails after restore
+
+Case D (cleanFull then compile):
+  leftover Analysis dropped
+  not this leftover
+
+Not this packet:
+  gradle configuration-cache leftover (specimen-088 / specimen-104)
+  rustc incremental (specimen-075)
+  derived gocache (specimen-078)
+  tsbuildinfo leftover signature (specimen-111)

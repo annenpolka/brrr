@@ -1,0 +1,11 @@
+{
+  "id": "specimen-004",
+  "manifest": "\nid: specimen-004\nkind: REAL_SOURCE_BACKED\nrepository: npm/cli\nfailing_ref: 51c2bf81fa2c31547d0fec44fff2aaac3d9a9862\nfixed_ref: 9dd70e899c909f43aa7b49f940755f4e06361bff\nsource_issue: https://github.com/npm/cli/issues/9876\nsource_pr: https://github.com/npm/cli/pull/9877\nmechanism_tags:\n  - optional-peer\n  - install-graph\n  - eager-fetch\necosystem: node\nreproduction_status: source-backed\nsafety_status: not-executed-on-host\npacket_tokens_estimate: 6000\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\n`npm install vite` into an empty project installs about 10 packages but, with a cold cache, also downloads full registry metadata for many packages that do not end up installed (playwright, @types/node, webdriverio, jsdom, sass, less, terser, vitest's optional peers, ...).\n\nThe developer wants to know *why those fetches happened* and which dependency edges caused work that the final tree does not use.\n",
+  "observed": "# OBSERVED\n\nPublic npm/cli#9876 / PR 9877. Empty cache, `npm install vite`:\n\n| | before (failing) | after (fixed, not shown to you as a solution) |\n| registry requests | 86 | 54 |\n| cached registry data | ~121MB | ~72MB |\n\nFinal install: ~10 packages. Fetches include full packuments for optional peers that are not installed.\n\nThe failing world still produces a valid tree; the cost and the fetch set are the surprise.\n",
+  "commands": "# COMMANDS\n\n```\nrm -rf ~/.npm/_cacache   # do not run this on the host lab\nnpm install vite\n```\nThis packet is source-backed; do not execute npm against the operator machine.\n",
+  "tree": "empty project\npackage.json { }\nnpm install vite\n",
+  "source": "pr: https://github.com/npm/cli/pull/9877\nissue: https://github.com/npm/cli/issues/9876\nfailing_ref: 51c2bf81fa2c31547d0fec44fff2aaac3d9a9862\nfixed_ref: 9dd70e899c909f43aa7b49f940755f4e06361bff\nmerged_at: 2026-08-20T20:27:58Z\n",
+  "answer_key": "KNOWN FIX (sealed): loadPeerSet resolved unmet optional peer edges into the virtual root even though they are pruned later. Skip peerOptional edges with no current resolution and no parent edge so packuments are not fetched.\n",
+  "curation": "ACCEPT_R1\n"
+}

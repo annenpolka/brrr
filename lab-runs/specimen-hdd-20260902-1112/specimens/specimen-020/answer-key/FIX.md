@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): an empty old range `@@ -N,0` is the gap after original line N, not a nonempty 1-based line that should be decremented into an earlier index. Keep hunk location against the original file. Do not tell Dreamers.

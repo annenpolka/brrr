@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""vcache: leftover fsModuleCache key minted for a later-externalized module."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("id", "externalize", "cache_key", "disk_write")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "id" not in fields:
+        raise ValueError(f"{source}: need id")
+    return fields
+
+
+def yn_in(val: str) -> bool:
+    return val in {"yes", "true", "1"}
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    ext = yn_in(fields.get("externalize") or "")
+    key = fields.get("cache_key") or "-"
+    disk = yn_in(fields.get("disk_write") or "")
+    leftover = ext and key not in {"", "-"} and not disk
+    return {
+        "id": fields["id"],
+        "externalize": ext,
+        "cache_key": key,
+        "disk_write": disk,
+        "leftover_key": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"id\t{result['id']}",
+        f"externalize\t{yn(result['externalize'])}",
+        f"cache_key\t{result['cache_key']}",
+        f"disk_write\t{yn(result['disk_write'])}",
+        f"leftover_key\t{yn(result['leftover_key'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="vcache",
+        description=(
+            "Name leftover fsModuleCache key minted for a module that the run "
+            "then treats as external. grep of the id hits memory write and fs empty."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"vcache: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_key"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

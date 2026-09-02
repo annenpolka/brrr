@@ -1,0 +1,11 @@
+{
+  "id": "specimen-077",
+  "manifest": "\nid: specimen-077\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-json-omit-false\nfixed_ref: fixture-json-include-false\nmechanism_tags: [serialization-boundary, omitempty, missing-as-true]\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 1600\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nTwo encodings of the same record `{flag: false, name: x}`. Encoder A omits `flag` because it is false. Encoder B includes `\"flag\": false`. Downstream treats missing key as true.\n\nThe developer wants to know which encoder dropped the false and whether the decoded object still has the key.\n",
+  "observed": "# OBSERVED\n\nOwned files/two_encoders.py. Host-executed:\n\nA {\"name\": \"x\"}\nB {\"flag\": false, \"name\": \"x\"}\nA_has_flag False\nB_has_flag True\n",
+  "commands": "# COMMANDS\n\npython3 files/two_encoders.py\n",
+  "tree": "TREE\n\nfiles/two_encoders.py\n",
+  "curation": "ACCEPT_R1\n\ncontrastiveness: high (omit-false vs include-false)\nreproducibility: owned fixture host-executed\ninformation density: high\nsafety: owned-fixture\nnontriviality: missing-key-as-true inverts omitted false\n",
+  "answer_key": "# FIX\n\nEncoder A filters `v is not False` so false keys disappear. Downstream treats missing as true.\nKeep false values in the encoding, or treat missing as false, or distinguish missing vs false.\nDo not show this to Dreamers.\n",
+  "source": "# SOURCE\n\nDerived JSON omit-false fixture. Originally dreamed as hdd-omitfalse (id was briefly specimen-074 before that id was recast to ruby/rubygems PR 9556).\n"
+}

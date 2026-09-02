@@ -1,0 +1,32 @@
+Shared workspace target dir (all cases A–C):
+  <ws>/target/.rustc_info.json
+  <ws>/target/debug/deps/libautocfg-589c41db1eea6297.rlib
+
+Compiler X (Fedora 1.82.0-1.fc42):
+  path: /usr/bin/rustc
+  mtime: 2024-10-17 00:00:00 (clamped)
+  rustc -vV release: 1.82.0
+  rustc -vV commit-hash: f6e511eec (2024-10-15)
+  rustc -vV host: x86_64-unknown-linux-gnu
+  rustc -vV extra suffix: (Fedora 1.82.0-1.fc42)
+
+Compiler Y (Fedora 1.82.0-1.fc40):
+  path: /usr/bin/rustc
+  mtime: 2024-10-17 00:00:00 (clamped)
+  rustc -vV release: 1.82.0
+  rustc -vV commit-hash: f6e511eec (2024-10-15)
+  rustc -vV host: x86_64-unknown-linux-gnu
+  rustc -vV extra suffix: (Fedora 1.82.0-1.fc40)
+
+hash_exe inputs on failing_ref (each of rustc, wrapper, workspace_wrapper):
+  resolved path
+  mtime
+
+rustup extra inputs (only if RUSTUP_HOME and RUSTUP_TOOLCHAIN are both set):
+  rustup_toolchain string
+  rustup_home string
+  mtime of $RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/bin/rustc
+
+Cache::load decision:
+  equal rustc_fingerprint -> reuse entire CacheData (including cached -vV stdout)
+  unequal -> empty CacheData with the new fingerprint

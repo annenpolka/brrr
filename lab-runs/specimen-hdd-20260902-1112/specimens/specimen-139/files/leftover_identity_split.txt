@@ -1,0 +1,25 @@
+Registry / fixture:
+  black --code from two directories in one process
+  leftover project-root pyproject after CWD change
+
+Case A (second black --code, same CWD):
+  current project-root identity
+  not leftover-after-cwd-change
+
+Case B (black --code from different CWD, leftover lru_cache):
+  leftover: previous CWD's project root / pyproject.toml
+  resolved CWD omitted from cache key (srcs=())
+  wrong config applied
+
+Case C (new process from CWD B):
+  current CWD root identity
+  not leftover previous directory
+
+Case D (CWD resolved before cache key):
+  each directory gets its own pyproject.toml
+  not leftover previous root
+
+Not this packet:
+  ruff leftover cache vs nested pyproject (specimen-114)
+  pytest leftover cache-dir supporting files (specimen-107)
+  eslint leftover plugin name@version omitted from toJSON (specimen-132)

@@ -1,0 +1,24 @@
+Registry / fixture:
+  vcs_version generate_to template
+  leftover process cache after amend/commit
+
+Case A (second export-codegen, same HEAD):
+  current cache identity
+  not leftover-after-git-change
+
+Case B (amend or new commit, leftover process cache):
+  leftover: previous setuptools_scm stdout / generated version module
+  git hash omitted from VenvPexProcess identity
+  enclosing MaybeGitWorktree rule reran; child process reused
+
+Case C (rm -rf ~/.cache/pants):
+  fresh process identity
+  not leftover previous git describe
+
+Case D (PER_SESSION cache_scope):
+  cache miss after git change
+  not leftover previous version string
+
+Not this packet:
+  rustc incremental false-green (specimen-075)
+  pants leftover process cache vs env (pants#23645 OPEN)

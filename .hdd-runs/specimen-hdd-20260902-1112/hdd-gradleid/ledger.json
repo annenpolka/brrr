@@ -1,0 +1,68 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "A cache load can wait on a shared object owned by another thread",
+    "A waiter can block on a lock whose owner is another thread"
+  ],
+  "established": [
+    "Packet: configuration-cache hang",
+    "Packet: shared object wait"
+  ],
+  "rejected": [
+    "jstack, SharedObjectRegistry traces, 92% hang are Dreamer-generated",
+    "DeadlockSimulation.java is Dreamer-generated"
+  ],
+  "constraints": [
+    "No Gradle",
+    "Ground with threading.Lock owner/waiter labels"
+  ],
+  "open_questions": [],
+  "human_pressure": [
+    "No Gradle. Continue on two threads and one lock. Show owner vs waiter."
+  ],
+  "harvest_candidates": [
+    "Who owns the lock the waiter never acquired"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name lock owner vs waiter",
+    "nearest_existing_operation": "jstack",
+    "observable_delta": "one query whose object is owner vs waiter",
+    "reason": "timeout does not name the owner",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:27:26+09:00",
+      "summary": "Invented Gradle hang/jstack. Preserve wait-for-shared-lock vs progress. Continue only on an owned lock fixture; no Gradle.",
+      "pressure": [
+        "No Gradle. Continue on two threads and one lock. Show owner vs waiter."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name the owner of a lock a waiter is blocked on",
+        "nearest_existing_operation": "jstack plus reading lock ids",
+        "observable_delta": "one query whose object is owner vs waiter",
+        "reason": "timeout error does not name the owner",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T12:36:24+09:00",
+      "summary": "Turn 2 still writes Java deadlock theater. Harvest owner-vs-waiter; ground in Python threading. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name lock owner vs waiter",
+        "nearest_existing_operation": "jstack",
+        "observable_delta": "one query whose object is owner vs waiter",
+        "reason": "timeout does not name the owner",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

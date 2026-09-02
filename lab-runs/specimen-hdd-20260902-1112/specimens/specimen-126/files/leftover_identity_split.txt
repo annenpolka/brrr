@@ -1,0 +1,26 @@
+Registry / fixture:
+  root overrides { brace-expansion: 2.0.1 }
+  a via file:./pkgs/a depends on glob@7.2.0
+  leftover lock brace-expansion@1.1.15
+
+Case A (glob is a direct root dep, no Link):
+  overridden 2.0.1
+  not leftover original
+
+Case B (path crosses file: link, leftover original):
+  leftover: 1.1.15 un-overridden
+  nested override omitted on Link target
+
+Case C (no overrides field):
+  original identity is correct
+  not leftover of an override
+
+Case D (OverrideSet forwarded before subtree):
+  2.0.1
+  not leftover original
+
+Not this packet:
+  optional-peer leftover (specimen-004/033)
+  nested override subsequent-install leftover OverrideSet (specimen-095)
+  leftover after deleting overrides (npm/cli#8986 open)
+  earthly leftover CACHE --id (specimen-123/124)

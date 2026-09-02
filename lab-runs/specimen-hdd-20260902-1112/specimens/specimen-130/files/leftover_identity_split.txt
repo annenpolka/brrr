@@ -1,0 +1,26 @@
+Registry / fixture:
+  artifact-cache leftover bottle
+  formula.rb unchanged
+  patches/foo.diff old then new
+  tap_git_revision of previous bottle
+
+Case A (formula+patch match bottle revision):
+  cache valid
+  not leftover after patch change
+
+Case B (patch edited, leftover bottle):
+  leftover: previous bottle identity
+  no_diff? true (formula path only)
+  leftover bottle installed
+
+Case C (formula.rb edited):
+  no_diff? false
+  cache invalid
+  not this leftover
+
+Case D (delete artifact-cache bottle):
+  fresh bottle
+  not leftover cache identity
+
+Not this packet:
+  Homebrew#20936 formula_auditor revision (job-0539 skip axis)

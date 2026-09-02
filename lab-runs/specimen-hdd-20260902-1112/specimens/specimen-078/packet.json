@@ -1,0 +1,11 @@
+{
+  "id": "specimen-078",
+  "manifest": "\nid: specimen-078\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-testcache-omits-buildid\nfixed_ref: fixture-testcache-includes-buildid\nmechanism_tags: [test-cache, buildid, identity-hash]\necosystem: go\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 1400\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nA test cache keys freshness by the test file list only. First run builds with binary buildid `buildid-aaa`. The binary is rewritten with `buildid-bbb`. Second run reports FRESH because the cache key ignored buildid.\n\nThe developer wants to know whether the cache key included the binary buildid, and whether FRESH reused a stale binary.\n",
+  "observed": "# OBSERVED\n\nOwned files/gocache_buildid.py. Host-executed:\n\nfirst BUILT key 55e3acdd667f buildid buildid-aaa\nsecond FRESH key 55e3acdd667f buildid buildid-bbb cached_buildid buildid-aaa\nsame_key True\nkey_includes_buildid False\nstale_binary True\n",
+  "commands": "# COMMANDS\n\npython3 files/gocache_buildid.py\n",
+  "tree": "TREE\n\nfiles/gocache_buildid.py\n",
+  "curation": "ACCEPT_R1\n\ncontrastiveness: high\nreproducibility: owned fixture host-executed\nsafety: owned-fixture\n",
+  "answer_key": "# FIX\n\nInclude binary buildid in the test cache key. FRESH with a changed buildid is a stale binary.\nDo not show this to Dreamers.\n",
+  "source": "# SOURCE\n\nDerived analog of go test cache / buildid mismatch. Dreamed as hdd-gocache. Id 075 was recast to rust-lang/rust PR 133828.\n"
+}

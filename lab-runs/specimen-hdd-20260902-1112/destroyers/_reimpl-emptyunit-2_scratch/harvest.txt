@@ -1,0 +1,152 @@
+=== reimpl owned dump ===
+collection	testing/test_timeout.py::test_1	testing/test_timeout.py::test_2
+dist	loadgroup
+pending	1
+requeued	yes
+completed_only_n	1
+completed_only	testing/test_timeout.py::test_1
+incomplete_scopes	testing/test_timeout.py::test_2
+first_assigned	testing/test_timeout.py::test_1
+would_send	()
+assigned	testing/test_timeout.py::test_1
+reschedule	no
+hang_unit	testing/test_timeout.py::test_1
+hang_risk	yes
+scopes_n	2
+scope	testing/test_timeout.py::test_1
+items	testing/test_timeout.py::test_1
+completed	testing/test_timeout.py::test_1
+incomplete	-
+missing	-
+send	()
+empty_send	yes
+completed_only_unit	yes
+scope	testing/test_timeout.py::test_2
+items	testing/test_timeout.py::test_2
+completed	-
+incomplete	testing/test_timeout.py::test_2
+missing	-
+send	(1)
+empty_send	no
+completed_only_unit	no
+rc=1
+=== reimpl live-first ===
+collection	done.py::t	live.py::u
+dist	loadgroup
+pending	1
+requeued	yes
+completed_only_n	1
+completed_only	done.py::t
+incomplete_scopes	live.py::u
+first_assigned	live.py::u
+would_send	(1)
+assigned	live.py::u	done.py::t
+reschedule	yes
+hang_unit	done.py::t
+hang_risk	yes
+scopes_n	2
+scope	live.py::u
+items	live.py::u
+completed	-
+incomplete	live.py::u
+missing	-
+send	(1)
+empty_send	no
+completed_only_unit	no
+scope	done.py::t
+items	done.py::t
+completed	done.py::t
+incomplete	-
+missing	-
+send	()
+empty_send	yes
+completed_only_unit	yes
+rc=1
+=== reimpl pending3 ===
+collection	a.py::t1	a.py::t2	a.py::t3	b.py::t
+dist	loadscope
+pending	3
+requeued	yes
+completed_only_n	1
+completed_only	b.py
+incomplete_scopes	a.py
+first_assigned	a.py
+would_send	(0,1,2)
+assigned	a.py
+reschedule	no
+hang_unit	-
+hang_risk	no
+scopes_n	2
+scope	a.py
+items	a.py::t1	a.py::t2	a.py::t3
+completed	-
+incomplete	a.py::t1	a.py::t2	a.py::t3
+missing	-
+send	(0,1,2)
+empty_send	no
+completed_only_unit	no
+scope	b.py
+items	b.py::t
+completed	b.py::t
+incomplete	-
+missing	-
+send	()
+empty_send	yes
+completed_only_unit	yes
+rc=0
+=== same tests loadgroup ===
+collection	mod.py::a	mod.py::b
+dist	loadgroup
+pending	1
+requeued	yes
+completed_only_n	1
+completed_only	mod.py::a
+incomplete_scopes	mod.py::b
+first_assigned	mod.py::a
+would_send	()
+assigned	mod.py::a
+reschedule	no
+hang_unit	mod.py::a
+hang_risk	yes
+scopes_n	2
+scope	mod.py::a
+items	mod.py::a
+completed	mod.py::a
+incomplete	-
+missing	-
+send	()
+empty_send	yes
+completed_only_unit	yes
+scope	mod.py::b
+items	mod.py::b
+completed	-
+incomplete	mod.py::b
+missing	-
+send	(1)
+empty_send	no
+completed_only_unit	no
+rc=1
+=== same tests loadscope ===
+collection	mod.py::a	mod.py::b
+dist	loadscope
+pending	1
+requeued	yes
+completed_only_n	0
+completed_only	-
+incomplete_scopes	mod.py
+first_assigned	mod.py
+would_send	(1)
+assigned	mod.py
+reschedule	no
+hang_unit	-
+hang_risk	no
+scopes_n	1
+scope	mod.py
+items	mod.py::a	mod.py::b
+completed	mod.py::a
+incomplete	mod.py::b
+missing	-
+send	(1)
+empty_send	no
+completed_only_unit	no
+rc=0

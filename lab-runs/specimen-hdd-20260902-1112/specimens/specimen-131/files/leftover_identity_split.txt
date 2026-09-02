@@ -1,0 +1,26 @@
+Registry / fixture:
+  .ninja_deps leftover previous import edges
+  a.pcm / b.pcm C++ modules
+  first build: b imports a
+  edit: a imports b
+
+Case A (first build):
+  deps log matches current imports
+  not leftover
+
+Case B (sources flipped, leftover deps log):
+  leftover: previous discovered-deps identity
+  LoadDeps before dirty
+  cycle a.pcm -> b.pcm -> a.pcm
+
+Case C (delete .ninja_deps then ninja):
+  no leftover deps-log identity
+  not leftover
+
+Case D (output mtime newer than stored deps):
+  LoadDepsFromLog rejects
+  not leftover mtime-valid log
+
+Not this packet:
+  rustc incremental fingerprint (specimen-075)
+  cargo rustc extra-filename (specimen-086)

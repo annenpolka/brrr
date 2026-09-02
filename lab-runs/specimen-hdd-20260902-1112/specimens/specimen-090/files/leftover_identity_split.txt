@@ -1,0 +1,40 @@
+Registry / fixture:
+  test/watchCases/long-term-caching/css-contenthash-asset-url
+  0/style.css: .a { background: url("./logo.png"); }
+  0/logo.png: bytes C0
+  1/style.css: same url() plus color: red
+  2/logo.png: bytes C1
+  cssFilename [name].[contenthash].css
+  assetModuleFilename [name].[contenthash][ext]
+  realContentHash: false
+
+Case A (first compile / never leftover):
+  webpack watch step 0
+  CSS asset name H_css0
+  PNG asset name H_png0
+  emitted CSS contains H_png0
+  CssUrlDependency has no updateHash
+  CSS module hash = CSS source bytes (request ./logo.png in source)
+
+Case B (CSS source change, PNG stable):
+  overlay 1/style.css
+  CSS name H_css1 !== H_css0
+  PNG name still H_png0
+
+Case C (PNG bytes change; CSS source still step-1; package still imported):
+  overlay 2/logo.png
+  PNG name H_png1 !== H_png0
+  failing_ref CSS name leftover H_css1
+  failing_ref rendered CSS may still contain H_png0
+    (data.url css-url leftover shadows assetPath)
+  long-term cache: leftover CSS URL, or leftover url() pointing at moved PNG
+
+Case D (never url() the PNG from CSS):
+  no CssUrlDependency
+  no CSS [contenthash] identity involving the asset
+
+Not this packet:
+  leftover runtime-chunk hash of an asset no longer in the compilation (#20710 / PR 20724)
+  RealContentHashPlugin post-process digest (#11339 / #9520)
+  HTML referenced-module updateHash (#21018)
+  leftover storedBuildState after .yarn/unplugged remove (specimen-089)

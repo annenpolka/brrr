@@ -1,0 +1,25 @@
+Registry / fixture:
+  EOLANG Transpilation.version() global transpile cache
+  leftover no-step-files result after trackSteps=true
+
+Case A (second transpile, same flags, same XSL fingerprint):
+  current cache identity
+  not leftover-after-flag
+
+Case B (trackSteps flipped on, leftover cache hit):
+  leftover: previous no-step-files transpile result
+  steps() omitted from version() key
+  shared cache
+
+Case C (private cache / cache miss):
+  fresh step XMIRs
+  not leftover previous result
+
+Case D (steps() in the cache key):
+  new key after trackSteps change
+  not leftover previous result
+
+Not this packet:
+  sbt leftover last-write zinc Analysis (specimen-117)
+  rustc incremental fingerprint (specimen-075)
+  buildah leftover RUN --mount from-stage (specimen-148)

@@ -1,0 +1,24 @@
+Registry / fixture:
+  include("sub")
+  named collection: project.files(provider { "someFile.txt" })
+  CC store then load
+
+Case A (absolute named files):
+  path identity unchanged
+  no leftover base dir
+
+Case B (named provider relative in :sub, CC load):
+  store: .../sub/someFile.txt
+  failing_ref load: .../root/someFile.txt
+  leftover: root-directory resolver omitted from the collection identity
+
+Case C (fileTree("src").files queried, then src/file3):
+  not this leftover (specimen-088 omitted WorkInputs)
+
+Case D (named files("file1","file2"), rewrite file1 bytes):
+  names stay; contents not this leftover axis
+
+Not this packet:
+  ConfigurableFileTree query observation omitted (specimen-088)
+  unused system-property snapshot (specimen-076)
+  script class compiler race (specimen-042)

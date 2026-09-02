@@ -1,0 +1,67 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "An encoder can omit false while a sibling keeps the key; downstream treats missing as true",
+    "One encoder can drop a false value so the decoded object lacks the key; another keeps \"flag\": false",
+    "Downstream that treats a missing key as true inverts the omitted false"
+  ],
+  "established": [
+    "Host two_encoders.py: A {\"name\":\"x\"} A_has_flag False; B {\"flag\":false,\"name\":\"x\"} B_has_flag True",
+    "Owned two encodings: A {\"name\": \"x\"} A_has_flag False; B {\"flag\": false, \"name\": \"x\"} B_has_flag True"
+  ],
+  "rejected": [
+    "Invented cli inspect/diff/probe is not installed",
+    "Invented cli inspect/diff/probe transcripts are not installed",
+    "Recommended encoder patch is not host evidence"
+  ],
+  "constraints": [
+    "Owned two JSON encodings. No encoder library theater.",
+    "No invented CLI. Owned two JSON objects. Name which encoding dropped false and whether the decoded object still has the key"
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "which encoder dropped false, and whether the decoded object still has the key",
+    "which encoding omitted false, and whether the decoded object still has that key"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name keys present as false in one encoding and absent in the other",
+    "nearest_existing_operation": "json.dumps / key membership",
+    "observable_delta": "dropped_false flag; A_has no; B_has yes",
+    "reason": "join omit-false with missing-as-true; not listMapKey tagjoin",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:51:41+09:00",
+      "summary": "Invented cli inspect/diff. Harvest which encoder omitted false and whether the decoded object still has the key. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name omitted-false vs present-false vs missing-as-true",
+        "nearest_existing_operation": "print both JSON strings",
+        "observable_delta": "A omitted flag; B kept false; missing infers true",
+        "reason": "printing both encodings still leaves the downstream default as a hand join",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:59:34+09:00",
+      "summary": "Invented inspect/diff/probe CLI wrapping json.dumps. Preserve omit-false vs missing-key-as-true on owned encodings. Harvest that question. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name keys present as false in one encoding and absent in the other",
+        "nearest_existing_operation": "json.dumps / key membership",
+        "observable_delta": "dropped_false flag; A_has no; B_has yes",
+        "reason": "join omit-false with missing-as-true; not listMapKey tagjoin",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

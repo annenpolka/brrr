@@ -1,0 +1,21 @@
+# .github/workflows/build.yml on failing_ref (reduced)
+
+check-generated-files:
+  name: 'Check if generated files are up to date'
+  runs-on: ubuntu-24.04
+  steps:
+    - name: Build CPython
+      run: |
+        make -j4 regen-all
+        make regen-stdlib-module-names regen-sbom regen-unicodedata
+    - name: Check for changes
+      run: |
+        git add -u
+        changes=$(git status --porcelain)
+        if test -n "$changes"; then
+          echo "Generated files not up to date."
+          echo "Perhaps you forgot to run make regen-all or build.bat --regen. ;)"
+          echo "$changes"
+          git diff --staged || true
+          exit 1
+        fi

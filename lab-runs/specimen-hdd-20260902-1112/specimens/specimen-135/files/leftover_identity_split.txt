@@ -1,0 +1,25 @@
+Registry / fixture:
+  dprint.jsonc exec cacheKeyFiles: [./rustfmt.toml]
+  leftover incremental cache after rustfmt.toml change
+
+Case A (second dprint fmt, same rustfmt.toml):
+  current cache identity
+  not leftover-after-cacheKeyFiles-change
+
+Case B (rustfmt.toml flipped, leftover cache):
+  leftover: previous formatter output
+  resolved plugin cache_key omitted (raw dprint.jsonc map only)
+  files not reformatted
+
+Case C (dprint clear-cache):
+  fresh cache identity
+  not leftover previous config
+
+Case D (resolved config in incremental hash):
+  cache miss after cacheKeyFiles change
+  not leftover previous output
+
+Not this packet:
+  eslint leftover plugin name@version omitted from toJSON (specimen-132)
+  stylelint leftover cache hashing empty CLI config (specimen-133)
+  ruff leftover cache vs nested pyproject (specimen-114)

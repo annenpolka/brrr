@@ -1,0 +1,34 @@
+{
+  "summary": "Preserve leaked module state plus the order that exposes it. Host-captured run_orders.py already shows test_a\to test_b FAIL with acc=['a'] and the reverse PASS. testflow-analyzer, JSON captures, and inject-cleanup are Dreamer-generated. Do not ask for more novelty.",
+  "preserve_add": [
+    "A module-level list mutated by one test can make a later test fail",
+    "The same two tests can be green or red depending only on run order"
+  ],
+  "established_add": [
+    "Host-captured stdlib runner: order (test_a, test_b) test_b FAIL ['a']; reverse both PASS; acc_after ['a'] in both",
+    "Packet: pytest default file order fails test_b; reverse nodeids pass"
+  ],
+  "rejected_add": [
+    "testflow-analyzer is not installed; capture/permute/report/inject-cleanup output is Dreamer-generated",
+    "A leakage-scan.json artifact was not produced on this host"
+  ],
+  "constraints_add": [
+    "No test-framework inspector, no hidden module-reload oracle, no auto-fix injector",
+    "Observable evidence is the two ordered runs and the remaining acc value"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Ask which name leaked between tests and which order is sufficient to expose the failure"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name the leaked mutable state between tests and the run order sufficient to expose it",
+    "nearest_existing_operation": "run the suite twice in opposite orders and print the leftover list",
+    "observable_delta": "one query that reports leaked name plus exposing order instead of a two-run manual diff",
+    "reason": "ordinary pytest shows a failure; the surviving question is leak provenance plus sufficient order, not a new runner"
+  },
+  "pressure": [
+    "There is no testflow-analyzer. Continue only if the leak name and exposing order can be emitted from the two ordered runs already captured."
+  ],
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Classification USEFUL_COMPOSITION. Ground independently; do not implement testflow-analyzer. Unseen dogfood: specimen-012."
+}

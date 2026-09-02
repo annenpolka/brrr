@@ -1,0 +1,27 @@
+Registry / fixture:
+  install-strategy=linked
+  deps: rimraf + semver (or minimatch)
+  npm uninstall rimraf
+
+Case A (hoisted uninstall):
+  .bin/rimraf removed
+  no leftover shim
+
+Case B (linked uninstall, semver remains):
+  leftover: .bin/rimraf dangling
+  store + top-level rimraf gone
+  .bin/semver kept
+
+Case C (linked first install, rimraf never present):
+  no leftover uninstall shim
+
+Case D (rm -rf node_modules && npm install):
+  fresh tree
+  not leftover sweep
+
+Not this packet:
+  npm optional-peer leftover (specimen-004/033)
+  bun optional-peer leftover (specimen-082)
+  npm nested-override leftover (specimen-095)
+  yarn leftover PnP build state (specimen-089)
+  cargo git+ssh vs registry (job-0339: no merged PR)

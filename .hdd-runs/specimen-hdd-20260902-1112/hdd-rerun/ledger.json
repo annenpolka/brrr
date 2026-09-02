@@ -1,0 +1,101 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "A rerun can reuse the same test class instance that the failing attempt mutated",
+    "Fixture cleanup can run while the instance identity stays the same",
+    "A rerun may reuse the same instance so state on self leaks into the next attempt",
+    "A rerun can reuse the same test class instance the failing attempt mutated",
+    "Distinct test items can still get new instances"
+  ],
+  "established": [
+    "Packet mechanism: leaked instance on rerun (pytest-rerunfailures, failing_ref 0440e2158c98187a6ccd283e9c0b65475d1cd620)",
+    "Public pytest-rerunfailures #340: create a fresh test class instance for each rerun",
+    "Packet mechanism: leaked instance on rerun; pytest-rerunfailures failing_ref 0440e215"
+  ],
+  "rejected": [
+    "Numeric object ids, ITEM INSTANCE debug prints, and sed-into-plugin transcripts are not host evidence",
+    "A recommended _reset_test_instance helper is a Dreamer patch, not a specimen observation",
+    "Specific memory ids and SETUP/TEST counts in this transcript are unverified",
+    "Numeric object ids and pytest -s transcripts were not captured on this host",
+    "Direct recursion of test_flaky is not the rerun protocol"
+  ],
+  "constraints": [
+    "No plugin source checkout, no in-place sed of third-party code",
+    "A tiny owned class with an autouse fixture and a rerun loop is the world if a clone is absent",
+    "Do not install pytest-rerunfailures on the host",
+    "An owned class with a counter on self is enough",
+    "No plugin checkout",
+    "An owned loop that reuses one instance across attempts is the world"
+  ],
+  "open_questions": [
+    "Can instance identity across attempts be shown from user-visible prints of id(self) on an owned fixture?",
+    "Can the tool show same vs new id(self) across attempts using a tiny fixture?"
+  ],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "Ask whether a rerun used a new instance or the leftover one, and which attributes survived",
+    "Ask whether a retry reused the failed instance"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "for a rerun, report whether the test class instance was reused and what attributes leaked",
+    "nearest_existing_operation": "print id(self) in setup/call/teardown",
+    "observable_delta": "one query whose object is leftover instance identity across attempts",
+    "reason": "ordinary rerun output shows pass/fail; it does not name instance reuse",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T11:52:02+09:00",
+      "summary": "Preserve leftover class-instance identity across reruns. Invented object ids, sed patches of pytest_rerunfailures.py, pytest 6.5.2, and a proposed del item.instance helper are Dreamer-generated. This host has no plugin checkout. Do not treat the proposed patch as an observation. Do not ask for more novelty.",
+      "pressure": [
+        "There is no pytest-rerunfailures checkout here. Continue only on an owned class-instance fixture with user-visible ids."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "for a rerun, report whether the test class instance was reused and what attributes leaked",
+        "nearest_existing_operation": "print id(self) in setup/call/teardown and read the log",
+        "observable_delta": "one query whose object is leftover instance identity across attempts, not a new pytest",
+        "reason": "ordinary rerun output shows pass/fail; it does not name instance reuse as the object",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T11:53:22+09:00",
+      "summary": "Preserve instance identity across reruns. Printed ids are Dreamer-generated. Continue with an owned fixture that records id(self) without pytest-rerunfailures if that plugin is not installed.",
+      "pressure": [
+        "pytest-rerunfailures is not installed. Continue on a tiny class fixture that records id(self) across two manual re-invocations of the same test method."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "show whether a retry reused the same test instance identity",
+        "nearest_existing_operation": "print id(self) in setup",
+        "observable_delta": "one query whose object is instance reuse across retries",
+        "reason": "ordinary pytest output does not make instance identity first-class",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T12:10:14+09:00",
+      "summary": "Preserve leftover class-instance identity across attempts inside one item. Recursive self.test_flaky() is not a rerun loop; invented object ids and pytest transcripts are Dreamer-generated. Harvest using an owned attempt loop that reuses the instance. Do not ask for more novelty.",
+      "pressure": [
+        "Do not recurse the test method. Use an owned attempt loop over one instance."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "for a rerun, report whether the test class instance was reused and what attributes leaked",
+        "nearest_existing_operation": "print id(self) in setup/call/teardown",
+        "observable_delta": "one query whose object is leftover instance identity across attempts",
+        "reason": "ordinary rerun output shows pass/fail; it does not name instance reuse",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [
+    "Do not recurse the test method. Use an owned attempt loop over one instance."
+  ],
+  "pending": null
+}

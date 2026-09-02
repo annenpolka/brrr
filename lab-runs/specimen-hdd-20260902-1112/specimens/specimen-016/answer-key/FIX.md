@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): include lockfile contents in the freshness digest so a lock-only bump cannot reuse the prior artifact identity. Specimen-006 leftover-member restores are a sibling symptom of the same stale-fingerprint family; this mutation isolates the lockfile axis. Do not tell Dreamers.

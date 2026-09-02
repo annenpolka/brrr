@@ -1,0 +1,2 @@
+KNOWN FIX (sealed): kubernetes PR 124553. 1.30 codegen emitted x-kubernetes-list-map-keys name/ip for imagePullSecrets and hostAliases, but LocalObjectReference.Name stayed +optional without a default and HostAlias.IP stayed omitempty/unrequired, so CRD admission rejected the generated OpenAPI. Repair: empty-string default (kubebuilder:default) on Name, required IP on HostAlias, then hack/update-codegen.sh to refresh swagger and v3 OpenAPI specs.
+Do not show this to Dreamers, initial Red Pen, initial Grounders, or first-selection judges.

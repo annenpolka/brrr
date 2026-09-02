@@ -1,0 +1,24 @@
+Registry / fixture:
+  inventory cache plugin jsonfile
+  leftover inventory after --flush-cache
+
+Case A (second playbook, no --flush-cache):
+  current cache identity
+  not leftover-after-flush
+
+Case B (--flush-cache, leftover inventory plugin cache):
+  leftover: previous inventory parse
+  inventory omitted from flush (facts only)
+  plugin still sees cache=True
+
+Case C (delete jsonfile cache dir):
+  fresh inventory identity
+  not leftover previous parse
+
+Case D (InventoryManager cache=False on flush):
+  cache miss / Updating cache
+  not leftover previous inventory
+
+Not this packet:
+  pants leftover vcs_version process cache (specimen-136)
+  ansible leftover vars_files (#38394 closed without PR)

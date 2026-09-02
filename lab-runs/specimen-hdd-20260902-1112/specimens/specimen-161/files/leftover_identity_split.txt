@@ -1,0 +1,24 @@
+Registry / fixture:
+  Next.js 'use cache' / getHmrRefreshHash
+  leftover previous page after edit for cookieless requests
+
+Case A (HMR cookie present after edit):
+  current cache identity (hash in key)
+  not leftover-after-edit
+
+Case B (cookieless after edit, leftover cache):
+  leftover: previous 'use cache' entry
+  server hash omitted on the request path
+
+Case C (cold start / empty store):
+  fresh compute
+  not leftover previous page
+
+Case D (server-attached hash):
+  every client misses after an edit
+  not leftover previous page
+
+Not this packet:
+  webpack persistent cache (specimen-090)
+  bun define-table omitted from runtime-transpile hash (specimen-156)
+  jest haste mock-name delete (specimen-157)

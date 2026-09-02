@@ -1,0 +1,26 @@
+Registry / fixture:
+  tasks.create args=["file"] outputs=["{{ file }}"]
+  tasks.multiple depends-on create A.txt then create B.txt
+  leftover task-cache default-create.json
+
+Case A (first pixi run multiple):
+  A writes default-create.json
+  B overwrites same filename
+  both ran
+
+Case B (second pixi run multiple, leftover B file):
+  leftover: B computation hash under env+name
+  A omitted from filename
+  no cache hit
+
+Case C (single parametrized depend):
+  one instantiation
+  cache hit
+  not this leftover
+
+Case D (delete task-cache folder):
+  fresh identity
+  not leftover filename
+
+Not this packet:
+  go-task leftover wildcard fingerprint omitting MATCH (specimen-115)

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""unusedfp: name unread snapshot keys that changed identity while used keys did not."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+def parse_props(text: str, *, source: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"{source}:{lineno}: expected NAME=VALUE")
+        name, _, value = line.partition("=")
+        if not name:
+            raise ValueError(f"{source}:{lineno}: empty name")
+        out[name] = value
+    return out
+
+
+def ident(props: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(props, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def inspect(first: dict[str, str], second: dict[str, str], used: list[str]) -> dict:
+    unused_first = [k for k in first if k not in used]
+    unused_second = [k for k in second if k not in used]
+    unused = []
+    for k in unused_first + unused_second:
+        if k not in unused:
+            unused.append(k)
+    changed_unused = [k for k in unused if first.get(k) != second.get(k)]
+    used_first = {k: first[k] for k in used if k in first}
+    used_second = {k: second[k] for k in used if k in second}
+    all_same = ident(first) == ident(second)
+    used_same = ident(used_first) == ident(used_second)
+    return {
+        "used": used,
+        "unused": unused,
+        "changed_unused": changed_unused,
+        "all_first": ident(first),
+        "all_second": ident(second),
+        "used_first": ident(used_first),
+        "used_second": ident(used_second),
+        "all_same": all_same,
+        "used_same": used_same,
+        "invalidate_unused": (not all_same) and used_same and bool(changed_unused),
+    }
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "-"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"used\t{fmt_list(result['used'])}",
+        f"unused\t{fmt_list(result['unused'])}",
+        f"changed_unused\t{fmt_list(result['changed_unused'])}",
+        f"all_first\t{result['all_first']}",
+        f"all_second\t{result['all_second']}",
+        f"used_first\t{result['used_first']}",
+        f"used_second\t{result['used_second']}",
+        f"all_same\t{'yes' if result['all_same'] else 'no'}",
+        f"used_same\t{'yes' if result['used_same'] else 'no'}",
+        f"invalidate_unused\t{'yes' if result['invalidate_unused'] else 'no'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="unusedfp",
+        description=(
+            "Compare two property maps. Name unread keys that entered a full "
+            "snapshot identity and changed, while used keys did not."
+        ),
+    )
+    parser.add_argument("first")
+    parser.add_argument("second")
+    parser.add_argument("--used", action="append", default=[], help="key actually read (repeatable)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not args.used:
+        print("unusedfp: need at least one --used key", file=sys.stderr)
+        return 1
+    try:
+        first = parse_props(Path(args.first).read_text(encoding="utf-8"), source=args.first)
+        second = parse_props(Path(args.second).read_text(encoding="utf-8"), source=args.second)
+    except (OSError, ValueError) as err:
+        print(f"unusedfp: {err}", file=sys.stderr)
+        return 1
+    result = inspect(first, second, args.used)
+    sys.stdout.write(format_report(result))
+    return 1 if result["invalidate_unused"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

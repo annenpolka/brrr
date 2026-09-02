@@ -1,0 +1,1 @@
+- There is no xclim tree. Continue using a two-directory fixture: conftest in a subdirectory rootdir, items collected from a parent path. Show which config applied to which item.

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""nilkeep: name a user-null key dropped by empty-map default coalesce."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def parse_record(text: str, *, source: str) -> dict:
+    default_kind = None
+    user: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key == "default":
+            default_kind = rest
+        elif key == "user":
+            if "\t" not in rest:
+                raise ValueError(f"{source}:{lineno}: user needs name<TAB>value")
+            name, val = rest.split("\t", 1)
+            user[name] = val
+        else:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+    if default_kind is None:
+        raise ValueError(f"{source}: missing default")
+    if default_kind not in {"empty-map", "{}", "null", "~"}:
+        raise ValueError(f"{source}: default must be empty-map or null")
+    if default_kind == "{}":
+        default_kind = "empty-map"
+    if default_kind == "~":
+        default_kind = "null"
+    return {"default": default_kind, "user": user, "source": source}
+
+
+def is_null(value: str) -> bool:
+    return value in {"~", "null", "nil", "<nil>", "-"}
+
+
+def inspect(rec: dict) -> dict:
+    # Failing coalesce: empty-map default deletes user keys whose value is null.
+    # Null default leaves the user map as-is.
+    kept: list[str] = []
+    dropped: list[str] = []
+    for name, val in rec["user"].items():
+        if rec["default"] == "empty-map" and is_null(val):
+            dropped.append(name)
+        else:
+            kept.append(name)
+    return {
+        "default": rec["default"],
+        "kept": kept,
+        "dropped": dropped,
+        "user_nulls": [n for n, v in rec["user"].items() if is_null(v)],
+    }
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "-"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"default\t{result['default']}",
+        f"user_nulls\t{fmt_list(result['user_nulls'])}",
+        f"kept\t{fmt_list(result['kept'])}",
+        f"dropped\t{fmt_list(result['dropped'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="nilkeep",
+        description=(
+            "Given a chart default shape and user keys, name user-null keys "
+            "dropped by empty-map coalesce and kept by a null default."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        rec = parse_record(Path(args.record).read_text(encoding="utf-8"), source=args.record)
+    except (OSError, ValueError) as err:
+        print(f"nilkeep: {err}", file=sys.stderr)
+        return 1
+    result = inspect(rec)
+    sys.stdout.write(format_report(result))
+    return 1 if result["dropped"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

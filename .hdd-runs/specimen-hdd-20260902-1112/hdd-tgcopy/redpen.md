@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover terragrunt dest vs omitted ref from cache path / no copy manifest is two greps. Do not harvest a tgcopy TSV. Do not send terragrunt leftover-copy theater back to R1. Distinct from 118.

@@ -1,0 +1,29 @@
+{
+  "summary": "Invented depscan traces. Harvest whether fileTree configuration-cache identity is dir+pattern only (file names omitted) vs named-file collection. Stop.",
+  "preserve_add": [
+    "A ConfigurableFileTree queried at configuration time can keep the same cache identity after a file is added under the tree"
+  ],
+  "established_add": [
+    "Packet: Groovy fileTree(\"src\").files store+load then add src/file3 still loads; named files() collection is a different identity axis",
+    "Instrumentation of fileCollectionObserved does not cover DefaultConfigurableFileTree.getFiles in the packet"
+  ],
+  "rejected_add": [
+    "Invented depscan / Gradle bytecode transcripts are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned two identity records: dir+pattern vs file names. No gradle."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether a fileTree configuration-cache identity included the file names or only dir+pattern, so adding a file still loads"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name whether a fileTree cache identity omitted member file names (dir+pattern only) so an added file still hits",
+    "nearest_existing_operation": "print the file list and the cache hit",
+    "observable_delta": "omitted-names vs names-in-identity; load-after-add vs miss",
+    "reason": "the printed files= list and the cache load are two observations; the join is which identity the tree used"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned dir+pattern vs names records. Do not send gradle theater back to R1."
+}

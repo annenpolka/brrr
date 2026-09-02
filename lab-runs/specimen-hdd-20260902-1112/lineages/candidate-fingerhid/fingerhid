@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""fingerhid: name path+mtime fingerprint collision while -vV strings differ."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("path", "mtime", "vv", "size", "birth")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key, rest = key.strip(), rest.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if not rest or rest == "-":
+            raise ValueError(f"{source}:{lineno}: not a legal NAME")
+        fields[key] = rest
+    for need in ("path", "mtime", "vv"):
+        if need not in fields:
+            raise ValueError(f"{source}: missing {need}")
+    return fields
+
+
+def inspect(a: dict[str, str], b: dict[str, str]) -> dict:
+    same_path = a["path"] == b["path"]
+    same_mtime = a["mtime"] == b["mtime"]
+    vv_mismatch = a["vv"] != b["vv"]
+    same_size = a.get("size") == b.get("size") if ("size" in a and "size" in b) else None
+    same_birth = a.get("birth") == b.get("birth") if ("birth" in a and "birth" in b) else None
+    hidden = same_path and same_mtime and vv_mismatch
+    return {
+        "path_a": a["path"],
+        "path_b": b["path"],
+        "mtime_a": a["mtime"],
+        "mtime_b": b["mtime"],
+        "vv_a": a["vv"],
+        "vv_b": b["vv"],
+        "same_path": same_path,
+        "same_mtime": same_mtime,
+        "vv_mismatch": vv_mismatch,
+        "same_size": same_size,
+        "same_birth": same_birth,
+        "hidden_by_fingerprint": hidden,
+    }
+
+
+def yn(v: bool | None) -> str:
+    if v is None:
+        return "-"
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"same_path\t{yn(result['same_path'])}",
+        f"same_mtime\t{yn(result['same_mtime'])}",
+        f"vv_mismatch\t{yn(result['vv_mismatch'])}",
+        f"same_size\t{yn(result['same_size'])}",
+        f"same_birth\t{yn(result['same_birth'])}",
+        f"hidden_by_fingerprint\t{yn(result['hidden_by_fingerprint'])}",
+        f"vv_a\t{result['vv_a']}",
+        f"vv_b\t{result['vv_b']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="fingerhid",
+        description=(
+            "Compare two rustc identity records. hidden_by_fingerprint when "
+            "path and mtime match and -vV strings differ. size/birth are "
+            "spectator (not in rustc_fingerprint)."
+        ),
+    )
+    parser.add_argument("first")
+    parser.add_argument("second")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        def load(p: str) -> dict[str, str]:
+            if p == "-":
+                raise ValueError("both records must be paths (not a single stdin)")
+            return parse_record(Path(p).read_text(encoding="utf-8"), source=p)
+
+        a = load(args.first)
+        b = load(args.second)
+    except (OSError, ValueError) as err:
+        print(f"fingerhid: {err}", file=sys.stderr)
+        return 1
+    result = inspect(a, b)
+    sys.stdout.write(format_report(result))
+    return 1 if result["hidden_by_fingerprint"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

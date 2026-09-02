@@ -1,0 +1,24 @@
+Registry / fixture:
+  salt.crypt.get_rsa_key process memoize
+  leftover RSA key after on-disk rotation
+
+Case A (second call, same file, same mtime):
+  current cache identity
+  not leftover-after-rotation
+
+Case B (PEM rewritten, leftover memoize hit):
+  leftover: previous RSA private-key object
+  mtime omitted from memoize key
+  same process
+
+Case C (new process / empty memoize):
+  fresh key identity
+  not leftover previous key
+
+Case D (memoize key includes mtime):
+  new key after rotation
+  not leftover previous key
+
+Not this packet:
+  pants leftover vcs_version process cache (specimen-136)
+  black leftover project-root vs omitted CWD (specimen-139)

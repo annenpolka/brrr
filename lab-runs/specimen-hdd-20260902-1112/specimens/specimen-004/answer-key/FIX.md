@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): loadPeerSet resolved unmet optional peer edges into the virtual root even though they are pruned later. Skip peerOptional edges with no current resolution and no parent edge so packuments are not fetched.

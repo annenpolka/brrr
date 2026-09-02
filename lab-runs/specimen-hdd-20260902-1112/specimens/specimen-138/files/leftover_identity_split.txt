@@ -1,0 +1,25 @@
+Registry / fixture:
+  prisma generate --watch
+  leftover generated client after schema.prisma appends model B
+
+Case A (second watch tick, same schema.prisma):
+  current generated client identity
+  not leftover-after-schema-change
+
+Case B (schema.prisma appends model B, leftover schemaContext):
+  leftover: previous schema's generated client (A.ts only)
+  current schema file omitted from watch generate identity
+  B.ts missing
+
+Case C (prisma generate without --watch):
+  current schema identity
+  not leftover previous client
+
+Case D (reload schema inside watch loop):
+  generated client includes B.ts
+  not leftover previous schema
+
+Not this packet:
+  protobuf JSON unknown-fields (specimen-041)
+  protobuf CI generated-code-drift (specimen-043)
+  pants leftover vcs_version process cache (specimen-136)

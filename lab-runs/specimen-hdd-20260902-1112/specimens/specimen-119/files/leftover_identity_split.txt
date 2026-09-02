@@ -1,0 +1,23 @@
+Registry / fixture:
+  [tasks.create] args = ["file"]; outputs = ["{{ file }}"]
+  leftover cache file from create A.txt
+
+Case A (first create A.txt):
+  cache written as env-create.json
+  not leftover yet
+
+Case B (later create B.txt, leftover A cache):
+  leftover: filename identity of A
+  rendered B.txt omitted from the key
+
+Case C (differently named task):
+  unique key
+  not this leftover
+
+Case D (delete task-cache folder):
+  fresh identity
+  not leftover filename
+
+Not this packet:
+  go-task leftover wildcard checksum (specimen-115)
+  gradle compiler fingerprints (specimen-076/088/104)

@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""freshmiss: given two builds, name FRESH-but-missing as an identity miss."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN_FIELDS = ("status", "identity", "requested", "present", "dir", "bytes")
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def split_values(rest: str) -> list[str]:
+    if "\t" in rest:
+        parts = rest.split("\t")
+    else:
+        parts = rest.split()
+    return [part for part in parts if part]
+
+
+class Build:
+    def __init__(
+        self,
+        *,
+        status: str,
+        identity: str,
+        requested: list[str],
+        present: list[str],
+        source: str,
+        dir: Path | None = None,
+        sizes: dict[str, int] | None = None,
+    ) -> None:
+        self.status = status
+        self.identity = identity
+        self.requested = unique(requested)
+        self.present = unique(present)
+        self.source = source
+        self.dir = dir
+        self.sizes = sizes or {}
+
+    @property
+    def missing(self) -> list[str]:
+        present = set(self.present)
+        return [name for name in self.requested if name not in present]
+
+
+def parse_record(path: Path) -> Build:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise OSError(f"cannot read {path}: {err}") from err
+
+    status = None
+    identity = None
+    requested: list[str] = []
+    present: list[str] = []
+    directory: Path | None = None
+    sizes: dict[str, int] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{path}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN_FIELDS:
+            raise ValueError(f"{path}:{lineno}: unknown field {key!r}")
+        if key == "status":
+            if not rest:
+                raise ValueError(f"{path}:{lineno}: empty status")
+            status = rest
+        elif key == "identity":
+            if not rest:
+                raise ValueError(f"{path}:{lineno}: empty identity")
+            identity = rest
+        elif key == "requested":
+            requested.extend(split_values(rest))
+        elif key == "present":
+            present.extend(split_values(rest))
+        elif key == "dir":
+            if not rest:
+                raise ValueError(f"{path}:{lineno}: empty dir")
+            directory = Path(rest)
+        elif key == "bytes":
+            parts = rest.split("\t")
+            if len(parts) != 2:
+                raise ValueError(f"{path}:{lineno}: bytes needs name<TAB>size")
+            name, size_s = parts[0], parts[1]
+            try:
+                sizes[name] = int(size_s)
+            except ValueError as err:
+                raise ValueError(f"{path}:{lineno}: bad size {size_s!r}") from err
+
+    if status is None:
+        raise ValueError(f"{path}: missing status")
+    if identity is None:
+        raise ValueError(f"{path}: missing identity")
+    return Build(
+        status=status,
+        identity=identity,
+        requested=requested,
+        present=present,
+        source=str(path),
+        dir=directory,
+        sizes=sizes,
+    )
+
+
+def path_in_dir(root: Path, name: str) -> Path:
+    candidate = Path(name)
+    if candidate.is_absolute():
+        return candidate
+    return root / candidate
+
+
+def observe_present(build: Build, dir_override: Path | None = None) -> Build:
+    """If a directory is set, present is which requested paths exist there."""
+    root = dir_override if dir_override is not None else build.dir
+    if root is None:
+        return build
+    if not root.is_dir():
+        raise ValueError(f"not a directory: {root}")
+    present = []
+    sizes = dict(build.sizes)
+    for name in build.requested:
+        path = path_in_dir(root, name)
+        if path.exists():
+            present.append(name)
+            try:
+                sizes[name] = path.stat().st_size
+            except OSError:
+                pass
+    build.present = unique(present)
+    build.dir = root
+    build.sizes = sizes
+    return build
+
+
+def compare(first: Build, second: Build) -> dict:
+    extra = [name for name in second.requested if name not in set(first.requested)]
+    missing = second.missing
+    stubs = [
+        name
+        for name in extra
+        if name in set(second.present) and second.sizes.get(name, -1) == 0
+    ]
+    same = first.identity == second.identity
+    if not same:
+        verdict = "identity-changed"
+        omitted: list[str] = []
+    elif second.status == "FRESH" and missing:
+        verdict = "FRESH-but-missing"
+        omitted = list(missing)
+    elif second.status == "FRESH" and stubs:
+        verdict = "FRESH-but-stub"
+        omitted = list(stubs)
+    elif second.status == "FRESH":
+        verdict = "FRESH-complete"
+        omitted = []
+    else:
+        verdict = "rebuilt"
+        omitted = []
+    return {
+        "first": first,
+        "second": second,
+        "verdict": verdict,
+        "same_identity": same,
+        "requested_extra": extra,
+        "missing": missing,
+        "stub": stubs,
+        "omitted_from_identity": omitted,
+    }
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def format_report(result: dict) -> str:
+    first: Build = result["first"]
+    second: Build = result["second"]
+    lines = [
+        f"verdict\t{result['verdict']}",
+        f"identity\t{second.identity}",
+        f"same_identity\t{str(result['same_identity']).lower()}",
+        f"first_status\t{first.status}",
+        f"second_status\t{second.status}",
+        f"requested_extra\t{fmt_list(result['requested_extra'])}",
+        f"missing\t{fmt_list(result['missing'])}",
+        f"stub\t{fmt_list(result['stub'])}",
+        f"omitted_from_identity\t{fmt_list(result['omitted_from_identity'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="freshmiss",
+        description=(
+            "Compare two build records. If the second is FRESH on the same "
+            "identity while a requested output is absent, report "
+            "FRESH-but-missing as an identity miss, not a successful cache hit."
+        ),
+    )
+    parser.add_argument("first", metavar="FIRST", help="first build record")
+    parser.add_argument("second", metavar="SECOND", help="second build record")
+    parser.add_argument(
+        "--dir",
+        metavar="DIR",
+        help="observe second-build present from DIR (overrides a dir field)",
+    )
+    parser.add_argument(
+        "--first-dir",
+        metavar="DIR",
+        help="observe first-build present from DIR (overrides a dir field)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    first_path = Path(args.first)
+    second_path = Path(args.second)
+    try:
+        first = parse_record(first_path)
+        second = parse_record(second_path)
+        first_dir = Path(args.first_dir) if args.first_dir else None
+        second_dir = Path(args.dir) if args.dir else None
+        observe_present(first, first_dir)
+        observe_present(second, second_dir)
+    except (OSError, ValueError) as err:
+        print(f"freshmiss: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(compare(first, second)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

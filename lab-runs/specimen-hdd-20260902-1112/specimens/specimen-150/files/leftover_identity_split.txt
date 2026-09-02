@@ -1,0 +1,28 @@
+Registry / fixture:
+  systemd get_paths_from_environ SYSTEMD_UNIT_PATH
+  leftover cwd search path after empty :: component
+
+Case A (unset SYSTEMD_UNIT_PATH):
+  default search-path identity
+  not leftover-cwd
+
+Case B (/foo::/bar, leftover empty component):
+  leftover: cwd . as a search path
+  empty :: split then made absolute
+
+Case C ("" empty string):
+  empty search path
+  not leftover cwd; not default path
+
+Case D (/foo: trailing colon):
+  /foo plus built-in defaults
+  not leftover cwd
+
+Case E (leading/middle empty rejected):
+  EINVAL
+  not leftover cwd search path
+
+Not this packet:
+  local-fixture env-empty-vs-unset (specimen-010)
+  pip empty user proxy vs global (specimen-031)
+  compose leftover listed-without-equals vs image ENV (this-tick compose packet)

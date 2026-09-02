@@ -1,0 +1,38 @@
+Registry / fixture:
+  TestMetafileVeryLongExternalPaths
+  project/bytesInOutput should be at least 99.css
+    a { background: url(<99 fours>.file) }
+  LoaderFile / LoaderCopy / LoaderCSS
+  NeedsMetafile: true
+  uniqueKey = prefix16 + "A" + 8-digit sourceIndex  (25 bytes)
+
+Case A (never url() / never file-loader):
+  CSS bytesInOutput tracks printed CSS source
+  no uniqueKey placeholder
+  no leftover
+
+Case B (url() + file loader, no publicPath):
+  printer CSS: url(<uniqueKey>)
+  written CSS: url(image-<hash>.svg)
+  failing_ref bytesInOutput leftover uniqueKey length (public report 61)
+  failing_ref outputs.bytes substituted (public report 94)
+
+Case C (url() + publicPath / long asset-names):
+  written CSS includes /some-long-public-path/ or long [hash] name
+  failing_ref bytesInOutput still leftover 61
+  reporter substituted length 76
+  --asset-names / --public-path do not move bytesInOutput
+
+Case D (in-tree 99-char name; package still imported):
+  CSS bytesInOutput leftover 52 vs bytes 196
+  JS file-loader bytesInOutput leftover 45 for the 99-char .file
+
+Case E (never url() the asset from CSS):
+  no uniqueKey in that CSS compileResult
+  no CSS bytesInOutput identity involving the asset
+
+Not this packet:
+  webpack CSS module [contenthash] leftover after PNG filename move (specimen-090 / webpack#20938)
+  CSS-from-JS stub leftover in metafile.inputs (esbuild PR 504)
+  leftover missing CLI metafile on watch rebuilds (#1357)
+  plugin onEnd metafile undefined after first watch build (#1186)

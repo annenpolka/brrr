@@ -1,0 +1,37 @@
+{
+  "summary": "Preserve the eval-vs-display disagreement. Treat pytest --assert=plain contrast as packet-consistent; treat PYTEST_DEBUG bytecode dumps, precise co_code listings, and 'side_effect executed twice' as Dreamer-generated until a host fixture shows them. Do not ask for more novelty.",
+  "preserve_add": [
+    "Rewritten assertion failure messages can disagree with values a plain assertion (or the interpreter) computed",
+    "A later assignment-expression can make an earlier operand display the post-assignment value"
+  ],
+  "established_add": [
+    "Packet observation: rewritten explanation showed (False and False) while side_effect returns True",
+    "Packet observation: --assert=plain is a real pytest switch; any output from it in this transcript is unverified Dreamer text"
+  ],
+  "rejected_add": [
+    "Invented rewrite_dump.log / PYTEST_DEBUG bytecode is not specimen evidence",
+    "Precise instruction listings are unsupported precision"
+  ],
+  "constraints_add": [
+    "No rewriter bytecode dump, no hidden AST inspector, no semantic oracle",
+    "Only pytest stdout/stderr and user-visible counters may be treated as observable"
+  ],
+  "open_questions_add": [
+    "Can eval-count vs display-count be shown without inspecting rewriter internals?"
+  ],
+  "harvest_candidates_add": [
+    "Ask which assertion-failure values came from live evaluation versus the display path"
+  ],
+  "pressure": [
+    "This environment cannot dump rewritten bytecode or AST. Continue using the tool on the walrus assertion using only pytest's user-visible output and a counter in the test source.",
+    "A companion fixture exists where a display helper re-invokes the expression after the real evaluation. Use the same tool. Show which numbers came from the live call versus the display path."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "compare what an assertion evaluated with what its failure message displayed, including side-effect counts",
+    "nearest_existing_operation": "run pytest twice with --assert=plain versus rewrite and manually diff",
+    "observable_delta": "one query that labels each displayed value as eval-time or display-time instead of a two-run manual diff",
+    "reason": "the interesting remainder is provenance of displayed assertion values, not a new pytest"
+  },
+  "redpen_markdown": "NEXT_ACTION=CONTINUE_WITH_COUNTEREXAMPLE specimen-015. Provenance: SPECIMEN_OBSERVED for the False-and-False packet; DREAMER_GENERATED for bytecode and the twice-count until reproduced."
+}

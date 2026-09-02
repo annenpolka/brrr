@@ -1,0 +1,29 @@
+{
+  "summary": "Invented rustc -Zdump-dep-graph / query-dep-graph transcripts. Preserve typeck stayed green because an anon-task dep index was never read. Harvest green query vs unrecorded first-run dep. Stop.",
+  "preserve_add": [
+    "A query can stay green across a revision when a first-run dependency was never recorded",
+    "with_anon_task can return a DepNodeIndex that the caller does not read_index"
+  ],
+  "established_add": [
+    "Packet: next-solver with_cached_task uses with_anon_task and does not read_index; old solver in_task does; cfail2 ICEs decoding a gone DefId while typeck of poll is reused"
+  ],
+  "rejected_add": [
+    "Invented rustc incremental dumps and DefId tables are not host-executed"
+  ],
+  "constraints_add": [
+    "No rustc. Owned two tables: recorded deps of a query vs identities that changed. Transfer is not visitid."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "which query stayed green, and which first-run dependency that identity did not record"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name a green query versus a changed identity missing from its recorded deps",
+    "nearest_existing_operation": "print two dep lists / visitid",
+    "observable_delta": "green typeck_of poll; missing type_of Error",
+    "reason": "two dumps still leave the unrecorded edge as a hand join"
+  },
+  "pressure": [],
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground greendep on owned recorded-vs-changed tables. Do not send rustc dumps back to R1."
+}

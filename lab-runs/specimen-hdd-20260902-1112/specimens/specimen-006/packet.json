@@ -1,0 +1,11 @@
+{
+  "id": "specimen-006",
+  "manifest": "\nid: specimen-006\nkind: REAL_SOURCE_BACKED\nrepository: astral-sh/uv\nfailing_ref: b187a5124c8168ce0876ccd8c076a1b9744a213b\nfixed_ref: d555d7115883740c19f87a74cce2b983c968cb09\nsource_pr: https://github.com/astral-sh/uv/pull/20774\nmechanism_tags:\n  - ci-cache\n  - stale-fingerprint\n  - workspace\necosystem: rust\nreproduction_status: source-backed\nsafety_status: not-executed-on-host\npacket_tokens_estimate: 5000\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nLinux CI Rust caches for a workspace grow across lockfile updates. Fallback restores keep older fingerprints for workspace members next to newly compiled artifacts. Disk usage climbs; it is unclear which cache entries are still live for the current lockfile.\n\nThe developer wants to distinguish current workspace outputs from superseded fingerprints without deleting the whole cache.\n",
+  "observed": "# OBSERVED\n\nPublic astral-sh/uv#20774.\n\n- Action: `cache-workspace-crates` remains wanted.\n- Symptom: after lockfile updates, fallback cache restores retain older fingerprints for workspace members alongside new artifacts.\n- External dependencies should remain cached.\n- Growth is observed on Linux CI across successive lockfile updates.\n",
+  "commands": "# COMMANDS\n\nCI restore of Rust cache after a lockfile bump; compare fingerprint directories for workspace members before/after. Not executed on the lab host.\n",
+  "tree": "workspace members + target/ + CI rust cache\n",
+  "source": "pr: https://github.com/astral-sh/uv/pull/20774\nfailing_ref: b187a5124c8168ce0876ccd8c076a1b9744a213b\nfixed_ref: d555d7115883740c19f87a74cce2b983c968cb09\nmerged_at: 2026-07-28T19:14:42Z\n",
+  "answer_key": "KNOWN FIX (sealed): track Cargo fingerprint use during cache-refreshing builds and remove only superseded artifacts for affected workspace members; keep current workspace outputs and external dependencies.\n",
+  "curation": "ACCEPT_R1\n"
+}

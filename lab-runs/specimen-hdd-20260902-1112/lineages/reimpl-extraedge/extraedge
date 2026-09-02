@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""Two-pass extra-edge attach graph over a pair of package records.
+
+Canonical input is a JSON document. TSV is compiled into that document.
+Pass 1 builds extra → extra-edge edges and attaches resolved extra-edge
+nodes. Pass 2 walks declared extras: a miss is an extra whose mapped
+neighbors are all unattached.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+
+EMPTY = "."
+MAX_INPUT = 64_000
+MAX_IDENTITY = 1024
+MAX_NAME = 256
+MAX_EXTRAS = 256
+KNOWN_TSV = frozenset({"package", "version", "declared", "resolved", "extra"})
+
+
+def first_seen(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def cells(row: str) -> list[str]:
+    return next(csv.reader([row], delimiter="\t", quoting=csv.QUOTE_NONE))
+
+
+def check_name(name: str, *, source: str, where: str) -> str:
+    if name == "":
+        raise ValueError(f"{source}: empty extra name")
+    if name == EMPTY:
+        raise ValueError(f"{source}: empty-list marker cannot mix with names")
+    if "\x00" in name:
+        raise ValueError(f"{source}: NUL in extra name")
+    if len(name) > MAX_NAME:
+        raise ValueError(f"{source}: extra name exceeds {MAX_NAME} characters")
+    return name
+
+
+def check_identity(value: str, *, field: str, source: str) -> str:
+    if not value:
+        raise ValueError(f"{source}: empty {field}")
+    if "\x00" in value:
+        raise ValueError(f"{source}: NUL in {field}")
+    if len(value) > MAX_IDENTITY:
+        raise ValueError(f"{source}: {field} exceeds {MAX_IDENTITY} characters")
+    return value
+
+
+def names_from_rest(rest: list[str], *, source: str, lineno: int) -> list[str]:
+    loc = f"{source}:{lineno}"
+    if rest == [] or rest == [""] or rest == [EMPTY]:
+        return []
+    out: list[str] = []
+    for part in rest:
+        token = part.strip()
+        check_name(token, source=loc, where="name")
+        out.append(token)
+    if len(out) > MAX_EXTRAS:
+        raise ValueError(f"{loc}: more than {MAX_EXTRAS} extras")
+    return first_seen(out)
+
+
+def names_from_json(value: Any, *, field: str, source: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{source}: {field} must be a JSON array")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{source}: {field} entries must be strings")
+        check_name(item.strip(), source=source, where=field)
+        out.append(item.strip())
+    if len(out) > MAX_EXTRAS:
+        raise ValueError(f"{source}: more than {MAX_EXTRAS} extras")
+    return first_seen(out)
+
+
+def add_map(
+    extras: dict[str, list[str]],
+    name: str,
+    targets: list[str],
+    *,
+    source: str,
+    replace: bool,
+) -> None:
+    if not targets:
+        raise ValueError(f"{source}: extra {name!r} needs an extra-edge target")
+    if len(targets) > MAX_EXTRAS:
+        raise ValueError(f"{source}: more than {MAX_EXTRAS} extra-edge targets")
+    prev = extras.get(name)
+    if prev is None:
+        extras[name] = list(targets)
+        return
+    if replace:
+        raise ValueError(f"{source}: duplicate extra {name!r}")
+    extras[name] = first_seen(prev + targets)
+
+
+def extras_from_json(payload: dict[str, Any], *, source: str) -> dict[str, list[str]]:
+    extras: dict[str, list[str]] = {}
+    if "extras" in payload:
+        blob = payload["extras"]
+        if isinstance(blob, dict):
+            for raw_name, raw_targets in blob.items():
+                name = check_name(str(raw_name).strip(), source=source, where="extra")
+                targets = names_from_json(raw_targets, field=f"extras.{name}", source=source)
+                add_map(extras, name, targets, source=source, replace=True)
+        elif isinstance(blob, list):
+            for item in blob:
+                if not isinstance(item, list) or len(item) < 2:
+                    raise ValueError(f"{source}: extras rows need name and target")
+                name = check_name(str(item[0]).strip(), source=source, where="extra")
+                targets = names_from_json(item[1:], field=f"extras.{name}", source=source)
+                add_map(extras, name, targets, source=source, replace=False)
+        else:
+            raise ValueError(f"{source}: extras must be an object or array")
+    if "edges" in payload:
+        blob = payload["edges"]
+        if not isinstance(blob, list):
+            raise ValueError(f"{source}: edges must be a JSON array")
+        for item in blob:
+            if not isinstance(item, dict) or "extra" not in item:
+                raise ValueError(f"{source}: edge needs extra")
+            name = check_name(str(item["extra"]).strip(), source=source, where="extra")
+            if "targets" in item:
+                targets = names_from_json(item["targets"], field=f"edge.{name}", source=source)
+            elif "target" in item:
+                if not isinstance(item["target"], str):
+                    raise ValueError(f"{source}: edge target must be a string")
+                targets = names_from_json([item["target"]], field=f"edge.{name}", source=source)
+            else:
+                raise ValueError(f"{source}: edge needs target")
+            add_map(extras, name, targets, source=source, replace=False)
+    if len(extras) > MAX_EXTRAS:
+        raise ValueError(f"{source}: more than {MAX_EXTRAS} extras")
+    return extras
+
+
+def document(
+    *,
+    package: str,
+    version: str,
+    declared: list[str],
+    extras: dict[str, list[str]],
+    resolved: list[str],
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "package": package,
+        "version": version,
+        "declared": first_seen(declared),
+        "extras": {name: list(targets) for name, targets in extras.items()},
+        "resolved": first_seen(resolved),
+        "source": source,
+    }
+
+
+def compile_tsv(text: str, *, source: str) -> dict[str, Any]:
+    package = None
+    version = None
+    declared: list[str] | None = None
+    resolved: list[str] | None = None
+    extras: dict[str, list[str]] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if "\t" not in raw:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        row = cells(raw)
+        key = row[0].strip()
+        loc = f"{source}:{lineno}"
+        if key not in KNOWN_TSV:
+            raise ValueError(f"{loc}: unknown field {key!r}")
+        rest = row[1:]
+        if key == "package":
+            if package is not None:
+                raise ValueError(f"{loc}: duplicate package")
+            if len(rest) != 1:
+                raise ValueError(f"{loc}: extra columns on package")
+            package = check_identity(rest[0].strip(), field="package", source=loc)
+        elif key == "version":
+            if version is not None:
+                raise ValueError(f"{loc}: duplicate version")
+            if len(rest) != 1:
+                raise ValueError(f"{loc}: extra columns on version")
+            version = check_identity(rest[0].strip(), field="version", source=loc)
+        elif key == "declared":
+            if declared is not None:
+                raise ValueError(f"{loc}: duplicate declared")
+            declared = names_from_rest(rest, source=source, lineno=lineno)
+        elif key == "resolved":
+            if resolved is not None:
+                raise ValueError(f"{loc}: duplicate resolved")
+            resolved = names_from_rest(rest, source=source, lineno=lineno)
+        elif key == "extra":
+            if not rest or rest == [""] or rest == [EMPTY]:
+                raise ValueError(f"{loc}: extra needs name and extra-edge target")
+            name = check_name(rest[0].strip(), source=loc, where="extra")
+            targets = names_from_rest(rest[1:], source=source, lineno=lineno)
+            add_map(extras, name, targets, source=loc, replace=True)
+    if package is None:
+        raise ValueError(f"{source}: missing package")
+    if version is None:
+        raise ValueError(f"{source}: missing version")
+    if resolved is None:
+        raise ValueError(f"{source}: missing resolved")
+    if len(extras) > MAX_EXTRAS:
+        raise ValueError(f"{source}: more than {MAX_EXTRAS} extras")
+    return document(
+        package=package,
+        version=version,
+        declared=declared or [],
+        extras=extras,
+        resolved=resolved,
+        source=source,
+    )
+
+
+def compile_json(text: str, *, source: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{source}: {err}") from err
+    if isinstance(payload, list):
+        if len(payload) != 1 or not isinstance(payload[0], dict):
+            raise ValueError(f"{source}: JSON array must hold one object")
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: JSON object required")
+    if "package" not in payload:
+        raise ValueError(f"{source}: missing package")
+    if "version" not in payload:
+        raise ValueError(f"{source}: missing version")
+    if "resolved" not in payload:
+        raise ValueError(f"{source}: missing resolved")
+    if not isinstance(payload["package"], str):
+        raise ValueError(f"{source}: package must be a string")
+    if not isinstance(payload["version"], str):
+        raise ValueError(f"{source}: version must be a string")
+    package = check_identity(payload["package"].strip(), field="package", source=source)
+    version = check_identity(payload["version"].strip(), field="version", source=source)
+    declared = names_from_json(payload.get("declared", []), field="declared", source=source)
+    extras = extras_from_json(payload, source=source)
+    resolved = names_from_json(payload["resolved"], field="resolved", source=source)
+    return document(
+        package=package,
+        version=version,
+        declared=declared,
+        extras=extras,
+        resolved=resolved,
+        source=source,
+    )
+
+
+def first_payload_line(text: str) -> str:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def load_document(text: str, *, source: str = "<input>") -> dict[str, Any]:
+    if len(text) > MAX_INPUT:
+        raise ValueError(f"{source}: input exceeds {MAX_INPUT} bytes")
+    start = first_payload_line(text)
+    if start.startswith("{") or start.startswith("["):
+        return compile_json(text, source=source)
+    return compile_tsv(text, source=source)
+
+
+@dataclass
+class EdgeNode:
+    """An extra-edge package name. `mapped` is true if the extras table points here."""
+
+    name: str
+    attached: set[str] = field(default_factory=set)
+    mapped: bool = False
+
+
+class AttachGraph:
+    """Pass 1 attaches extra-edge nodes; pass 2 walks declared extras."""
+
+    def __init__(self) -> None:
+        self.identity: dict[str, tuple[str, str]] = {}
+        self.declared: dict[str, list[str]] = {"a": [], "b": []}
+        self.resolved: dict[str, list[str]] = {"a": [], "b": []}
+        self.out: dict[str, list[str]] = {}
+        self.edges: dict[str, EdgeNode] = {}
+        self.trace: list[dict[str, Any]] = []
+
+    def _ensure_edge(self, name: str, *, mapped: bool = False) -> EdgeNode:
+        node = self.edges.get(name)
+        if node is None:
+            node = EdgeNode(name=name, mapped=mapped)
+            self.edges[name] = node
+            return node
+        if mapped:
+            node.mapped = True
+        return node
+
+    def ingest(self, side: str, doc: dict[str, Any]) -> None:
+        self.identity[side] = (doc["package"], doc["version"])
+        self.declared[side] = list(doc["declared"])
+        self.resolved[side] = list(doc["resolved"])
+        for extra, targets in doc["extras"].items():
+            prev = self.out.get(extra)
+            if prev is not None and prev != list(targets):
+                raise ValueError(
+                    f"conflicting extra-edge map for {extra!r}: {prev} vs {list(targets)}"
+                )
+            self.out[extra] = list(targets)
+            for target in targets:
+                self._ensure_edge(target, mapped=True)
+            self.trace.append(
+                {"op": "map", "side": side, "extra": extra, "targets": list(targets)}
+            )
+        for token in doc["resolved"]:
+            node = self._ensure_edge(token)
+            node.attached.add(side)
+            self.trace.append({"op": "attach", "side": side, "edge": token})
+
+    def walk(self) -> dict[str, Any]:
+        a_id = self.identity["a"]
+        b_id = self.identity["b"]
+        same = a_id == b_id
+        result: dict[str, Any] = {
+            "package_a": a_id[0],
+            "version_a": a_id[1],
+            "package_b": b_id[0],
+            "version_b": b_id[1],
+            "same_package": same,
+            "extras": dict(self.out),
+            "unmapped": [],
+            "missed_a": [],
+            "missed_b": [],
+            "attached_b": [],
+            "declared": first_seen(self.declared["a"] + self.declared["b"]),
+            "resolved_a": list(self.resolved["a"]),
+            "resolved_b": list(self.resolved["b"]),
+        }
+        self.trace.append({"op": "identity", "same": same})
+        if not same:
+            return result
+        declared = result["declared"]
+        unmapped = [name for name in declared if name not in self.out]
+        result["unmapped"] = unmapped
+        if unmapped:
+            self.trace.append({"op": "unmapped", "names": list(unmapped)})
+            return result
+        for side, key in (("a", "missed_a"), ("b", "missed_b")):
+            missed: list[str] = []
+            for extra in self.declared[side]:
+                targets = self.out[extra]
+                if not any(side in self.edges[target].attached for target in targets):
+                    missed.append(extra)
+                    self.trace.append(
+                        {"op": "miss", "side": side, "extra": extra, "targets": list(targets)}
+                    )
+            result[key] = missed
+        attached_only: list[str] = []
+        for token in self.resolved["b"]:
+            node = self.edges[token]
+            if node.mapped and "b" in node.attached and "a" not in node.attached:
+                attached_only.append(token)
+                self.trace.append({"op": "only_b", "edge": token})
+        result["attached_b"] = attached_only
+        return result
+
+
+def compare(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    graph = AttachGraph()
+    graph.ingest("a", first)
+    graph.ingest("b", second)
+    result = graph.walk()
+    result["graph"] = graph
+    return result
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else EMPTY
+
+
+def render(result: dict[str, Any]) -> str:
+    lines = [
+        f"package_a\t{result['package_a']}",
+        f"version_a\t{result['version_a']}",
+        f"package_b\t{result['package_b']}",
+        f"version_b\t{result['version_b']}",
+        f"same_package\t{'yes' if result['same_package'] else 'no'}",
+    ]
+    if not result["same_package"]:
+        lines += [
+            "identity\tmismatch",
+            f"declared\t{EMPTY}",
+            f"resolved_a\t{EMPTY}",
+            f"resolved_b\t{EMPTY}",
+            f"missed_a\t{EMPTY}",
+            f"missed_b\t{EMPTY}",
+            f"attached_b\t{EMPTY}",
+        ]
+        return "\n".join(lines) + "\n"
+    for name, targets in result["extras"].items():
+        lines.append("map\t" + "\t".join([name, *targets]))
+    lines += [
+        f"declared\t{fmt_list(result['declared'])}",
+        f"resolved_a\t{fmt_list(result['resolved_a'])}",
+        f"resolved_b\t{fmt_list(result['resolved_b'])}",
+    ]
+    if result["unmapped"]:
+        lines += [
+            f"unmapped\t{fmt_list(result['unmapped'])}",
+            f"missed_a\t{EMPTY}",
+            f"missed_b\t{EMPTY}",
+            f"attached_b\t{EMPTY}",
+        ]
+        return "\n".join(lines) + "\n"
+    lines += [
+        f"missed_a\t{fmt_list(result['missed_a'])}",
+        f"missed_b\t{fmt_list(result['missed_b'])}",
+        f"attached_b\t{fmt_list(result['attached_b'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def read_source(path: str) -> str:
+    if path == "-":
+        data = sys.stdin.read()
+    else:
+        data = Path(path).read_text(encoding="utf-8")
+    if len(data) > MAX_INPUT:
+        raise ValueError(f"{path}: input exceeds {MAX_INPUT} bytes")
+    return data
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="extraedge",
+        description=(
+            "Load two package-version records as JSON (or TSV compiled to JSON). "
+            "Build an extra → extra-edge attach graph, then walk declared extras "
+            "whose mapped neighbors did not attach. Extra-edges attached only on "
+            "the second record are named. Unmapped extras are refused."
+        ),
+    )
+    parser.add_argument("first", metavar="FIRST")
+    parser.add_argument("second", metavar="SECOND")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.first == "-" and args.second == "-":
+        print("extraedge: stdin used twice", file=sys.stderr)
+        return 1
+    src_first = "<stdin>" if args.first == "-" else args.first
+    src_second = "<stdin>" if args.second == "-" else args.second
+    try:
+        first = load_document(read_source(args.first), source=src_first)
+        second = load_document(read_source(args.second), source=src_second)
+        result = compare(first, second)
+    except (OSError, ValueError) as err:
+        print(f"extraedge: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(render(result))
+    if (
+        not result["same_package"]
+        or result["unmapped"]
+        or result["missed_a"]
+        or result["missed_b"]
+    ):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

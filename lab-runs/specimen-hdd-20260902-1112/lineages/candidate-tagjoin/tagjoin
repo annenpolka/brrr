@@ -1,0 +1,1287 @@
+#!/usr/bin/env python3
+"""tagjoin: name fields whose optionality tags disagree with listMapKey identity."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# Spaces around '=' are allowed. Colons let +kubebuilder:validation:Optional through.
+MARKER_RE = re.compile(r"^//\s*\+([A-Za-z][\w:.-]*)(?:\s*=\s*(\S*))?\s*$")
+TYPE_RE = re.compile(r"^type\s+([A-Za-z_]\w*)\s+struct\s*\{")
+FIELD_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s+(\S+)\s+`([^`]*)`")
+# Anonymous embed with tags: Base `json:",inline"` (no field type token).
+EMBED_TAGGED_RE = re.compile(r"^\s*(\*?)([A-Za-z_][\w.]*)\s+`([^`]*)`")
+FIELD_UNTAGGED_RE = re.compile(
+    r"^\s*([A-Za-z_]\w*)\s+(\*?\[.*?\]\*?[A-Za-z_][\w.]*|\*?[A-Za-z_][\w.]*)\s*$"
+)
+ANON_UNTAGGED_RE = re.compile(r"^\s*(\*?)([A-Za-z_][\w.]*)\s*$")
+TAG_RE = re.compile(r'(\w+):"([^"]*)"')
+APPLY_RE = re.compile(
+    r"properties\[(?P<list>[A-Za-z_]\w*)\]"
+    r"\.items\.properties\[(?P<key>[A-Za-z_]\w*)\]"
+    r".{0,120}?x-kubernetes-list-map-keys"
+)
+YAML_STRUCTURAL = {
+    "properties",
+    "items",
+    "spec",
+    "schema",
+    "openAPIV3Schema",
+    "validation",
+    "components",
+    "schemas",
+    "definitions",
+    "allOf",
+    "anyOf",
+    "oneOf",
+}
+YAML_KEY_RE = re.compile(r"^[A-Za-z_][\w.-]*$")
+BLOCK_SCALAR_RE = re.compile(r"^[|>][+-]?(?:\d+)?$")
+LINE_KEYWORDS = frozenset(
+    {
+        "package",
+        "import",
+        "type",
+        "func",
+        "var",
+        "const",
+        "return",
+        "if",
+        "for",
+        "go",
+        "defer",
+        "range",
+        "case",
+        "switch",
+        "select",
+        "struct",
+        "interface",
+        "map",
+        "chan",
+        "else",
+        "break",
+        "continue",
+        "goto",
+        "fallthrough",
+        "default",
+    }
+)
+
+
+@dataclass
+class Field:
+    name: str
+    go_type: str
+    tags: dict[str, str]
+    markers: dict[str, list[str]]
+    owner: str | None
+    line: int
+
+
+@dataclass
+class Struct:
+    name: str
+    fields: list[Field] = field(default_factory=list)
+    markers: dict[str, list[str]] = field(default_factory=dict)
+    line: int = 0
+
+
+@dataclass
+class Join:
+    list_name: str
+    list_json: str
+    list_omitempty: bool
+    elem: str
+    field_name: str
+    json_name: str
+    json_tag: str
+    omitempty: bool
+    plus_optional: bool
+    protobuf_opt: bool
+    identity: list[str]
+    verdict: str
+    line: int
+    has_default: bool = False
+    omitzero: bool = False
+
+
+def strip_bom(text: str) -> str:
+    return text.replace("\ufeff", "")
+
+
+def parse_markers(lines: list[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for raw in lines:
+        match = MARKER_RE.match(raw.strip().replace("\ufeff", ""))
+        if match is None:
+            continue
+        key, value = match.group(1), match.group(2)
+        out.setdefault(key, []).append("" if value is None else value)
+    return out
+
+
+def parse_tags(blob: str) -> dict[str, str]:
+    return {key: value for key, value in TAG_RE.findall(blob)}
+
+
+def code_and_comment(raw: str) -> tuple[str, str | None]:
+    """Split trailing // from a line, ignoring // inside backticks."""
+    in_tick = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "`":
+            in_tick = not in_tick
+        elif ch == "/" and not in_tick and i + 1 < len(raw) and raw[i + 1] == "/":
+            return raw[:i], raw[i:]
+        i += 1
+    return raw, None
+
+
+def parse_field_line(raw: str) -> tuple[str, str, str] | None:
+    """Return (name, go_type, tag_blob) for a field or anonymous embed."""
+    code, _comment = code_and_comment(raw.replace("\ufeff", ""))
+    code = code.rstrip()
+    if not code.strip():
+        return None
+    tagged = FIELD_RE.match(code)
+    if tagged is not None:
+        return tagged.group(1), tagged.group(2), tagged.group(3)
+    embed = EMBED_TAGGED_RE.match(code)
+    if embed is not None:
+        star, typ, tags = embed.group(1), embed.group(2), embed.group(3)
+        name = typ.rsplit(".", 1)[-1]
+        return name, f"{star}{typ}", tags
+    stripped = code.strip()
+    head = stripped.split(None, 1)[0] if stripped else ""
+    if head in LINE_KEYWORDS:
+        return None
+    if "(" in stripped or "=" in stripped:
+        return None
+    untagged = FIELD_UNTAGGED_RE.match(code)
+    if untagged is not None:
+        return untagged.group(1), untagged.group(2), ""
+    anon = ANON_UNTAGGED_RE.match(code)
+    if anon is not None:
+        star, typ = anon.group(1), anon.group(2)
+        name = typ.rsplit(".", 1)[-1]
+        if name in LINE_KEYWORDS:
+            return None
+        return name, f"{star}{typ}", ""
+    return None
+
+
+def split_json_tag(tag: str | None) -> tuple[str, list[str]]:
+    """Keep an empty first token. encoding/json: json:\",omitempty\" is name=\"\" + omitempty."""
+    if not tag:
+        return "", []
+    parts = [p.strip() for p in tag.split(",")]
+    name = parts[0] if parts else ""
+    opts = [p for p in parts[1:] if p]
+    return name, opts
+
+
+def json_parts(tag: str | None) -> tuple[str, bool]:
+    """(json_name, omitempty_or_omitzero). Empty name is \"\", not the first option."""
+    name, opts = split_json_tag(tag)
+    return name, "omitempty" in opts or "omitzero" in opts
+
+
+def json_omitzero(tag: str | None) -> bool:
+    _name, opts = split_json_tag(tag)
+    return "omitzero" in opts
+
+
+def protobuf_is_opt(tag: str | None) -> bool:
+    if not tag:
+        return False
+    parts = [p.strip() for p in tag.split(",") if p.strip()]
+    return "opt" in parts
+
+
+def elem_type(go_type: str) -> str | None:
+    text = go_type.strip()
+    if not text.startswith("[]"):
+        return None
+    text = text[2:].lstrip("*")
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text or None
+
+
+def parse_go(text: str) -> tuple[dict[str, list[Struct]], list[Field]]:
+    structs: dict[str, list[Struct]] = {}
+    loose: list[Field] = []
+    pending: list[str] = []
+    current: Struct | None = None
+
+    def take_markers(extra: str | None = None) -> dict[str, list[str]]:
+        lines = list(pending)
+        pending.clear()
+        if extra:
+            lines.append(extra)
+        return parse_markers(lines)
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.replace("\ufeff", "").strip()
+        if stripped.startswith("//"):
+            pending.append(stripped)
+            continue
+        if stripped == "":
+            continue
+        type_match = TYPE_RE.match(stripped)
+        if type_match is not None:
+            markers = take_markers()
+            current = Struct(name=type_match.group(1), markers=markers, line=lineno)
+            structs.setdefault(current.name, []).append(current)
+            continue
+        if stripped == "}":
+            pending.clear()
+            current = None
+            continue
+        parsed = parse_field_line(raw)
+        if parsed is not None:
+            name, go_type, tag_blob = parsed
+            _code, comment = code_and_comment(raw.replace("\ufeff", ""))
+            markers = take_markers(comment)
+            fld = Field(
+                name=name,
+                go_type=go_type,
+                tags=parse_tags(tag_blob),
+                markers=markers,
+                owner=current.name if current is not None else None,
+                line=lineno,
+            )
+            if current is not None:
+                current.fields.append(fld)
+            else:
+                loose.append(fld)
+            continue
+        pending.clear()
+    return structs, loose
+
+
+def type_base_name(go_type: str) -> str:
+    text = go_type.strip().lstrip("*")
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def wire_name(fld: Field) -> str | None:
+    """JSON wire name. None if the field is omitted from JSON (json:\"-\").
+
+    No json tag, or an empty json name (json:\",omitempty\"), means the Go
+    field name is the wire name. An explicit json name is never replaced by
+    the Go name.
+    """
+    tag = fld.tags.get("json")
+    if tag is None:
+        return fld.name
+    name, _opts = split_json_tag(tag)
+    if name == "-":
+        return None
+    if name == "":
+        return fld.name
+    return name
+
+
+def field_json_name(fld: Field) -> str:
+    wn = wire_name(fld)
+    return wn if wn is not None else fld.name
+
+
+def is_inline_embed(fld: Field) -> bool:
+    """Anonymous / empty-name json:,inline embeds flatten into the parent JSON object.
+
+    json:\"inner,inline\" keeps the nested name; encoding/json does not flatten it.
+    """
+    tag = fld.tags.get("json")
+    name, opts = split_json_tag(tag)
+    if name == "-":
+        return False
+    if name == "" and "inline" in opts:
+        return True
+    if fld.name == type_base_name(fld.go_type) and (tag is None or name == ""):
+        return True
+    return False
+
+
+def unique_struct(
+    struct_map: dict[str, list[Struct]], name: str | None
+) -> tuple[str, Struct | None]:
+    if not name:
+        return "missing", None
+    defs = struct_map.get(name) or []
+    if len(defs) == 0:
+        return "missing", None
+    if len(defs) > 1:
+        return "collision", None
+    return "ok", defs[0]
+
+
+def collect_identity_fields(
+    struct: Struct,
+    struct_map: dict[str, list[Struct]],
+    seen: set[str] | None = None,
+) -> tuple[list[Field], bool]:
+    """JSON-visible fields, walking json:,inline / anonymous embeds.
+
+    Second value is True if an inlined type is defined more than once.
+    """
+    seen = set(seen or ())
+    if struct.name in seen:
+        return [], False
+    seen.add(struct.name)
+    out: list[Field] = []
+    collided = False
+    for fld in struct.fields:
+        if is_inline_embed(fld):
+            inner_name = type_base_name(fld.go_type)
+            status, inner = unique_struct(struct_map, inner_name)
+            if status == "collision":
+                collided = True
+                continue
+            if status == "ok" and inner is not None:
+                nested, nest_c = collect_identity_fields(inner, struct_map, seen)
+                out.extend(nested)
+                collided = collided or nest_c
+            continue
+        out.append(fld)
+    return out, collided
+
+
+def find_key_hits(
+    struct: Struct | None,
+    key: str,
+    struct_map: dict[str, list[Struct]],
+) -> tuple[list[Field], str]:
+    """Match list-map keys against JSON wire names, not Go names of renamed fields.
+
+    Status is ok or type-collision. json:\"-\" is not a key. An explicit json
+    name is never replaced by the Go field name.
+    """
+    if struct is None:
+        return [], "ok"
+    visible, collided = collect_identity_fields(struct, struct_map)
+    if collided:
+        return [], "type-collision"
+    exact: list[Field] = []
+    for fld in visible:
+        wn = wire_name(fld)
+        if wn is None:
+            continue
+        if wn == key:
+            exact.append(fld)
+    return exact, "ok"
+
+
+def identity_markers(fld: Field) -> list[str]:
+    names: list[str] = []
+    if fld.markers.get("listMapKey"):
+        names.append("listMapKey")
+    if fld.markers.get("patchMergeKey") or "patchMergeKey" in fld.tags:
+        names.append("patchMergeKey")
+    return names
+
+
+def marker_optional(fld: Field) -> bool:
+    keys = fld.markers
+    return "optional" in keys or "kubebuilder:validation:Optional" in keys
+
+
+def marker_default(fld: Field) -> bool:
+    for key in fld.markers:
+        if key in ("default", "kubebuilder:default"):
+            return True
+        if key.startswith("kubebuilder:default:") or key.startswith("kubebuilder:default="):
+            return True
+    return False
+
+
+def optional_label(join: Join) -> str:
+    bits: list[str] = []
+    if join.plus_optional:
+        bits.append("+optional")
+    if join.omitempty:
+        bits.append("omitempty")
+    if join.omitzero:
+        bits.append("omitzero")
+    if join.has_default:
+        bits.append("default")
+    if not bits and join.verdict == "disagree" and "x-kubernetes-list-map-keys" in join.identity:
+        bits.append("not-required")
+    return ",".join(bits) if bits else "-"
+
+
+def all_fields(structs: dict[str, list[Struct]], loose: list[Field]) -> list[Field]:
+    fields: list[Field] = list(loose)
+    for defs in structs.values():
+        for struct in defs:
+            fields.extend(struct.fields)
+    return fields
+
+
+def other_omitempty(
+    fields: list[Field],
+    joins: list[Join],
+    used_fields: set[tuple[str, str]] | None = None,
+) -> list[str]:
+    """omitempty fields that are not list-map keys (grep hits these too)."""
+    used = used_fields or {
+        (join.elem, join.field_name)
+        for join in joins
+        if join.verdict != "missing"
+    }
+    names: list[str] = []
+    seen: set[str] = set()
+    for fld in fields:
+        json_name, opts = split_json_tag(fld.tags.get("json"))
+        if json_name == "-":
+            continue
+        if "omitempty" not in opts:
+            continue
+        if fld.markers.get("listMapKey"):
+            continue
+        owner = fld.owner or "-"
+        if (owner, fld.name) in used:
+            continue
+        qual = f"{owner}.{fld.name}" if owner != "-" else fld.name
+        if qual in seen:
+            continue
+        seen.add(qual)
+        names.append(qual)
+    return names
+
+
+def list_map_keys(fld: Field) -> list[str]:
+    """Distinct +listMapKey values; comma-separated tokens count as several keys."""
+    raw = fld.markers.get("listMapKey") or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        for part in str(item).split(","):
+            key = part.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def target_verdict(optional: bool, has_default: bool) -> str:
+    """Specimen rule: a list-map key must be required or have a default."""
+    if has_default:
+        return "agree"
+    return "disagree" if optional else "agree"
+
+
+def inspect_fields(
+    structs: dict[str, list[Struct]], fields: list[Field]
+) -> tuple[list[Join], set[tuple[str, str]]]:
+    joins: list[Join] = []
+    used: set[tuple[str, str]] = set()
+    for fld in fields:
+        keys = list_map_keys(fld)
+        if not keys:
+            continue
+        elem = elem_type(fld.go_type)
+        _list_json_name, list_omit = json_parts(fld.tags.get("json"))
+        list_json = fld.tags.get("json") or _list_json_name or "-"
+        ident = identity_markers(fld) or ["listMapKey"]
+        status, struct = unique_struct(structs, elem)
+        for key in keys:
+            if status == "collision":
+                joins.append(
+                    Join(
+                        list_name=fld.name,
+                        list_json=list_json or "-",
+                        list_omitempty=list_omit,
+                        elem=elem or "-",
+                        field_name=key,
+                        json_name=key,
+                        json_tag="duplicate-type",
+                        omitempty=False,
+                        plus_optional=False,
+                        protobuf_opt=False,
+                        identity=ident,
+                        verdict="collision",
+                        line=fld.line,
+                    )
+                )
+                continue
+            hits, hit_status = find_key_hits(struct, key, structs)
+            if hit_status == "type-collision":
+                joins.append(
+                    Join(
+                        list_name=fld.name,
+                        list_json=list_json or "-",
+                        list_omitempty=list_omit,
+                        elem=struct.name if struct is not None else (elem or "-"),
+                        field_name=key,
+                        json_name=key,
+                        json_tag="duplicate-type",
+                        omitempty=False,
+                        plus_optional=False,
+                        protobuf_opt=False,
+                        identity=ident,
+                        verdict="collision",
+                        line=fld.line,
+                    )
+                )
+                continue
+            if not hits:
+                joins.append(
+                    Join(
+                        list_name=fld.name,
+                        list_json=list_json or "-",
+                        list_omitempty=list_omit,
+                        elem=elem or "-",
+                        field_name=key,
+                        json_name=key,
+                        json_tag="-",
+                        omitempty=False,
+                        plus_optional=False,
+                        protobuf_opt=False,
+                        identity=ident,
+                        verdict="missing",
+                        line=fld.line,
+                    )
+                )
+                continue
+            if len(hits) > 1:
+                names = ",".join(t.name for t in hits)
+                json_tags = ",".join(t.tags.get("json") or t.name for t in hits)
+                for t in hits:
+                    used.add((t.owner or "-", t.name))
+                joins.append(
+                    Join(
+                        list_name=fld.name,
+                        list_json=list_json or "-",
+                        list_omitempty=list_omit,
+                        elem=struct.name if struct is not None else (elem or "-"),
+                        field_name=names,
+                        json_name=key,
+                        json_tag=json_tags,
+                        omitempty=False,
+                        plus_optional=False,
+                        protobuf_opt=False,
+                        identity=ident,
+                        verdict="collision",
+                        line=fld.line,
+                    )
+                )
+                continue
+            target = hits[0]
+            used.add((target.owner or "-", target.name))
+            json_name, omit = json_parts(target.tags.get("json"))
+            omitzero = json_omitzero(target.tags.get("json"))
+            plus_opt = marker_optional(target)
+            proto_opt = protobuf_is_opt(target.tags.get("protobuf"))
+            has_def = marker_default(target)
+            # omitempty and omitzero are both "may be absent from JSON".
+            # protobuf opt is printed, not a verdict. +default satisfies identity.
+            optional = omit or plus_opt
+            wn = wire_name(target)
+            display_json = target.tags.get("json")
+            if display_json is None:
+                display_json = wn or target.name
+            joins.append(
+                Join(
+                    list_name=fld.name,
+                    list_json=list_json or "-",
+                    list_omitempty=list_omit,
+                    elem=struct.name if struct is not None else (elem or "-"),
+                    field_name=target.name,
+                    json_name=wn or json_name or target.name,
+                    json_tag=display_json,
+                    omitempty="omitempty" in split_json_tag(target.tags.get("json"))[1],
+                    plus_optional=plus_opt,
+                    protobuf_opt=proto_opt,
+                    identity=ident,
+                    verdict=target_verdict(optional, has_def),
+                    line=target.line,
+                    has_default=has_def,
+                    omitzero=omitzero,
+                )
+            )
+    return joins, used
+
+
+def _yaml_unquote(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _yaml_scalar(text: str):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        return [_yaml_unquote(p) for p in inner.split(",") if p.strip()]
+    if text in ("null", "~"):
+        return None
+    if text in ("true", "false"):
+        return text == "true"
+    return _yaml_unquote(text)
+
+
+def _yaml_rows(text: str) -> list[tuple[int, str]]:
+    rows: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        raw = raw.replace("\t", "  ").replace("\ufeff", "").rstrip("\r")
+        stripped = raw.lstrip(" ")
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        indent = len(raw) - len(stripped)
+        if " #" in stripped:
+            head, _sep, _tail = stripped.partition(" #")
+            if head.count('"') % 2 == 0 and head.count("'") % 2 == 0:
+                stripped = head.rstrip()
+        rows.append((indent, stripped))
+    return rows
+
+
+def _is_block_scalar(val: str) -> bool:
+    return bool(BLOCK_SCALAR_RE.match(val.strip()))
+
+
+def _looks_json(text: str) -> bool:
+    stripped = text.lstrip("\ufeff \t\r\n")
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
+class _YamlSubsetParser:
+    """Indent mapping/list subset. Keeps siblings after `|-` / wrapped scalars.
+
+    Sequence items (`- name: v1` plus nested `schema:`) stay one object.
+    Not a full YAML parser: no anchors, aliases, or tag types.
+    """
+
+    def __init__(self, rows: list[tuple[int, str]]):
+        self.rows = rows
+
+    def parse_all(self):
+        if not self.rows:
+            return None
+        tree, _idx = self.parse_value(0, self.rows[0][0])
+        return tree
+
+    def _skip_deeper(self, idx: int, parent_indent: int) -> int:
+        while idx < len(self.rows) and self.rows[idx][0] > parent_indent:
+            idx += 1
+        return idx
+
+    def absorb_item_tail(self, item: dict, idx: int, seq_indent: int):
+        rows = self.rows
+        while idx < len(rows):
+            nindent, nstripped = rows[idx]
+            if nindent <= seq_indent:
+                break
+            if nstripped.startswith("-"):
+                break
+            if ":" not in nstripped:
+                idx += 1
+                continue
+            extra, idx = self.parse_map(idx, nindent)
+            if isinstance(extra, dict):
+                item.update(extra)
+            break
+        return item, idx
+
+    def parse_seq(self, idx: int, seq_indent: int):
+        rows = self.rows
+        seq: list = []
+        while idx < len(rows):
+            indent, stripped = rows[idx]
+            if indent < seq_indent:
+                break
+            if indent > seq_indent or not stripped.startswith("-"):
+                break
+            rest = stripped[1:].strip()
+            idx += 1
+            if rest == "":
+                if idx < len(rows) and rows[idx][0] > seq_indent:
+                    item, idx = self.parse_value(idx, rows[idx][0])
+                else:
+                    item = None
+            elif rest.endswith(":") and not rest.startswith("[") and rest.count(":") == 1:
+                key = _yaml_unquote(rest[:-1].strip())
+                if idx < len(rows) and rows[idx][0] > seq_indent:
+                    child, idx = self.parse_value(idx, rows[idx][0])
+                    item = {key: child}
+                else:
+                    item = {key: None}
+            elif ":" in rest and not rest.startswith("[") and not rest.startswith("{"):
+                key, _, val = rest.partition(":")
+                key = _yaml_unquote(key.strip())
+                val = val.strip()
+                if _is_block_scalar(val):
+                    idx = self._skip_deeper(idx, indent)
+                    item = {key: val}
+                else:
+                    item = {key: _yaml_scalar(val)}
+                    while idx < len(rows) and rows[idx][0] > indent + 2:
+                        idx += 1
+            else:
+                item = _yaml_scalar(rest)
+            if isinstance(item, dict):
+                item, idx = self.absorb_item_tail(item, idx, seq_indent)
+            seq.append(item)
+        return seq, idx
+
+    def parse_map(self, idx: int, map_indent: int):
+        rows = self.rows
+        mapping: dict = {}
+        while idx < len(rows):
+            indent, stripped = rows[idx]
+            if indent < map_indent:
+                break
+            if indent > map_indent:
+                # Block / wrapped scalar leftovers. Do not end the map:
+                # later siblings (x-kubernetes-list-map-keys) live at map_indent.
+                idx += 1
+                continue
+            if stripped.startswith("-"):
+                break
+            if ":" not in stripped:
+                break
+            key, _, val = stripped.partition(":")
+            key = _yaml_unquote(key.strip())
+            val = val.strip()
+            idx += 1
+            if val != "":
+                if _is_block_scalar(val):
+                    idx = self._skip_deeper(idx, map_indent)
+                    mapping[key] = val
+                else:
+                    mapping[key] = _yaml_scalar(val)
+                    idx = self._skip_deeper(idx, map_indent)
+                continue
+            if idx < len(rows):
+                nindent, nstripped = rows[idx]
+                if nstripped.startswith("-") and nindent >= map_indent:
+                    child, idx = self.parse_seq(idx, nindent)
+                    mapping[key] = child
+                    continue
+                if nindent > map_indent:
+                    child, idx = self.parse_value(idx, nindent)
+                    mapping[key] = child
+                    continue
+            mapping[key] = None
+        return mapping, idx
+
+    def parse_value(self, idx: int, min_indent: int):
+        indent, stripped = self.rows[idx]
+        if stripped.startswith("-"):
+            return self.parse_seq(idx, indent)
+        return self.parse_map(idx, indent)
+
+    def scan_list_map_nodes(self) -> list[tuple[str, dict]]:
+        """Local maps that contain x-kubernetes-list-map-keys, even after a Go prefix."""
+        rows = self.rows
+        out: list[tuple[str, dict]] = []
+        for i, (indent, stripped) in enumerate(rows):
+            key = _yaml_unquote(stripped.partition(":")[0].strip())
+            if key != "x-kubernetes-list-map-keys":
+                continue
+            start = i
+            j = i
+            while j > 0 and rows[j - 1][0] >= indent:
+                j -= 1
+                if rows[j][0] == indent and not rows[j][1].startswith("-"):
+                    start = j
+            node, _idx = self.parse_map(start, indent)
+            if not isinstance(node, dict):
+                continue
+            parent = "-"
+            k = start
+            while k > 0:
+                k -= 1
+                if rows[k][0] < indent:
+                    raw = rows[k][1]
+                    if raw.startswith("-"):
+                        raw = raw[1:].strip()
+                    if ":" in raw:
+                        parent = _yaml_unquote(raw.partition(":")[0].strip())
+                    break
+            out.append((parent, node))
+        return out
+
+
+def load_yaml_subset(text: str):
+    """Indent-based mapping/list subset. Not a full YAML parser."""
+    parser = _YamlSubsetParser(_yaml_rows(text))
+    return parser.parse_all()
+
+
+def load_schema_tree(text: str):
+    if _looks_json(text):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    return load_yaml_subset(text)
+
+
+def _walk_yaml(node, path: tuple[str, ...] = ()):
+    if isinstance(node, dict):
+        yield path, node
+        for key, child in node.items():
+            yield from _walk_yaml(child, path + (str(key),))
+    elif isinstance(node, list):
+        for i, child in enumerate(node):
+            yield from _walk_yaml(child, path + (str(i),))
+
+
+def _path_list_name(path: tuple[str, ...]) -> str:
+    for part in reversed(path):
+        if part not in YAML_STRUCTURAL and not part.isdigit():
+            return part
+    return path[-1] if path else "-"
+
+
+def _as_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                out.extend(k for k in item.keys() if YAML_KEY_RE.match(str(k)))
+            elif item is not None and YAML_KEY_RE.match(str(item).strip()):
+                out.append(str(item).strip())
+        return out
+    if isinstance(value, str) and YAML_KEY_RE.match(value.strip()):
+        return [value.strip()]
+    return []
+
+
+def _pointer_get(tree, ref: str):
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return None
+    cur = tree
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def _schema_merge(base: dict, extra: dict) -> dict:
+    out = dict(base)
+    for key, value in extra.items():
+        if key == "properties" and isinstance(value, dict):
+            props = dict(out.get("properties") or {}) if isinstance(out.get("properties"), dict) else {}
+            props.update(value)
+            out["properties"] = props
+        elif key == "required":
+            req: list[str] = []
+            for item in _as_list(out.get("required")) + _as_list(value):
+                if item not in req:
+                    req.append(item)
+            out["required"] = req
+        elif key not in out:
+            out[key] = value
+    return out
+
+
+def _resolve_schema(tree, node, seen: set[str] | None = None):
+    if tree is None or not isinstance(node, dict):
+        return node if isinstance(node, dict) else {}
+    seen = set(seen or ())
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/") and ref not in seen:
+        seen.add(ref)
+        target = _pointer_get(tree, ref)
+        if isinstance(target, dict):
+            resolved = _resolve_schema(tree, target, seen)
+            extra = {k: v for k, v in node.items() if k not in ("$ref", "allOf")}
+            node = _schema_merge(resolved, extra)
+    if "allOf" in node and isinstance(node.get("allOf"), list):
+        merged = {k: v for k, v in node.items() if k != "allOf"}
+        for part in node["allOf"]:
+            if isinstance(part, dict):
+                merged = _schema_merge(merged, _resolve_schema(tree, part, seen))
+        node = merged
+    return node
+
+
+def _unresolved_ref(node) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if isinstance(node.get("$ref"), str) and not isinstance(node.get("properties"), dict):
+        return True
+    if "allOf" in node and not isinstance(node.get("properties"), dict):
+        return True
+    return False
+
+
+def _yaml_key_state(node: dict, key: str, tree=None) -> tuple[bool, bool] | None:
+    """Item-level (is_optional, has_default). None if items is an unresolved $ref."""
+    items = node.get("items") if isinstance(node.get("items"), dict) else {}
+    items = _resolve_schema(tree, items)
+    if _unresolved_ref(items):
+        return None
+    required = _as_list(items.get("required"))
+    props = items.get("properties") if isinstance(items.get("properties"), dict) else {}
+    prop = props.get(key) if isinstance(props, dict) else None
+    if isinstance(prop, dict):
+        prop = _resolve_schema(tree, prop)
+    has_def = isinstance(prop, dict) and "default" in prop
+    is_required = key in required
+    return (not is_required), has_def
+
+
+def _join_from_yaml_node(list_name: str, key: str, node: dict, tree) -> Join | None:
+    state = _yaml_key_state(node, key, tree)
+    if state is None:
+        return None
+    optional, has_def = state
+    return Join(
+        list_name=list_name,
+        list_json=list_name,
+        list_omitempty=False,
+        elem=list_name,
+        field_name=key,
+        json_name=key,
+        json_tag=key,
+        omitempty=False,
+        plus_optional=False,
+        protobuf_opt=False,
+        identity=["x-kubernetes-list-map-keys"],
+        verdict=target_verdict(optional, has_def),
+        line=0,
+        has_default=has_def,
+    )
+
+
+def _joins_from_tree(tree, root) -> list[Join]:
+    joins: list[Join] = []
+    seen: set[tuple[str, str]] = set()
+    for path, node in _walk_yaml(tree):
+        if not isinstance(node, dict):
+            continue
+        raw_keys = node.get("x-kubernetes-list-map-keys")
+        if raw_keys is None:
+            continue
+        keys = _as_list(raw_keys)
+        if not keys:
+            continue
+        list_name = _path_list_name(path)
+        for key in keys:
+            ident = (list_name, key)
+            if ident in seen:
+                continue
+            join = _join_from_yaml_node(list_name, key, node, root)
+            if join is None:
+                continue
+            seen.add(ident)
+            joins.append(join)
+    return joins
+
+
+def inspect_yaml_schema(text: str) -> list[Join]:
+    if "x-kubernetes-list-map-keys" not in text:
+        return []
+    tree = None
+    try:
+        tree = load_schema_tree(text)
+    except Exception:
+        tree = None
+    joins: list[Join] = []
+    if tree is not None:
+        joins = _joins_from_tree(tree, tree)
+    if joins:
+        return joins
+    try:
+        parser = _YamlSubsetParser(_yaml_rows(text))
+        seen: set[tuple[str, str]] = set()
+        for list_name, node in parser.scan_list_map_nodes():
+            raw_keys = node.get("x-kubernetes-list-map-keys")
+            if raw_keys is None:
+                continue
+            keys = _as_list(raw_keys)
+            if list_name in YAML_STRUCTURAL:
+                list_name = _path_list_name((list_name,))
+            for key in keys:
+                ident = (list_name, key)
+                if ident in seen:
+                    continue
+                join = _join_from_yaml_node(list_name, key, node, tree)
+                if join is None:
+                    continue
+                seen.add(ident)
+                joins.append(join)
+    except Exception:
+        return joins
+    return joins
+
+
+def inspect_apply_error(text: str) -> list[Join]:
+    if "x-kubernetes-list-map-keys" not in text or "properties[" not in text:
+        return []
+    joins: list[Join] = []
+    seen: set[tuple[str, str]] = set()
+    for match in APPLY_RE.finditer(text):
+        list_name = match.group("list")
+        key = match.group("key")
+        ident = (list_name, key)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        joins.append(
+            Join(
+                list_name=list_name,
+                list_json=list_name,
+                list_omitempty=False,
+                elem=list_name,
+                field_name=key,
+                json_name=key,
+                json_tag=key,
+                omitempty=False,
+                plus_optional=False,
+                protobuf_opt=False,
+                identity=["x-kubernetes-list-map-keys"],
+                verdict="disagree",
+                line=0,
+            )
+        )
+    return joins
+
+
+def identity_hints(text: str) -> list[str]:
+    hints: list[str] = []
+    if "x-kubernetes-list-map-keys" in text:
+        hints.append("x-kubernetes-list-map-keys")
+    if "+listMapKey" in text:
+        hints.append("+listMapKey")
+    return hints
+
+
+def join_key(join: Join) -> tuple:
+    return (join.verdict, join.elem, join.field_name, join.list_name, join.json_name)
+
+
+def dedupe_joins(joins: list[Join]) -> list[Join]:
+    seen: set[tuple] = set()
+    out: list[Join] = []
+    for join in joins:
+        key = join_key(join)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(join)
+    return out
+
+
+def _grouped(joins: list[Join]) -> dict[str, list[Join]]:
+    return {
+        "disagree": [j for j in joins if j.verdict == "disagree"],
+        "agree": [j for j in joins if j.verdict == "agree"],
+        "missing": [j for j in joins if j.verdict == "missing"],
+        "collision": [j for j in joins if j.verdict == "collision"],
+    }
+
+
+def inspect(text: str) -> dict:
+    text = strip_bom(text)
+    structs, loose = parse_go(text)
+    fields = all_fields(structs, loose)
+    go_joins, used = inspect_fields(structs, fields)
+    yaml_joins = inspect_yaml_schema(text)
+    apply_joins = inspect_apply_error(text)
+    joins = dedupe_joins(list(go_joins) + yaml_joins + apply_joins)
+    others = other_omitempty(fields, joins, used)
+    unparsed: list[str] = []
+    if not joins:
+        unparsed = identity_hints(text)
+    else:
+        if "x-kubernetes-list-map-keys" in text and not yaml_joins and not apply_joins:
+            unparsed.append("x-kubernetes-list-map-keys")
+        if "+listMapKey" in text and not go_joins:
+            unparsed.append("+listMapKey")
+    grouped = _grouped(joins)
+    return {
+        "structs": structs,
+        "loose": loose,
+        "joins": joins,
+        "disagree": grouped["disagree"],
+        "agree": grouped["agree"],
+        "missing": grouped["missing"],
+        "collision": grouped["collision"],
+        "other_omitempty": others,
+        "unparsed": unparsed,
+    }
+
+
+def protobuf_label(join: Join) -> str:
+    return "opt" if join.protobuf_opt else "-"
+
+
+def format_join(join: Join) -> str:
+    qual = f"{join.elem}.{join.field_name}"
+    return "\t".join(
+        [
+            join.verdict,
+            qual,
+            "list",
+            join.list_name,
+            "list_json",
+            join.list_json,
+            "elem",
+            join.elem,
+            "field",
+            join.field_name,
+            "json",
+            join.json_tag,
+            "optional",
+            optional_label(join),
+            "protobuf",
+            protobuf_label(join),
+            "identity",
+            ",".join(join.identity),
+        ]
+    )
+
+
+def format_report(result: dict) -> str:
+    lines = [format_join(join) for join in result["joins"]]
+    unparsed = result.get("unparsed") or []
+    for hint in unparsed:
+        lines.append(f"unparsed\t{hint}")
+    if not lines:
+        lines.append("join\tnone")
+    others = result.get("other_omitempty") or []
+    if others:
+        lines.append("other_omitempty\t" + "\t".join(others))
+    else:
+        lines.append("other_omitempty\tnone")
+    lines.append(f"disagree_n\t{len(result['disagree'])}")
+    lines.append(f"agree_n\t{len(result['agree'])}")
+    lines.append(f"missing_n\t{len(result['missing'])}")
+    lines.append(f"collision_n\t{len(result.get('collision') or [])}")
+    lines.append(f"unparsed_n\t{len(unparsed)}")
+    return "\n".join(lines) + "\n"
+
+
+def read_chunks(paths: list[str] | None) -> tuple[list[str], str]:
+    if not paths or paths == ["-"]:
+        return [sys.stdin.read()], "<stdin>"
+    chunks: list[str] = []
+    labels: list[str] = []
+    for path in paths:
+        if path == "-":
+            chunks.append(sys.stdin.read())
+            labels.append("<stdin>")
+            continue
+        chunks.append(Path(path).read_text(encoding="utf-8"))
+        labels.append(path)
+    return chunks, ",".join(labels)
+
+
+def inspect_sources(chunks: list[str]) -> dict:
+    """Parse each fragment separately so FILE.go FILE.yaml both join."""
+    if not chunks:
+        return inspect("")
+    if len(chunks) == 1:
+        return inspect(chunks[0])
+    joins: list[Join] = []
+    others: list[str] = []
+    unparsed: list[str] = []
+    seen_other: set[str] = set()
+    seen_unparsed: set[str] = set()
+    structs: dict = {}
+    loose: list[Field] = []
+    for chunk in chunks:
+        result = inspect(chunk)
+        joins.extend(result["joins"])
+        for name in result.get("other_omitempty") or []:
+            if name in seen_other:
+                continue
+            seen_other.add(name)
+            others.append(name)
+        for hint in result.get("unparsed") or []:
+            if hint in seen_unparsed:
+                continue
+            seen_unparsed.add(hint)
+            unparsed.append(hint)
+        structs.update(result.get("structs") or {})
+        loose.extend(result.get("loose") or [])
+    joins = dedupe_joins(joins)
+    grouped = _grouped(joins)
+    return {
+        "structs": structs,
+        "loose": loose,
+        "joins": joins,
+        "disagree": grouped["disagree"],
+        "agree": grouped["agree"],
+        "missing": grouped["missing"],
+        "collision": grouped["collision"],
+        "other_omitempty": others,
+        "unparsed": unparsed,
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tagjoin",
+        description=(
+            "Join json omitempty / +optional with +listMapKey identity, "
+            "and OpenAPI x-kubernetes-list-map-keys with required/default. "
+            "Grep hits both tags; this names the field that is both."
+        ),
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if any identity key disagrees (or is missing / collision)",
+    )
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="with --check, do not fail on missing keys",
+    )
+    parser.add_argument(
+        "source",
+        nargs="*",
+        help="Go / YAML / JSON / apply-error files (default: stdin). Each path is parsed, then joins merge.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        chunks, _source = read_chunks(args.source)
+        result = inspect_sources(chunks)
+    except OSError as err:
+        print(f"tagjoin: {err}", file=sys.stderr)
+        return 1
+    except ValueError as err:
+        print(f"tagjoin: {err}", file=sys.stderr)
+        return 2
+    sys.stdout.write(format_report(result))
+    if result.get("unparsed"):
+        return 2
+    if args.check:
+        if result["disagree"] or result.get("collision"):
+            return 1
+        if result["missing"] and not args.allow_missing:
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

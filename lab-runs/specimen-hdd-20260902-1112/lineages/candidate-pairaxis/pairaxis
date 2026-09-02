@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Name the single field that differs between two pair traces."""
+from __future__ import annotations
+
+import argparse
+import ast
+import sys
+from pathlib import Path
+
+
+def parse_record(text: str) -> dict[str, str]:
+    rec: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            key, _, rest = line.partition("\t")
+            rec[key.strip()] = rest.strip()
+            continue
+        if "=" in line:
+            key, _, rest = line.partition("=")
+            rec[key.strip()] = rest.strip()
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            rec[parts[0]] = " ".join(parts[1:])
+    return rec
+
+
+def maybe_literal(value: str):
+    try:
+        return ast.literal_eval(value)
+    except Exception:
+        return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="pairaxis")
+    parser.add_argument("left")
+    parser.add_argument("right")
+    args = parser.parse_args(argv)
+    left_path = Path(args.left)
+    right_path = Path(args.right)
+    for path in (left_path, right_path):
+        if not path.is_file():
+            print(f"pairaxis: file not found: {path}", file=sys.stderr)
+            return 2
+    left = parse_record(left_path.read_text(encoding="utf-8"))
+    right = parse_record(right_path.read_text(encoding="utf-8"))
+    keys = sorted(set(left) | set(right))
+    diffs = []
+    for key in keys:
+        lv = left.get(key, "<absent>")
+        rv = right.get(key, "<absent>")
+        if maybe_literal(lv) != maybe_literal(rv):
+            diffs.append((key, lv, rv))
+    print(f"left   {left_path}")
+    print(f"right  {right_path}")
+    print(f"fields {len(keys)}")
+    if not diffs:
+        print("only_axis  none")
+        print("n_diff  0")
+        return 0
+    print(f"n_diff  {len(diffs)}")
+    print(f"only_axis  {diffs[0][0] if len(diffs) == 1 else 'multiple'}")
+    for key, lv, rv in diffs:
+        print(f"diff  {key}  left={lv}  right={rv}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

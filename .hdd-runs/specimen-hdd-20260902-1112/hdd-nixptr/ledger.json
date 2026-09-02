@@ -1,0 +1,65 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "A done-set keyed by pointer address can skip a later lock node after that address is reused",
+    "A done-set keyed by pointer can skip a distinct node that reused an address"
+  ],
+  "established": [
+    "Packet: prefetch-inputs prints a different missing subset each run; done is std::set<const Node *>; work queued with std::bind",
+    "Packet: flake-prefetch-inputs pointer reuse"
+  ],
+  "rejected": [
+    "Invented nix flake prefetch-inputs --debug address logs and proposed src patches are not host evidence",
+    "Invented %p logs and nix flake prefetch-inputs runs are not host-executed"
+  ],
+  "constraints": [
+    "No nix. Owned events: insert(addr, name) then later worker(addr, name)",
+    "Owned set of ids vs set of pointers fixture"
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "Which node identities were inserted into done, whether those addresses still named the same lock nodes when the worker ran, and which inputs were never fetched",
+    "address identity vs value identity of visited nodes"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "show whether a visit set used pointer identity or value identity",
+    "nearest_existing_operation": "print object ids",
+    "observable_delta": "skipped-because-pointer vs distinct-value",
+    "reason": "missed fetch from address reuse",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:18:14+09:00",
+      "summary": "Invented nix debug address logs. Preserve pointer identity vs lock-node identity. Harvest on owned addr/name events; no nix.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name when a pointer address in a done-set no longer names the same lock node",
+        "nearest_existing_operation": "lockident / pathnode",
+        "observable_delta": "same address, different node name, skipped fetch",
+        "reason": "address equality is the wrong object",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:19:35+09:00",
+      "summary": "Invented nix debug logs. Preserve visited-set keyed by pointer so reused objects are skipped. Harvest address vs value identity. Stop inventing nix.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "show whether a visit set used pointer identity or value identity",
+        "nearest_existing_operation": "print object ids",
+        "observable_delta": "skipped-because-pointer vs distinct-value",
+        "reason": "missed fetch from address reuse",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

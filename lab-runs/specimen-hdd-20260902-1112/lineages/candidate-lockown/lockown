@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Name the owner of a threading.Lock versus the waiter blocked on it."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+
+
+def _label() -> str:
+    return threading.current_thread().name
+
+
+class OwnedLock:
+    """threading.Lock plus owner/waiter labels. The stdlib lock has neither."""
+
+    def __init__(self, name: str = "L") -> None:
+        self.name = name
+        self._lock = threading.Lock()
+        self._meta = threading.Lock()
+        self._owner: str | None = None
+        self._waiters: list[str] = []
+        self.waiter_entered = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = _label()
+        with self._meta:
+            if self._owner is not None and self._owner != me:
+                if me not in self._waiters:
+                    self._waiters.append(me)
+                self.waiter_entered.set()
+        ok = self._lock.acquire(blocking, timeout)
+        with self._meta:
+            if me in self._waiters:
+                self._waiters.remove(me)
+            if ok:
+                self._owner = me
+        return ok
+
+    def release(self) -> None:
+        me = _label()
+        with self._meta:
+            if self._owner == me:
+                self._owner = None
+        self._lock.release()
+
+    def snapshot(self) -> dict[str, str]:
+        with self._meta:
+            waiters = list(self._waiters)
+            owner = self._owner
+        waiter = waiters[0] if waiters else "none"
+        return {
+            "lock": self.name,
+            "owner": owner if owner is not None else "none",
+            "waiter": waiter,
+            "held": "true" if owner is not None else "false",
+        }
+
+
+def format_rows(rows: dict[str, str]) -> str:
+    lines = [f"{key}  {rows[key]}" for key in ("lock", "owner", "waiter", "held")]
+    return "\n".join(lines)
+
+
+def run_scene(
+    owner_name: str = "holder",
+    waiter_name: str = "blocked",
+    lock_name: str = "L",
+    *,
+    release_after: bool = True,
+    waiter_timeout: float | None = None,
+    wait_for_waiter: float = 2.0,
+) -> dict[str, str]:
+    """Two threads, one lock. Snapshot owner vs waiter while blocked.
+
+    Release the owner after the snapshot so the waiter is still a waiter at
+    query time and the process does not wait out an acquire timeout.
+    """
+    lock = OwnedLock(lock_name)
+    held = threading.Event()
+    let_go = threading.Event()
+
+    def owner() -> None:
+        lock.acquire()
+        held.set()
+        let_go.wait(wait_for_waiter + (waiter_timeout or 0) + 1)
+        lock.release()
+
+    def waiter() -> None:
+        held.wait(wait_for_waiter)
+        timeout = -1 if waiter_timeout is None else waiter_timeout
+        lock.acquire(timeout=timeout)
+        if lock.snapshot()["owner"] == waiter_name:
+            lock.release()
+
+    t_owner = threading.Thread(target=owner, name=owner_name, daemon=True)
+    t_waiter = threading.Thread(target=waiter, name=waiter_name, daemon=True)
+    t_owner.start()
+    if not held.wait(wait_for_waiter):
+        raise RuntimeError("owner never acquired")
+    t_waiter.start()
+    if not lock.waiter_entered.wait(wait_for_waiter):
+        raise RuntimeError("waiter never entered")
+    snap = lock.snapshot()
+    if release_after:
+        let_go.set()
+        t_owner.join(wait_for_waiter)
+        t_waiter.join(wait_for_waiter)
+    else:
+        t_waiter.join((waiter_timeout or 0) + wait_for_waiter)
+        let_go.set()
+        t_owner.join(wait_for_waiter)
+    return snap
+
+
+def timeout_probe(timeout: float = 0.2) -> dict[str, str]:
+    """Nearest existing operation: acquire timeout does not name the owner."""
+    lock = threading.Lock()
+    held = threading.Event()
+    let_go = threading.Event()
+
+    def owner() -> None:
+        lock.acquire()
+        held.set()
+        let_go.wait(timeout + 2)
+        lock.release()
+
+    t = threading.Thread(target=owner, name="holder", daemon=True)
+    t.start()
+    held.wait(2)
+    ok = lock.acquire(timeout=timeout)
+    rows = {
+        "ok": "true" if ok else "false",
+        "held": "true" if lock.locked() else "false",
+        "owner": "unnamed",
+        "waiter": "unnamed",
+        "reason": "timeout does not name the owner",
+    }
+    if ok:
+        lock.release()
+    let_go.set()
+    t.join(2)
+    return rows
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="lockown",
+        description="Name lock owner vs waiter on one threading.Lock.",
+    )
+    p.add_argument(
+        "--contrast",
+        action="store_true",
+        help="print acquire-timeout probe (does not name owner) and exit",
+    )
+    args = p.parse_args(argv)
+    if args.contrast:
+        rows = timeout_probe()
+        print(f"ok  {rows['ok']}")
+        print(f"held  {rows['held']}")
+        print(f"owner  {rows['owner']}")
+        print(f"waiter  {rows['waiter']}")
+        print(f"reason  {rows['reason']}")
+        return 0
+    try:
+        snap = run_scene(release_after=True, waiter_timeout=None)
+    except RuntimeError as exc:
+        print(f"lockown: {exc}", file=sys.stderr)
+        return 1
+    print(format_rows(snap))
+    if snap["owner"] == "none" or snap["waiter"] == "none":
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

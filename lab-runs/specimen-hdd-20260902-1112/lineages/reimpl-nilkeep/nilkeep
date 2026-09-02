@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Two-pass coalesce tables over JSON values maps.
+
+Canonical input is a JSON document of chart and user values. TSV compiles
+into that document under wrap key `data`. Pass 1 copies dest nils into src.
+Pass 2 deletes dest keys that are still nil. A null chart value skips the
+table walk, so user nils stay present.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+EMPTY = "-"
+WRAP = "data"
+MAX_INPUT = 64_000
+MAX_KEYS = 256
+NULL_TOKENS = frozenset({"~", "null", "nil", "<nil>", "-"})
+EMPTY_MAP_TOKENS = frozenset({"empty-map", "{}"})
+NULL_KIND_TOKENS = frozenset({"null", "~"})
+KNOWN_TSV = frozenset({"default", "user", "wrap"})
+
+
+def clone(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: clone(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clone(item) for item in value]
+    return value
+
+
+def is_table(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else EMPTY
+
+
+def quote_map(table: dict[str, Any]) -> str:
+    if not table:
+        return "map[]"
+    bits: list[str] = []
+    for key in sorted(table):
+        val = table[key]
+        if val is None:
+            shown = "<nil>"
+        elif is_table(val):
+            shown = quote_map(val)
+        else:
+            shown = str(val)
+        bits.append(f"{key}:{shown}")
+    return "map[" + " ".join(bits) + "]"
+
+
+def first_payload_line(text: str) -> str:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def json_blob(text: str, *, source: str) -> str:
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if line.startswith("{") or line.startswith("["):
+            return "\n".join(lines[index:])
+    raise ValueError(f"{source}: no JSON object")
+
+
+def check_key(name: str, *, source: str) -> str:
+    if name == "":
+        raise ValueError(f"{source}: empty key")
+    if "\x00" in name:
+        raise ValueError(f"{source}: NUL in key")
+    if len(name) > MAX_KEYS:
+        raise ValueError(f"{source}: key exceeds {MAX_KEYS} characters")
+    return name
+
+
+def tsv_null(token: str) -> bool:
+    return token in NULL_TOKENS
+
+
+def default_to_chart(kind: str, wrap: str, *, source: str) -> dict[str, Any]:
+    if kind in EMPTY_MAP_TOKENS:
+        return {wrap: {}}
+    if kind in NULL_KIND_TOKENS:
+        return {wrap: None}
+    raise ValueError(f"{source}: default must be empty-map or null")
+
+
+def kind_of(chart: dict[str, Any], wrap: str) -> str:
+    node = chart.get(wrap) if wrap else chart
+    if node is None:
+        return "null"
+    if is_table(node):
+        return "empty-map"
+    return "scalar"
+
+
+def infer_wrap(chart: dict[str, Any], user: dict[str, Any]) -> str:
+    if is_table(user.get(WRAP)) and WRAP in chart:
+        return WRAP
+    return ""
+
+
+def table_at(values: dict[str, Any], wrap: str) -> dict[str, Any]:
+    if not wrap:
+        return values if is_table(values) else {}
+    node = values.get(wrap)
+    return node if is_table(node) else {}
+
+
+@dataclass
+class ValuesDoc:
+    """Chart and user values maps. `wrap` is the nested table under study."""
+
+    chart: dict[str, Any]
+    user: dict[str, Any]
+    wrap: str
+    source: str
+
+
+@dataclass
+class Report:
+    default: str
+    user_nulls: list[str]
+    kept: list[str]
+    dropped: list[str]
+    quoted: str
+    dest: dict[str, Any]
+    trace: list[dict[str, Any]] = field(default_factory=list)
+
+
+class CoalesceTables:
+    """Two-pass dest/src table join, merge=false.
+
+    Pass 1 (`copy_nils`) writes dest nils onto src so an empty chart table
+    still observes user-null keys. Pass 2 (`apply_src`) walks src and
+    deletes dest keys that are nil. `coalesce_values` only enters that
+    walk when the chart value is itself a table; a null chart value skips.
+    """
+
+    def __init__(self) -> None:
+        self.trace: list[dict[str, Any]] = []
+
+    def copy_nils(self, dst: dict[str, Any], src: dict[str, Any], *, path: str) -> dict[str, Any]:
+        out = dict(src)
+        for key, val in dst.items():
+            if val is None:
+                out[key] = None
+                self.trace.append({"op": "copy_nil", "path": path, "key": key})
+        return out
+
+    def apply_src(self, dst: dict[str, Any], src: dict[str, Any], *, path: str) -> dict[str, Any]:
+        out = dict(dst)
+        for key, val in src.items():
+            if key in out and out[key] is None:
+                del out[key]
+                self.trace.append({"op": "delete", "path": path, "key": key})
+            elif key not in out:
+                out[key] = clone(val)
+                self.trace.append({"op": "fill", "path": path, "key": key})
+            elif is_table(val) and is_table(out.get(key)):
+                child = f"{path}.{key}" if path else key
+                out[key] = self.coalesce_tables(out[key], val, path=child)
+        return out
+
+    def coalesce_tables(
+        self, dst: dict[str, Any], src: dict[str, Any], *, path: str
+    ) -> dict[str, Any]:
+        marked = self.copy_nils(dst, src, path=path)
+        return self.apply_src(dst, marked, path=path)
+
+    def coalesce_values(self, user: dict[str, Any], chart: dict[str, Any]) -> dict[str, Any]:
+        dest = clone(user)
+        for key, src_val in chart.items():
+            if key not in dest:
+                dest[key] = clone(src_val)
+                self.trace.append({"op": "copy_chart", "key": key})
+                continue
+            user_val = dest[key]
+            if user_val is None:
+                del dest[key]
+                self.trace.append({"op": "delete_top", "key": key})
+                continue
+            if not is_table(user_val):
+                continue
+            if is_table(src_val):
+                dest[key] = self.coalesce_tables(user_val, src_val, path=key)
+            else:
+                self.trace.append(
+                    {"op": "skip_table", "key": key, "src_null": src_val is None}
+                )
+        return dest
+
+
+def compile_tsv(text: str, *, source: str) -> ValuesDoc:
+    default_kind: str | None = None
+    wrap = WRAP
+    user_table: dict[str, Any] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        loc = f"{source}:{lineno}"
+        if key not in KNOWN_TSV:
+            raise ValueError(f"{loc}: unknown field {key!r}")
+        if key == "default":
+            if default_kind is not None:
+                raise ValueError(f"{loc}: duplicate default")
+            default_kind = rest.strip()
+        elif key == "wrap":
+            wrap = check_key(rest.strip(), source=loc)
+        elif key == "user":
+            if "\t" not in rest:
+                raise ValueError(f"{loc}: user needs name<TAB>value")
+            name, val = rest.split("\t", 1)
+            name = check_key(name.strip(), source=loc)
+            token = val.strip()
+            user_table[name] = None if tsv_null(token) else token
+    if default_kind is None:
+        raise ValueError(f"{source}: missing default")
+    if not user_table:
+        raise ValueError(f"{source}: no user keys")
+    if len(user_table) > MAX_KEYS:
+        raise ValueError(f"{source}: more than {MAX_KEYS} user keys")
+    return ValuesDoc(
+        chart=default_to_chart(default_kind, wrap, source=source),
+        user={wrap: user_table},
+        wrap=wrap,
+        source=source,
+    )
+
+
+def as_object(payload: Any, *, source: str, field: str) -> dict[str, Any]:
+    if payload is None:
+        raise ValueError(f"{source}: {field} must be an object")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: {field} must be a JSON object")
+    out: dict[str, Any] = {}
+    for raw_key, val in payload.items():
+        key = check_key(str(raw_key), source=source)
+        if is_table(val):
+            if len(val) > MAX_KEYS:
+                raise ValueError(f"{source}: more than {MAX_KEYS} keys")
+            out[key] = as_object(val, source=source, field=f"{field}.{key}")
+        else:
+            out[key] = val
+    return out
+
+
+def compile_json(text: str, *, source: str) -> ValuesDoc:
+    try:
+        payload = json.loads(json_blob(text, source=source))
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{source}: {err}") from err
+    if isinstance(payload, list):
+        if len(payload) != 1 or not isinstance(payload[0], dict):
+            raise ValueError(f"{source}: JSON array must hold one object")
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: JSON object required")
+    wrap = payload.get("wrap", WRAP)
+    if not isinstance(wrap, str) or not wrap:
+        raise ValueError(f"{source}: wrap must be a string")
+    wrap = check_key(wrap, source=source)
+    if "chart" in payload:
+        if "user" not in payload:
+            raise ValueError(f"{source}: missing user")
+        chart = payload["chart"]
+        user = payload["user"]
+        if not isinstance(chart, dict):
+            raise ValueError(f"{source}: chart must be a JSON object")
+        if not isinstance(user, dict):
+            raise ValueError(f"{source}: user must be a JSON object")
+        chart_map = as_object(chart, source=source, field="chart")
+        user_map = as_object(user, source=source, field="user")
+        if "wrap" not in payload:
+            wrap = infer_wrap(chart_map, user_map) or wrap
+        return ValuesDoc(chart=chart_map, user=user_map, wrap=wrap, source=source)
+    if "default" in payload:
+        if "user" not in payload:
+            raise ValueError(f"{source}: missing user")
+        kind_raw = payload["default"]
+        if kind_raw is None:
+            kind = "null"
+        elif kind_raw == {} or kind_raw == "empty-map" or kind_raw == "{}":
+            kind = "empty-map"
+        elif kind_raw in NULL_KIND_TOKENS:
+            kind = "null"
+        else:
+            raise ValueError(f"{source}: default must be empty-map or null")
+        user_raw = payload["user"]
+        if not isinstance(user_raw, dict):
+            raise ValueError(f"{source}: user must be a JSON object")
+        user_table = as_object(user_raw, source=source, field="user")
+        if wrap in user_table and is_table(user_table[wrap]):
+            user_map = user_table
+        else:
+            user_map = {wrap: user_table}
+        return ValuesDoc(
+            chart=default_to_chart(kind, wrap, source=source),
+            user=user_map,
+            wrap=wrap,
+            source=source,
+        )
+    raise ValueError(f"{source}: missing chart or default")
+
+
+def load_document(text: str, *, source: str = "<input>") -> ValuesDoc:
+    if len(text) > MAX_INPUT:
+        raise ValueError(f"{source}: input exceeds {MAX_INPUT} bytes")
+    start = first_payload_line(text)
+    if start.startswith("{") or start.startswith("["):
+        return compile_json(text, source=source)
+    return compile_tsv(text, source=source)
+
+
+def inspect(doc: ValuesDoc) -> Report:
+    engine = CoalesceTables()
+    before = table_at(doc.user, doc.wrap)
+    dest = engine.coalesce_values(doc.user, doc.chart)
+    after = table_at(dest, doc.wrap)
+    user_nulls = [name for name, val in before.items() if val is None]
+    dropped = [name for name in before if name not in after]
+    kept = [name for name in before if name in after]
+    return Report(
+        default=kind_of(doc.chart, doc.wrap),
+        user_nulls=user_nulls,
+        kept=kept,
+        dropped=dropped,
+        quoted=quote_map(after),
+        dest=dest,
+        trace=list(engine.trace),
+    )
+
+
+def render(report: Report) -> str:
+    lines = [
+        f"default\t{report.default}",
+        f"user_nulls\t{fmt_list(report.user_nulls)}",
+        f"kept\t{fmt_list(report.kept)}",
+        f"dropped\t{fmt_list(report.dropped)}",
+        f"quoted\t{report.quoted}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def read_source(path: str) -> tuple[str, str]:
+    if path == "-":
+        return sys.stdin.read(), "<stdin>"
+    return Path(path).read_text(encoding="utf-8"), path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="nilkeep",
+        description=(
+            "Coalesce JSON chart/user values maps through a two-pass table "
+            "join. Name user-null keys deleted when the chart value is an "
+            "empty table, and kept when that chart value is null."
+        ),
+    )
+    parser.add_argument("record", nargs="?", default="-", help="record path or -")
+    args = parser.parse_args(argv)
+    try:
+        text, source = read_source(args.record)
+        report = inspect(load_document(text, source=source))
+    except (OSError, ValueError, json.JSONDecodeError, TypeError, KeyError) as err:
+        print(f"nilkeep: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(render(report))
+    return 1 if report.dropped else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

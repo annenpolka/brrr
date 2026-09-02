@@ -1,0 +1,32 @@
+// excerpt @ d340bdf50821e6db173a9e41bc7bde740275ba33
+// src/google/protobuf/util/internal/protostream_objectwriter.h
+
+  struct Options {
+    bool struct_integers_as_strings;
+    // Not treat unknown fields as an error. If there is an unknown fields,
+    // just ignore it and continue to process the rest.
+    bool ignore_unknown_fields;
+    bool use_lower_camel_for_enums;
+    bool ignore_null_value_map_entry;
+    Options()
+        : struct_integers_as_strings(false),
+          ignore_unknown_fields(false),
+          use_lower_camel_for_enums(false),
+          ignore_null_value_map_entry(false) {}
+    static const Options& Defaults() {
+      static Options defaults;
+      return defaults;
+    }
+  };
+
+  // public constructor: Options default to Defaults()
+  ProtoStreamObjectWriter(TypeResolver* type_resolver,
+                          const google::protobuf::Type& type,
+                          strings::ByteSink* output, ErrorListener* listener,
+                          const ProtoStreamObjectWriter::Options& options =
+                              ProtoStreamObjectWriter::Options::Defaults());
+
+  // private TypeInfo constructor: no Options parameter
+  ProtoStreamObjectWriter(const TypeInfo* typeinfo,
+                          const google::protobuf::Type& type,
+                          strings::ByteSink* output, ErrorListener* listener);

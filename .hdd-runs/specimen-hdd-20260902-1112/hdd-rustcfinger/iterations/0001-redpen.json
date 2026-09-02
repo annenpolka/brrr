@@ -1,0 +1,29 @@
+{
+  "summary": "Invented cargo source walk. Harvest whether path+mtime fingerprint collides while -vV host strings differ. Stop.",
+  "preserve_add": [
+    "Two rustc binaries can share path and clamped mtime and still print different Fedora host strings in rustc -vV"
+  ],
+  "established_add": [
+    "Packet: rustc_fingerprint hashes resolved path + mtime only; Cache::load reuses .rustc_info.json on equal fingerprint and does not re-run -vV",
+    "Owned split: same /usr/bin/rustc and 2024-10-17 mtime, vv fc42 vs fc40"
+  ],
+  "rejected_add": [
+    "Invented Cache::load / cargo build transcripts are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned two rustc identity records. No cargo/rustc required for the identity question."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether two rustc identities collide on path+mtime fingerprint while verbose-version host strings differ"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name fingerprint collision vs -vV mismatch for two rustc identities",
+    "nearest_existing_operation": "diff two rustc -vV strings; compare path and mtime",
+    "observable_delta": "hidden_by_fingerprint when path+mtime match and vv differs",
+    "reason": "path/mtime equality and vv mismatch are two observations; the join is cache reuse hiding the compiler"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned rustc identity records. Do not send cargo theater back to R1."
+}

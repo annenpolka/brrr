@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""Classify a lying zero / green as exactly one exclusive why."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+
+SAFE_HEADS = {
+    "true": 0,
+    "false": 1,
+    "echo": 0,
+    "printf": 0,
+    ":": 0,
+}
+
+WHYS = (
+    "swallowed-nonzero",
+    "abort-before-visit",
+    "observed-ok",
+    "unknown",
+)
+
+
+class ParseError(ValueError):
+    pass
+
+
+class Unmodeled(ValueError):
+    def __init__(self, command: str) -> None:
+        super().__init__(command)
+        self.command = command
+
+
+@dataclass(frozen=True)
+class Token:
+    kind: str  # WORD or OP
+    value: str
+
+
+@dataclass(frozen=True)
+class Pipeline:
+    commands: tuple[tuple[str, ...], ...]
+
+    @property
+    def source(self) -> str:
+        return " | ".join(display_words(cmd) for cmd in self.commands)
+
+
+@dataclass(frozen=True)
+class AndOr:
+    first: Pipeline
+    rest: tuple[tuple[str, Pipeline], ...]
+
+
+@dataclass(frozen=True)
+class ShellEv:
+    swallow: bool
+    step_status: int
+    all_ok: bool
+
+
+@dataclass(frozen=True)
+class WaitEv:
+    visited: bool
+    oneshot: bool
+    abort: str
+
+
+@dataclass(frozen=True)
+class Verdict:
+    why: str
+    claims: tuple[str, ...]
+    detail: str
+
+
+def display_word(word: str) -> str:
+    if word == "" or any(ch.isspace() for ch in word) or any(
+        ch in word for ch in "|&;<>()$`\\\"'"
+    ):
+        return "'" + word.replace("'", "'\\''") + "'"
+    return word
+
+
+def display_words(words: tuple[str, ...] | list[str]) -> str:
+    return " ".join(display_word(w) for w in words)
+
+
+def tokenize(src: str) -> list[Token]:
+    tokens: list[Token] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if ch in " \t\r\n":
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or src[i - 1] in " \t\n;"):
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if src.startswith("||", i):
+            tokens.append(Token("OP", "||"))
+            i += 2
+            continue
+        if src.startswith("&&", i):
+            tokens.append(Token("OP", "&&"))
+            i += 2
+            continue
+        if ch == "|":
+            tokens.append(Token("OP", "|"))
+            i += 1
+            continue
+        if ch == ";":
+            tokens.append(Token("OP", ";"))
+            i += 1
+            continue
+        if ch in "<>(){}":
+            raise ParseError(f"unsupported shell syntax near {src[i:i + 8]!r}")
+        if ch == "&":
+            raise ParseError("unsupported & (background); use &&")
+        word, end = read_word(src, i)
+        tokens.append(Token("WORD", word))
+        i = end
+    return tokens
+
+
+def read_word(src: str, i: int) -> tuple[str, int]:
+    n = len(src)
+    parts: list[str] = []
+    start = i
+    while i < n:
+        ch = src[i]
+        if ch in " \t\r\n;":
+            break
+        if src.startswith("||", i) or src.startswith("&&", i):
+            break
+        if ch in "|#<>(){}&":
+            break
+        if ch == "'":
+            i += 1
+            begin = i
+            while i < n and src[i] != "'":
+                i += 1
+            if i >= n:
+                raise ParseError("unterminated single quote")
+            parts.append(src[begin:i])
+            i += 1
+            continue
+        if ch == '"':
+            i += 1
+            chunk: list[str] = []
+            while i < n and src[i] != '"':
+                if src[i] == "\\" and i + 1 < n:
+                    chunk.append(src[i + 1])
+                    i += 2
+                    continue
+                chunk.append(src[i])
+                i += 1
+            if i >= n:
+                raise ParseError("unterminated double quote")
+            parts.append("".join(chunk))
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            parts.append(src[i + 1])
+            i += 2
+            continue
+        parts.append(ch)
+        i += 1
+    if i == start and not parts:
+        raise ParseError(f"empty word near {src[start:start + 8]!r}")
+    return "".join(parts), i
+
+
+def tokens_from_argv(argv: list[str]) -> list[Token]:
+    tokens: list[Token] = []
+    for item in argv:
+        if item in ("||", "&&", "|", ";"):
+            tokens.append(Token("OP", item))
+        else:
+            tokens.append(Token("WORD", item))
+    return tokens
+
+
+class Parser:
+    def __init__(self, tokens: list[Token]) -> None:
+        self.tokens = tokens
+        self.i = 0
+
+    def peek(self) -> Token | None:
+        if self.i >= len(self.tokens):
+            return None
+        return self.tokens[self.i]
+
+    def peek_op(self) -> str | None:
+        tok = self.peek()
+        if tok is not None and tok.kind == "OP":
+            return tok.value
+        return None
+
+    def take(self) -> Token:
+        tok = self.tokens[self.i]
+        self.i += 1
+        return tok
+
+    def skip_semicolons(self) -> None:
+        while self.peek_op() == ";":
+            self.take()
+
+    def parse_script(self) -> list[AndOr]:
+        parts: list[AndOr] = []
+        self.skip_semicolons()
+        while self.peek() is not None:
+            parts.append(self.parse_andor())
+            self.skip_semicolons()
+        if not parts:
+            raise ParseError("empty command")
+        return parts
+
+    def parse_andor(self) -> AndOr:
+        first = self.parse_pipeline()
+        rest: list[tuple[str, Pipeline]] = []
+        while self.peek_op() in ("||", "&&"):
+            op = self.take().value
+            rest.append((op, self.parse_pipeline()))
+        return AndOr(first, tuple(rest))
+
+    def parse_pipeline(self) -> Pipeline:
+        commands = [self.parse_simple()]
+        while self.peek_op() == "|":
+            self.take()
+            commands.append(self.parse_simple())
+        return Pipeline(tuple(commands))
+
+    def parse_simple(self) -> tuple[str, ...]:
+        words: list[str] = []
+        while True:
+            tok = self.peek()
+            if tok is None or tok.kind != "WORD":
+                break
+            self.take()
+            words.append(tok.value)
+        if not words:
+            near = self.peek()
+            got = near.value if near else "end of input"
+            raise ParseError(f"expected command, got {got}")
+        return tuple(words)
+
+
+def parse_snippet(src: str) -> list[AndOr]:
+    return Parser(tokenize(src)).parse_script()
+
+
+def parse_argv(argv: list[str]) -> list[AndOr]:
+    if not argv:
+        raise ParseError("empty command")
+    return Parser(tokens_from_argv(argv)).parse_script()
+
+
+def run_builtin(words: tuple[str, ...]) -> int:
+    head = words[0]
+    if head not in SAFE_HEADS:
+        raise Unmodeled(display_words(words))
+    return SAFE_HEADS[head]
+
+
+def run_pipeline(pipe: Pipeline, events: list[tuple[str, int]]) -> int:
+    last = 0
+    for cmd in pipe.commands:
+        last = run_builtin(cmd)
+        events.append((display_words(cmd), last))
+    return last
+
+
+def eval_andor(
+    node: AndOr,
+    events: list[tuple[str, int]],
+    swallows: list[str],
+) -> int:
+    status = run_pipeline(node.first, events)
+    last_fail = node.first.source if status != 0 else None
+    for op, pipe in node.rest:
+        if op == "||":
+            if status == 0:
+                continue
+            right = run_pipeline(pipe, events)
+            if right == 0 and last_fail is not None:
+                swallows.append(last_fail)
+            status = right
+            last_fail = pipe.source if status != 0 else None
+            continue
+        if op == "&&":
+            if status != 0:
+                continue
+            status = run_pipeline(pipe, events)
+            last_fail = pipe.source if status != 0 else None
+    return status
+
+
+def eval_list(parts: list[AndOr]) -> tuple[int, list[tuple[str, int]], list[str]]:
+    events: list[tuple[str, int]] = []
+    swallows: list[str] = []
+    status = 0
+    for node in parts:
+        status = eval_andor(node, events, swallows)
+    return status, events, swallows
+
+
+def decide_shell(src: str | None = None, argv: list[str] | None = None) -> ShellEv:
+    if src is not None:
+        if not src.strip():
+            raise ParseError("empty command")
+        parts = parse_snippet(src)
+    elif argv is not None:
+        parts = parse_argv(argv)
+    else:
+        raise ParseError("empty command")
+    step, events, swallows = eval_list(parts)
+    swallow = bool(swallows) and step == 0
+    all_ok = bool(events) and all(status == 0 for _, status in events)
+    return ShellEv(swallow=swallow, step_status=step, all_ok=all_ok)
+
+
+def decide_wait(
+    timeout: float,
+    wait_for_creation: bool,
+    for_cond: str,
+    exists: bool,
+) -> WaitEv:
+    oneshot = timeout == 0
+    if oneshot and wait_for_creation and for_cond != "delete":
+        return WaitEv(
+            visited=False,
+            oneshot=False,
+            abort="wait-for-creation-requires-timeout",
+        )
+    if not exists and wait_for_creation and for_cond != "delete" and timeout > 0:
+        return WaitEv(visited=False, oneshot=False, abort="none")
+    return WaitEv(
+        visited=bool(exists or for_cond == "delete"),
+        oneshot=oneshot,
+        abort="none",
+    )
+
+
+def claims_from(shell: ShellEv | None, wait: WaitEv | None) -> list[str]:
+    claims: list[str] = []
+    if shell is not None:
+        if shell.swallow:
+            claims.append("swallowed-nonzero")
+        elif shell.step_status == 0 and shell.all_ok:
+            claims.append("observed-ok")
+    if wait is not None:
+        if wait.abort == "wait-for-creation-requires-timeout":
+            claims.append("abort-before-visit")
+        elif wait.visited:
+            claims.append("observed-ok")
+    return claims
+
+
+def detail_for(
+    why: str,
+    claims: list[str],
+    shell: ShellEv | None,
+    wait: WaitEv | None,
+) -> str:
+    if why == "swallowed-nonzero":
+        return "|| hid a nonzero; step status 0"
+    if why == "abort-before-visit":
+        return "timeout 0 aborted before visiting the object"
+    if why == "observed-ok":
+        bits: list[str] = []
+        if shell is not None and shell.step_status == 0 and shell.all_ok:
+            bits.append("compound succeeded")
+        if wait is not None and wait.visited:
+            if wait.oneshot:
+                bits.append("oneshot visit")
+            else:
+                bits.append("object visited")
+        return "; ".join(bits) if bits else "observed ok"
+    if len(claims) > 1:
+        return "two reasons for the zero; exclusive class refuses"
+    if shell is not None and shell.step_status != 0:
+        return "step status is not 0"
+    if (
+        shell is not None
+        and shell.step_status == 0
+        and not shell.swallow
+        and not shell.all_ok
+    ):
+        return "step 0 without || swallow or visit"
+    if wait is not None and not wait.visited and wait.abort == "none":
+        return "did not visit and did not abort"
+    return "no exclusive reason for the zero"
+
+
+def classify(shell: ShellEv | None, wait: WaitEv | None) -> Verdict:
+    raw = claims_from(shell, wait)
+    uniq = list(dict.fromkeys(raw))
+    why = uniq[0] if len(uniq) == 1 else "unknown"
+    return Verdict(why=why, claims=tuple(uniq), detail=detail_for(why, uniq, shell, wait))
+
+
+def format_verdict(verdict: Verdict) -> str:
+    claims = " ".join(verdict.claims) if verdict.claims else "none"
+    return (
+        f"why  {verdict.why}\n"
+        f"claims  {claims}\n"
+        f"detail  {verdict.detail}\n"
+    )
+
+
+def split_argv_list(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    if "--" not in argv:
+        return argv, None
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
+
+
+def parse_args(argv: list[str], prog: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=(
+            "Classify a lying zero / green as exactly one of "
+            "swallowed-nonzero, abort-before-visit, observed-ok, unknown. "
+            "Not parent stdout concatenated."
+        ),
+    )
+    parser.add_argument(
+        "snippet",
+        nargs="?",
+        help="shell snippet (simple commands, ||, &&, |, ;)",
+    )
+    parser.add_argument("--timeout", type=float, help="wait budget; 0 is oneshot")
+    parser.add_argument(
+        "--wait-for-creation",
+        choices=("true", "false"),
+        help="creation-wait flag (requires --timeout)",
+    )
+    parser.add_argument(
+        "--for",
+        dest="for_cond",
+        default=None,
+        help="wait condition; delete ignores wait-for-creation",
+    )
+    parser.add_argument(
+        "--object-exists",
+        choices=("true", "false"),
+        help="whether the waited object exists (requires --timeout)",
+    )
+    return parser.parse_args(argv)
+
+
+def load_shell(
+    args: argparse.Namespace,
+    argv_tokens: list[str] | None,
+    prog: str,
+) -> ShellEv | None:
+    n_sources = sum(
+        [args.snippet is not None, argv_tokens is not None]
+    )
+    if n_sources == 0:
+        return None
+    if n_sources > 1:
+        raise ValueError(f"{prog}: use only one of snippet or -- argv list")
+    if argv_tokens is not None:
+        return decide_shell(argv=argv_tokens)
+    return decide_shell(src=args.snippet)
+
+
+def load_wait(args: argparse.Namespace, prog: str) -> WaitEv | None:
+    extra = args.wait_for_creation is not None or args.object_exists is not None
+    if args.timeout is None:
+        if extra:
+            raise ValueError(f"{prog}: --wait-for-creation / --object-exists need --timeout")
+        return None
+    wait_for_creation = (
+        True if args.wait_for_creation is None else args.wait_for_creation == "true"
+    )
+    exists = True if args.object_exists is None else args.object_exists == "true"
+    for_cond = args.for_cond if args.for_cond is not None else "jsonpath"
+    return decide_wait(args.timeout, wait_for_creation, for_cond, exists)
+
+
+def main(argv: list[str] | None = None) -> int:
+    prog = os.path.basename(sys.argv[0]) or "zerowhy"
+    if prog.endswith(".py"):
+        prog = "zerowhy"
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        option_argv, argv_tokens = split_argv_list(raw)
+        args = parse_args(option_argv, prog)
+        shell = load_shell(args, argv_tokens, prog)
+        wait = load_wait(args, prog)
+        if shell is None and wait is None:
+            raise ValueError(
+                f"{prog}: need a snippet, -- WORD ..., or --timeout"
+            )
+        verdict = classify(shell, wait)
+    except ParseError as err:
+        print(f"{prog}: parse error: {err}", file=sys.stderr)
+        return 2
+    except Unmodeled as err:
+        print(f"{prog}: unmodeled command: {err.command}", file=sys.stderr)
+        return 2
+    except ValueError as err:
+        text = str(err)
+        print(text if text.startswith(prog) else f"{prog}: {text}", file=sys.stderr)
+        return 2
+    sys.stdout.write(format_verdict(verdict))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

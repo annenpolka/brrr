@@ -1,0 +1,75 @@
+== grep def parse (both files) ==
+/Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-013/files/pkg_util.py:1:def parse(x):
+/Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-013/files/pkg_parse.py:1:def parse(x):
+
+== fixture /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-013/files/test_parse_identity.py ==
+util ('legacy', '  z  ')
+parse ('moved', 'z')
+same_function False
+stale_test_would_see legacy
+
+== bindname parse (all binds) ==
+name	parse
+count	2
+same_function	False
+
+import	from pkg_parse import parse
+bind	pkg_parse.parse
+runs	pkg_parse.parse
+kind	def
+file	pkg_parse.py
+line	1
+source	"def parse(x):\n    return ('moved', x.strip())"
+
+import	from pkg_util import parse
+bind	pkg_util.parse
+runs	pkg_util.parse
+kind	def
+file	pkg_util.py
+line	1
+source	"def parse(x):\n    return ('legacy', x)"
+
+== bindname --from pkg_util parse (stale import / leftover helper) ==
+query	from pkg_util import parse
+import	from pkg_util import parse
+bind	pkg_util.parse
+runs	pkg_util.parse
+kind	def
+file	pkg_util.py
+line	1
+source	"def parse(x):\n    return ('legacy', x)\n"
+also	pkg_parse.parse
+same_function	False
+
+== bindname --import 'from pkg_parse import parse' (moved definition) ==
+query	from pkg_parse import parse
+import	from pkg_parse import parse
+bind	pkg_parse.parse
+runs	pkg_parse.parse
+kind	def
+file	pkg_parse.py
+line	1
+source	"def parse(x):\n    return ('moved', x.strip())\n"
+also	pkg_util.parse
+same_function	False
+
+== bindname --file test_parse_identity.py parse ==
+name	parse
+count	2
+same_function	False
+
+import	from pkg_util import parse
+bind	pkg_util.parse
+runs	pkg_util.parse
+kind	def
+file	pkg_util.py
+line	1
+source	"def parse(x):\n    return ('legacy', x)\n"
+
+import	from pkg_parse import parse
+bind	pkg_parse.parse
+runs	pkg_parse.parse
+kind	def
+file	pkg_parse.py
+line	1
+source	"def parse(x):\n    return ('moved', x.strip())\n"

@@ -1,0 +1,27 @@
+Registry / fixture:
+  pyproject extras chgnet/sevennet/all/alignn/m3gnet with conflicts
+  leftover uv.lock e3nn -> torch 2.5.1 / sympy 1.13.1 with extras marker omitted
+
+Case A (uv sync, no extras):
+  torch 2.5.1 production identity
+  not leftover extras-marker
+
+Case B (uv sync --extra m3gnet, leftover true markers):
+  leftover: torch 2.5.1 / sympy 1.13.1 unconditional
+  also extra-gated torch 2.2.0 / sympy 1.13.3
+  extras marker omitted from lock identity
+
+Case C (extras markers kept on ambiguous edges):
+  extra-gated stay extra-gated
+  not leftover unconditional
+
+Case D (delete uv.lock then lock):
+  fresh identity
+  not leftover simplified-to-true
+
+Not this packet:
+  extraedge / specimen-080 / specimen-098 extras CLI
+  uv CI cache leftover fingerprints (specimen-006)
+  uv leftover git vs directory (specimen-102)
+  pdm extra path URL expanded (specimen-106)
+  earthly leftover CACHE --id unexpanded ARG (specimen-123/124)

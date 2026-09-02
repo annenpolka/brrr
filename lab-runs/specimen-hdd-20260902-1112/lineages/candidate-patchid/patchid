@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""patchid: name patchedDependencies identity class for a selector."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def parse_patched(text: str, *, source: str) -> dict[str, dict]:
+    """Minimal YAML subset for patchedDependencies only. No pyyaml."""
+    entries: dict[str, dict] = {}
+    in_block = False
+    current: str | None = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if raw.strip().startswith("#") or not raw.strip():
+            continue
+        if raw.rstrip() == "patchedDependencies:":
+            in_block = True
+            current = None
+            continue
+        if not in_block:
+            continue
+        if not raw.startswith(" "):
+            in_block = False
+            current = None
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if indent == 2 and line.endswith(":") and not line.startswith("path:") and not line.startswith("hash:"):
+            selector = line[:-1].strip().strip("'\"")
+            current = selector
+            entries[selector] = {"kind": "object", "path": "", "hash": ""}
+            continue
+        if indent == 2 and ":" in line:
+            selector, rest = line.split(":", 1)
+            selector = selector.strip().strip("'\"")
+            rest = rest.strip().strip("'\"")
+            current = selector
+            if rest == "":
+                entries[selector] = {"kind": "empty", "path": "", "hash": ""}
+            else:
+                entries[selector] = {"kind": "hash-only", "path": "", "hash": rest}
+            continue
+        if indent >= 4 and current is not None and ":" in line:
+            key, rest = line.split(":", 1)
+            key = key.strip()
+            rest = rest.strip().strip("'\"")
+            rec = entries.setdefault(current, {"kind": "object", "path": "", "hash": ""})
+            rec["kind"] = "object"
+            if key == "path":
+                rec["path"] = rest
+            elif key == "hash":
+                rec["hash"] = rest
+            else:
+                raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+            continue
+        raise ValueError(f"{source}:{lineno}: unparsed patchedDependencies line")
+    return entries
+
+
+def inspect(entries: dict[str, dict], selector: str) -> dict:
+    rec = entries.get(selector)
+    if rec is None:
+        return {
+            "selector": selector,
+            "kind": "omitted",
+            "path": "-",
+            "hash": "-",
+            "has_path": False,
+            "has_hash": False,
+        }
+    has_path = bool(rec.get("path"))
+    has_hash = bool(rec.get("hash"))
+    return {
+        "selector": selector,
+        "kind": rec["kind"],
+        "path": rec.get("path") or "-",
+        "hash": rec.get("hash") or "-",
+        "has_path": has_path,
+        "has_hash": has_hash,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"selector\t{result['selector']}",
+        f"kind\t{result['kind']}",
+        f"path\t{result['path']}",
+        f"hash\t{result['hash']}",
+        f"has_path\t{yn(result['has_path'])}",
+        f"has_hash\t{yn(result['has_hash'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="patchid",
+        description=(
+            "Name which identity patchedDependencies contained for a selector: "
+            "path+hash object, hash-only string, empty hash, or omitted. "
+            "grep of the selector hits both shapes."
+        ),
+    )
+    parser.add_argument("lockfile")
+    parser.add_argument("--selector", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.lockfile == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.lockfile).read_text(encoding="utf-8")
+            source = args.lockfile
+        entries = parse_patched(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"patchid: {err}", file=sys.stderr)
+        return 1
+    result = inspect(entries, args.selector)
+    sys.stdout.write(format_report(result))
+    return 0 if result["kind"] == "hash-only" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

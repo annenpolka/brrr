@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""bindslot: leftover vs moved same-name helpers inside one module, with no path identity."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import sys
+from dataclasses import dataclass
+
+TRY_TYPES: tuple[type, ...] = (ast.Try,)
+if hasattr(ast, "TryStar"):
+    TRY_TYPES += (ast.TryStar,)
+
+
+@dataclass(frozen=True)
+class Slot:
+    kind: str
+    line: int
+    source: str
+    from_module: str | None = None
+
+
+class ToolError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def node_source(text: str, node: ast.AST) -> str:
+    segment = ast.get_source_segment(text, node)
+    if segment is not None:
+        return segment
+    lines = text.splitlines(True)
+    start = getattr(node, "lineno", 1) - 1
+    end = getattr(node, "end_lineno", start + 1)
+    return "".join(lines[start:end])
+
+
+def name_targets(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for elt in node.elts:
+            names.extend(name_targets(elt))
+        return names
+    if isinstance(node, ast.Starred):
+        return name_targets(node.value)
+    return []
+
+
+def iter_module_stmts(body: list[ast.stmt]):
+    """Module-namespace statements, including compound wrappers. Not nested def/class bodies."""
+    for node in body:
+        yield node
+        if isinstance(node, ast.If):
+            yield from iter_module_stmts(node.body)
+            yield from iter_module_stmts(node.orelse)
+        elif isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
+            yield from iter_module_stmts(node.body)
+            yield from iter_module_stmts(node.orelse)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            yield from iter_module_stmts(node.body)
+        elif isinstance(node, TRY_TYPES):
+            yield from iter_module_stmts(node.body)
+            for handler in node.handlers:
+                yield handler
+                yield from iter_module_stmts(handler.body)
+            yield from iter_module_stmts(node.orelse)
+            yield from iter_module_stmts(node.finalbody)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                yield from iter_module_stmts(case.body)
+
+
+def slot_from_node(text: str, node: ast.AST, name: str) -> Slot | None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        return Slot("def", node.lineno, node_source(text, node))
+    if isinstance(node, ast.ClassDef) and node.name == name:
+        return Slot("class", node.lineno, node_source(text, node))
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if name in name_targets(target):
+                return Slot("assign", node.lineno, node_source(text, node))
+    if isinstance(node, ast.AnnAssign):
+        if (
+            isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and node.value is not None
+        ):
+            return Slot("assign", node.lineno, node_source(text, node))
+    if isinstance(node, ast.AugAssign) and name in name_targets(node.target):
+        return Slot("assign", node.lineno, node_source(text, node))
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            local = alias.asname or alias.name.split(".")[0]
+            if local == name:
+                return Slot("import", node.lineno, node_source(text, node), alias.name)
+    if isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            local = alias.asname or alias.name
+            if local == name:
+                return Slot(
+                    "import",
+                    node.lineno,
+                    node_source(text, node),
+                    node.module,
+                )
+    if isinstance(node, (ast.For, ast.AsyncFor)) and name in name_targets(node.target):
+        return Slot("assign", node.lineno, node_source(text, node))
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None and name in name_targets(item.optional_vars):
+                return Slot("assign", node.lineno, node_source(text, node))
+    if isinstance(node, ast.ExceptHandler) and node.name == name:
+        return Slot("assign", node.lineno, node_source(text, node))
+    return None
+
+
+def slots_for_name(text: str, name: str) -> list[Slot]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as err:
+        raise ToolError(f"syntax error: {err}") from err
+    found: list[Slot] = []
+    for node in iter_module_stmts(tree.body):
+        slot = slot_from_node(text, node, name)
+        if slot is not None:
+            found.append(slot)
+    return found
+
+
+def same_function(slots: list[Slot]) -> bool:
+    if not slots:
+        return True
+    runs = slots[-1].source
+    return all(slot.source == runs for slot in slots)
+
+
+def format_report(name: str, slots: list[Slot]) -> str:
+    lines = [
+        f"name\t{name}",
+        f"slots\t{len(slots)}",
+        f"runs_slot\t{len(slots) - 1}",
+        f"same_function\t{same_function(slots)}",
+        "",
+    ]
+    last = len(slots) - 1
+    for index, slot in enumerate(slots):
+        if index:
+            lines.append("")
+        role = "runs" if index == last else "leftover"
+        lines.extend(
+            [
+                f"slot\t{index}",
+                f"role\t{role}",
+                f"kind\t{slot.kind}",
+                f"line\t{slot.line}",
+            ]
+        )
+        if slot.from_module is not None:
+            lines.append(f"from\t{slot.from_module}")
+        lines.append(f"source\t{slot.source!r}")
+    return "\n".join(lines) + "\n"
+
+
+def read_file(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except UnicodeDecodeError as err:
+        raise ToolError(f"not utf-8: {path}: {err}") from err
+    except OSError as err:
+        raise ToolError(f"{err}") from err
+
+
+def load_source(args: argparse.Namespace) -> str:
+    chosen = [bool(args.source_file), bool(args.concat), args.code is not None]
+    if sum(chosen) > 1:
+        raise ToolError("use one of -s / --concat / --code", code=2)
+    if args.code is not None:
+        return args.code
+    if args.concat:
+        parts = [read_file(path) for path in args.concat]
+        return "\n".join(parts)
+    if args.source_file:
+        return read_file(args.source_file)
+    if sys.stdin.isatty():
+        raise ToolError(
+            "source required (file, --concat, --code, or stdin)",
+            code=2,
+        )
+    return sys.stdin.read()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="bindslot",
+        description=(
+            "For a name in one module, print every binding slot and which "
+            "body would run. Distinguishes leftover same-name helpers after "
+            "concatenation. Path is not identity; stdin needs no filesystem path."
+        ),
+    )
+    parser.add_argument("name", metavar="NAME", help="module-global name to resolve")
+    parser.add_argument(
+        "-s",
+        "--source",
+        dest="source_file",
+        metavar="FILE",
+        help="read this file as the module source (use - for stdin)",
+    )
+    parser.add_argument(
+        "--concat",
+        action="append",
+        metavar="FILE",
+        help="append FILE to the module source (repeatable; one module, no path split)",
+    )
+    parser.add_argument(
+        "--code",
+        metavar="TEXT",
+        help="module source as a string (no filesystem path)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parse_args(argv)
+        if not args.name:
+            raise ToolError("NAME is required", code=2)
+        text = load_source(args)
+        slots = slots_for_name(text, args.name)
+        if not slots:
+            print(f"bindslot: no slots for {args.name}", file=sys.stderr)
+            return 1
+        sys.stdout.write(format_report(args.name, slots))
+        return 0
+    except ToolError as err:
+        print(f"bindslot: {err}", file=sys.stderr)
+        return err.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

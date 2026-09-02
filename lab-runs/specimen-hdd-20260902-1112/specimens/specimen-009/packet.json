@@ -1,0 +1,11 @@
+{
+  "id": "specimen-009",
+  "manifest": "\nid: specimen-009\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-order-b-after-a\nfixed_ref: fixture-order-b-before-a\nmechanism_tags:\n  - order-dependent-test\n  - leaked-global-state\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2500\nanswer_key_sealed: true\nparent_specimens: [specimen-001, specimen-003, specimen-008]\nmutations: [specimen-012]\n",
+  "task": "# TASK\n\nTwo tests share a module-level list. One test appends. The other asserts the list is empty. Depending on collection/run order, the suite is green or red. The developer wants a first-class view of *what leaked between tests* and *which order is sufficient to expose it*.\n",
+  "observed": "# OBSERVED\n\nSee files/test_order.py. Captured on this lab host (owned fixture, not untrusted OSS):\n\n```\npython3 -m pytest files/test_order.py -q --tb=line\n# default file order (test_a then test_b): FAIL test_b\npython3 -m pytest files/test_order.py::test_b files/test_order.py::test_a -q --tb=line\n# reverse: PASS\n```\n",
+  "commands": "# COMMANDS\n\n```\npython3 -m pytest files/test_order.py -q --tb=line\npython3 -m pytest files/test_order.py::test_b files/test_order.py::test_a -q --tb=line\n```\n",
+  "tree": "files/test_order.py\n",
+  "source": "Derived from observed mechanisms in specimen-001/003/008 (leaked state, order). Owned fixture; executed on lab host.\n",
+  "answer_key": "KNOWN FIX (sealed): isolate module global per test (or do not share acc). The failure is order-dependent leaked state. Do not tell Dreamers the fix.\n",
+  "curation": "ACCEPT_R1\n"
+}

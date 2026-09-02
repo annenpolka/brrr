@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""envhop: name env keys dropped because they are not POSIX identifiers."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+POSIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_env(text: str, *, source: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"{source}:{lineno}: expected NAME=VALUE")
+        name, _, value = line.partition("=")
+        if not name:
+            raise ValueError(f"{source}:{lineno}: empty name")
+        out[name] = value
+    return out
+
+
+def inspect(before: dict[str, str], after: dict[str, str]) -> dict:
+    invalid = [k for k in before if not POSIX.match(k)]
+    dropped = [k for k in before if k not in after]
+    dropped_invalid = [k for k in dropped if k in set(invalid)]
+    kept = [k for k in before if k in after]
+    return {
+        "invalid_posix": invalid,
+        "dropped": dropped,
+        "dropped_invalid": dropped_invalid,
+        "kept": kept,
+        "survived_invalid": [k for k in invalid if k in after],
+    }
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"invalid_posix\t{fmt_list(result['invalid_posix'])}",
+        f"dropped\t{fmt_list(result['dropped'])}",
+        f"dropped_invalid\t{fmt_list(result['dropped_invalid'])}",
+        f"survived_invalid\t{fmt_list(result['survived_invalid'])}",
+        f"kept\t{fmt_list(result['kept'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="envhop",
+        description=(
+            "Compare env maps before and after a hop. Name keys that are not "
+            "POSIX identifiers and were dropped."
+        ),
+    )
+    parser.add_argument("before")
+    parser.add_argument("after")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        before = parse_env(Path(args.before).read_text(encoding="utf-8"), source=args.before)
+        after = parse_env(Path(args.after).read_text(encoding="utf-8"), source=args.after)
+    except (OSError, ValueError) as err:
+        print(f"envhop: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(before, after)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

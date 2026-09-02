@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""refkey: leftover SHA-only keep-git-dir cache key that omitted the named ref."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("pin", "keep_git_dir", "ref_a", "ref_b", "key_a", "key_b")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    for need in ("pin", "keep_git_dir", "ref_a", "ref_b", "key_a", "key_b"):
+        if need not in fields:
+            raise ValueError(f"{source}: need {need}")
+    return fields
+
+
+def yn_in(val: str) -> bool:
+    return val in {"yes", "true", "1", "keep"}
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    keep = yn_in(fields["keep_git_dir"])
+    leftover = keep and fields["key_a"] == fields["key_b"] and fields["ref_a"] != fields["ref_b"]
+    return {
+        "pin": fields["pin"],
+        "keep_git_dir": keep,
+        "ref_a": fields["ref_a"],
+        "ref_b": fields["ref_b"],
+        "key_a": fields["key_a"],
+        "key_b": fields["key_b"],
+        "leftover_ref": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"pin\t{result['pin']}",
+        f"keep_git_dir\t{yn(result['keep_git_dir'])}",
+        f"ref_a\t{result['ref_a']}",
+        f"ref_b\t{result['ref_b']}",
+        f"key_a\t{result['key_a']}",
+        f"key_b\t{result['key_b']}",
+        f"leftover_ref\t{yn(result['leftover_ref'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="refkey",
+        description=(
+            "Name leftover SHA-only keep-git-dir cache key that omitted the "
+            "named ref so two tags at one commit collide."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"refkey: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_ref"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

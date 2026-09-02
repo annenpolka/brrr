@@ -1,0 +1,26 @@
+Registry / fixture:
+  workspace depends on jsr:@pkg/a@1 and jsr:@pkg/b@1
+  both jsr packages list dependencies: ["npm:dep@1"]
+  specifiers also has npm:dep@1
+
+Case A (drop a jsr package that does not share npm: with remaining jsr):
+  remaining jsr.dependencies ⊆ specifiers
+  no leftover
+
+Case B (drop @pkg/a; @pkg/b remains; both named npm:dep@1):
+  failing_ref: specifiers loses npm:dep@1
+  jsr["@pkg/b@1.0.0"].dependencies still ["npm:dep@1"]
+  leftover: jsr-dep npm: name vs purged specifier
+
+Case C (both jsr packages remain):
+  tables stay joined
+  not leftover
+
+Case D (npm-only root specifier removed):
+  npm disassociates from root only
+  not this jsr.dependencies leftover
+
+Not this packet:
+  npm leftover metadata (specimen-004)
+  bun optional-peer leftover (specimen-082)
+  npm nested overrides leftover (specimen-095)

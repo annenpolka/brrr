@@ -1,0 +1,25 @@
+# failing_ref 545eda389c41478e2f99d23212254d757d8c2cef
+# ConfigOptionParser._get_ordered_configuration_items
+
+    def _get_ordered_configuration_items(self):
+        override_order = ["global", self.name, ":env:"]
+        section_items: dict[str, list[tuple[str, Any]]] = {
+            name: [] for name in override_order
+        }
+
+        for _, value in self.config.items():
+            for section_key, val in value.items():
+                # ignore empty values
+                if not val:
+                    logger.debug(
+                        "Ignoring configuration key '%s' as its value is empty.",
+                        section_key,
+                    )
+                    continue
+
+                section, key = section_key.split(".", 1)
+                if section in override_order:
+                    section_items[section].append((key, val))
+
+        for section in override_order:
+            yield from section_items[section]

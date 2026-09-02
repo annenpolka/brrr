@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""armtimer: name which timer was armed while starting vs after start period."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN = (
+    "start_period",
+    "start_interval",
+    "interval",
+    "status",
+    "elapsed",
+)
+
+
+def parse_num(rest: str, *, source: str, lineno: int, key: str) -> float:
+    try:
+        return float(rest)
+    except ValueError as err:
+        raise ValueError(f"{source}:{lineno}: {key} must be a number") from err
+
+
+def parse_record(text: str, *, source: str = "<input>") -> dict:
+    vals: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        vals[key] = rest
+    for need in KNOWN:
+        if need not in vals:
+            raise ValueError(f"{source}: missing {need}")
+    return {
+        "start_period": parse_num(vals["start_period"], source=source, lineno=0, key="start_period"),
+        "start_interval": parse_num(vals["start_interval"], source=source, lineno=0, key="start_interval"),
+        "interval": parse_num(vals["interval"], source=source, lineno=0, key="interval"),
+        "status": vals["status"],
+        "elapsed": parse_num(vals["elapsed"], source=source, lineno=0, key="elapsed"),
+    }
+
+
+def inspect(rec: dict) -> dict:
+    remaining = rec["start_period"] - rec["elapsed"]
+    starting = rec["status"] == "starting" and rec["elapsed"] < rec["start_period"]
+    armed = rec["start_interval"] if starting else rec["interval"]
+    expected = rec["interval"] if remaining <= 0 else min(rec["interval"], max(remaining, 0))
+    # After period: regular interval. During starting the packet world arms start_interval.
+    if starting:
+        expected_after = rec["interval"]
+        late = armed > remaining and remaining >= 0
+    else:
+        expected_after = rec["interval"]
+        late = False
+    return {
+        "armed": armed,
+        "during": "starting" if starting else rec["status"],
+        "period_end": rec["start_period"],
+        "remaining": remaining,
+        "expected_after_period": expected_after,
+        "late": late,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_num(v: float) -> str:
+    if v == int(v):
+        return str(int(v))
+    return str(v)
+
+
+def format_report(result: dict) -> str:
+    return (
+        f"armed\t{format_num(result['armed'])}\n"
+        f"during\t{result['during']}\n"
+        f"period_end\t{format_num(result['period_end'])}\n"
+        f"remaining\t{format_num(result['remaining'])}\n"
+        f"expected_after_period\t{format_num(result['expected_after_period'])}\n"
+        f"late\t{yn(result['late'])}\n"
+    )
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="armtimer")
+    parser.add_argument("record", nargs="?")
+    args = parser.parse_args(argv)
+    try:
+        if args.record:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        else:
+            text = sys.stdin.read()
+            source = "<stdin>"
+        rec = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"armtimer: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(rec)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

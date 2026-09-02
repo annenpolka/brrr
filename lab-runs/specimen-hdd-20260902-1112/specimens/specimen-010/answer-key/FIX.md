@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): `if v:` treats empty assignment as absent, so inherited KEY survives. Distinguishing unset vs empty requires `if k in mapping` / explicit empty string assignment. Do not tell Dreamers.

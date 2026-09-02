@@ -1,0 +1,30 @@
+{
+  "summary": "Invented Gradle hang/jstack. Preserve wait-for-shared-lock vs progress. Continue only on an owned lock fixture; no Gradle.",
+  "preserve_add": [
+    "A cache load can wait on a shared object owned by another thread"
+  ],
+  "established_add": [
+    "Packet: configuration-cache hang"
+  ],
+  "rejected_add": [
+    "jstack, SharedObjectRegistry traces, 92% hang are Dreamer-generated"
+  ],
+  "constraints_add": [
+    "No Gradle"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Who owns the lock the waiter never acquired"
+  ],
+  "pressure": [
+    "No Gradle. Continue on two threads and one lock. Show owner vs waiter."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name the owner of a lock a waiter is blocked on",
+    "nearest_existing_operation": "jstack plus reading lock ids",
+    "observable_delta": "one query whose object is owner vs waiter",
+    "reason": "timeout error does not name the owner"
+  },
+  "redpen_markdown": "NEXT_ACTION=CONTINUE_WITH_COUNTEREXAMPLE"
+}

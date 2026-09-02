@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""overleft: leftover OverrideSet after carrying edge gone vs lock original identity."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("package", "lock_version", "original_version", "override_set")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "package" not in fields or "lock_version" not in fields:
+        raise ValueError(f"{source}: need package, lock_version")
+    return fields
+
+
+def yn_in(val: str) -> bool:
+    return val in {"yes", "true", "1", "present"}
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    lock = fields["lock_version"]
+    original = fields.get("original_version") or ""
+    oset = yn_in(fields.get("override_set") or "")
+    leftover = oset and bool(original) and lock == original
+    return {
+        "package": fields["package"],
+        "lock_version": lock,
+        "original_version": original or "-",
+        "override_set": oset,
+        "leftover_override": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"package\t{result['package']}",
+        f"lock_version\t{result['lock_version']}",
+        f"original_version\t{result['original_version']}",
+        f"override_set\t{yn(result['override_set'])}",
+        f"leftover_override\t{yn(result['leftover_override'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="overleft",
+        description=(
+            "Name leftover OverrideSet after the carrying edge is gone versus "
+            "lock original identity."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"overleft: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_override"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

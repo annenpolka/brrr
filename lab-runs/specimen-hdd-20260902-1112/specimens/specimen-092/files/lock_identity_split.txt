@@ -1,0 +1,35 @@
+Registry / fixture:
+  flake.lock nodes.dep.locked.{rev, narHash, lastModified, type}
+  GitHub CI input: github:blockfrost/blockfrost-tests
+  rev 5297592395d1dbd46e88247e459896838c854340
+  lastModified 1770733010
+  H_nar_stale = sha256-4cKMeE/8GptnxWnB6LliJy3gCvjVI34TXTwQHEsHcUA=
+  H_nar_live  = sha256-YR+cemfm4AMEJcUEr/tm0cis3rWKQ0dPFbjwhEVrV94=
+  in-tree: git+file dep with GIT_*_DATE pinned so lastModified is identical
+
+Case A (consistent lock / never leftover):
+  lock rev=R1 narHash=H_nar1
+  nix eval -> "rev1"
+  store path = computeStorePath(H_nar1)
+  cache key = getFingerprint = R1 (github) or R1 plus suffixes (git)
+
+Case B (rev moved, narHash leftover):
+  lock rev=R2 narHash=H_nar1
+  H_nar1 store path still present from case A
+  eval may serve leftover NAR of R1 under fingerprint R2
+
+Case C (narHash corrected on poisoned cache):
+  lock rev=R2 narHash=H_nar2
+  failing_ref: NAR hash mismatch / mismatch in field 'narHash'
+  public log: expected H_nar_live, got H_nar_stale
+  workaround: delete ~/.cache/nix/fetcher-cache-v4.sqlite
+
+Case D (same corrected lock, fresh cache, never case B):
+  eval "rev2"
+  no mismatch
+
+Not this packet:
+  detached HEAD guessed ref=master, same rev, two hashed trees (#16391)
+  git-lfs pointer file NAR vs smudged NAR (#10079)
+  nested submodule NAR (#10588)
+  github tarball NAR vs git clone NAR for an untouched lock

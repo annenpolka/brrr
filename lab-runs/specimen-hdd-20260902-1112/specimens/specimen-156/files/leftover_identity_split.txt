@@ -1,0 +1,24 @@
+Registry / fixture:
+  bun runtime transpiler cache (.pile, VERSION 27)
+  leftover substituted JS after bunfig [define] change
+
+Case A (second run, same source, same define):
+  current cache identity
+  not leftover-after-define-change
+
+Case B (define/--drop flipped, leftover cache hit):
+  leftover: previous substituted JS
+  define table omitted from features hash
+  same source bytes
+
+Case C (empty cache / VERSION bump):
+  fresh substituted output
+  not leftover previous define
+
+Case D (define_hash in features hash):
+  new key after define/--drop change
+  not leftover previous substitution
+
+Not this packet:
+  bun optional-peer leftover in lockfile (specimen-082)
+  eo leftover transpile vs omitted trackSteps (specimen-151)

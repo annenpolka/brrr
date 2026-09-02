@@ -1,0 +1,404 @@
+# Incidents
+
+- 2026-09-02 22:28 JST Specimen scout (emit_164 job-0677): SKIP swc leftover cache vs define (no merged leftover-HIT omitted-define pair; leftover-flag like bun 156). SKIP job-0709 kotlin leftover IC vs external dep hash (leftover-flag omitted fingerprint restated from packed 163). Did not invent refs. Packed unique leftover same-name helper vs moved definition after 001-163: specimen-164 fxn/zeitwerk leftover gem inception vs app-added MyGem::Foo (`8100bd18` / `f9b21aa3`; not 054/157/159/160/163), specimen-165 ruby/ruby#4715 leftover Qundef autoload after helper fail (`ded5a66c` / `08759ede`; Bug 15790). Did not pack leftover-flag omitted-hash TSV (160 crystal / 161 next HMR / 163 kotlin dep / bundefine/jesthaste/gleamrm/vcpkgenv). 075 not overwritten. SKIP bazel#29298. Honor KILL fossils envlayers, reimpl-emptyunit-2. Enqueued READY_R1_DREAM job-0714/0715; init_trial then dream.sh for hdd-zeitincept/hdd-rbauto (pgrep dream --trial was 1, then 2; not 4). Isolation unchanged.
+- 2026-09-02 20:07 JST Honor MUTATE bindname (DESTROYER_bindname_13 job-0606): Honor-KILL 1–9 did not fire. leftover ast.py still helper; no import_module; also does not exec siblings; t=T(); T.x=0; if t.x list is dead; del T.x; if T.x without else is not a list bind. Remaining leftover-identity: class-body If/For/walrus, FunctionDef sentinel, Name-bases, Delete-Name, missing-attr If-else (skip both). Unpack/For Attribute and class U: y=T.x MATCH. Subscript assign declared. 98/98. sha256 `d0e4fff4285380107fbccdceb2a4f0325be724b9f6950ea011c57d4460a06643`. Enqueued READY_MUTATE worker_hint mutate-bindname-14. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 19:46 JST Honor KEEP ordleak (DESTROYER_ordleak_4 job-0593): Honor-KILL 1–6 did not fire (subprocess isolation reverse n=10 not leftover n=11; leaked none never beside exposing_order ≠ none; time_ns/object()/nan/dataclass identity not leaks; nested/relative helpers load from copy; dual-FAIL smear is leaked `<unseen>` rc=1 not green pair; join is not two greps of run_orders.py). DESTROYER_2 leftovers (private-slots underscore skip, helper class attrs, nested pkg.helper walk) stay `<unseen>` ceilings. Start-of-victim join still real. 35/35. sha256 `4a4bc7d73f16688ad0330302bc4c0f0f3fcdbdbf8888ae75117ad5111faa3306`. First KEEP is not protection. No fossil. Do not merge with leakorder. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 19:44 JST Honor KEEP tagjoin (DESTROYER_tagjoin_4 job-0591): Honor-KILL did not fire (TRANSFER CRDs unparsed_n 0; Go-name case-fold not restored; FILE.go FILE.yaml disagree_n 4; not a HostAlias grep table). First KEEP (tagjoin_3) is not protection. Synthetic required-then-optional first-wins is declared (list_name, key) uniqueness; real TRANSFER mixed optionality count 0. Remaining cuts need a YAML parser / CRD version-diff. 52/52. sha256 `89a5144de349c3e1207b8939bc2312e4f22c4775820081a68488cd16e2e6ea09`. No fossil. Do not grow a full YAML parser. Do not send kubectl theater back to R1.
+- 2026-09-02 19:43 JST Honor KEEP leakorder (DESTROYER_leakorder_4 job-0592): Honor-KILL did not fire (leftover-after is labeled leftover= not leaked=; subprocess isolation not deepcopy; leaked_names none never sits next to sufficient ≠ none; leftover-after diverges from start-of-victim on restore / leftover_only / same_twice / helper.n leftover 11 vs FAIL n=10). AST-static mutated names persist where leftover is {}. Competing sibling of Honor-KEEP ordleak_3; leftover-after join is real; do not merge. First KEEP/MUTATE is not protection. No fossil. Do not copy ordleak's temp-tree. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 19:40 JST Honor MUTATE bindname (DESTROYER_bindname_12 job-0590): Honor-KILL 1–8 did not fire. leftover ast.py still helper; no import_module; also does not exec siblings; class T: x=1; T.x=0; if T.x list is dead. Remaining leftover-identity: instance-follows-class t=T(); T.x=0; if t.x, unpack/For Attribute targets, class-body outer env, del-then-missing If, const Subscript assign. 94/94. sha256 `8f019efdab17ab25c2d136adc84761b9f5051cac71bed8321c5c87879354ff15`. Enqueued READY_MUTATE worker_hint mutate-bindname-13. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 19:21 JST Honor MUTATE bindname (DESTROYER_bindname_11 job-0579): Honor-KILL 1–10 did not fire. leftover ast.py still helper; no import_module; also does not exec siblings; nonempty genexp-For is list bind; empty genexp-For is not kind=def; if f'{1:d}' list live. Remaining leftover-identity: post-class Attribute assign T.x/t.x / AnnAssign / del, T() ignores __init__, multi-gen comp, JoinedStr conversion-then-format-spec. 90/90. sha256 `bf07a0ef52c21723b676558e313eba79e89cb3d35432800726b954b2f3be2c8f`. Enqueued READY_MUTATE worker_hint mutate-bindname-12. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 19:08 JST Honor MUTATE bindname (DESTROYER_bindname_10 job-0567): Honor-KILL 1–9 did not fire. leftover ast.py still helper; no import_module; also does not exec siblings; empty genexp-For is not kind=def; SetComp/DictComp/filter ListComp list live. Remaining leftover-identity: format-spec JoinedStr, nonempty genexp-as-sequence (For/comp/Starred), Attribute assign T.x/t.x, T() ignores __init__, multi-gen comp. 86/86. sha256 `0bddedf8657f0dbc4eed4fe26f39676228bd31fc6ea2cb1be2a711d37c901570`. Enqueued READY_MUTATE worker_hint mutate-bindname-11. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:52 JST Honor MUTATE bindname (DESTROYER_bindname_9 applied as mutate-10 job-0561): genexp sentinel so empty For-iter is not a list bind; SetComp/DictComp/filter ListComp; instance Call. 86/86. sha256 `0bddedf8657f0dbc4eed4fe26f39676228bd31fc6ea2cb1be2a711d37c901570`. Worktree `14790cb` / HEAD `b4f03d1`. Parent main `432f954`. leftover ast.py still helper. DESTROYER_bindname_10 claimed job-0567. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:49 JST Honor MUTATE bindname (DESTROYER_bindname_9 job-0553): Honor-KILL 1–9 did not fire. leftover ast.py still helper; no import_module; also does not exec siblings. Remaining leftover-identity: SetComp/DictComp, ListComp filter/const-elt, GeneratorExp-as-For-iter, format-spec, if-lambda, no-arg t=T(); if t.x. 82/82. sha256 `5dc2944551764460327c06648af72002f94d1e83510d33744c8b6e09892bbc12`. Enqueued READY_MUTATE worker_hint mutate-bindname-10. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:36 JST Honor MUTATE bindname (DESTROYER_bindname_8 applied as mutate-9 job-0552): const For-body, Attribute, class attr, ListComp, GeneratorExp-always-truthy. 82/82. sha256 `5dc2944551764460327c06648af72002f94d1e83510d33744c8b6e09892bbc12`. Worktree `1f07315` / HEAD `69fbdd6`. Parent main `432f954`. leftover ast.py still helper. DESTROYER_bindname_9 claimed job-0553. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:33 JST Host/coordinator Red Pen KILL hdd-uvxmark (s125) and hdd-overlink (s126): THIN_WRAPPER leftover-flag. Do not harvest those TSVs. Distinct from extraedge/006/102/106 and 004/033/095.
+- 2026-09-02 18:22 JST Host Red Pen KILL hdd-cachearg (s123) and hdd-ccreloc (s127): THIN_WRAPPER leftover-flag. Do not harvest those TSVs. Distinct from 115 / 104. specimen-124 duplicate of 123 earthly PR 3810.
+- 2026-09-02 18:20 JST Honor MUTATE bindname (DESTROYER_bindname_7 applied as mutate-8 job-0543): const Subscript/JoinedStr/starred collections and nested unpack list matches query. 78/78. sha256 `650d990f42e32e808600bbb81f1ea350467cea4770aee36e28ba44ad18e95944`. Worktree `1a12a94` / HEAD `8496b3c`. Parent main `432f954`. leftover ast.py still helper. DESTROYER_bindname_8 claimed job-0551. specimen-124 is duplicate of 123 earthly PR 3810. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:01 JST Honor MUTATE bindname (DESTROYER_bindname_6 applied as mutate-7 job-0533): const UAdd/Invert/In, tuple unpack, local TYPE_CHECKING=True list matches query. 73/73. sha256 `d6bff2a14b02279082718b25a4b6ed6c101b78ae5846ee05431c7d7cd4e8e281`. Worktree `06ba4c0` / HEAD `127d072`. Parent main `432f954`. leftover ast.py still helper. DESTROYER_bindname_7 claimed job-0534. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 18:00 JST Host Red Pen KILL hdd-regttl (s121): THIN_WRAPPER leftover inverted TTL + omitted version vs TOFU checksum. Distinct from 075/086/115. Do not harvest a regttl TSV. Dreamer named sealed PR 9144.
+- 2026-09-02 17:55 JST Coordinator Red Pen KILL hdd-wraphash (s122): THIN_WRAPPER leftover wrap-file checkout vs current wrap identity (`meson.build` present AND wrap-hash omitted). Invented meson-inspect theater. Distinct from 064/070/092. Do not harvest a wraphash TSV. Dreamer named sealed PR 10728.
+- 2026-09-02 17:50 JST Host/coordinator Red Pen KILL hdd-pixiarg (s119): THIN_WRAPPER leftover task-cache filename environment-task omitting args so A.txt/B.txt share `default-create.json`. Invented pixi run theater. Distinct from 115. Do not harvest a pixiarg TSV. Dreamer named sealed PR 3782. job-0520 SKIP duplicate of 119.
+- 2026-09-02 17:42 JST Honor MUTATE bindname (DESTROYER_bindname_5 applied as mutate-6 job-0507): leftover importlib.util/machinery miss (full-name `_imp.is_frozen`); leftover importlib.py/abc still helper; list last-wins of `if 1+1` / `if []:` / IfExp / multi-target / typing_extensions TYPE_CHECKING matches query. 67/67. sha256 `39b159bc04c4bb14248ee82f98ca6d448266db73f69537a5879c287a217e6011`. Worktree `e8e3edd` / HEAD `ab57764`. Parent main `432f954`. DESTROYER_bindname_6 claimed job-0518. First KEEP/MUTATE is not protection. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 17:40 JST Host/coordinator Red Pen KILL hdd-tfomitid (s118): THIN_WRAPPER leftover omitted Identity vs copied Value/Private/Status. Distinct from 081. Do not harvest a tfomitid TSV.
+- 2026-09-02 17:37 JST Honor-KILL reimpl-emptyunit-2 (DESTROYER_reimpl-emptyunit-2): same leftover formula as KEEP candidate-emptyunit (flatten + dist partition + burst send `()`). Harvest SAME 30/30; shared fixtures stdout byte-identical 11/11. Not first-dict sticker (4/7). Not two greps. First KEEP of parent is not protection. Do not mutate a copy into a second style. Do not send pytest-xdist theater back to R1.
+- 2026-09-02 17:31 JST Honor MUTATE bindname (DESTROYER_bindname_5): Honor-KILL did not fire (leftover ast.py not Cellar; no import_module; also does not exec siblings; leftover sys.py/io.py/encodings.py/os.py is has no name not kind=def; leftover tokenize.py leftover helper not tokenize.open miss; leftover-identity join not two greps). Leftovers: frozen submodule importlib.util/machinery honesty cannot bind still kind=def; list last-wins const-known if 1+1 / if []: dead-only. First KEEP/MUTATE is not protection. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 17:30 JST Host Red Pen KILL hdd-taskwild (s115), hdd-diffcache (s116), hdd-tsbuildinfo (s113 duplicate of tsdtsig). THIN_WRAPPER leftover-flag. Do not harvest those TSVs.
+- 2026-09-02 17:27 JST Host Red Pen KILL hdd-zincanal (s117): THIN_WRAPPER of leftover zinc last-write vs file identity. Invented scode theater. Distinct from treeid. Do not harvest a zincanal TSV.
+- 2026-09-02 17:23 JST Host Red Pen KILL hdd-cmpabandon (s110): THIN_WRAPPER of lock abandoned vs installed.json vs two jq fields. Invented composer theater; named sealed PR 12423. Distinct from 074/021/086. Do not harvest a cmpabandon TSV. SKIP s112 R1 (same PR 12423 as s110). s113 is NOT a duplicate of s111: s111 is leftover d.ts-text signature after visibility revert (#49527); s113 is leftover semanticDiagnosticsPerFile after JSON module content change (#64025). Packed unique 114 ruff nested-pyproject cache (#12264; not #2407 F401), 115 go-task wildcard fingerprint (#1795; pants hunt had no merged pair), 116 coder filename-keyed highlight cache (PR 27987; next.js webpack leftover had no merged pair). SKIP conan/cargo-sparse/npm-bundled (no merged pair). 075 not overwritten. SKIP bazel#29298. init_trial then dream.sh (no 180s wrapper) for hdd-tsbuildinfo/ruffnest/taskwild/diffcache. Did not steal DESTROYER_bindname_5 (mutate-5 landed). Did not launch job-0504 hdd-tfomitid (TARGET_R1 already 4+). KEEP gen-2 not this tick (hybrids already NON-JOIN; leftover-after transfer still open).
+- 2026-09-02 17:23 JST Host Red Pen KILL hdd-cmpabandon (s110): THIN_WRAPPER of lock abandoned vs installed.json. Dreamer used post-fix Composer. Distinct from extraedge. SKIP s112/s113 R1 as duplicates of 110/111.
+- 2026-09-02 17:19 JST Host Red Pen KILL hdd-tsdtsig (s111): THIN_WRAPPER of leftover tsbuildinfo signature vs stale diagnostic. Invented tsc theater. Distinct from 067. Do not harvest a tsdtsig TSV.
+- 2026-09-02 17:16 JST Specimen scout (emit_109): exclusive mkdir claimed 110-111 after 109 (jdx/mise leftover-lockfile-pin). Packed composer leftover abandoned identity in installed.json vs lock (110 / #12417 / PR 12423; unique vs 021/074) and TypeScript leftover .tsbuildinfo d.ts-text signature omitting diagnostics (111 / #49527 / PR 49543; unique vs 067/075). job-0458..0465 were already SKIP by scout-t1708-* as "no pinned pair"; 0458/0460 were false starvation. SKIP conan lock leftover (job-0459: no merged pair), ruff cache leftover (job-0461: #2407 F401 / #3897 serialization), cargo git sparse leftover vs checkout (job-0462: #11165 still open; #11751 is sparse-registry .crates.toml prefix not git sparse-checkout), npm bundledDependencies leftover (job-0463: #3466/#9289/#7137/#5111/#6251 still open), pants fingerprint leftover (job-0464: no merged pair), next.js webpack cache leftover (job-0465: #47394 open; PR 92569 is turbopack). SKIP bazel#29298 unfixed. Did not invent refs. 075 not overwritten. Enqueued READY_R1_DREAM job-0486/0487; recorded DONE scout job-0488/0489. Did not dream.sh (R1 already in flight hdd-miselock job-0478).
+- 2026-09-02 17:01 JST Host Red Pen KILL hdd-npmlinkbin (s108): THIN_WRAPPER of leftover .bin shim vs missing package. Dreamer used post-fix npm. Distinct from 004/082/095/peerleft. Do not harvest an npmlinkbin TSV.
+- 2026-09-02 16:57 JST Wrapper 180s timeout killed dream.sh for hdd-jsrpurged and hdd-pdmroot (world.md only, no 0001-dreamer.md, ledger not appended). Relaunching with no wrapper timeout. Do not bound dream.sh at 180s (HTTP timeout is 900s).
+- 2026-09-02 16:54 JST Duplicate dream.sh for hdd-jsrpurged and hdd-pdmroot (coordinator trees 43628/43630 plus extra PGID 43667/43668). Killed the extra pair (hdd.py 43697/43699). One dream per trial remains. Do not double-launch the same trial. Atomic ledger helps but concurrent dreams still waste credits.
+- 2026-09-02 16:55 JST Specimen scout (emit_105): cargo git+ssh vs registry leftover (job-0339) has no merged pinned failing+fixed pair (cargo#14526 closed without PR; #14466/#10756 not_planned; #13549 is SSH URL error-message). Did not invent refs. Packed pytest leftover cache-dir identity (107 / #12167 / PR 12168; unique vs 001-003 assertion/collection/fixture) and npm linked leftover .bin shim (108 / #9613 / PR 9632; not peer leftover 004/082/095). SKIP hatch dist-cache vs pyproject (job-0455: #2345 is leftover CLI plugin-manager not dist cache), cmake fileapi (job-0454; no merged pair), bazel#29298 unfixed. 075 not overwritten. Exclusive mkdir claimed 107-108 after 105-106 (deno_lockfile / pdm). Enqueued READY_R1_DREAM job-0466/0467; did not dream.sh (R1 already in flight hdd-jsrpurged/hdd-pdmroot).
+- 2026-09-02 16:52 JST Honor MUTATE bindname (DESTROYER_bindname_4): Honor-KILL did not fire (leftover ast.py not Cellar; no import_module; also does not exec siblings; leftover sys.py/builtins.py is has no name not kind=def; leftover-identity join not two greps). Leftovers: already-imported stdlib io/encodings honesty ImportError still kind=def; leftover tokenize.py honesty leftover vs tokenize.open miss; list last-wins const-known if flag / if 1==1 / TYPE_CHECKING alias. First KEEP/MUTATE is not protection. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 16:39 JST Honor KEEP leakorder (DESTROYER_leakorder_3): Honor-KILL did not fire (leftover-after is labeled leftover= not leaked=; subprocess isolation not deepcopy; leaked_names none never sits next to sufficient ≠ none; leftover-after diverges from start-of-victim on restore). Competing sibling of Honor-KEEP ordleak_3; leftover-after join is real; do not merge. First KEEP/MUTATE is not protection. No fossil. Do not copy ordleak's temp-tree. Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 16:37 JST Host Red Pen KILL hdd-ccnamed (s104): THIN_WRAPPER of leftover root vs subproject baseDir. Invented codeq theater. Distinct from Honor-KILLed treeid (088). Do not harvest a ccnamed TSV. Do not send gradle CC theater back to R1.
+- 2026-09-02 16:32 JST Honor-KILL catleft (DESTROYER_catleft): THIN_WRAPPER of member_spec!=catalog: and member_spec!=catalog_range. Replica leftover+rc owned 3/3. First HARVEST is not protection. Do not send bun catalog theater back to R1. Distinct from 082.
+- 2026-09-02 16:31 JST Duplicate dream.sh for hdd-scpsub and hdd-uvgitdir (coordinator 16:30 then host 16:31). Killed the second pair. Do not double-launch the same trial. Atomic ledger helps but concurrent dreams still waste credits.
+- 2026-09-02 16:30 JST Host drafted KILL JSON for hdd-buncat after coordinator already HARVEST_NOW. Unrecorded host KILL is not the ledger. Ground harvest then Honor-KILL THIN_WRAPPER. Host Red Pen KILL hdd-workrepl (s103) recorded in ledger.
+- 2026-09-02 16:28 JST Honor MUTATE bindname (DESTROYER_bindname_3): Honor-KILL did not fire (leftover ast.py not Cellar; no import_module; also does not exec siblings; unique __name__ honest). Leftovers: builtin sys/builtins honesty ImportError, list last-wins dead complements, --file assign vs --from follow. First KEEP/MUTATE is not protection. mutate-bindname-4 in flight (job-0433). Do not send THIN_WRAPPER back to R1.
+- 2026-09-02 16:28 JST Honor KEEP tagjoin (DESTROYER_tagjoin_3): Honor-KILL did not fire (TRANSFER CRDs unparsed_n 0; Go-name case-fold not restored; FILE.go FILE.yaml disagree_n 4; not a HostAlias grep table). Mutate-3 YAML `|-` walker landed. First KEEP/MUTATE is not protection. No fossil. Do not grow a full YAML parser.
+- 2026-09-02 16:28 JST Honor KEEP ordleak (DESTROYER_ordleak_3): Honor-KILL did not fire (nested/relative helpers load from copy; dual-FAIL smear is leaked `<unseen>` not `leaked none`; no same-process deepcopy). Mutate-3 copy-import-tree landed. First KEEP/MUTATE is not protection. No fossil. Do not merge with leakorder.
+- 2026-09-02 16:26 JST Specimen scout (emit_099): go cmd/go work/replace leftover hunt found no merged pinned failing+fixed pair (golang/go#50750 closed not_planned; #54264/#73655/#81139 still open; #60430 gopls-only). Did not invent refs. Packed bun catalog leftover (100 / #21852 / PR 36304), cargo SCP-like submodule leftover (101 / #16740 / PR 16744; distinct from KILLed 099 cargo#7987 submodule db cache), uv git-path leftover directory (102 / #19152 / PR 19269 leftover-identity, not uv.lock vs pylock). SKIP bazel#29298 (job-0421/0336). 075 not overwritten.
+- 2026-09-02 16:25 JST Host Red Pen KILL hdd-gitsubdb (s099): THIN_WRAPPER of checkout_present AND NOT db_present. Invented cargo-fixture theater. Distinct from pathdup/091. Do not harvest a gitsubdb TSV. Do not send cargo submodule theater back to R1.
+- 2026-09-02 16:20 JST Honor-KILL pathnode (DESTROYER_pathnode_2): THIN_WRAPPER of caller found|missing plus register-list membership. Mutate landed unbound/shared stickers; (7) miss still rc=0 / no --check. Replica leftover+rc 41/41. Harvest without n3 lookup is miss none. First MUTATE is not protection. Do not grow a pytest importer. Do not send collection-event theater back to R1.
+- 2026-09-02 16:17 JST Host Red Pen KILL hdd-pipextra (s098): THIN_WRAPPER of extras-on-link vs constraint-without-extras. Invented resolver theater. Distinct from pipmark and extraedge. Do not harvest a pipextra TSV. Do not send pip extras theater back to R1.
+- 2026-09-02 16:12 JST Honor-KILL procpath (DESTROYER_procpath): THIN_WRAPPER of reactor_present and not local_repo and processorpath fail/omitted/missing. Replica leftover+rc owned 3/3. Distinct from extraedge. Do not send Maven processorpath theater back to R1. First HARVEST is not protection.
+- 2026-09-02 16:12 JST Honor-KILL refkey (DESTROYER_refkey): THIN_WRAPPER of keep_git_dir and key_a==key_b and ref_a!=ref_b. pin spectator. Replica leftover+rc owned 3/3. Do not send keep-git-dir / BuildKit theater back to R1. First HARVEST is not protection.
+- 2026-09-02 16:11 JST Host drafted KILL JSON for hdd-mvnextra / hdd-gitrefkey after coordinator already `record-redpen` HARVEST_NOW (`0001-redpen.json`). Unrecorded host KILL is not the ledger (same class as 15:11 sumzip). Ground harvests then Honor-KILL THIN_WRAPPER. Do not send maven/buildkit theater back to R1.
+- 2026-09-02 16:09 JST Honor-KILL hunkland (DESTROYER_hunkland_2): mutation (1)+(2)+(3) never queued; sha256 unchanged. Context hunk still mis-indexed; land is opcode 0; apply_exit sticker. First MUTATE is not protection.
+- 2026-09-02 16:09 JST Honor-KILL swallowecho (DESTROYER_swallowecho_2): mutation (1)+(2)+(3) never queued; sha256 unchanged. `if false || true` still swallow yes. First MUTATE is not protection.
+
+- 2026-09-02 16:03 JST Honor-KILL overleft (DESTROYER_overleft): THIN_WRAPPER of override_set flag plus lock_version==original_version. Replica leftover+rc owned 3/3 + extra well-formed 6/6. package spectator. Same class as Honor-KILLed pnpbuilt/peerleft. Do not send npm/arborist theater back to R1. First HARVEST is not protection.
+- 2026-09-02 16:03 JST Honor-KILL esbleft (DESTROYER_esbleft): THIN_WRAPPER of bool(uniquekey_len) and bytes_in_output==uniquekey_len and substituted_bytes!=bytes_in_output. Replica leftover+rc owned 3/3 + extra well-formed 7/7. awk of the three fields already prints the harvest. First HARVEST is not protection. Do not send esbuild/uniqueKey theater back to R1. Distinct from Honor-KILLed cssleft; same leftover-equality class.
+- 2026-09-02 15:51 JST Concurrent dream.sh for hdd-esbmeta and hdd-vcachekey ran before init_trial (No HDD workspace) and also hit r1-ledger Extra data. Recovered: init then relaunch; observed_usd 0.0 on the failed turns. Do not dream.sh until init_trial.sh has a seed.md. Coordinator launched hdd-overleft only after init.
+- 2026-09-02 15:55 JST Honor-KILL inprobe (DESTROYER_inprobe): THIN_WRAPPER of caller-labeled probe rows. Replica leftover+rc 52/52 byte-identical. awk of docker-in-cgroup / docker-or-/containers/-in-mountinfo already names owned 065. path_used spectator 10/10. notdocker is in-docker. First KEEP is not protection. Do not mutate into dockpath. Do not send cgroup/mountinfo / docker inspect theater back to R1.
+- 2026-09-02 15:54 JST Honor-KILL poslayer (DESTROYER_poslayer_2): THIN_WRAPPER of caller-labeled position/layer rows. Replica replace+split plus token-in-argv vs token-in-template 45/45 byte-identical. Owned harvest stdout byte-identical to printf of ten TSV rows (10/10). Fixture override_subst.py already prints the join. First MUTATE is not protection. Mutation never queued; bytes unchanged. Do not grow a tox.ini / -x / quoting parser. Do not send leftover-posargs theater back to R1.
+- 2026-09-02 15:52 JST Concurrent dream.sh writers concatenated a second object onto r1-ledger.json (JSONDecodeError Extra data). Repaired by keeping the first JSON object. save_ledger now writes via tmp+replace; load_ledger accepts the first object if Extra data remains.
+- 2026-09-02 15:48 JST Honor-KILL freshmiss (DESTROYER_freshmiss_2): THIN_WRAPPER of two identity hashes plus extra-stub vs produced. Replica 63/63 byte-identical. First MUTATE is not protection. Mutate-freshmiss-2 landed only `bytes NAME 0`; (1)+(3)+(7) and env/flag omitted did not. Do not merge with stubextra. Do not send cache hasher / cargo / uv theater back to R1.
+- 2026-09-02 15:48 JST Honor-KILL keyorder (DESTROYER_keyorder_2): THIN_WRAPPER of key-order diff on caller JSON / mapping literals (`tuple(keys)` vs `sorted` vs `--obj` after `literal_eval`). Replica inspect TSV 29/29 byte-identical. `json.loads` labels 4/4. `jq keys` / `keys_unsorted` already names the split. First MUTATE is not protection; (1)+(2)+(3) never landed; sha256 unchanged. Do not send key-order theater back to R1. Do not wrap `json.dumps(sort_keys=True)`.
+- 2026-09-02 15:47 JST Honor-KILL lockown (DESTROYER_lockown_2): THIN_WRAPPER of caller-labeled owner/waiter rows. CLI stdout byte-identical to printf of holder/blocked (10/10). run_scene replica 8/8. Same-name never waits. snapshot does not read threading.Lock. First KEEP is not protection. Do not grow jstack/Gradle attach. Do not send deadlock theater back to R1.
+- 2026-09-02 15:46 JST Honor-KILL keptfp (DESTROYER_keptfp_2): THIN_WRAPPER of caller fingerprint membership (`lockfile_hash == current`) on a caller-complete current/entry table. Replica leftover+rc 35/35 success, 10/10 stdin errors byte-identical. awk $4==current already names the owned partition. First MUTATE is not protection. Mutation never queued; bytes unchanged. Do not merge with freshmiss/lockident. Do not send leftover-hash / uv theater back to R1.
+- 2026-09-02 15:45 JST Honor-KILL fingerhid (DESTROYER_fingerhid_2): THIN_WRAPPER of path== and mtime== and vv!= on caller-typed fields. Replica leftover+rc 32/32 byte-identical. Size/birth spectators. First KEEP is not protection. Same class as Honor-KILLed fingerid / platid. Do not mint a third rustc_fingerprint CLI. Do not send cargo theater back to R1.
+- 2026-09-02 15:36 JST Honor-KILL addrid (DESTROYER_adrid_2): THIN_WRAPPER of set(addr) occupancy on caller-complete insert/worker bags plus set(name)-set(fetched) leftover. Replica leftover+rc 20/20 byte-identical. Insert vs worker is field labels, not a shrinking done-set. First KEEP is not protection. Do not merge with visitid. Do not send pointer-set / nix theater back to R1.
+- 2026-09-02 13:43 JST R1 race: host `dream.sh hdd-s067,s068,s069,s071` in parallel produced empty out/err for s067–s069 (world.md only). Coordinator had already dreamed the same seeds as `hdd-sentinel`, `hdd-envdrop`, `hdd-gitinc`. Did not re-spend R1 on the empty trials. s071 succeeded and was Red-Penned.
+- 2026-09-02 14:18 JST Scout rustc overwrote `specimens/specimen-075` (was derived gocache_buildid; now rust-lang/rust#133828). Derived gocache lives as specimen-078. Do not overwrite 075 again.
+- 2026-09-02 15:06 JST Honor-KILL platid (DESTROYER_platid_2): same string-inequality + default-true-flags primitive as Honor-KILLed platident. Park `hdd-frozenplat` (world.md only, no dreamer.md, no live `hdd.py`); do not spend R1 on a second s074 identity harvest. Stale machine_task `r1-hdd-tfident` closed (identjson already harvested+KILLed).
+- 2026-09-02 15:11 JST Host `redpen/hdd-sumzip-0001.json` drafted KILL (two greps) after coordinator had already `record-redpen` HARVEST_NOW into the trial ledger (`0001-redpen.json`). Embodiment `candidate-sumident` grounded. DESTROYER_sumident Honor-KILL. Do not treat the unrecorded host KILL JSON as the ledger.
+- 2026-09-02 15:35 JST Honor-KILL silentadd (DESTROYER_silentadd_2): THIN_WRAPPER of prefix-walk / scan-0 plus remainder membership. Replica 24/24 byte-identical. First KEEP is not protection. Mutate-silentadd was a no-op (kill condition `still prefix walk`). Do not send prefix-walk theater back to R1. Do not grow a git index parser.
+
+- 2026-09-02 11:20:32 JST SCHEDULING_FAILURE consecutive=1: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:21:23 JST SCHEDULING_FAILURE consecutive=2: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:22:53 JST SCHEDULING_FAILURE consecutive=3: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:24:23 JST SCHEDULING_FAILURE consecutive=4: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:25:53 JST SCHEDULING_FAILURE consecutive=5: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:27:23 JST SCHEDULING_FAILURE consecutive=6: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 11:28:53 JST SCHEDULING_FAILURE consecutive=7: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 11:30:23 JST SCHEDULING_FAILURE consecutive=8: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:31:54 JST SCHEDULING_FAILURE consecutive=9: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:33:24 JST SCHEDULING_FAILURE consecutive=10: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:34:54 JST SCHEDULING_FAILURE consecutive=11: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:49:54 JST SCHEDULING_FAILURE consecutive=12: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 11:51:24 JST SCHEDULING_FAILURE consecutive=13: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 11:52:54 JST SCHEDULING_FAILURE consecutive=14: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 11:54:24 JST SCHEDULING_FAILURE consecutive=15: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 12:04:55 JST SCHEDULING_FAILURE consecutive=16: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 1 > 0
+- 2026-09-02 12:21:25 JST SCHEDULING_FAILURE consecutive=17: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 1 > 0
+- 2026-09-02 13:15:28 JST SCHEDULING_FAILURE consecutive=18: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 13:16:58 JST SCHEDULING_FAILURE consecutive=19: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 13:36:28 JST SCHEDULING_FAILURE consecutive=20: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:37:58 JST SCHEDULING_FAILURE consecutive=21: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:39:28 JST SCHEDULING_FAILURE consecutive=22: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:40:59 JST SCHEDULING_FAILURE consecutive=23: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:42:29 JST SCHEDULING_FAILURE consecutive=24: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:43:59 JST SCHEDULING_FAILURE consecutive=25: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 13:45:29 JST SCHEDULING_FAILURE consecutive=26: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 13:46:59 JST SCHEDULING_FAILURE consecutive=27: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 13:48:29 JST SCHEDULING_FAILURE consecutive=28: active_reasoning_workers 7 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 13:49:59 JST SCHEDULING_FAILURE consecutive=29: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 13:51:29 JST SCHEDULING_FAILURE consecutive=30: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 13:52:59 JST SCHEDULING_FAILURE consecutive=31: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 13:54:29 JST SCHEDULING_FAILURE consecutive=32: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 13:55:59 JST SCHEDULING_FAILURE consecutive=33: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 13:57:29 JST SCHEDULING_FAILURE consecutive=34: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 13:58:59 JST SCHEDULING_FAILURE consecutive=35: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 14:00:29 JST SCHEDULING_FAILURE consecutive=36: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 16 > 0
+- 2026-09-02 14:01:59 JST SCHEDULING_FAILURE consecutive=37: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 16 > 0
+- 2026-09-02 14:04:59 JST SCHEDULING_FAILURE consecutive=38: active_reasoning_workers 10 < MIN 12 AND ready_jobs_total 16 > 0
+- 2026-09-02 14:08:00 JST SCHEDULING_FAILURE consecutive=39: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 14:09:30 JST SCHEDULING_FAILURE consecutive=40: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 16 > 0
+- 2026-09-02 14:30:31 JST SCHEDULING_FAILURE consecutive=41: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 16 > 0
+- 2026-09-02 14:35:01 JST SCHEDULING_FAILURE consecutive=42: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 14:36:31 JST SCHEDULING_FAILURE consecutive=43: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 14 > 0
+- 2026-09-02 14:41:01 JST SCHEDULING_FAILURE consecutive=44: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 14:59:02 JST SCHEDULING_FAILURE consecutive=45: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:00:32 JST SCHEDULING_FAILURE consecutive=46: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:02:02 JST SCHEDULING_FAILURE consecutive=47: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:03:32 JST SCHEDULING_FAILURE consecutive=48: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 21 > 0
+- 2026-09-02 15:05:02 JST SCHEDULING_FAILURE consecutive=49: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:06:32 JST SCHEDULING_FAILURE consecutive=50: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:08:02 JST SCHEDULING_FAILURE consecutive=51: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:09:32 JST SCHEDULING_FAILURE consecutive=52: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:11:02 JST SCHEDULING_FAILURE consecutive=53: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 15:12:32 JST SCHEDULING_FAILURE consecutive=54: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 15:14:02 JST SCHEDULING_FAILURE consecutive=55: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 1 > 0
+- 2026-09-02 15:15:32 JST SCHEDULING_FAILURE consecutive=56: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 15:27:33 JST SCHEDULING_FAILURE consecutive=57: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 15:29:03 JST SCHEDULING_FAILURE consecutive=58: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 16:00:34 JST SCHEDULING_FAILURE consecutive=59: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 16:02:04 JST SCHEDULING_FAILURE consecutive=60: active_reasoning_workers 9 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 16:03:34 JST SCHEDULING_FAILURE consecutive=61: active_reasoning_workers 8 < MIN 12 AND ready_jobs_total 21 > 0
+- 2026-09-02 16:05:05 JST SCHEDULING_FAILURE consecutive=62: active_reasoning_workers 7 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:06:35 JST SCHEDULING_FAILURE consecutive=63: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:08:05 JST SCHEDULING_FAILURE consecutive=64: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:09:35 JST SCHEDULING_FAILURE consecutive=65: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:11:05 JST SCHEDULING_FAILURE consecutive=66: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:12:35 JST SCHEDULING_FAILURE consecutive=67: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 21 > 0
+- 2026-09-02 16:14:05 JST SCHEDULING_FAILURE consecutive=68: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 16:15:35 JST SCHEDULING_FAILURE consecutive=69: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:17:05 JST SCHEDULING_FAILURE consecutive=70: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:18:35 JST SCHEDULING_FAILURE consecutive=71: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:20:05 JST SCHEDULING_FAILURE consecutive=72: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:21:35 JST SCHEDULING_FAILURE consecutive=73: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 19 > 0
+- 2026-09-02 16:23:05 JST SCHEDULING_FAILURE consecutive=74: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 18 > 0
+- 2026-09-02 16:24:35 JST SCHEDULING_FAILURE consecutive=75: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 18 > 0
+- 2026-09-02 16:26:05 JST SCHEDULING_FAILURE consecutive=76: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 13 > 0
+- 2026-09-02 16:27:35 JST SCHEDULING_FAILURE consecutive=77: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 16:29:06 JST SCHEDULING_FAILURE consecutive=78: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 16:30:36 JST SCHEDULING_FAILURE consecutive=79: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 16:32:06 JST SCHEDULING_FAILURE consecutive=80: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 16:33:36 JST SCHEDULING_FAILURE consecutive=81: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:35:06 JST SCHEDULING_FAILURE consecutive=82: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:36:36 JST SCHEDULING_FAILURE consecutive=83: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:38:06 JST SCHEDULING_FAILURE consecutive=84: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:39:36 JST SCHEDULING_FAILURE consecutive=85: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:41:06 JST SCHEDULING_FAILURE consecutive=86: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:42:36 JST SCHEDULING_FAILURE consecutive=87: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:44:06 JST SCHEDULING_FAILURE consecutive=88: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:45:36 JST SCHEDULING_FAILURE consecutive=89: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:47:06 JST SCHEDULING_FAILURE consecutive=90: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 16:48:36 JST SCHEDULING_FAILURE consecutive=91: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 16:50:06 JST SCHEDULING_FAILURE consecutive=92: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 16:51:36 JST SCHEDULING_FAILURE consecutive=93: active_reasoning_workers 11 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 16:53:06 JST SCHEDULING_FAILURE consecutive=94: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 16:54:37 JST SCHEDULING_FAILURE consecutive=95: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 16:56:07 JST SCHEDULING_FAILURE consecutive=96: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:57:37 JST SCHEDULING_FAILURE consecutive=97: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 16:59:07 JST SCHEDULING_FAILURE consecutive=98: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:00:37 JST SCHEDULING_FAILURE consecutive=99: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:02:07 JST SCHEDULING_FAILURE consecutive=100: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:03:37 JST SCHEDULING_FAILURE consecutive=101: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:05:07 JST SCHEDULING_FAILURE consecutive=102: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:06:37 JST SCHEDULING_FAILURE consecutive=103: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:08:07 JST SCHEDULING_FAILURE consecutive=104: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:12:37 JST SCHEDULING_FAILURE consecutive=105: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 17:14:07 JST SCHEDULING_FAILURE consecutive=106: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 17:15:37 JST SCHEDULING_FAILURE consecutive=107: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 17:17:08 JST SCHEDULING_FAILURE consecutive=108: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 17:18:38 JST SCHEDULING_FAILURE consecutive=109: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 17:20:08 JST SCHEDULING_FAILURE consecutive=110: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 17:21:38 JST SCHEDULING_FAILURE consecutive=111: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 17:23:08 JST SCHEDULING_FAILURE consecutive=112: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 17:24:38 JST SCHEDULING_FAILURE consecutive=113: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 17:26:08 JST SCHEDULING_FAILURE consecutive=114: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 17:27:38 JST SCHEDULING_FAILURE consecutive=115: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 17:29:08 JST SCHEDULING_FAILURE consecutive=116: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 17:30:38 JST SCHEDULING_FAILURE consecutive=117: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 12 > 0
+- 2026-09-02 17:32:08 JST SCHEDULING_FAILURE consecutive=118: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:33:38 JST SCHEDULING_FAILURE consecutive=119: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:35:08 JST SCHEDULING_FAILURE consecutive=120: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:36:38 JST SCHEDULING_FAILURE consecutive=121: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 17:38:08 JST SCHEDULING_FAILURE consecutive=122: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 17:39:38 JST SCHEDULING_FAILURE consecutive=123: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 17:41:09 JST SCHEDULING_FAILURE consecutive=124: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 17:42:39 JST SCHEDULING_FAILURE consecutive=125: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 17:44:09 JST SCHEDULING_FAILURE consecutive=126: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 17:45:39 JST SCHEDULING_FAILURE consecutive=127: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 17:47:09 JST SCHEDULING_FAILURE consecutive=128: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 17:48:39 JST SCHEDULING_FAILURE consecutive=129: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 17:50:09 JST SCHEDULING_FAILURE consecutive=130: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 17:51:39 JST SCHEDULING_FAILURE consecutive=131: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 17:53:09 JST SCHEDULING_FAILURE consecutive=132: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 17:54:39 JST SCHEDULING_FAILURE consecutive=133: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 17:56:09 JST SCHEDULING_FAILURE consecutive=134: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 17:57:39 JST SCHEDULING_FAILURE consecutive=135: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 17:59:09 JST SCHEDULING_FAILURE consecutive=136: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 18:00:39 JST SCHEDULING_FAILURE consecutive=137: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 18:02:10 JST SCHEDULING_FAILURE consecutive=138: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 18:03:40 JST SCHEDULING_FAILURE consecutive=139: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 18:05:10 JST SCHEDULING_FAILURE consecutive=140: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 18:15:40 JST SCHEDULING_FAILURE consecutive=141: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 18:17:10 JST SCHEDULING_FAILURE consecutive=142: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 18:18:40 JST SCHEDULING_FAILURE consecutive=143: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 13 > 0
+- 2026-09-02 18:20:10 JST SCHEDULING_FAILURE consecutive=144: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 13 > 0
+- 2026-09-02 18:21:40 JST SCHEDULING_FAILURE consecutive=145: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:23:10 JST SCHEDULING_FAILURE consecutive=146: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:24:40 JST SCHEDULING_FAILURE consecutive=147: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:26:10 JST SCHEDULING_FAILURE consecutive=148: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:27:40 JST SCHEDULING_FAILURE consecutive=149: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:29:11 JST SCHEDULING_FAILURE consecutive=150: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:30:41 JST SCHEDULING_FAILURE consecutive=151: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:32:11 JST SCHEDULING_FAILURE consecutive=152: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 11 > 0
+- 2026-09-02 18:33:41 JST SCHEDULING_FAILURE consecutive=153: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:35:11 JST SCHEDULING_FAILURE consecutive=154: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:36:41 JST SCHEDULING_FAILURE consecutive=155: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:38:11 JST SCHEDULING_FAILURE consecutive=156: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:39:41 JST SCHEDULING_FAILURE consecutive=157: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 10 > 0
+- 2026-09-02 18:41:11 JST SCHEDULING_FAILURE consecutive=158: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 18:42:41 JST SCHEDULING_FAILURE consecutive=159: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 18:44:11 JST SCHEDULING_FAILURE consecutive=160: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 18:45:41 JST SCHEDULING_FAILURE consecutive=161: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 18:47:11 JST SCHEDULING_FAILURE consecutive=162: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 18:48:41 JST SCHEDULING_FAILURE consecutive=163: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 18:50:11 JST SCHEDULING_FAILURE consecutive=164: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 18:51:41 JST SCHEDULING_FAILURE consecutive=165: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 18:53:11 JST SCHEDULING_FAILURE consecutive=166: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 18:54:42 JST SCHEDULING_FAILURE consecutive=167: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 18:56:12 JST SCHEDULING_FAILURE consecutive=168: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 18:57:42 JST SCHEDULING_FAILURE consecutive=169: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 18:59:12 JST SCHEDULING_FAILURE consecutive=170: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:00:42 JST SCHEDULING_FAILURE consecutive=171: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:02:12 JST SCHEDULING_FAILURE consecutive=172: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:03:42 JST SCHEDULING_FAILURE consecutive=173: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:05:12 JST SCHEDULING_FAILURE consecutive=174: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:06:42 JST SCHEDULING_FAILURE consecutive=175: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:08:12 JST SCHEDULING_FAILURE consecutive=176: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 19:09:42 JST SCHEDULING_FAILURE consecutive=177: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:11:12 JST SCHEDULING_FAILURE consecutive=178: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:12:42 JST SCHEDULING_FAILURE consecutive=179: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:14:12 JST SCHEDULING_FAILURE consecutive=180: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:15:42 JST SCHEDULING_FAILURE consecutive=181: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:17:12 JST SCHEDULING_FAILURE consecutive=182: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:18:42 JST SCHEDULING_FAILURE consecutive=183: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:20:13 JST SCHEDULING_FAILURE consecutive=184: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:21:43 JST SCHEDULING_FAILURE consecutive=185: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 19:23:13 JST SCHEDULING_FAILURE consecutive=186: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:24:43 JST SCHEDULING_FAILURE consecutive=187: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 19:26:13 JST SCHEDULING_FAILURE consecutive=188: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:27:43 JST SCHEDULING_FAILURE consecutive=189: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:29:13 JST SCHEDULING_FAILURE consecutive=190: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:30:43 JST SCHEDULING_FAILURE consecutive=191: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:32:13 JST SCHEDULING_FAILURE consecutive=192: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:33:43 JST SCHEDULING_FAILURE consecutive=193: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:35:13 JST SCHEDULING_FAILURE consecutive=194: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:36:43 JST SCHEDULING_FAILURE consecutive=195: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:42:44 JST SCHEDULING_FAILURE consecutive=196: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 19:44:14 JST SCHEDULING_FAILURE consecutive=197: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 19:45:44 JST SCHEDULING_FAILURE consecutive=198: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 19:47:14 JST SCHEDULING_FAILURE consecutive=199: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 8 > 0
+- 2026-09-02 19:48:44 JST SCHEDULING_FAILURE consecutive=200: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:50:14 JST SCHEDULING_FAILURE consecutive=201: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:51:44 JST SCHEDULING_FAILURE consecutive=202: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:53:14 JST SCHEDULING_FAILURE consecutive=203: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:54:44 JST SCHEDULING_FAILURE consecutive=204: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:56:14 JST SCHEDULING_FAILURE consecutive=205: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:57:45 JST SCHEDULING_FAILURE consecutive=206: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 19:59:15 JST SCHEDULING_FAILURE consecutive=207: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:00:45 JST SCHEDULING_FAILURE consecutive=208: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:02:15 JST SCHEDULING_FAILURE consecutive=209: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:03:45 JST SCHEDULING_FAILURE consecutive=210: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:05:15 JST SCHEDULING_FAILURE consecutive=211: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:06:45 JST SCHEDULING_FAILURE consecutive=212: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:08:15 JST SCHEDULING_FAILURE consecutive=213: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 20:09:45 JST SCHEDULING_FAILURE consecutive=214: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:11:15 JST SCHEDULING_FAILURE consecutive=215: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:12:45 JST SCHEDULING_FAILURE consecutive=216: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:14:15 JST SCHEDULING_FAILURE consecutive=217: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:15:45 JST SCHEDULING_FAILURE consecutive=218: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:17:15 JST SCHEDULING_FAILURE consecutive=219: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:18:46 JST SCHEDULING_FAILURE consecutive=220: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:20:16 JST SCHEDULING_FAILURE consecutive=221: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:21:46 JST SCHEDULING_FAILURE consecutive=222: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:23:16 JST SCHEDULING_FAILURE consecutive=223: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:24:46 JST SCHEDULING_FAILURE consecutive=224: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:26:16 JST SCHEDULING_FAILURE consecutive=225: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:27:46 JST SCHEDULING_FAILURE consecutive=226: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:29:16 JST SCHEDULING_FAILURE consecutive=227: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 20:30:46 JST SCHEDULING_FAILURE consecutive=228: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 20:32:16 JST SCHEDULING_FAILURE consecutive=229: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 20:33:46 JST SCHEDULING_FAILURE consecutive=230: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 20:35:16 JST SCHEDULING_FAILURE consecutive=231: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 20:36:46 JST SCHEDULING_FAILURE consecutive=232: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 20:38:16 JST SCHEDULING_FAILURE consecutive=233: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 9 > 0
+- 2026-09-02 20:39:46 JST SCHEDULING_FAILURE consecutive=234: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:41:16 JST SCHEDULING_FAILURE consecutive=235: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:42:46 JST SCHEDULING_FAILURE consecutive=236: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:44:16 JST SCHEDULING_FAILURE consecutive=237: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:45:47 JST SCHEDULING_FAILURE consecutive=238: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:47:17 JST SCHEDULING_FAILURE consecutive=239: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:48:47 JST SCHEDULING_FAILURE consecutive=240: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:50:17 JST SCHEDULING_FAILURE consecutive=241: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:51:47 JST SCHEDULING_FAILURE consecutive=242: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:53:17 JST SCHEDULING_FAILURE consecutive=243: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:54:47 JST SCHEDULING_FAILURE consecutive=244: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:56:17 JST SCHEDULING_FAILURE consecutive=245: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:57:47 JST SCHEDULING_FAILURE consecutive=246: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 20:59:17 JST SCHEDULING_FAILURE consecutive=247: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:00:47 JST SCHEDULING_FAILURE consecutive=248: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:02:17 JST SCHEDULING_FAILURE consecutive=249: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:03:47 JST SCHEDULING_FAILURE consecutive=250: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:05:17 JST SCHEDULING_FAILURE consecutive=251: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:06:47 JST SCHEDULING_FAILURE consecutive=252: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:08:18 JST SCHEDULING_FAILURE consecutive=253: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:09:48 JST SCHEDULING_FAILURE consecutive=254: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:11:18 JST SCHEDULING_FAILURE consecutive=255: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:12:48 JST SCHEDULING_FAILURE consecutive=256: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:14:18 JST SCHEDULING_FAILURE consecutive=257: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:15:48 JST SCHEDULING_FAILURE consecutive=258: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:17:18 JST SCHEDULING_FAILURE consecutive=259: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 21:18:48 JST SCHEDULING_FAILURE consecutive=260: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:24:48 JST SCHEDULING_FAILURE consecutive=261: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:26:18 JST SCHEDULING_FAILURE consecutive=262: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:27:48 JST SCHEDULING_FAILURE consecutive=263: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:30:48 JST SCHEDULING_FAILURE consecutive=264: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 2 > 0
+- 2026-09-02 21:32:18 JST SCHEDULING_FAILURE consecutive=265: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 21:35:19 JST SCHEDULING_FAILURE consecutive=266: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 21:36:49 JST SCHEDULING_FAILURE consecutive=267: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 21:38:19 JST SCHEDULING_FAILURE consecutive=268: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 21:41:19 JST SCHEDULING_FAILURE consecutive=269: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 5 > 0
+- 2026-09-02 21:42:49 JST SCHEDULING_FAILURE consecutive=270: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 4 > 0
+- 2026-09-02 21:44:19 JST SCHEDULING_FAILURE consecutive=271: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 21:45:49 JST SCHEDULING_FAILURE consecutive=272: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 21:47:19 JST SCHEDULING_FAILURE consecutive=273: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 21:48:49 JST SCHEDULING_FAILURE consecutive=274: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 7 > 0
+- 2026-09-02 21:54:49 JST SCHEDULING_FAILURE consecutive=275: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 21:56:19 JST SCHEDULING_FAILURE consecutive=276: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:57:49 JST SCHEDULING_FAILURE consecutive=277: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 21:59:20 JST SCHEDULING_FAILURE consecutive=278: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 6 > 0
+- 2026-09-02 22:03:50 JST SCHEDULING_FAILURE consecutive=279: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 3 > 0
+- 2026-09-02 22:05:20 JST SCHEDULING_FAILURE consecutive=280: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:06:50 JST SCHEDULING_FAILURE consecutive=281: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:08:20 JST SCHEDULING_FAILURE consecutive=282: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:09:50 JST SCHEDULING_FAILURE consecutive=283: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:11:20 JST SCHEDULING_FAILURE consecutive=284: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:12:50 JST SCHEDULING_FAILURE consecutive=285: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:14:20 JST SCHEDULING_FAILURE consecutive=286: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 21 > 0
+- 2026-09-02 22:15:50 JST SCHEDULING_FAILURE consecutive=287: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:17:20 JST SCHEDULING_FAILURE consecutive=288: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:18:50 JST SCHEDULING_FAILURE consecutive=289: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:20:20 JST SCHEDULING_FAILURE consecutive=290: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:21:50 JST SCHEDULING_FAILURE consecutive=291: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:23:20 JST SCHEDULING_FAILURE consecutive=292: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 15 > 0
+- 2026-09-02 22:24:50 JST SCHEDULING_FAILURE consecutive=293: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 22 > 0
+- 2026-09-02 22:26:21 JST SCHEDULING_FAILURE consecutive=294: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 22 > 0
+- 2026-09-02 22:27:51 JST SCHEDULING_FAILURE consecutive=295: active_reasoning_workers 5 < MIN 12 AND ready_jobs_total 22 > 0
+- 2026-09-02 22:29:21 JST SCHEDULING_FAILURE consecutive=296: active_reasoning_workers 6 < MIN 12 AND ready_jobs_total 26 > 0
+- 2026-09-02 22:30:51 JST SCHEDULING_FAILURE consecutive=297: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 22:32:21 JST SCHEDULING_FAILURE consecutive=298: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 22:33:51 JST SCHEDULING_FAILURE consecutive=299: active_reasoning_workers 4 < MIN 12 AND ready_jobs_total 20 > 0
+- 2026-09-02 22:35:21 JST SCHEDULING_FAILURE consecutive=300: active_reasoning_workers 3 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:36:51 JST SCHEDULING_FAILURE consecutive=301: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:38:21 JST SCHEDULING_FAILURE consecutive=302: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:39:51 JST SCHEDULING_FAILURE consecutive=303: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:41:21 JST SCHEDULING_FAILURE consecutive=304: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:42:51 JST SCHEDULING_FAILURE consecutive=305: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:44:21 JST SCHEDULING_FAILURE consecutive=306: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:45:51 JST SCHEDULING_FAILURE consecutive=307: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:47:21 JST SCHEDULING_FAILURE consecutive=308: active_reasoning_workers 2 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:48:51 JST SCHEDULING_FAILURE consecutive=309: active_reasoning_workers 1 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:50:21 JST SCHEDULING_FAILURE consecutive=310: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:51:52 JST SCHEDULING_FAILURE consecutive=311: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:53:22 JST SCHEDULING_FAILURE consecutive=312: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 23 > 0
+- 2026-09-02 22:54:52 JST SCHEDULING_FAILURE consecutive=313: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:56:22 JST SCHEDULING_FAILURE consecutive=314: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:57:52 JST SCHEDULING_FAILURE consecutive=315: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 22:59:22 JST SCHEDULING_FAILURE consecutive=316: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:00:52 JST SCHEDULING_FAILURE consecutive=317: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:02:22 JST SCHEDULING_FAILURE consecutive=318: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:03:52 JST SCHEDULING_FAILURE consecutive=319: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:05:22 JST SCHEDULING_FAILURE consecutive=320: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:06:52 JST SCHEDULING_FAILURE consecutive=321: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:08:22 JST SCHEDULING_FAILURE consecutive=322: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:09:52 JST SCHEDULING_FAILURE consecutive=323: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:11:22 JST SCHEDULING_FAILURE consecutive=324: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:12:52 JST SCHEDULING_FAILURE consecutive=325: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:14:23 JST SCHEDULING_FAILURE consecutive=326: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:15:53 JST SCHEDULING_FAILURE consecutive=327: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:17:23 JST SCHEDULING_FAILURE consecutive=328: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:18:53 JST SCHEDULING_FAILURE consecutive=329: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:20:23 JST SCHEDULING_FAILURE consecutive=330: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:21:53 JST SCHEDULING_FAILURE consecutive=331: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:23:23 JST SCHEDULING_FAILURE consecutive=332: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0
+- 2026-09-02 23:24:53 JST SCHEDULING_FAILURE consecutive=333: active_reasoning_workers 0 < MIN 12 AND ready_jobs_total 24 > 0

@@ -1,0 +1,25 @@
+Registry / fixture:
+  buildah --layers RUN --mount=from=stage
+  leftover /version after source stage rebuilt
+
+Case A (second build, source stage unchanged):
+  current cache identity
+  not leftover-after-source-stage-change
+
+Case B (source stage rebuilt, leftover RUN --mount):
+  leftover: previous /version
+  DidExecute omitted
+  Using cache on the copy step
+
+Case C (--no-cache):
+  fresh stage identity
+  not leftover previous mount
+
+Case D (avoid cache when mounted stage DidExecute):
+  new /version after source change
+  not leftover previous mount
+
+Not this packet:
+  moby leftover (specimen-066)
+  skaffold leftover remote digest (specimen-144)
+  buildkit leftover git-dir cache key omitting ref (specimen-097)

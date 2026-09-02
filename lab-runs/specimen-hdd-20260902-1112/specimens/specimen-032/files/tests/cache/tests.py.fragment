@@ -1,0 +1,12 @@
+# failing_ref cd7554e5517992d5ca2594ffc936cb193daab26c
+
+    def test_cached_control_private_not_cached(self):
+        """Responses with 'Cache-Control: private' are not cached."""
+        view_with_private_cache = cache_page(3)(
+            cache_control(private=True)(hello_world_view)
+        )
+        request = self.factory.get("/view/")
+        response = view_with_private_cache(request, "1")
+        self.assertEqual(response.content, b"Hello World 1")
+        response = view_with_private_cache(request, "2")
+        self.assertEqual(response.content, b"Hello World 2")

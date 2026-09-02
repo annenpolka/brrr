@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""falseomit: name keys present as false in one JSON encoding and absent in the other."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def load_obj(path: str, *, source: str) -> dict:
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = Path(path).read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{source}: invalid JSON: {err}") from err
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: expected a JSON object")
+    return data
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def inspect(first: dict, second: dict) -> dict:
+    keys_a = list(first)
+    keys_b = list(second)
+    missing_in_a = [k for k in keys_b if k not in first]
+    missing_in_b = [k for k in keys_a if k not in second]
+    false_in_b = [k for k, v in second.items() if v is False]
+    false_in_a = [k for k, v in first.items() if v is False]
+    dropped_false = [k for k in missing_in_a if second.get(k) is False]
+    return {
+        "keys_a": keys_a,
+        "keys_b": keys_b,
+        "missing_in_a": missing_in_a,
+        "missing_in_b": missing_in_b,
+        "false_in_a": false_in_a,
+        "false_in_b": false_in_b,
+        "dropped_false": dropped_false,
+        "a_has": {k: k in first for k in dropped_false},
+        "b_has": {k: k in second for k in dropped_false},
+        "b_value": {k: second.get(k) for k in dropped_false},
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"keys_a\t{fmt_list(result['keys_a'])}",
+        f"keys_b\t{fmt_list(result['keys_b'])}",
+        f"missing_in_a\t{fmt_list(result['missing_in_a'])}",
+        f"missing_in_b\t{fmt_list(result['missing_in_b'])}",
+        f"false_in_a\t{fmt_list(result['false_in_a'])}",
+        f"false_in_b\t{fmt_list(result['false_in_b'])}",
+        f"dropped_false\t{fmt_list(result['dropped_false'])}",
+        "missing_decoded_as\ttrue",
+    ]
+    for key in result["dropped_false"]:
+        lines.append(f"a_has\t{key}\t{'yes' if result['a_has'][key] else 'no'}")
+        lines.append(f"b_has\t{key}\t{'yes' if result['b_has'][key] else 'no'}")
+        val = result["b_value"][key]
+        lines.append(f"b_value\t{key}\t{json.dumps(val)}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="falseomit",
+        description=(
+            "Compare two JSON objects. Name keys present as false in one "
+            "encoding and absent in the other."
+        ),
+    )
+    parser.add_argument("first", metavar="A.json")
+    parser.add_argument("second", metavar="B.json")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        first = load_obj(args.first, source=args.first)
+        second = load_obj(args.second, source=args.second)
+    except (OSError, ValueError) as err:
+        print(f"falseomit: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(first, second)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,185 @@
+== nearest existing: grep omitempty / listMapKey / +optional ==
+4:	// +optional
+8:	// +listMapKey=name
+9:	ImagePullSecrets []LocalObjectReference `json:"imagePullSecrets,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,15,rep,name=imagePullSecrets"`
+11:	// +optional
+15:	// +listMapKey=ip
+16:	HostAliases []HostAlias `json:"hostAliases,omitempty" patchStrategy:"merge" patchMergeKey:"ip" protobuf:"bytes,23,rep,name=hostAliases"`
+20:	IP string `json:"ip,omitempty" protobuf:"bytes,1,opt,name=ip"`
+21:	Hostnames []string `json:"hostnames,omitempty" protobuf:"bytes,2,rep,name=hostnames"`
+26:	// +optional
+27:	Name string `json:"name,omitempty" protobuf:"bytes,1,opt,name=name"`
+(hits both tags; does not name which identity key is optional)
+
+== tagjoin owned wrapped fixture (specimen-052 shape) ==
+disagree	LocalObjectReference.Name	list	ImagePullSecrets	list_json	imagePullSecrets,omitempty	elem	LocalObjectReference	field	Name	json	name,omitempty	optional	+optional,omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+disagree	HostAlias.IP	list	HostAliases	list_json	hostAliases,omitempty	elem	HostAlias	field	IP	json	ip,omitempty	optional	omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+other_omitempty	HostAlias.Hostnames
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin excerpt /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-052/files/types_excerpt.go ==
+disagree	LocalObjectReference.Name	list	ImagePullSecrets	list_json	imagePullSecrets,omitempty	elem	LocalObjectReference	field	Name	json	name,omitempty	optional	+optional,omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+disagree	HostAlias.IP	list	HostAliases	list_json	hostAliases,omitempty	elem	HostAlias	field	IP	json	ip,omitempty	optional	omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+other_omitempty	HostAlias.Hostnames
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin unseen Ports / containerPort ==
+disagree	ContainerPort.ContainerPort	list	Ports	list_json	ports,omitempty	elem	ContainerPort	field	ContainerPort	json	containerPort,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin agree (required name key, list still omitempty) ==
+agree	Item.Name	list	Items	list_json	items,omitempty	elem	Item	field	Name	json	name	optional	-	protobuf	-	identity	listMapKey
+other_omitempty	Item.Value
+disagree_n	0
+agree_n	1
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin json empty name omitempty (not agree) ==
+disagree	Item.Name	list	Items	list_json	items	elem	Item	field	Name	json	,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin json address vs listMapKey=ip (missing, not HostAlias.IP) ==
+missing	HostAlias.ip	list	HostAliases	list_json	hostAliases	elem	HostAlias	field	ip	json	-	optional	-	protobuf	-	identity	listMapKey
+other_omitempty	HostAlias.IP
+disagree_n	0
+agree_n	0
+missing_n	1
+collision_n	0
+unparsed_n	0
+
+== tagjoin duplicate +listMapKey (disagree_n 1) ==
+disagree	Item.Name	list	Items	list_json	items	elem	Item	field	Name	json	name,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin YAML OpenAPI-ish x-kubernetes-list-map-keys ==
+disagree	imagePullSecrets.name	list	imagePullSecrets	list_json	imagePullSecrets	elem	imagePullSecrets	field	name	json	name	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+disagree	hostAliases.ip	list	hostAliases	list_json	hostAliases	elem	hostAliases	field	ip	json	ip	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+other_omitempty	none
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin YAML description |- then list-map keys ==
+agree	conditions.type	list	conditions	list_json	conditions	elem	conditions	field	type	json	type	optional	-	protobuf	-	identity	x-kubernetes-list-map-keys
+agree	claims.name	list	claims	list_json	claims	elem	claims	field	name	json	name	optional	-	protobuf	-	identity	x-kubernetes-list-map-keys
+other_omitempty	none
+disagree_n	0
+agree_n	2
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin YAML versions: sequence CRD ==
+disagree	hostAliases.ip	list	hostAliases	list_json	hostAliases	elem	hostAliases	field	ip	json	ip	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+disagree	imagePullSecrets.name	list	imagePullSecrets	list_json	imagePullSecrets	elem	imagePullSecrets	field	name	json	name	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+other_omitempty	none
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin JSON OpenAPI list-map keys ==
+disagree	hostAliases.ip	list	hostAliases	list_json	hostAliases	elem	hostAliases	field	ip	json	ip	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+disagree	imagePullSecrets.name	list	imagePullSecrets	list_json	imagePullSecrets	elem	imagePullSecrets	field	name	json	name	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+other_omitempty	none
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin FILE.go FILE.yaml (documented order) ==
+disagree	LocalObjectReference.Name	list	ImagePullSecrets	list_json	imagePullSecrets,omitempty	elem	LocalObjectReference	field	Name	json	name,omitempty	optional	+optional,omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+disagree	HostAlias.IP	list	HostAliases	list_json	hostAliases,omitempty	elem	HostAlias	field	IP	json	ip,omitempty	optional	omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+disagree	imagePullSecrets.name	list	imagePullSecrets	list_json	imagePullSecrets	elem	imagePullSecrets	field	name	json	name	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+disagree	hostAliases.ip	list	hostAliases	list_json	hostAliases	elem	hostAliases	field	ip	json	ip	optional	not-required	protobuf	-	identity	x-kubernetes-list-map-keys
+other_omitempty	HostAlias.Hostnames
+disagree_n	4
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin spaces around +listMapKey = ==
+disagree	Item.Name	list	Items	list_json	items	elem	Item	field	Name	json	name,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin json:,inline embed (HostAlias.IP, not missing) ==
+disagree	HostAlias.IP	list	HostAliases	list_json	hostAliases	elem	HostAlias	field	IP	json	ip,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin untagged list field ==
+disagree	Item.Name	list	Items	list_json	-	elem	Item	field	Name	json	name,omitempty	optional	omitempty	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	1
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin duplicate type HostAlias (collision, not last-wins) ==
+collision	HostAlias.ip	list	HostAliases	list_json	hostAliases	elem	HostAlias	field	ip	json	duplicate-type	optional	-	protobuf	-	identity	listMapKey
+other_omitempty	HostAlias.IP
+disagree_n	0
+agree_n	0
+missing_n	0
+collision_n	1
+unparsed_n	0
+
+== tagjoin UTF-8 BOM (agree Item.Name, not join none) ==
+agree	Item.Name	list	Items	list_json	items	elem	Item	field	Name	json	name	optional	-	protobuf	-	identity	listMapKey
+other_omitempty	none
+disagree_n	0
+agree_n	1
+missing_n	0
+collision_n	0
+unparsed_n	0
+
+== tagjoin --check owned fixture (disagree → rc 1) ==
+disagree	LocalObjectReference.Name	list	ImagePullSecrets	list_json	imagePullSecrets,omitempty	elem	LocalObjectReference	field	Name	json	name,omitempty	optional	+optional,omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+disagree	HostAlias.IP	list	HostAliases	list_json	hostAliases,omitempty	elem	HostAlias	field	IP	json	ip,omitempty	optional	omitempty	protobuf	opt	identity	listMapKey,patchMergeKey
+other_omitempty	HostAlias.Hostnames
+disagree_n	2
+agree_n	0
+missing_n	0
+collision_n	0
+unparsed_n	0
+rc=1

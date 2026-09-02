@@ -1,0 +1,24 @@
+Registry / fixture:
+  CDK contentFingerprint large-file cache
+  leftover sha256 after same-size rewrite
+
+Case A (second fingerprint, same bytes, same mtime):
+  current cache identity
+  not leftover-after-rewrite
+
+Case B (contents rewritten, leftover cache hit):
+  leftover: previous sha256 fingerprint
+  full mtime omitted (day-of-month + ms-of-second)
+  same inode and size
+
+Case C (cache cleared / Node < 12 bypass):
+  fresh content identity
+  not leftover previous hash
+
+Case D (full mtime in cache key):
+  new hash after rewrite
+  not leftover previous fingerprint
+
+Not this packet:
+  black leftover project-root vs omitted CWD (specimen-139)
+  rustc incremental fingerprint (specimen-075)

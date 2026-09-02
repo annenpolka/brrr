@@ -1,0 +1,33 @@
+{
+  "summary": "Preserve instance identity across reruns. Printed ids are Dreamer-generated. Continue with an owned fixture that records id(self) without pytest-rerunfailures if that plugin is not installed.",
+  "preserve_add": [
+    "A rerun may reuse the same instance so state on self leaks into the next attempt"
+  ],
+  "established_add": [
+    "Public pytest-rerunfailures #340: create a fresh test class instance for each rerun"
+  ],
+  "rejected_add": [
+    "Specific memory ids and SETUP/TEST counts in this transcript are unverified"
+  ],
+  "constraints_add": [
+    "Do not install pytest-rerunfailures on the host",
+    "An owned class with a counter on self is enough"
+  ],
+  "open_questions_add": [
+    "Can the tool show same vs new id(self) across attempts using a tiny fixture?"
+  ],
+  "harvest_candidates_add": [
+    "Ask whether a retry reused the failed instance"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "show whether a retry reused the same test instance identity",
+    "nearest_existing_operation": "print id(self) in setup",
+    "observable_delta": "one query whose object is instance reuse across retries",
+    "reason": "ordinary pytest output does not make instance identity first-class"
+  },
+  "pressure": [
+    "pytest-rerunfailures is not installed. Continue on a tiny class fixture that records id(self) across two manual re-invocations of the same test method."
+  ],
+  "redpen_markdown": "NEXT_ACTION=CONTINUE_WITH_COUNTEREXAMPLE"
+}

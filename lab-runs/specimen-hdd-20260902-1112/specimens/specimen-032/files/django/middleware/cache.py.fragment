@@ -1,0 +1,36 @@
+# failing_ref cd7554e5517992d5ca2594ffc936cb193daab26c
+# UpdateCacheMiddleware.process_response (excerpt)
+
+        if response.streaming or response.status_code not in (200, 304):
+            return response
+
+        if (
+            not request.COOKIES
+            and response.cookies
+            and has_vary_header(response, "Cookie")
+        ):
+            return response
+
+        # Don't cache a response with 'Cache-Control: private'
+        if "private" in response.get("Cache-Control", ()):
+            return response
+
+        timeout = self.page_timeout
+        if timeout is None:
+            timeout = get_max_age(response)
+            if timeout is None:
+                timeout = self.cache_timeout
+            elif timeout == 0:
+                return response
+        patch_response_headers(response, timeout)
+        if timeout and response.status_code == 200:
+            cache_key = learn_cache_key(
+                request, response, timeout, self.key_prefix, cache=self.cache
+            )
+            if hasattr(response, "render") and callable(response.render):
+                response.add_post_render_callback(
+                    lambda r: self.cache.set(cache_key, r, timeout)
+                )
+            else:
+                self.cache.set(cache_key, response, timeout)
+        return response

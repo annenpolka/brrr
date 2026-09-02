@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""narleftover: leftover fetcher-cache NAR for a rev fingerprint vs lock narHash."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("rev", "lock_nar", "cache_nar")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "rev" not in fields or "lock_nar" not in fields or "cache_nar" not in fields:
+        raise ValueError(f"{source}: need rev, lock_nar, cache_nar")
+    return fields
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    lock = fields["lock_nar"]
+    cache = fields["cache_nar"]
+    leftover = cache != lock
+    return {
+        "rev": fields["rev"],
+        "lock_nar": lock,
+        "cache_nar": cache,
+        "leftover_stale_nar": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"rev\t{result['rev']}",
+        f"lock_nar\t{result['lock_nar']}",
+        f"cache_nar\t{result['cache_nar']}",
+        f"leftover_stale_nar\t{yn(result['leftover_stale_nar'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="narleftover",
+        description=(
+            "Name leftover fetcher-cache NAR for a rev fingerprint versus the "
+            "lock narHash after correction. grep of the rev hits both."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"narleftover: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_stale_nar"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,33 @@
+Registry / fixture:
+  in-tree: src/it/MCOMPILER-203-processorpath (reactor extra processor)
+  in-tree: src/it/MCOMPILER-522-unresolvable-dependency (missing extra GAV)
+  public MCOMPILER-496: extra processor in current multi-module build requires install/download
+
+Extra GAV (cases B/C):
+  org.issue:annotation-processor:1.0-SNAPSHOT
+  org.apache.maven.plugins.compiler.it:annotation-processor-non-existing:1.0-SNAPSHOT
+
+Case A (published extra GAV already in local repo):
+  -processorpath ~/.m2/repository/…/*.jar
+  compile classpath does not contain it unless also a <dependency>
+
+Case B (reactor sibling extra, process-test-classes, no install):
+  extra GAV not on annotation-user compile classpath
+  annotation-processor/target/classes exists in the reactor checkout
+  resolveProcessorPathEntries uses local+remote ArtifactResolutionRequest
+  public report: cannot resolve from current multi-module build
+
+Case C (missing extra GAV):
+  Resolution of annotationProcessorPath dependencies failed
+  Could not find artifact …:annotation-processor-non-existing:jar:1.0-SNAPSHOT
+
+Case D (extra GAV also a compile <dependency>):
+  compile classpath uses ordinary reactor project artifacts
+  processorpath still uses the separate ArtifactResolutionRequest
+
+Not this packet:
+  poetry extras table miss (specimen-021)
+  gradle configuration-cache unused property identity (specimen-076)
+  MCOMPILER-320 additionalCompilePathItems (PR 1, WON'T FIX, unpinned)
+  MCOMPILER-372 extra test-jar --patch-module (PR 27, unmerged)
+  SUREFIRE-2179 additionalClasspathDependencies (external-only by design)

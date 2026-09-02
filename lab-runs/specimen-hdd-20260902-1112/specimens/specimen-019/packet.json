@@ -1,0 +1,11 @@
+{
+  "id": "specimen-019",
+  "manifest": "\nid: specimen-019\nkind: COUNTEREXAMPLE_FIXTURE\nrepository: local-fixture\nmechanism_tags:\n  - config-substitution\n  - override-raw\n  - false-success\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2300\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nA file-backed command template is `pytest {posargs}`. A CLI override supplies the same spelling, `pytest {posargs}`, plus leftover arguments `tests src`. The process exits 0. One argv actually contains `tests` and `src`. The other argv\u2019s last token is the characters `{posargs}`.\n\nThe developer wants to know which layer expanded the token, and which tests (if any) the override actually ran.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/override_subst.py. File-backed template expands. The override path keeps the token as a literal argv element and still reports exit 0.\n\nPublic grounding (not executed here): tox-dev/tox#4047 / PR 4048 \u2014 `tox -x 'env_run_base.commands=pytest {posargs}' -- tests src` ran pytest against a directory named `{posargs}` rather than forwarding the arguments.\n\n## Captured host execution (stdlib, no third-party packages)\n```\nfile_argv ['pytest', 'tests', 'src']\noverride_argv ['pytest', '{posargs}']\ncli_leftover ['tests', 'src']\noverride_exit 0\noverride_ran_against {posargs}\n```\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/override_subst.py\n```\n",
+  "tree": "files/override_subst.py\n",
+  "source": "COUNTEREXAMPLE_FIXTURE against \u201cexit 0 means the intended command ran\u201d and \u201ca `{posargs}` spelling in the override was expanded\u201d.\nGrounded in tox-dev/tox#4047, PR https://github.com/tox-dev/tox/pull/4048\n(override values skipped the substitution pass used for file-backed config).\nOwned fixture; executed on lab host. tox itself was not installed.\n",
+  "answer_key": "KNOWN FIX (sealed): run CLI/TOX_OVERRIDE strings through the same substitution pass as file-backed values so `{posargs}` is not a literal argv token; leftover `--` arguments then attach to the expanded command. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\nCounterexample: exit 0 with a literal substitution token as the ran-against path.\n"
+}

@@ -1,0 +1,11 @@
+{
+  "id": "specimen-072",
+  "manifest": "\nid: specimen-072\nkind: PAIRED_SPECIMEN\nrepository: local-fixture\nfailing_ref: fixture-order-a-then-b-extra-global\nfixed_ref: fixture-order-b-then-a-extra-global\nmechanism_tags:\n  - order-dependent-test\n  - leaked-global-state\n  - extra-global\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2100\nanswer_key_sealed: true\nparent_specimens: [specimen-009]\nmutations: []\n",
+  "task": "# TASK\n\nPaired runs of the same two tests. Besides the leaked `acc` list from specimen-009,\ntest_a also sets an extra module global `flag = True`. test_b asserts `acc == []`\nand `flag is False`. Pair A (`test_b` then `test_a`) PASS. Pair B (`test_a` then\n`test_b`) FAIL. Same files. Only order changes.\n\nThe developer wants one question that names both leaked objects without reading\nboth traces by hand.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/run_orders_extra.py. Host-executed:\n\norder ('test_b', 'test_a')\n  test_b PASS\n  test_a PASS\n  acc_after ['a'] flag_after True\n\norder ('test_a', 'test_b')\n  test_a PASS\n  test_b FAIL\n  acc_after ['a'] flag_after True\n",
+  "commands": "# COMMANDS\n\npython3 files/run_orders_extra.py\n",
+  "tree": "TREE\n\nfiles/run_orders_extra.py\n",
+  "curation": "ACCEPT_R1\n",
+  "answer_key": "# FIX\n\nBoth `acc` and `flag` are module globals mutated by test_a. Order B sees them.\nA leak query that only snapshots `acc` misses `flag`.\n",
+  "source": "# SOURCE\n\nPaired PASS/FAIL from specimen-009 with an extra global `flag`.\nOwned fixture; no pytest required.\n"
+}

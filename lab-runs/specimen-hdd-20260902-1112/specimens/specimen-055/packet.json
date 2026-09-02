@@ -1,0 +1,11 @@
+{
+  "id": "specimen-055",
+  "manifest": "\nid: specimen-055\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-rootdir-subdir-collect-parent\nfixed_ref: fixture-collect-inside-rootdir\nmechanism_tags:\n  - rootdir-scope\n  - conftest-visibility\n  - collection-path\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2200\nanswer_key_sealed: true\nparent_specimens: [specimen-002]\nmutations: []\n",
+  "task": "# TASK\n\npytest is invoked with `--rootdir proj` while collection starts at the parent directory that contains both `proj/` and `tests/`. A name injected by `proj/conftest.py` is missing for the collected test. Collecting only under `proj/` the name is present.\n\nThe developer wants to know which conftest/config objects actually applied to the collected item.\n",
+  "observed": "# OBSERVED\n\nOwned layout (not a pytest clone):\n\n```\nparent/\n  tests/test_item.py\n  proj/conftest.py   # defines helper = 'from-rootdir-conftest'\n  proj/pytest.ini\n```\n\nHost-captured idea: a test that prints `helper if present else 'MISSING'`.\n\nWhen the collection path is the parent, the item can run without the rootdir conftest binding. When collection is inside `proj/`, the binding is present.\n\nThis packet does not execute pytest 9.1.1 on the host; it is a reduced layout of specimen-002.\n",
+  "commands": "# COMMANDS\n\n```\n# conceptual:\n# pytest --rootdir=proj tests/test_item.py\n# pytest --rootdir=proj proj\n```\n",
+  "tree": "parent\n  tests/test_item.py\n  proj/conftest.py\n  proj/pytest.ini\n",
+  "source": "Derived from specimen-002 (pytest-dev/pytest rootdir vs collection path).\nOwned fixture only. No third-party checkout.\n",
+  "answer_key": "KNOWN FIX (sealed): pytest 9.1 started applying rootdir more strictly so a conftest under --rootdir=subdir is not visible to items collected from a parent path. Collecting inside the rootdir restores the binding. Do not show this to Dreamers, initial Red Pen, initial Grounders, or first-selection judges.\n",
+  "curation": "ACCEPT_R1\nOwned two-directory counterexample for hdd-rootdir. Contrast: parent collection vs collection inside rootdir.\n"
+}

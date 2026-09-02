@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover pants vcs_version process cache vs omitted git hash is two greps. Do not harvest a pantvcs TSV. Do not send pants process-cache theater back to R1. Distinct from 075 / not #23645 OPEN.

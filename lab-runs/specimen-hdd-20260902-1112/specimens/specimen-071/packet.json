@@ -1,0 +1,11 @@
+{
+  "id": "specimen-071",
+  "manifest": "\nid: specimen-071\nkind: ADVERSARIAL_SPECIMEN\nrepository: local-fixture\nfailing_ref: fixture-extra-stub-present\nfixed_ref: fixture-extra-produced-for-request\nmechanism_tags:\n  - stale-fingerprint\n  - extra-output-stub\n  - present-but-not-produced\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2200\nanswer_key_sealed: true\nparent_specimens: [specimen-011]\nmutations: []\n",
+  "task": "# TASK\n\nA tiny build cache keys freshness by input hash only. First build writes `out.bin`\nand also writes an empty `out.sbom` stub as a side effect of hashing (extra was\nnot requested). Second build asks for extra output `out.sbom` from the same\ninputs. Cache reports FRESH. `out.sbom` exists. Its bytes are the empty stub.\n\nThe developer wants to know whether the extra file was produced for this request\nor leftover from the identity write, and which requested outputs were outside\nthat identity.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/cache_build_stub.py. Host-executed:\n\nfirst BUILT extra_requested False extra_exists True extra_bytes 0 key 9280cc7e16e9\nsecond FRESH extra_requested True extra_exists True extra_bytes 0 key 9280cc7e16e9\nsame_key True\nstub_leftover True\n",
+  "commands": "# COMMANDS\n\npython3 files/cache_build_stub.py\n",
+  "tree": "TREE\n\nfiles/cache_build_stub.py\n",
+  "curation": "ACCEPT_R1\n",
+  "answer_key": "# FIX\n\nThe stub is written whenever the identity is computed, not when extra is requested.\nPresence of `out.sbom` is not production-for-this-request. Identity still omits extra.\nDo not treat exists() as extra-complete.\n",
+  "source": "# SOURCE\n\nDerived adversarial of specimen-011 extra-output: present-but-stub instead of missing.\nOwned fixture; no third-party cache.\n"
+}

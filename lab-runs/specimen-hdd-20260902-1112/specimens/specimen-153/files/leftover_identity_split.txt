@@ -1,0 +1,23 @@
+Registry / fixture:
+  ~/.hex/packages/<repo>/<package>-<version>.tar
+  leftover tarball after registry checksum change
+
+Case A (second deps.get, same checksum):
+  current cache identity
+  not leftover-after-republish
+
+Case B (checksum changed, leftover cached tarball):
+  leftover: previous package-version.tar
+  mismatch omitted from fetch path
+  CaseClauseError
+
+Case C (rm tarball / cache missing):
+  fresh fetch identity
+  not leftover previous tarball
+
+Case D (mismatch refetch):
+  new tarball after checksum change
+  not leftover previous package
+
+Not this packet:
+  rubygems frozen lockfile platform identity (specimen-074)

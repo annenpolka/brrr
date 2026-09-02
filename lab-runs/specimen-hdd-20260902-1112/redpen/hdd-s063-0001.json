@@ -1,0 +1,30 @@
+{
+  "summary": "Invented pytest --debug traces of loadscope internals. Harvest completed-only work units that requeue into an empty send. Stop.",
+  "preserve_add": [
+    "A crashed node's whole assigned dict can be requeued, including scopes whose tests are already completed",
+    "send_runtest_some of an empty index list leaves the replacement worker waiting"
+  ],
+  "established_add": [
+    "Packet: workqueue.update(workload) puts every assigned scope back; indexes keep only not-completed items",
+    "Hang log: replacing crashed worker gw0, then the suite never finishes under --dist=loadgroup"
+  ],
+  "rejected_add": [
+    "Invented xdist DEBUG lines and scheduler_debug.log are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned work-unit table: scope to nodeid to completed bool. No pytest-xdist."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Which requeued work units were already completed, and which of those would send an empty index list"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name completed-only units that requeue into an empty send",
+    "nearest_existing_operation": "print the workqueue dict",
+    "observable_delta": "completed_only vs send () vs hang_risk",
+    "reason": "the hang is the empty send after a completed-only requeue, not the crash itself"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned work-unit records. Do not send pytest theater back to R1."
+}

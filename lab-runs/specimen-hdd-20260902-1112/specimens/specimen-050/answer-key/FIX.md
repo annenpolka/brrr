@@ -1,0 +1,2 @@
+KNOWN FIX (sealed): serde PR 2786. FlatMapSerializer.serialize_unit_variant ignored the variant identifier and returned Unsupported::Enum, while flatten deserialize already treated a unit variant as a map key whose value is null. Repair writes serialize_entry(variant, unit-value) and cfg-gates the Enum unsupported arm to no_std/no_alloc only. In-tree regression: flatten::enum_::unit in test_annotations.rs.
+Do not show this to Dreamers, initial Red Pen, initial Grounders, or first-selection judges.

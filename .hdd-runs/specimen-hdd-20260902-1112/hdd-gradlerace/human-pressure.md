@@ -1,0 +1,1 @@
+- No Gradle. Continue on a tiny unsynchronized dict written from two threads.

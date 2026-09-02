@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover omitted abandoned in installed.json vs lock is two greps. Do not harvest a cmpabandon TSV. Do not send composer theater back to R1. Distinct from 074/021/086. Dreamer named the sealed PR.

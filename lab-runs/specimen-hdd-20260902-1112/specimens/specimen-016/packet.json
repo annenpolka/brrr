@@ -1,0 +1,11 @@
+{
+  "id": "specimen-016",
+  "manifest": "\nid: specimen-016\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-lockfile-omitted-from-key\nfixed_ref: fixture-lockfile-in-key\nmechanism_tags:\n  - stale-fingerprint\n  - lockfile-not-in-key\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2400\nanswer_key_sealed: true\nparent_specimens: [specimen-006]\nmutations: []\n",
+  "task": "# TASK\n\nA tiny crate cache reports freshness from a short hex identity. After the first build, only `Cargo.lock` (here, a one-line lockfile) changes: `serde = \"1.0.0\"` becomes `serde = \"1.0.219\"`. The second build prints FRESH. The artifact still says it was built with `1.0.0`.\n\nThe developer wants to know which bytes entered that identity, and whether the live lockfile is one of them.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/cache_lock.py. Derived from specimen-006 (CI cache retaining superseded fingerprints across lockfile updates) by changing one axis: leftover *workspace member artifacts* vs a *lockfile-only* change against the same source tree.\n\n## Captured host execution (stdlib, no third-party packages)\n```\nfirst BUILT key 673767793f4a artifact built-with:serde = \"1.0.0\"\nafter_lock_bump FRESH key 673767793f4a artifact built-with:serde = \"1.0.0\"\nsame_key True\nlock_changed True\nlock_old serde = \"1.0.0\"\nlock_new serde = \"1.0.219\"\n```\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/cache_lock.py\n```\n",
+  "tree": "files/cache_lock.py\n",
+  "source": "Derived from specimen-006 (astral-sh/uv#20774 workspace CI cache / stale fingerprint).\nAxis changed: leftover workspace-member fingerprints \u2192 lockfile bytes absent from the freshness identity.\nOwned fixture; executed on lab host. Not a reproduction of uv itself.\n",
+  "answer_key": "KNOWN FIX (sealed): include lockfile contents in the freshness digest so a lock-only bump cannot reuse the prior artifact identity. Specimen-006 leftover-member restores are a sibling symptom of the same stale-fingerprint family; this mutation isolates the lockfile axis. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\nDerived lockfile-vs-source identity contrast; lock bump with FRESH is locally verified.\n"
+}

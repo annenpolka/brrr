@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): pytest 9.1 started applying rootdir more strictly so a conftest under --rootdir=subdir is not visible to items collected from a parent path. Collecting inside the rootdir restores the binding. Do not show this to Dreamers, initial Red Pen, initial Grounders, or first-selection judges.

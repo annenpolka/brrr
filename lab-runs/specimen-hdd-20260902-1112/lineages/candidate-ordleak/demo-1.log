@@ -1,0 +1,180 @@
+== fixture /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-009/files/test_order.py ==
+order ('test_a', 'test_b')
+  test_a PASS
+  test_b FAIL ['a']
+  acc_after ['a']
+order ('test_b', 'test_a')
+  test_b PASS
+  test_a PASS
+  acc_after ['a']
+
+== ordleak test_a test_b (both orders) ==
+file	/Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/specimens/specimen-009/files/test_order.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	acc	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== class-attribute Box.items ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_class_attr.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	Box.items	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== helper-module from helper import bucket ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/helper/test_order.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	bucket	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== class-method TestOrder.test_a ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_class_method.py
+pair	TestOrder.test_a	TestOrder.test_b
+order	TestOrder.test_a TestOrder.test_b
+status	TestOrder.test_a	PASS
+status	TestOrder.test_b	FAIL	['a']
+order	TestOrder.test_b TestOrder.test_a
+status	TestOrder.test_b	PASS
+status	TestOrder.test_a	PASS
+exposing_order	TestOrder.test_a TestOrder.test_b
+leaked	TestOrder.acc	into	TestOrder.test_b	[]	['a']	via	TestOrder.test_a
+exit: 1
+
+== import-time time_ns is not a leak ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_stamp.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	PASS
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	none
+leaked	none
+exit: 0
+
+== env split is unseen, not none ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_env.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	a
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	<unseen>
+exit: 1
+
+== function-local holder.acc ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_fnattr.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	holder.acc	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== private _acc is named ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_private.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	_acc	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== package from pkg.helper import bucket ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/pkg/test_from_pkg.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	bucket	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== relative from .helper import bucket ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/pkg/test_relative.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	['a']
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	bucket	into	test_b	[]	['a']	via	test_a
+exit: 1
+
+== slots box.n ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_slots.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	1
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	test_a test_b
+leaked	box	into	test_b	Box(n=0)	Box(n=1)	via	test_a
+leaked	box.n	into	test_b	0	1	via	test_a
+exit: 1
+
+== dual-FAIL /tmp smear is unseen not none ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_smear.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	FAIL	a
+order	test_b test_a
+status	test_b	FAIL	a
+status	test_a	PASS
+exposing_order	none
+leaked	<unseen>
+exit: 1
+
+== binary stdout is not a utf-8 crash ==
+file	/Users/annenpolka/.grok/worktrees/annenpolka-brrr/candidate-ordleak-ordleak/ordleak/tests/fixtures/test_binary.py
+pair	test_a	test_b
+order	test_a test_b
+status	test_a	PASS
+status	test_b	PASS
+order	test_b test_a
+status	test_b	PASS
+status	test_a	PASS
+exposing_order	none
+leaked	none
+exit: 0
+

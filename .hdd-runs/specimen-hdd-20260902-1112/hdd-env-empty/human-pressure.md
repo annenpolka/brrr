@@ -1,0 +1,1 @@
+- There is no process-attach tracer. Only the two loader return dicts and os.environ prints are observable. Emit a layer table for KEY.

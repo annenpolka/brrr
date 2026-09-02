@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""identjson: name decode class of leftover identity JSON vs schema identity."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+OMITTED_JSON = {None, "", "-", "none", "nil"}
+NIL_SCHEMA = {"nil", "-", "none", "empty"}
+EMPTY_SCHEMA = {"{}", "empty-object"}
+
+
+def parse_record(text: str, *, source: str) -> dict:
+    schema = None
+    raw_json = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key == "schema":
+            schema = rest
+        elif key == "identity_json":
+            raw_json = rest
+        else:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+    if schema is None:
+        raise ValueError(f"{source}: missing schema")
+    return {"schema": schema, "identity_json": raw_json, "source": source}
+
+
+def schema_fields(schema: str) -> list[str] | None:
+    if schema in NIL_SCHEMA:
+        return None
+    if schema in EMPTY_SCHEMA:
+        return []
+    # Identity object attributes: space- or comma-separated ("id  arn", "id, arn").
+    return [p for p in schema.replace(",", " ").split() if p]
+
+
+def inspect(rec: dict) -> dict:
+    fields = schema_fields(rec["schema"])
+    schema_kind = "nil" if fields is None else "present"
+    raw = rec["identity_json"]
+    # Decode skips the identity branch when IdentityJSON is nil (zero cty.Value).
+    if raw in OMITTED_JSON:
+        return {
+            "schema": schema_kind,
+            "json": "omitted",
+            "decode": "omitted",
+            "error_class": "-",
+        }
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"identity_json: {err}") from err
+    # JSON null unmarshals as typed null of ImpliedType (EmptyObject or object).
+    if obj is None:
+        return {
+            "schema": schema_kind,
+            "json": "null",
+            "decode": "typed-null",
+            "error_class": "-",
+        }
+    if not isinstance(obj, dict):
+        raise ValueError("identity_json must be a JSON object")
+    keys = list(obj.keys())
+    json_kind = "empty-object" if not keys else "present"
+    # nil *configschema.Object ImpliedType is EmptyObject; empty attr map is too.
+    empty_implied = fields is None or fields == []
+    if empty_implied:
+        if keys:
+            return {
+                "schema": schema_kind,
+                "json": json_kind,
+                "decode": "error",
+                "error_class": "unsupported-attribute",
+            }
+        return {
+            "schema": schema_kind,
+            "json": "empty-object",
+            "decode": "empty-object",
+            "error_class": "-",
+        }
+    extra = [k for k in keys if k not in fields]
+    if extra:
+        return {
+            "schema": "present",
+            "json": json_kind,
+            "decode": "error",
+            "error_class": "unsupported-attribute",
+        }
+    return {
+        "schema": "present",
+        "json": json_kind,
+        "decode": "object",
+        "error_class": "-",
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"schema\t{result['schema']}",
+        f"json\t{result['json']}",
+        f"decode\t{result['decode']}",
+        f"error_class\t{result['error_class']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="identjson",
+        description=(
+            "Name the decode class of leftover identity JSON against a nil "
+            "or present identity schema: object, omitted, typed-null, "
+            "empty-object, or unsupported-attribute error."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        rec = parse_record(Path(args.record).read_text(encoding="utf-8"), source=args.record)
+        result = inspect(rec)
+    except (OSError, ValueError) as err:
+        print(f"identjson: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    return 1 if result["decode"] == "error" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

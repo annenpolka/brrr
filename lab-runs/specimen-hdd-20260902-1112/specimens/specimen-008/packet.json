@@ -1,0 +1,11 @@
+{
+  "id": "specimen-008",
+  "manifest": "\nid: specimen-008\nkind: REAL_SOURCE_BACKED\nrepository: django/django\nfailing_ref: 0b40210e4808937a7c0922e8b7502bff4752faa3\nfixed_ref: 019551708027e70ddaea5910276493b5a4b30f0c\nsource_issue: https://code.djangoproject.com/ticket/37255\nsource_pr: https://github.com/django/django/pull/21745\nmechanism_tags:\n  - unspecified-order\n  - flaky-test\n  - sql\necosystem: python\nreproduction_status: source-backed\nsafety_status: not-executed-on-host\npacket_tokens_estimate: 5500\nanswer_key_sealed: true\nparent_specimens: []\nmutations: [specimen-012]\n",
+  "task": "# TASK\n\n~70 Django tests assert a specific row order for querysets whose SQL has no ORDER BY. They pass on a freshly loaded PostgreSQL table (physical order \u2248 insertion order) and fail later after updates/deletes reuse heap space, or when the planner chooses an index scan \u2014 with no change to Django or to the test.\n\nThe developer wants to see which assertions depend on an order the database did not promise.\n",
+  "observed": "# OBSERVED\n\nPublic Django ticket 37255 / PR 21745.\n\n- Assertions compare queryset results to a list with a fixed order.\n- Generated SQL has no ORDER BY.\n- Failures appear after heap reuse or planner index scans.\n- Same tests, same Django revision, different storage layout \u2192 different result order.\n",
+  "commands": "# COMMANDS\n\nDjango test suite on PostgreSQL after updates/deletes that reuse heap pages. Not executed on the lab host.\n",
+  "tree": "django/tests/  (~70 tests asserting unordered queryset order)\n",
+  "source": "pr: https://github.com/django/django/pull/21745\nticket: https://code.djangoproject.com/ticket/37255\nfailing_ref: 0b40210e4808937a7c0922e8b7502bff4752faa3\nfixed_ref: 019551708027e70ddaea5910276493b5a4b30f0c\nmerged_at: 2026-08-27T13:52:45Z\n",
+  "answer_key": "KNOWN FIX (sealed): tests were changed so they do not rely on unspecified unordered SELECT order (explicit order_by or order-insensitive comparisons). Not a Django ORM runtime fix.\n",
+  "curation": "ACCEPT_R1\n"
+}

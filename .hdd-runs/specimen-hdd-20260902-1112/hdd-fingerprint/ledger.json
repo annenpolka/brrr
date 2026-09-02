@@ -1,0 +1,97 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "A cache can report FRESH while a newly requested output kind is absent",
+    "Freshness identity may be keyed by inputs while requested outputs sit outside that identity",
+    "FRESH plus a missing requested extra output is the observable"
+  ],
+  "established": [
+    "Packet: first build without extra artifact, second build requests SBOM precursor, cache hit, file missing",
+    "Turn 1 packet: first build without extra artifact, second build requests it, cache hit, file missing",
+    "Owned cache_build.py prints first BUILT extra_exists False; second FRESH extra_exists False same key"
+  ],
+  "rejected": [
+    "cargo-inspect is not present; its JSON is Dreamer-generated",
+    "Specific fingerprint hashes and rustc 1.78.0 are unsupported precision",
+    "CARGO_BUILD_SBOM / -Zsbom / sbom-precursor.json were not produced on this host",
+    "Recommendations to change the cargo cache key are not specimen evidence",
+    "cargo build logs in this turn are not host-executed"
+  ],
+  "constraints": [
+    "No cache-introspection CLI that lists fingerprint components exists",
+    "Observable evidence is build status text and whether named output files exist",
+    "No cache-introspection CLI",
+    "Observable evidence is FRESH/BUILT text and whether named output files exist",
+    "Prefer the owned input-hash cache fixture over an invented cargo tree",
+    "Ground on the owned Python cache fixture"
+  ],
+  "open_questions": [
+    "Can the tool name the identity mismatch using only FRESH/BUILT and a missing path?"
+  ],
+  "human_pressure": [
+    "There is no cache-introspection CLI that lists fingerprint components. Only build status text and whether named output files exist are observable. A tiny owned cache that keys only on input hash and ignores extra outputs is present. Use the same tool on that fixture."
+  ],
+  "harvest_candidates": [
+    "Ask which requested outputs are absent from the freshness identity that just said FRESH",
+    "Report identity miss: FRESH while requested output absent"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "given two builds, say whether freshness identity omitted a requested output",
+    "nearest_existing_operation": "ls the output dir after a cache hit",
+    "observable_delta": "names FRESH-but-missing as an identity miss not a successful hit",
+    "reason": "ls cannot say why the extra output was not part of the key",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T11:35:48+09:00",
+      "summary": "Preserve the missing-output-from-freshness-identity question. cargo-inspect JSON, sha256 prefixes, rustc 1.78, and unit keys are fabricated precision. Do not request more novelty.",
+      "pressure": [
+        "There is no cargo-inspect and no fingerprint component listing. Continue using the tool with only the two build statuses and whether the extra output file exists.",
+        "A tiny owned cache that keys only on input hash and ignores extra outputs is present. Use the same tool on that fixture."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "given two builds, report whether freshness used an identity that omitted requested outputs",
+        "nearest_existing_operation": "read cargo verbose logs and ls target/",
+        "observable_delta": "one query that states FRESH-but-missing-output as an identity miss rather than a successful cache hit",
+        "reason": "surviving operation is naming the output set as part of cache identity, not a new build engine",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T11:52:02+09:00",
+      "summary": "Preserve FRESH-with-missing-requested-output. cargo -Zsbom, sbom-precursor.json, mermaid, and bitmask key recipes are Dreamer-generated. Host evidence remains build status plus whether a named extra file exists. Harvest the identity-miss question. Do not ask for more novelty.",
+      "pressure": [
+        "There is still no cargo-inspect. The owned cache fixture is the world."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "given two builds, report whether freshness used an identity that omitted requested outputs",
+        "nearest_existing_operation": "read verbose build logs and ls the extra output path",
+        "observable_delta": "one query that states FRESH-but-missing-output as an identity miss rather than a successful cache hit",
+        "reason": "surviving operation is naming the output set as part of cache identity, not a new build engine",
+        "iteration": 2
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T11:53:11+09:00",
+      "summary": "Turn 2 still talks cargo instead of the owned input-hash cache fixture. Harvest FRESH-but-missing-output using specimen-011. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "given two builds, say whether freshness identity omitted a requested output",
+        "nearest_existing_operation": "ls the output dir after a cache hit",
+        "observable_delta": "names FRESH-but-missing as an identity miss not a successful hit",
+        "reason": "ls cannot say why the extra output was not part of the key",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

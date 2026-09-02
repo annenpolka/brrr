@@ -1,0 +1,25 @@
+Registry / fixture:
+  moon.yml envFile: true, inputs include .env
+  leftover task cache after FOO=123 -> FOO=456
+
+Case A (second moon run, same .env):
+  current cache identity
+  not leftover-after-env-change
+
+Case B (.env flipped, leftover cache):
+  leftover: previous env file's task output
+  env file omitted from inputs and/or skipped as gitignored
+  cached output reused
+
+Case C (delete moon cache):
+  fresh hash identity
+  not leftover previous env
+
+Case D (env file hashed even if gitignored):
+  cache miss after .env change
+  not leftover previous output
+
+Not this packet:
+  pixi leftover task cache filename omitting args (specimen-119)
+  go-task leftover wildcard MATCH (specimen-115)
+  stylelint leftover cache hashing empty CLI config (specimen-133)

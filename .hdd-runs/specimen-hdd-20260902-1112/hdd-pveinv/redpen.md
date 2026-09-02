@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover proxmox inventory vs omitted persist after refresh is two greps. Do not harvest a pveinv TSV. Do not send ansible proxmox inventory-cache theater back to R1. Distinct from 136 and 142.

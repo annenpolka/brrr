@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): pytest 9.1 changed conftest fixture visibility from nodeid-based to node-based (#14098). Rootdir conftest became scoped to its Directory node; items collected outside rootdir do not have that Directory as ancestor. Fix attaches rootdir conftest to Session in _flush_pending_conftests_to_session and pytest_make_collect_report.

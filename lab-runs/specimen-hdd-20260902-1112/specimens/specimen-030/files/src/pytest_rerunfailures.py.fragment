@@ -1,0 +1,33 @@
+# failing_ref 0440e2158c98187a6ccd283e9c0b65475d1cd620
+# excerpts from src/pytest_rerunfailures.py
+
+def _remove_cached_results_from_failed_fixtures(item):
+    cached_result = "cached_result"
+    fixture_info = getattr(item, "_fixtureinfo", None)
+    for fixture_def_str in getattr(fixture_info, "name2fixturedefs", ()):
+        fixture_defs = fixture_info.name2fixturedefs[fixture_def_str]
+        for fixture_def in fixture_defs:
+            if getattr(fixture_def, cached_result, None) is not None:
+                result, _, err = getattr(fixture_def, cached_result)
+                if err:
+                    setattr(fixture_def, cached_result, None)
+                    if hasattr(fixture_def, "_finalizers"):
+                        fixture_def._finalizers.clear()
+
+
+def _remove_failed_setup_state_from_session(item):
+    setup_state = item.session._setupstate
+    if item in setup_state.stack:
+        del setup_state.stack[item]
+
+
+# inside pytest_runtest_protocol, after a failed attempt that will be retried:
+                report.outcome = "rerun"
+                time.sleep(delay * delay_backoff_factor ** (item.execution_count - 1))
+                if not parallel or works_with_current_xdist():
+                    item.ihook.pytest_runtest_logreport(report=report)
+                _remove_cached_results_from_failed_fixtures(item)
+                _remove_failed_setup_state_from_session(item)
+                _remove_failed_subtests_from_report(item, report)
+                _remove_failed_subtest_reports_from_stats(item)
+                break  # trigger rerun

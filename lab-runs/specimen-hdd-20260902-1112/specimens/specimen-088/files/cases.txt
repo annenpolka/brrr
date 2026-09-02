@@ -1,0 +1,32 @@
+Case A (queried directory tree) — build.gradle
+  task report {
+      def tree = fileTree("src")
+      def result = 'files=' + tree.files.name.sort()
+      doLast { println(result) }
+  }
+  disk run 1/2: src/file1, src/dir/file2
+  after run 2: create src/file3
+  question: run 3 CC identity with vs without the tree contents
+
+Case B (fixed names) — build.gradle
+  task report {
+      def files = files("file1", "file2")
+      def result = files.files.name
+      doLast { println(result) }
+  }
+  after store+load: rewrite file1 contents to "updated"
+  documented on the later integration test: still load, still [file1, file2]
+
+Case C (tree constructed, never queried)
+  fileTree("src") assigned, no .files / .empty / .contains / .visit
+  after store+load: create src/file3
+
+Kotlin DSL contrast on failing_ref (does notify):
+  DefaultPrecompiledScriptPluginsSupport.collectScriptPluginFiles
+  fileTree include **/*.gradle.kts, filter isFile,
+  Instrumented.fileCollectionObserved(it, "Kotlin DSL"), then .files
+
+Public 7.6 sample (gradle/configuration-cache-build-logic-inputs README):
+  queryDirInDsl against file-collections/src/dir
+  echo ignored > file-collections/src/dir/file3.txt
+  Gradle 7.6: incorrect cache hit, new file ignored

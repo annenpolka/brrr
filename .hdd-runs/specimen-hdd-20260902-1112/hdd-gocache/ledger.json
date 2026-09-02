@@ -1,0 +1,67 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "A test-file-list identity can stay FRESH while the binary buildid changed",
+    "A test cache keyed only by test files can report FRESH after the binary buildid changes",
+    "same_key True with key_includes_buildid False is a stale binary, not a hit"
+  ],
+  "established": [
+    "Host: key 55e3acdd667f same across buildid-aaa vs buildid-bbb; lockident tests in, buildid omitted",
+    "Owned: first BUILT key 55e3acdd667f buildid-aaa; second FRESH same key buildid-bbb cached_buildid-aaa; stale_binary True"
+  ],
+  "rejected": [
+    "Invented go tool buildid is not needed; the fixture already names the miss",
+    "Proposed test_key() patch is not host evidence",
+    "go tool buildid was not run"
+  ],
+  "constraints": [
+    "Transfer lockident. No new cache CLI. No go.",
+    "Owned two cache events: key, buildid, cached_buildid, status. freshmiss is missing extra, not stale buildid"
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "whether the cache key included the binary buildid",
+    "whether the cache key included the binary buildid, and whether FRESH reused a stale binary"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name FRESH same-key while buildid changed",
+    "nearest_existing_operation": "freshmiss / print cache key",
+    "observable_delta": "key_includes_buildid no; stale_binary yes",
+    "reason": "identity omitted buildid; extra-missing is a different absence",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T14:08:56+09:00",
+      "summary": "Used owned gocache_buildid.py (good). Harvest: FRESH identity omitted buildid. Transfer lockident. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name a blob omitted from a FRESH identity while a stale binary is reused",
+        "nearest_existing_operation": "lockident",
+        "observable_delta": "tests in_identity, buildid omitted",
+        "reason": "lockident already names this join",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T14:11:10+09:00",
+      "summary": "Used owned gocache_buildid.py (good). Did not invent a CLI. Preserve FRESH same key while buildid changed. Harvest key-includes-buildid vs stale binary. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name FRESH same-key while buildid changed",
+        "nearest_existing_operation": "freshmiss / print cache key",
+        "observable_delta": "key_includes_buildid no; stale_binary yes",
+        "reason": "identity omitted buildid; extra-missing is a different absence",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

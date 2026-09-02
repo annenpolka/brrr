@@ -1,0 +1,28 @@
+{
+  "summary": "Invented pytest --debug xdist logs. Preserve requeued completed work units after worker replace. Harvest on owned queue events; no pytest.",
+  "preserve_add": [
+    "After a crashed worker is replaced, a work unit already completed can be put back on the queue and the replacement never finishes"
+  ],
+  "established_add": [
+    "Packet: --dist=loadgroup hangs after faulthandler kills a worker; other dist modes finish"
+  ],
+  "rejected_add": [
+    "Invented xdist DEBUG scheduler transcripts are not host evidence"
+  ],
+  "constraints_add": [
+    "No pytest-xdist. Owned events: unit, completed, requeued, assigned"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Which work units were requeued after the crash, which were already completed, and which the replacement never finished"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name a completed work unit that was requeued to a replacement worker",
+    "nearest_existing_operation": "read the hang log",
+    "observable_delta": "completed vs requeued vs unfinished",
+    "reason": "hang log still leaves that join as a hand comparison"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Do not send invented xdist debug CLI back to R1."
+}

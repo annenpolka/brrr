@@ -1,0 +1,27 @@
+Registry / fixture:
+  cache_dir = .pytest_cache
+  Cache.set / Cache.mkdir
+
+Case A (first set, absent dir):
+  supporting-file identity written
+  no leftover uninitialized dir
+
+Case B (interrupt after dir exists, no .gitignore):
+  leftover: exists() identity
+  .gitignore / CACHEDIR.TAG omitted
+
+Case C (mkdir then set, no interrupt):
+  mkdir created _cachedir via parents=True
+  leftover: same omitted supporting files
+
+Case D (--cache-clear then set):
+  leftover dir removed
+  not this leftover
+
+Not this packet:
+  assertion display evaluation order (specimen-001)
+  collection-identity / config-scope (specimen-002)
+  object-identity / fixture-closure (specimen-003)
+  derived rootdir collect (specimen-055)
+  vitest cache key (specimen-094)
+  pytest#5702 / #3968 / #10002 / #14935 (open; no merged fixed_ref)

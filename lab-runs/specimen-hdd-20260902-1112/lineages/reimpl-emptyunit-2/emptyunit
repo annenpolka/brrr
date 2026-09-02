@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Name leftover empty-unit identity as collection-index partitions.
+
+Flatten a workqueue dump to (nodeid, completed) in insertion order, ignoring
+caller keys. Partition by dist-scope. Each partition's send is the collection
+indexes of its incomplete nodeids. Replacement burst is the first partition,
+plus the next when that first partition has 1 or 2 incompletes. hang_risk is
+any burst partition whose send list is empty.
+
+This is not a first-dict empty-list check and not a dist sticker on already
+grouped keys.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+DONE = frozenset({"done", "true", "yes", "1", "completed"})
+OPEN = frozenset({"open", "false", "no", "0", "incomplete"})
+ENVELOPE_KEYS = frozenset({"collection", "workqueue", "assigned", "dist"})
+DISTS = frozenset({"loadgroup", "loadscope"})
+COLLECTION_CAP = 8192
+WATERMARK_LO = 1
+WATERMARK_HI = 2
+
+
+class DumpError(Exception):
+    def __init__(self, message: str, source: str = "-") -> None:
+        super().__init__(message)
+        self.message = message
+        self.source = source
+
+
+def yesno(flag: bool) -> str:
+    return "yes" if flag else "no"
+
+
+def cells(items: Iterable[str]) -> str:
+    seq = list(items)
+    return "\t".join(seq) if seq else "-"
+
+
+def send_tuple(indexes: list[int]) -> str:
+    if not indexes:
+        return "()"
+    return "(" + ",".join(str(i) for i in indexes) + ")"
+
+
+def as_completed(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        raise DumpError(f"unknown completed flag {value!r}")
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in DONE:
+            return True
+        if key in OPEN:
+            return False
+        raise DumpError(f"unknown completed flag {value!r}")
+    raise DumpError(f"unknown completed flag {value!r}")
+
+
+def check_nodeid(nodeid: Any, *, where: str) -> str:
+    if not isinstance(nodeid, str):
+        raise DumpError(f"{where} must be a string, got {type(nodeid).__name__}")
+    if nodeid != nodeid.strip():
+        raise DumpError(f"whitespace in nodeid {nodeid!r}")
+    if nodeid == "":
+        raise DumpError("empty nodeid")
+    if nodeid == "-":
+        raise DumpError("empty sentinel")
+    return nodeid
+
+
+def scope_of(nodeid: str, dist: str) -> str:
+    if dist == "loadscope":
+        return nodeid.rsplit("::", 1)[0]
+    at = nodeid.rfind("@")
+    bracket = nodeid.rfind("]")
+    if at != -1 and at > bracket:
+        return nodeid[at + 1 :]
+    return nodeid
+
+
+@dataclass
+class Node:
+    nodeid: str
+    completed: bool
+
+
+@dataclass
+class Partition:
+    scope: str
+    nodes: list[Node] = field(default_factory=list)
+
+    def incompletes(self) -> list[Node]:
+        return [n for n in self.nodes if not n.completed]
+
+    def completes(self) -> list[Node]:
+        return [n for n in self.nodes if n.completed]
+
+    def pending(self) -> int:
+        return len(self.incompletes())
+
+    def completed_only(self) -> bool:
+        return bool(self.nodes) and self.pending() == 0
+
+    def send_indexes(self, collection: list[str]) -> list[int]:
+        indexes: list[int] = []
+        missing: list[str] = []
+        for node in self.incompletes():
+            try:
+                indexes.append(collection.index(node.nodeid))
+            except ValueError:
+                missing.append(node.nodeid)
+        if missing:
+            raise DumpError("index-error: " + ", ".join(missing) + " not in collection")
+        return indexes
+
+
+@dataclass
+class Record:
+    collection: list[str]
+    dist: str
+    nodes: list[Node]
+    source: str = "-"
+
+
+@dataclass
+class Report:
+    collection: list[str]
+    dist: str
+    partitions: list[Partition]
+    assigned: list[Partition]
+    reschedule: bool
+    pending: int
+    requeued: bool
+    hang_risk: bool
+    hang_unit: str | None
+    first_assigned: str | None
+    would_send: list[int] | None
+
+    def completed_only(self) -> list[str]:
+        return [p.scope for p in self.partitions if p.completed_only()]
+
+    def incomplete_scopes(self) -> list[str]:
+        return [p.scope for p in self.partitions if p.pending() > 0]
+
+
+def flatten_units(units: Any) -> list[Node]:
+    if not isinstance(units, dict):
+        raise DumpError("workqueue must be a dict of units")
+    nodes: list[Node] = []
+    seen: set[str] = set()
+    for _caller, inner in units.items():
+        if not isinstance(inner, dict):
+            raise DumpError("work unit must be a dict of nodeid -> completed")
+        for raw_id, raw_flag in inner.items():
+            nodeid = check_nodeid(raw_id, where="nodeid")
+            if nodeid in seen:
+                raise DumpError(f"duplicate nodeid {nodeid}")
+            seen.add(nodeid)
+            nodes.append(Node(nodeid, as_completed(raw_flag)))
+    return nodes
+
+
+def partition_nodes(nodes: list[Node], dist: str) -> list[Partition]:
+    order: list[str] = []
+    bags: dict[str, list[Node]] = {}
+    for node in nodes:
+        scope = scope_of(node.nodeid, dist)
+        if scope not in bags:
+            bags[scope] = []
+            order.append(scope)
+        bags[scope].append(node)
+    return [Partition(scope, bags[scope]) for scope in order]
+
+
+def choose_units(blob: dict[str, Any]) -> Any:
+    workqueue = blob.get("workqueue")
+    assigned = blob.get("assigned")
+    if workqueue:
+        return workqueue
+    if assigned:
+        return assigned
+    if workqueue == {}:
+        if assigned:
+            return assigned
+        return {}
+    return workqueue if workqueue is not None else assigned
+
+
+def parse_collection(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise DumpError("collection must be a list")
+    if len(value) > COLLECTION_CAP:
+        raise DumpError(f"collection exceeds cap ({COLLECTION_CAP})")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        nodeid = check_nodeid(item, where="collection")
+        if nodeid in seen:
+            raise DumpError(f"duplicate collection nodeid {nodeid}")
+        seen.add(nodeid)
+        out.append(nodeid)
+    return out
+
+
+def parse_dist(value: Any) -> str:
+    if value is None:
+        return "loadgroup"
+    if not isinstance(value, str):
+        raise DumpError("dist must be loadgroup|loadscope")
+    if value not in DISTS:
+        raise DumpError("dist must be loadgroup|loadscope")
+    return value
+
+
+def envelope_from_mapping(blob: dict[str, Any]) -> Record:
+    dist = parse_dist(blob.get("dist"))
+    units = choose_units(blob)
+    if units is None:
+        raise DumpError("missing workqueue")
+    nodes = flatten_units(units)
+    collection = parse_collection(blob.get("collection"))
+    if collection is None:
+        collection = [n.nodeid for n in nodes]
+        if len(collection) > COLLECTION_CAP:
+            raise DumpError(f"collection exceeds cap ({COLLECTION_CAP})")
+    return Record(collection=collection, dist=dist, nodes=nodes)
+
+
+def looks_like_hang_log(text: str) -> bool:
+    return "replacing crashed worker" in text or "workers [" in text
+
+
+def _eval_python(text: str) -> Any:
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        pass
+    try:
+        return eval(text, {"OrderedDict": OrderedDict, "__builtins__": {}}, {})
+    except Exception as exc:
+        raise DumpError(f"not a workqueue dump ({exc})") from exc
+
+
+def _json_or_python(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return _eval_python(text)
+
+
+def _split_two_blobs(text: str) -> tuple[str, str] | None:
+    stripped = text.strip()
+    if not stripped.startswith("["):
+        return None
+    depth = 0
+    in_str = False
+    quote = ""
+    escape = False
+    for i, ch in enumerate(stripped):
+        if in_str:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
+        if ch in "'\"":
+            in_str = True
+            quote = ch
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                first = stripped[: i + 1]
+                rest = stripped[i + 1 :].strip()
+                if rest:
+                    return first, rest
+                return None
+    return None
+
+
+def parse_mapping_blob(obj: Any) -> Record:
+    if isinstance(obj, list):
+        raise DumpError("not a workqueue dump")
+    if not isinstance(obj, dict):
+        raise DumpError("not a workqueue dump")
+    if ENVELOPE_KEYS.intersection(obj):
+        return envelope_from_mapping(obj)
+    if obj and all(isinstance(v, dict) for v in obj.values()):
+        return envelope_from_mapping({"workqueue": obj})
+    raise DumpError("not a workqueue dump")
+
+
+def parse_tsv(text: str) -> Record:
+    collection: list[str] | None = None
+    dist = "loadgroup"
+    units: OrderedDict[str, OrderedDict[str, bool]] = OrderedDict()
+    for raw in text.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if "\t" not in line:
+            raise DumpError("expected key<TAB>value")
+        fields = line.split("\t")
+        kind = fields[0]
+        rest = fields[1:]
+        if kind == "collection":
+            if rest == [""]:
+                collection = []
+            else:
+                collection = parse_collection(rest)
+        elif kind == "dist":
+            if not rest:
+                raise DumpError("dist must be loadgroup|loadscope")
+            dist = parse_dist(rest[0])
+        elif kind == "unit":
+            if len(rest) > 3:
+                raise DumpError("extra unit fields")
+            if len(rest) < 3:
+                raise DumpError("unit needs scope, nodeid, flag")
+            _scope, nodeid, flag = rest[0], rest[1], rest[2]
+            nodeid = check_nodeid(nodeid, where="nodeid")
+            inner = units.setdefault(nodeid, OrderedDict())
+            if nodeid in inner:
+                raise DumpError(f"duplicate nodeid {nodeid}")
+            inner[nodeid] = as_completed(flag)
+        else:
+            raise DumpError(f"unknown row {kind}")
+    blob: dict[str, Any] = {"dist": dist, "workqueue": units}
+    if collection is not None:
+        blob["collection"] = collection
+    return envelope_from_mapping(blob)
+
+
+def parse_dump(text: str, source: str = "-") -> Record:
+    text = text.lstrip("\ufeff")
+    if not text.strip():
+        raise DumpError("empty input", source)
+    if looks_like_hang_log(text):
+        raise DumpError("not a workqueue dump (hang log)", source)
+    stripped = text.strip()
+    try:
+        if stripped.startswith("{") or stripped.startswith("OrderedDict"):
+            rec = parse_mapping_blob(_json_or_python(stripped))
+            rec.source = source
+            return rec
+        if stripped.startswith("["):
+            pair = _split_two_blobs(stripped)
+            if pair is None:
+                raise DumpError("not a workqueue dump")
+            collection_obj = _json_or_python(pair[0])
+            wq_obj = _json_or_python(pair[1])
+            if not isinstance(wq_obj, dict):
+                raise DumpError("not a workqueue dump")
+            blob: dict[str, Any]
+            if ENVELOPE_KEYS.intersection(wq_obj):
+                blob = dict(wq_obj)
+                blob.setdefault("collection", collection_obj)
+            else:
+                blob = {"collection": collection_obj, "workqueue": wq_obj}
+            rec = envelope_from_mapping(blob)
+            rec.source = source
+            return rec
+        rec = parse_tsv(text)
+        rec.source = source
+        return rec
+    except DumpError as exc:
+        if exc.source == "-":
+            exc.source = source
+        raise
+
+
+def inspect(record: Record) -> Report:
+    parts = partition_nodes(record.nodes, record.dist)
+    pending = sum(p.pending() for p in parts)
+    requeued = pending > 0
+    assigned: list[Partition] = []
+    reschedule = False
+    if requeued and parts:
+        assigned = [parts[0]]
+        first_pending = parts[0].pending()
+        if WATERMARK_LO <= first_pending <= WATERMARK_HI and len(parts) > 1:
+            assigned.append(parts[1])
+            reschedule = True
+    for part in parts:
+        part.send_indexes(record.collection)
+    hang_unit = None
+    hang_risk = False
+    assigned_sends: list[list[int]] = []
+    for part in assigned:
+        send = part.send_indexes(record.collection)
+        assigned_sends.append(send)
+        if not send and hang_unit is None:
+            hang_risk = True
+            hang_unit = part.scope
+    first_assigned = assigned[0].scope if assigned else None
+    would_send = assigned_sends[0] if assigned else None
+    return Report(
+        collection=record.collection,
+        dist=record.dist,
+        partitions=parts,
+        assigned=assigned,
+        reschedule=reschedule,
+        pending=pending,
+        requeued=requeued,
+        hang_risk=hang_risk,
+        hang_unit=hang_unit,
+        first_assigned=first_assigned,
+        would_send=would_send,
+    )
+
+
+def render(report: Report) -> str:
+    lines = [
+        f"collection\t{cells(report.collection)}",
+        f"dist\t{report.dist}",
+        f"pending\t{report.pending}",
+        f"requeued\t{yesno(report.requeued)}",
+        f"completed_only_n\t{len(report.completed_only())}",
+        f"completed_only\t{cells(report.completed_only())}",
+        f"incomplete_scopes\t{cells(report.incomplete_scopes())}",
+        f"first_assigned\t{report.first_assigned or '-'}",
+        "would_send\t"
+        + ("-" if report.would_send is None else send_tuple(report.would_send)),
+        f"assigned\t{cells(p.scope for p in report.assigned)}",
+        f"reschedule\t{yesno(report.reschedule)}",
+        f"hang_unit\t{report.hang_unit or '-'}",
+        f"hang_risk\t{yesno(report.hang_risk)}",
+        f"scopes_n\t{len(report.partitions)}",
+    ]
+    for part in report.partitions:
+        send = part.send_indexes(report.collection)
+        lines.extend(
+            [
+                f"scope\t{part.scope}",
+                f"items\t{cells(n.nodeid for n in part.nodes)}",
+                f"completed\t{cells(n.nodeid for n in part.completes())}",
+                f"incomplete\t{cells(n.nodeid for n in part.incompletes())}",
+                "missing\t-",
+                f"send\t{send_tuple(send)}",
+                f"empty_send\t{yesno(not send)}",
+                f"completed_only_unit\t{yesno(part.completed_only())}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def read_source(argv: list[str]) -> tuple[str, str]:
+    if len(argv) > 2:
+        raise DumpError("usage: emptyunit [DUMP|-]")
+    if len(argv) == 1 or argv[1] == "-":
+        return sys.stdin.read(), "-"
+    path = argv[1]
+    p = Path(path)
+    if not p.exists():
+        raise DumpError(f"{path}: No such file", source=path)
+    return p.read_text(encoding="utf-8"), path
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    source = "-"
+    try:
+        text, source = read_source(argv)
+        record = parse_dump(text, source=source)
+        report = inspect(record)
+    except DumpError as exc:
+        loc = exc.source or source
+        sys.stderr.write(f"emptyunit: {loc}: {exc.message}\n")
+        return 1
+    except OSError as exc:
+        sys.stderr.write(f"emptyunit: {exc}\n")
+        return 1
+    sys.stdout.write(render(report))
+    return 1 if report.hang_risk else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

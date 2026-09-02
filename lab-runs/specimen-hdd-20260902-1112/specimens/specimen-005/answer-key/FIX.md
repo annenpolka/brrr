@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): Cargo excluded SBOM outputs when calculating a unit fingerprint. Include SBOM in the output set used for fingerprints so enabling SBOM invalidates the earlier build. Unit output/uplift path otherwise unchanged.

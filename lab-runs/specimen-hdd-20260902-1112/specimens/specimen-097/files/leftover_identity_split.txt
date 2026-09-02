@@ -1,0 +1,30 @@
+Registry / fixture:
+  two tags on one commit: a/v1.2.3 and a/v1.2.3-same
+  GitIdentifier.Remote shared
+  pin = resolved commit SHA (40 hex)
+
+Case A (KeepGitDir false, two tags, one commit):
+  tree bytes identical
+  cache key = SHA (len 40)
+  keys equal
+  no .git in snapshot
+
+Case B (KeepGitDir true, two tags, one commit):
+  pin equal
+  failing_ref key = SHA + ".git" for both (keys equal)
+  second snapshot can reuse first .git
+  leftover: named ref omitted from key; .git may lack a/v1.2.3-same
+
+Case C (KeepGitDir true, identifier is raw commit SHA):
+  key = SHA + ".git"
+  no named ref requested
+  not the two-tag leftover
+
+Case D (KeepGitDir true, two different commits):
+  SHA differs so keys differ
+  not leftover-ref
+
+Not this packet:
+  moby healthcheck StartPeriod vs StartInterval (specimen-066)
+  libgit2 (specimen-007)
+  cargo git checkout PathBuf with .. (specimen-091)

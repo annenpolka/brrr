@@ -1,0 +1,27 @@
+Registry / fixture:
+  package a/a 1.0.0 already in vendor/composer/installed.json
+  composer.lock later has abandoned / replacement changed
+  same version, same dist/source refs
+
+Case A (first install, already abandoned on repo):
+  installed.json written with abandoned
+  no leftover
+
+Case B (same-version install/update after abandoned changes):
+  leftover: installed.json omits abandoned (or keeps old replacement)
+  lock has new abandoned identity
+  composer audit reads installed.json
+
+Case C (rm -rf vendor && composer install):
+  installed.json rebuilt from lock
+  not leftover skip
+
+Case D (version 1.0.0 => 1.0.1):
+  UpdateOperation from version compare
+  not this leftover
+
+Not this packet:
+  poetry extras-reuse / lockfile-package (specimen-021)
+  rubygems platform-fallback-extra (specimen-074)
+  derived extra-ignores-marker (specimen-080)
+  pip leftover-base-without-extra (specimen-098)

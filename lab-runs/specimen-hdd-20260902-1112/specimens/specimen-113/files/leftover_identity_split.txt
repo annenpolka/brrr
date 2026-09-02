@@ -1,0 +1,25 @@
+Registry / fixture:
+  incremental + resolveJsonModule
+  check.ts imports data.json
+  tsconfig.tsbuildinfo
+
+Case A (cold, JSON has title):
+  no leftover diagnostic
+  clean
+
+Case B (warm, JSON {}):
+  TS2741 is current
+  not leftover
+
+Case C (warm, JSON title restored, leftover tsbuildinfo):
+  leftover: semanticDiagnosticsPerFile TS2741 for {}
+  JSON source has title
+
+Case D (delete tsbuildinfo):
+  fresh identity
+  not leftover replay
+
+Not this packet:
+  mypy leftover (specimen-067)
+  rust leftover (specimen-075)
+  TypeScript#30602 deleted js (open)

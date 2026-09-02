@@ -1,0 +1,26 @@
+Registry / fixture:
+  ruby rb_autoload_load
+  leftover undefined constant after helper loaded without defining it
+
+Case A (helper defines the constant):
+  current defined identity
+  not leftover-after-fail
+
+Case B (helper loaded, constant not defined, leftover Qundef):
+  leftover: undefined const_entry / autoload retry after $LOADED_FEATURES delete
+  same-name helper vs moved definition
+
+Case C (no autoload, name never registered):
+  missing identity / NameError
+  not leftover Qundef
+
+Case D (rb_const_remove after fail):
+  constant gone; no leftover autoload retry
+  not leftover undefined
+
+Not this packet:
+  cpython generated-code drift (specimen-054)
+  composer leftover abandoned (specimen-110)
+  jest haste leftover mock name (specimen-157)
+  gleam leftover compile cache after move (specimen-159)
+  zeitwerk leftover gem inception (this tick)

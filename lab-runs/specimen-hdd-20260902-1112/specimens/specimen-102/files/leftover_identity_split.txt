@@ -1,0 +1,29 @@
+Fixture:
+  git repo with root/ (Poetry, path = "../child") and child/
+  consumer: root = { git = "<repo>", subdirectory = "root" }
+  uv lock --no-cache
+
+Case A (uv workspace / tool.uv.sources path inside fetch_root):
+  path_source sees git_member
+  lock source is git + subdirectory
+  no leftover directory
+
+Case B (Poetry path inside the git checkout, no uv workspace):
+  from_metadata23 / Requirement::from
+  lock source is directory = absolute cache checkout path
+  leftover: machine-specific directory identity
+  live package is the git tree (same commit, subdirectory=child)
+
+Case C (path not under fetch_root):
+  real directory dependency
+  not leftover git identity
+
+Case D (git root package itself):
+  consumer already git+subdirectory=root
+  leftover is only the transitive path child
+
+Not this packet:
+  uv cache fingerprints (006/022/023)
+  uv.lock vs pylock.toml
+  cargo PathBuf .. (091)
+  pip extras-on-link (098)

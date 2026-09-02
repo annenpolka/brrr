@@ -1,0 +1,23 @@
+Registry / fixture:
+  Biome workspace close_file / WorkspaceDb parsed-source map
+  leftover ParsedSource after close
+
+Case A (file still open, content unchanged):
+  current parse identity
+  not leftover-after-close
+
+Case B (file closed, leftover parsed source):
+  leftover: previous ParsedSource for that path
+  documents/node_cache gone; files map omitted from eviction
+
+Case C (never opened / empty workspace db):
+  no parse
+  not leftover previous source
+
+Case D (db_remove_file on close):
+  path gone from files map
+  not leftover previous parse
+
+Not this packet:
+  jest haste mock-name delete (specimen-157)
+  gleam leftover cache after move+restore (specimen-159)

@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""stubextra: name leftover extra stub on FRESH vs extra produced for this request."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = (
+    "status",
+    "extra_requested",
+    "extra_exists",
+    "extra_bytes",
+    "key",
+    "extra_name",
+)
+
+
+def parse_truth(value: str) -> bool:
+    v = value.strip().lower()
+    if v in {"true", "yes", "1"}:
+        return True
+    if v in {"false", "no", "0"}:
+        return False
+    raise ValueError(f"unknown bool {value!r}")
+
+
+def parse_event(text: str, *, source: str) -> dict:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest
+    for need in ("status", "extra_requested", "extra_exists", "extra_bytes", "key"):
+        if need not in fields:
+            raise ValueError(f"{source}: missing {need}")
+    return {
+        "status": fields["status"],
+        "extra_requested": parse_truth(fields["extra_requested"]),
+        "extra_exists": parse_truth(fields["extra_exists"]),
+        "extra_bytes": int(fields["extra_bytes"]),
+        "key": fields["key"],
+        "extra_name": fields.get("extra_name") or "out.sbom",
+        "source": source,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def inspect(first: dict, second: dict) -> dict:
+    same_key = first["key"] == second["key"]
+    leftover = (
+        same_key
+        and not first["extra_requested"]
+        and first["extra_exists"]
+        and first["extra_bytes"] == 0
+        and second["extra_requested"]
+        and second["extra_exists"]
+        and second["extra_bytes"] == 0
+        and second["status"].upper() == "FRESH"
+    )
+    produced = second["extra_requested"] and second["extra_bytes"] > 0
+    outside = second["extra_requested"] and same_key and not produced
+    return {
+        "first": first,
+        "second": second,
+        "same_key": same_key,
+        "leftover_stub": leftover,
+        "produced_for_request": produced,
+        "extra_outside_identity": outside,
+        "requested_outside": second["extra_name"] if outside else None,
+    }
+
+
+def format_report(result: dict) -> str:
+    first, second = result["first"], result["second"]
+    lines = [
+        f"key\t{first['key']}",
+        f"same_key\t{yn(result['same_key'])}",
+        f"first_status\t{first['status']}",
+        f"second_status\t{second['status']}",
+        f"extra_requested_first\t{yn(first['extra_requested'])}",
+        f"extra_requested_second\t{yn(second['extra_requested'])}",
+        f"extra_bytes_first\t{first['extra_bytes']}",
+        f"extra_bytes_second\t{second['extra_bytes']}",
+        f"leftover_stub\t{yn(result['leftover_stub'])}",
+        f"produced_for_request\t{yn(result['produced_for_request'])}",
+        f"extra_outside_identity\t{yn(result['extra_outside_identity'])}",
+        f"requested_outside\t{result['requested_outside'] or 'none'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="stubextra",
+        description=(
+            "Compare two cache events. Name leftover extra stub on FRESH "
+            "versus extra produced for this request."
+        ),
+    )
+    parser.add_argument("first", metavar="FIRST")
+    parser.add_argument("second", metavar="SECOND")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        first = parse_event(Path(args.first).read_text(encoding="utf-8"), source=args.first)
+        second = parse_event(Path(args.second).read_text(encoding="utf-8"), source=args.second)
+    except (OSError, ValueError) as err:
+        print(f"stubextra: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(first, second)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

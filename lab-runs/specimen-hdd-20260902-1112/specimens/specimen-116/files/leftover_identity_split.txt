@@ -1,0 +1,24 @@
+Registry / fixture:
+  two edit_files turns on foo.ts
+  leftover highlight cache keyed by filename
+
+Case A (first diff of foo.ts):
+  AST stored under filename
+  not leftover yet
+
+Case B (second diff, different hunks, leftover cache):
+  leftover: stale first-body AST
+  crash
+
+Case C (content-derived cacheKey):
+  miss
+  not leftover filename identity
+
+Case D (different path):
+  unique filename key
+  not this leftover
+
+Not this packet:
+  webpack leftover cache (specimen-090)
+  vitest cache key (specimen-094)
+  next.js webpack cache leftover (no merged pair)

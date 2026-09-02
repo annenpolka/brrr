@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""platid: name materialized gem identity vs setup lookup identity."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("name", "version", "platform", "full", "install_exit", "lookup_status")
+
+
+class Ident:
+    def __init__(
+        self,
+        name: str,
+        version: str,
+        platform: str,
+        full: str | None,
+        source: str,
+        install_exit: str | None = None,
+        lookup_status: str | None = None,
+    ) -> None:
+        self.name = name
+        self.version = version
+        self.platform = platform
+        self.full = full or compose(name, version, platform)
+        self.source = source
+        self.install_exit = install_exit
+        self.lookup_status = lookup_status
+
+
+def compose(name: str, version: str, platform: str) -> str:
+    if platform in {"", "-", "none", "ruby"}:
+        return f"{name}-{version}"
+    return f"{name}-{version}-{platform}"
+
+
+def parse_record(text: str, *, source: str) -> Ident:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "name" not in fields or "version" not in fields:
+        raise ValueError(f"{source}: need name and version")
+    platform = fields.get("platform") or "ruby"
+    if platform in {"", "-", "none"}:
+        platform = "ruby"
+    return Ident(
+        fields["name"],
+        fields["version"],
+        platform,
+        fields.get("full"),
+        source,
+        install_exit=fields.get("install_exit"),
+        lookup_status=fields.get("lookup_status"),
+    )
+
+
+def inspect(installed: Ident, lookup: Ident) -> dict:
+    mismatch = installed.full != lookup.full
+    if installed.install_exit is None:
+        install_ok = True
+    else:
+        install_ok = installed.install_exit in {"0", "ok", "success"}
+    if lookup.lookup_status is None:
+        lookup_miss = mismatch
+    else:
+        lookup_miss = lookup.lookup_status in {"miss", "missing", "fail", "1"}
+    hidden = bool(mismatch and install_ok and lookup_miss)
+    return {
+        "installed": installed,
+        "lookup": lookup,
+        "same_name": installed.name == lookup.name,
+        "same_version": installed.version == lookup.version,
+        "same_platform": installed.platform == lookup.platform,
+        "same_full": installed.full == lookup.full,
+        "mismatch": mismatch,
+        "install_ok": install_ok,
+        "lookup_miss": lookup_miss,
+        "hidden_by_exit0": hidden,
+    }
+
+
+def format_report(result: dict) -> str:
+    inst: Ident = result["installed"]
+    look: Ident = result["lookup"]
+    lines = [
+        f"installed\t{inst.full}",
+        f"lookup\t{look.full}",
+        f"same_name\t{'yes' if result['same_name'] else 'no'}",
+        f"same_version\t{'yes' if result['same_version'] else 'no'}",
+        f"platform_installed\t{inst.platform}",
+        f"platform_lookup\t{look.platform}",
+        f"same_platform\t{'yes' if result['same_platform'] else 'no'}",
+        f"mismatch\t{'yes' if result['mismatch'] else 'no'}",
+        f"install_ok\t{'yes' if result['install_ok'] else 'no'}",
+        f"lookup_miss\t{'yes' if result['lookup_miss'] else 'no'}",
+        f"hidden_by_exit0\t{'yes' if result['hidden_by_exit0'] else 'no'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="platid",
+        description=(
+            "Compare two gem identities. Name the identity install materialized "
+            "versus the identity setup searched for."
+        ),
+    )
+    parser.add_argument("installed")
+    parser.add_argument("lookup")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        inst = parse_record(Path(args.installed).read_text(encoding="utf-8"), source=args.installed)
+        look = parse_record(Path(args.lookup).read_text(encoding="utf-8"), source=args.lookup)
+    except (OSError, ValueError) as err:
+        print(f"platid: {err}", file=sys.stderr)
+        return 1
+    result = inspect(inst, look)
+    sys.stdout.write(format_report(result))
+    return 1 if result["mismatch"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

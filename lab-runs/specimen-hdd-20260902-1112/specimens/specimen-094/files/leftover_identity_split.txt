@@ -1,0 +1,36 @@
+Registry / knobs:
+  experimental.fsModuleCache: true
+  cache root: node_modules/.experimental-vitest-cache
+  version: 1.0.0-beta.1
+  key material: id + fileContent + NODE_ENV + version + cacheConfig + coverage flag
+  shouldExternalize is not in the key
+
+Case A (inlined local module / never leftover):
+  shouldExternalize false
+  H_inlined minted from file bytes
+  disk file written (result has code)
+  warm fetch uses H_inlined
+
+Case B (ordinary file id, shouldExternalize true):
+  getCachePath still reads bytes and mints H_ext
+  saveMemoryCache(id, H_ext)
+  fetchAndProcess returns {externalize}
+  disk file named H_ext is not written
+  leftover memory identity: second fetch returns H_ext, fs [empty]
+
+Case C (data: / @vite/client / network):
+  {externalize} before getCachePath
+  no H_key (omitted)
+
+Case D (import.meta.glob( in source):
+  generateCachePath bails; memory null
+  omitted (bail), not a content hash
+
+Case E (fsModuleCache off):
+  getCachePath returns null without reading bytes for a key
+
+Not this packet:
+  pytest 001-003 (eval-order / rootdir / fixture-closure)
+  leftover 100KB cacheConfig hashed per module (#11029)
+  leftover __vitestTmp after cache sweep (#10869)
+  leftover importers stored in cache payload (#9422)

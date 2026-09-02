@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""dockpath: name cgroup detection vs mountinfo identity vs the -v path."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX12 = re.compile(r"^[0-9a-f]{12}$")
+HEX_CAPTURE = rb"([0-9a-fA-F]{12,64})"
+DOCKER_CTR = re.compile(rb"/var/lib/docker/containers/" + HEX_CAPTURE + rb"/")
+PODMAN_STORAGE = re.compile(
+    rb"/containers/storage/overlay-containers/" + HEX_CAPTURE + rb"/"
+)
+PODMAN_OVERLAY = re.compile(rb"/containers/overlay-containers/" + HEX_CAPTURE + rb"/")
+CONTAINERD_TASK = re.compile(
+    rb"io\.containerd\.runtime\.v2\.task/[^/\s]+/" + HEX_CAPTURE + rb"/"
+)
+DOCKER_V1_PATH = re.compile(rb"/docker/" + HEX_CAPTURE + rb"(?:/|$)")
+DOCKER_SCOPE = re.compile(rb"docker-" + HEX_CAPTURE + rb"\.scope")
+CRI_SCOPE = re.compile(rb"cri-containerd-" + HEX_CAPTURE + rb"\.scope")
+MOUNTINFO_RX = (DOCKER_CTR, PODMAN_STORAGE, PODMAN_OVERLAY, CONTAINERD_TASK)
+DEFAULT_DEST = "/src"
+
+
+class DockpathError(ValueError):
+    """User-facing join error; CLI prints as `dockpath: …`."""
+
+
+def yn(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def normalize_container_id(raw: str) -> str | None:
+    name = raw.strip().lower()
+    if HEX64.fullmatch(name) or HEX12.fullmatch(name):
+        return name
+    return None
+
+
+def decode_token(raw: bytes, *, what: str) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise DockpathError(f"invalid utf-8 in {what}: {err}") from err
+
+
+def iter_cgroup_lines(cgroup: bytes):
+    for line in cgroup.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            continue
+        yield stripped
+
+
+def split_cgroup_line(line: bytes) -> tuple[bytes, bytes, bytes] | None:
+    parts = line.split(b":", 2)
+    if len(parts) < 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def has_docker_substring(cgroup: bytes) -> bool:
+    """Specimen heuristic: `b'docker' in blob`. Named, not a remap predicate."""
+    return b"docker" in cgroup
+
+
+def classify_cgroup(cgroup: bytes) -> str:
+    has_v1 = False
+    has_v2 = False
+    for line in iter_cgroup_lines(cgroup):
+        parsed = split_cgroup_line(line)
+        if parsed is None:
+            continue
+        hid, controller, _path = parsed
+        if hid == b"0" and controller == b"":
+            has_v2 = True
+        elif controller:
+            has_v1 = True
+    if has_v1 and has_v2:
+        return "mixed"
+    if has_v1:
+        return "v1"
+    if has_v2:
+        return "v2"
+    return "empty"
+
+
+def _id_from_match(match: re.Match[bytes], *, what: str) -> str | None:
+    return normalize_container_id(decode_token(match.group(1), what=what))
+
+
+def cgroup_id_info(cgroup: bytes) -> tuple[str | None, str]:
+    """Return (id, kind) from cpuset basename, kubepods basename, or v2 scope."""
+    scope_id: str | None = None
+    cpuset_id: str | None = None
+    cpuset_kind = "cpuset"
+    for line in iter_cgroup_lines(cgroup):
+        parsed = split_cgroup_line(line)
+        if parsed is None:
+            continue
+        _hid, controller, path = parsed
+        path = path.strip()
+        for rx, what in ((DOCKER_SCOPE, "cgroup docker scope"), (CRI_SCOPE, "cgroup cri scope")):
+            match = rx.search(path)
+            if match and scope_id is None:
+                found = _id_from_match(match, what=what)
+                if found:
+                    scope_id = found
+        if controller != b"cpuset":
+            continue
+        name = os.path.basename(decode_token(path, what="cgroup id")).strip()
+        found = normalize_container_id(name)
+        if found:
+            cpuset_id = found
+            if b"kubepods" in path:
+                cpuset_kind = "kubepods"
+    if cpuset_id:
+        return cpuset_id, cpuset_kind
+    if scope_id:
+        return scope_id, "scope"
+    return None, "none"
+
+
+def cgroup_id(cgroup: bytes) -> str | None:
+    cid, _kind = cgroup_id_info(cgroup)
+    return cid
+
+
+def cgroup_docker_info(cgroup: bytes) -> tuple[bool, str]:
+    """In-docker from cpuset / v2 docker scope, not blob substring."""
+    via = "none"
+    for line in iter_cgroup_lines(cgroup):
+        parsed = split_cgroup_line(line)
+        if parsed is None:
+            continue
+        _hid, controller, path = parsed
+        if controller not in (b"cpuset", b""):
+            continue
+        if DOCKER_SCOPE.search(path):
+            return True, "scope"
+        if controller == b"cpuset" and DOCKER_V1_PATH.search(path):
+            via = "cpuset"
+    return via != "none", via
+
+
+def is_in_docker(cgroup: bytes) -> bool:
+    docker, _via = cgroup_docker_info(cgroup)
+    return docker
+
+
+def mountinfo_ids(blob: bytes) -> list[str]:
+    found: list[str] = []
+    for rx in MOUNTINFO_RX:
+        for match in rx.finditer(blob):
+            hid = _id_from_match(match, what="mountinfo id")
+            if hid and hid not in found:
+                found.append(hid)
+    return found
+
+
+def field_breaks_tsv(value: str) -> bool:
+    return any(ch in value for ch in "\t\n\r")
+
+
+def validate_path_field(name: str, value: str) -> str:
+    if value is None or value.strip() == "":
+        raise DockpathError(f"empty {name}")
+    if field_breaks_tsv(value):
+        raise DockpathError(f"{name} contains a TSV-breaking character")
+    if ":" in value:
+        raise DockpathError(f"{name} contains ':' (not a single -v field)")
+    return value
+
+
+def quote_vol_path(path: str) -> str:
+    if " " not in path and '"' not in path and "\\" not in path:
+        return path
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def format_volume(cwd: str, dest: str) -> str:
+    return f"{quote_vol_path(cwd)}:{quote_vol_path(dest)}"
+
+
+def id_source_of(cid: str | None, mids: list[str]) -> tuple[str, bool]:
+    if cid and mids:
+        if cid in mids:
+            return "both", False
+        return "mismatch", True
+    if cid:
+        return "cgroup", False
+    if mids:
+        return "mountinfo", False
+    return "none", False
+
+
+def inspect(
+    cgroup: bytes,
+    mountinfo: bytes,
+    cwd: str,
+    dest: str = DEFAULT_DEST,
+) -> dict:
+    cwd = validate_path_field("cwd", cwd)
+    dest = validate_path_field("dest", dest)
+    if not cgroup.strip() and not mountinfo.strip():
+        raise DockpathError("empty cgroup and mountinfo")
+    substring = has_docker_substring(cgroup)
+    kind = classify_cgroup(cgroup)
+    docker, docker_via = cgroup_docker_info(cgroup)
+    cid, cid_kind = cgroup_id_info(cgroup)
+    mids = mountinfo_ids(mountinfo)
+    source, mismatch = id_source_of(cid, mids)
+    usable = bool(cid or mids)
+    if docker:
+        remapped = "unsupported"
+        volume = "none"
+        would_inspect = usable
+    else:
+        remapped = "no"
+        volume = format_volume(cwd, dest)
+        would_inspect = False
+    return {
+        "cgroup_substring": substring,
+        "cgroup_kind": kind,
+        "cgroup_docker": docker,
+        "cgroup_docker_via": docker_via,
+        "cgroup_id": cid,
+        "cgroup_id_kind": cid_kind,
+        "mountinfo_ids": mids,
+        "cwd": cwd,
+        "dest": dest,
+        "volume": volume,
+        "would_inspect": would_inspect,
+        "remapped": remapped,
+        "id_source": source,
+        "id_mismatch": mismatch,
+    }
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"cgroup_substring\t{yn(result['cgroup_substring'])}",
+        f"cgroup_kind\t{result['cgroup_kind']}",
+        f"cgroup_docker\t{yn(result['cgroup_docker'])}",
+        f"cgroup_docker_via\t{result['cgroup_docker_via']}",
+        f"cgroup_id\t{result['cgroup_id'] or 'none'}",
+        f"cgroup_id_kind\t{result['cgroup_id_kind']}",
+        f"mountinfo_id\t{fmt_list(result['mountinfo_ids'])}",
+        f"id_source\t{result['id_source']}",
+        f"id_mismatch\t{yn(result['id_mismatch'])}",
+        f"cwd\t{result['cwd']}",
+        f"dest\t{result['dest']}",
+        f"volume\t{result['volume']}",
+        f"would_inspect\t{yn(result['would_inspect'])}",
+        f"remapped\t{result['remapped']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="dockpath",
+        description=(
+            "Read cgroup and mountinfo excerpts plus a cwd. Name which file "
+            "said in-docker, which still named a container id, and which path "
+            "became -v when remap did not run."
+        ),
+    )
+    parser.add_argument("cgroup", help="cgroup excerpt path")
+    parser.add_argument("mountinfo", help="mountinfo excerpt path")
+    parser.add_argument(
+        "--cwd",
+        required=True,
+        help="in-container cwd used as -v source when remap did not run",
+    )
+    parser.add_argument(
+        "--dest",
+        default=DEFAULT_DEST,
+        help=(
+            "volume destination (specimen docker-language convention; "
+            f"default {DEFAULT_DEST}; not discovered from excerpts)"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        cgroup = Path(args.cgroup).read_bytes()
+        mountinfo = Path(args.mountinfo).read_bytes()
+        report = inspect(cgroup, mountinfo, args.cwd, args.dest)
+    except (OSError, DockpathError, UnicodeDecodeError) as err:
+        print(f"dockpath: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""platident: name materialized identity vs lookup identity."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("install_id", "lookup_id", "install_exit", "lookup_status")
+
+
+def parse_record(text: str, *, source: str) -> dict:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest
+    if "install_id" not in fields or "lookup_id" not in fields:
+        raise ValueError(f"{source}: missing install_id or lookup_id")
+    return fields
+
+
+def split_id(value: str) -> tuple[str, str, str]:
+    """name-version or name-version-platform. Last two hyphen runs are not reliable;
+    split known gem full_name: name-version[-platform]."""
+    parts = value.split("-")
+    if len(parts) < 2:
+        return value, "", ""
+    # version starts at first token that looks like a version (digit)
+    idx = next((i for i, p in enumerate(parts) if p and p[0].isdigit()), None)
+    if idx is None or idx == 0:
+        return parts[0], "-".join(parts[1:]), ""
+    name = "-".join(parts[:idx])
+    rest = parts[idx:]
+    if len(rest) == 1:
+        return name, rest[0], ""
+    # version may contain extra dots only; platform is trailing tokens after version
+    version = rest[0]
+    platform = "-".join(rest[1:])
+    return name, version, platform
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def inspect(rec: dict) -> dict:
+    inst = rec["install_id"]
+    look = rec["lookup_id"]
+    iname, iver, iplat = split_id(inst)
+    lname, lver, lplat = split_id(look)
+    same_nv = iname == lname and iver == lver
+    mismatch = inst != look
+    install_ok = rec.get("install_exit", "0") in {"0", "ok", "success"}
+    lookup_miss = rec.get("lookup_status", "miss") in {"miss", "missing", "fail", "1"}
+    hidden = install_ok and lookup_miss and mismatch
+    return {
+        "install_id": inst,
+        "lookup_id": look,
+        "install_name": iname,
+        "install_version": iver,
+        "install_platform": iplat or "ruby",
+        "lookup_name": lname,
+        "lookup_version": lver,
+        "lookup_platform": lplat or "ruby",
+        "same_name_version": same_nv,
+        "identity_mismatch": mismatch,
+        "install_ok": install_ok,
+        "lookup_miss": lookup_miss,
+        "hidden_by_exit0": hidden,
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"install_id\t{result['install_id']}",
+        f"lookup_id\t{result['lookup_id']}",
+        f"install_platform\t{result['install_platform']}",
+        f"lookup_platform\t{result['lookup_platform']}",
+        f"same_name_version\t{yn(result['same_name_version'])}",
+        f"identity_mismatch\t{yn(result['identity_mismatch'])}",
+        f"install_ok\t{yn(result['install_ok'])}",
+        f"lookup_miss\t{yn(result['lookup_miss'])}",
+        f"hidden_by_exit0\t{yn(result['hidden_by_exit0'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="platident")
+    parser.add_argument("record", help="identity record path or -")
+    args = parser.parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        rec = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"platident: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(rec)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

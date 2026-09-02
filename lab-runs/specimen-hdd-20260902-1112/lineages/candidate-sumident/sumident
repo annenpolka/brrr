@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""sumident: name go.sum identity class for a module version (zip vs go.mod-only)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+EMPTY = "-"
+
+
+def parse_sum(text: str, *, source: str) -> list[tuple[str, str, str]]:
+    """Return (module, version, kind) with kind in {zip, mod}."""
+    rows: list[tuple[str, str, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            raise ValueError(f"{source}:{lineno}: expected module version [h1:…]")
+        module, ver = parts[0], parts[1]
+        if ver.endswith("/go.mod"):
+            kind = "mod"
+            ver = ver[: -len("/go.mod")]
+        else:
+            kind = "zip"
+        if not module or not ver or module == EMPTY or ver == EMPTY:
+            raise ValueError(f"{source}:{lineno}: not a legal NAME")
+        rows.append((module, ver, kind))
+    return rows
+
+
+def inspect(rows: list[tuple[str, str, str]], module: str, version: str) -> dict:
+    kinds = {kind for m, v, kind in rows if m == module and v == version}
+    has_mod = "mod" in kinds
+    has_zip = "zip" in kinds
+    if has_mod and has_zip:
+        identity = "both"
+    elif has_mod:
+        identity = "mod-only"
+    elif has_zip:
+        identity = "zip-only"
+    else:
+        identity = "neither"
+    return {
+        "module": module,
+        "version": version,
+        "mod": has_mod,
+        "zip": has_zip,
+        "identity": identity,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"module\t{result['module']}",
+        f"version\t{result['version']}",
+        f"mod\t{yn(result['mod'])}",
+        f"zip\t{yn(result['zip'])}",
+        f"identity\t{result['identity']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="sumident",
+        description=(
+            "Read a go.sum and name which identity a module version has: "
+            "zip content sum, go.mod-only sum, both, or neither. "
+            "grep of the module path hits both line types."
+        ),
+    )
+    parser.add_argument("sumfile", help="go.sum path or -")
+    parser.add_argument("--module", required=True)
+    parser.add_argument("--version", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.sumfile == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.sumfile).read_text(encoding="utf-8")
+            source = args.sumfile
+        rows = parse_sum(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"sumident: {err}", file=sys.stderr)
+        return 1
+    result = inspect(rows, args.module, args.version)
+    sys.stdout.write(format_report(result))
+    return 0 if result["identity"] == "both" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

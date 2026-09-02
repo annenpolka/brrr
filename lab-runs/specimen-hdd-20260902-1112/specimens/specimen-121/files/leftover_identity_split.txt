@@ -1,0 +1,27 @@
+Registry / fixture:
+  in-memory metadataCache
+  ChecksumTOFU fingerprints/ for new version
+  leftover previouschecksum after TTL
+
+Case A (first fetch 1.1.0 within TTL):
+  inverted predicate misses
+  network fetch
+  not leftover
+
+Case B (after TTL, fetch 1.1.1, leftover 1.1.0 cache):
+  leftover: 1.1.0 metadata reused
+  TOFU writes previouschecksum for 1.1.1
+  invalid registry source archive checksum
+
+Case C (version on MetadataCacheKey):
+  miss
+  not leftover previous-version identity
+
+Case D (delete fingerprints/):
+  fresh TOFU identity
+  not leftover on-disk fingerprint
+
+Not this packet:
+  rustc incremental fingerprint (specimen-075)
+  cargo rustc extra-filename (specimen-086)
+  go-task leftover wildcard MATCH (specimen-115)

@@ -1,0 +1,26 @@
+Registry / fixture:
+  parent git dep uses $CARGO_HOME/git/db/<ident>
+  nested submodule URL may be shared across two parents
+
+Case A (git dep, no submodule):
+  git/db exists
+  checkout copied from db
+  offline after rm checkouts can use db
+
+Case B (two git deps, same submodule URL):
+  failing_ref: submodule fetch per checkout
+  git/db may omit submodule ident
+  leftover: checkout-only submodule identity
+
+Case C (fetch then rm checkouts then --offline):
+  failing_ref: submodule not in db; offline fail
+  public #7987
+
+Case D (submodule already at recorded head_id):
+  failing_ref recurses update_submodules on that checkout
+  still no db write
+
+Not this packet:
+  cargo PathBuf .. (specimen-091)
+  libgit2 (specimen-007)
+  silentadd git index

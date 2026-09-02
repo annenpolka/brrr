@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover unset vs GetEnvironmentVariableW sz==0 JOIN of empty and unset is two greps. Do not harvest a vcpkgenv TSV. Do not send vcpkg empty-vs-unset theater back to R1. Distinct from 010/031/149/150.

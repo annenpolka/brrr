@@ -1,0 +1,31 @@
+{
+  "summary": "Used packet /proc excerpts (good) but stayed in cat/grep/python one-liners. Harvest which file said not-in-docker versus which still named the container, and which path went into -v. Stop.",
+  "preserve_add": [
+    "cgroup v2 can lack docker bytes while mountinfo still names a docker container id",
+    "When detection is false the volume source is the in-container cwd"
+  ],
+  "established_add": [
+    "Owned cgroup v2: 0::/system.slice/containerd.service (no docker, no cpuset)",
+    "Owned mountinfo: /var/lib/docker/containers/c33988ec7651ebc867cb24755eaf637a6734088bc7eef59d5799293a9e5450f7/hostname",
+    "Failing _is_in_docker is b'docker' in /proc/1/cgroup; _get_container_id wants cpuset"
+  ],
+  "rejected_add": [
+    "Live docker inspect and invented CI cwd listings are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned /proc excerpts plus a cwd. No docker."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Which /proc file decided not-in-docker, which still named the container id, and which path became -v"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name cgroup detection versus mountinfo identity versus the volume path",
+    "nearest_existing_operation": "cat cgroup and mountinfo",
+    "observable_delta": "cgroup_docker no, mountinfo_id present, remapped no",
+    "reason": "two files disagree on the same container; -v uses the in-container cwd"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned cgroup/mountinfo excerpts. Do not send docker inspect back to R1."
+}

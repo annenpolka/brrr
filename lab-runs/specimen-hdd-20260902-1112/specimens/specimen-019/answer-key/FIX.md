@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): run CLI/TOX_OVERRIDE strings through the same substitution pass as file-backed values so `{posargs}` is not a literal argv token; leftover `--` arguments then attach to the expanded command. Do not tell Dreamers.

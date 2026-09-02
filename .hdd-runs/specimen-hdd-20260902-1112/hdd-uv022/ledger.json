@@ -1,0 +1,88 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "A find/cache can key the wrong interpreter path",
+    "PYTHONEXECUTABLE can change interpreter metadata while a path-only cache key still hits",
+    "Two python paths can collapse to one cache row if the key ignores env"
+  ],
+  "established": [
+    "Packet: uv python find / PYTHONEXECUTABLE",
+    "Packet: first find with PYTHONEXECUTABLE=.venv returns .venv; second find with env removed still prints .venv",
+    "Packet: PYTHONEXECUTABLE vs uv python find"
+  ],
+  "rejected": [
+    "Invented dual venv commands are not host-executed",
+    "Invented msgpack cache dumps and uv python find transcripts are not host evidence",
+    "Simulated hashlib of interpreter_cache_entry.rs is not host evidence"
+  ],
+  "constraints": [
+    "No uv",
+    "No uv. Owned key-component list: path vs env. Transfer onto freshmiss/lockident",
+    "Owned two-path fixture"
+  ],
+  "open_questions": [],
+  "human_pressure": [
+    "No uv. Continue on two path strings and one cache key. Show requested vs cached interpreter."
+  ],
+  "harvest_candidates": [
+    "Which interpreter path the cache used",
+    "Which env component was omitted from the interpreter cache key",
+    "requested path vs cached path"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name requested interpreter path vs cached path",
+    "nearest_existing_operation": "ls two venvs",
+    "observable_delta": "which path the cache hit used",
+    "reason": "two pythons one row",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:03:50+09:00",
+      "summary": "Invented uv venv theater. Preserve interpreter-path cache identity. Continue owned fixture.",
+      "pressure": [
+        "No uv. Continue on two path strings and one cache key. Show requested vs cached interpreter."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name which interpreter path a cache hit actually used",
+        "nearest_existing_operation": "ls the venv python",
+        "observable_delta": "requested path vs cached path",
+        "reason": "two pythons, one cache row",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:06:20+09:00",
+      "summary": "Replayed uv python find and invented msgpack dumps. Preserve path-keyed cache holding env-dependent interpreter. Harvest omitted env component; no uv.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name an env component present in the payload and omitted from the cache key",
+        "nearest_existing_operation": "freshmiss / lockident",
+        "observable_delta": "requested other/ vs cached .venv after env unset",
+        "reason": "adjacent to freshmiss; do not mint a uv wrapper",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T13:16:07+09:00",
+      "summary": "Invented path-hash. Harvest requested vs cached interpreter path. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name requested interpreter path vs cached path",
+        "nearest_existing_operation": "ls two venvs",
+        "observable_delta": "which path the cache hit used",
+        "reason": "two pythons one row",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

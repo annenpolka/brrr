@@ -1,0 +1,24 @@
+Registry / fixture:
+  app depends on lib[test] @ file:///${PROJECT_ROOT}/../lib
+  lib is a sibling path package
+
+Case A (path dep, no extras):
+  --update-reuse keeps ${PROJECT_ROOT}
+  no leftover expansion
+
+Case B (extra lib[test], lock then --update-reuse):
+  first lock: file:///${PROJECT_ROOT}/../lib + path ../lib
+  failing reuse: file:///mnt/c/pdm-minimal/lib + path ../lib
+  leftover: expanded URL vs portable PROJECT_ROOT URL
+
+Case C (registry extra pytest):
+  no file URL
+  not this leftover
+
+Case D (first pdm lock only):
+  first-write identity
+  not reuse leftover
+
+Not this packet:
+  uv git vs directory (specimen-006/022/023/102)
+  pip extras-on-link (specimen-098)

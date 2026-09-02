@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""pathnode: name path-vs-node identity and fixture binds across collection events."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN_FIELDS = ("collect", "register", "lookup")
+
+
+class Collect:
+    __slots__ = ("path", "node")
+
+    def __init__(self, path: str, node: str) -> None:
+        self.path = path
+        self.node = node
+
+
+class Register:
+    __slots__ = ("fixture", "node")
+
+    def __init__(self, fixture: str, node: str) -> None:
+        self.fixture = fixture
+        self.node = node
+
+
+class Lookup:
+    __slots__ = ("fixture", "node", "found")
+
+    def __init__(self, fixture: str, node: str, found: bool) -> None:
+        self.fixture = fixture
+        self.node = node
+        self.found = found
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def parse_found(token: str, *, source: str, lineno: int) -> bool:
+    value = token.strip().lower()
+    if value in {"found", "yes", "true"}:
+        return True
+    if value in {"missing", "miss", "no", "false"}:
+        return False
+    raise ValueError(f"{source}:{lineno}: lookup result must be found|missing, got {token!r}")
+
+
+def parse_record(text: str, *, source: str = "<input>") -> tuple[list[Collect], list[Register], list[Lookup]]:
+    collects: list[Collect] = []
+    registers: list[Register] = []
+    lookups: list[Lookup] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        parts = [p for p in rest.split("\t") if p != ""]
+        if key not in KNOWN_FIELDS:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if key == "collect":
+            if len(parts) < 2:
+                raise ValueError(f"{source}:{lineno}: collect needs path, node")
+            collects.append(Collect(path=parts[0], node=parts[1]))
+        elif key == "register":
+            if len(parts) < 2:
+                raise ValueError(f"{source}:{lineno}: register needs fixture, node")
+            registers.append(Register(fixture=parts[0], node=parts[1]))
+        elif key == "lookup":
+            if len(parts) < 3:
+                raise ValueError(f"{source}:{lineno}: lookup needs fixture, node, found|missing")
+            lookups.append(
+                Lookup(
+                    fixture=parts[0],
+                    node=parts[1],
+                    found=parse_found(parts[2], source=source, lineno=lineno),
+                )
+            )
+    if not collects:
+        raise ValueError(f"{source}: missing collect")
+    return collects, registers, lookups
+
+
+def inspect(
+    collects: list[Collect],
+    registers: list[Register],
+    lookups: list[Lookup],
+) -> dict:
+    by_path: dict[str, list[str]] = {}
+    for event in collects:
+        by_path.setdefault(event.path, []).append(event.node)
+    dups = []
+    for path, nodes in by_path.items():
+        if len(nodes) < 2:
+            continue
+        uniq = unique(nodes)
+        dups.append(
+            {
+                "path": path,
+                "nodes": uniq,
+                "count": len(nodes),
+                "same_node": len(uniq) == 1,
+            }
+        )
+    bound: dict[str, list[str]] = {}
+    for event in registers:
+        bound.setdefault(event.fixture, [])
+        if event.node not in bound[event.fixture]:
+            bound[event.fixture].append(event.node)
+    by_node: dict[str, list[str]] = {}
+    for event in collects:
+        by_node.setdefault(event.node, []).append(event.path)
+    shared = []
+    for node, paths in by_node.items():
+        uniq = unique(paths)
+        if len(uniq) < 2:
+            continue
+        shared.append({"node": node, "paths": uniq})
+    misses = []
+    for event in lookups:
+        bound_nodes = list(bound.get(event.fixture) or [])
+        unbound = event.node not in bound_nodes
+        if event.found and not unbound:
+            continue
+        misses.append(
+            {
+                "fixture": event.fixture,
+                "lookup": event.node,
+                "bound_to": bound_nodes,
+                "found": event.found,
+                "unbound": unbound,
+            }
+        )
+    return {
+        "paths": [c.path for c in collects],
+        "nodes": [c.node for c in collects],
+        "dups": dups,
+        "shared": shared,
+        "misses": misses,
+        "bound": bound,
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        "paths\t" + "\t".join(result["paths"]),
+        "nodes\t" + "\t".join(result["nodes"]),
+    ]
+    if result["dups"]:
+        for dup in result["dups"]:
+            lines.append(
+                "dup_path\t"
+                + dup["path"]
+                + "\tnodes\t"
+                + "\t".join(dup["nodes"])
+                + "\tsame_node\t"
+                + ("yes" if dup["same_node"] else "no")
+            )
+    else:
+        lines.append("dup_path\tnone")
+    if result.get("shared"):
+        for shared in result["shared"]:
+            lines.append(
+                "shared_node\t"
+                + shared["node"]
+                + "\tpaths\t"
+                + "\t".join(shared["paths"])
+            )
+    else:
+        lines.append("shared_node\tnone")
+    if result["misses"]:
+        for miss in result["misses"]:
+            bound = "\t".join(miss["bound_to"]) if miss["bound_to"] else "none"
+            found = "yes" if miss["found"] else "no"
+            unbound = "yes" if miss.get("unbound") else "no"
+            lines.append(
+                "miss\t"
+                + miss["fixture"]
+                + "\tlookup\t"
+                + miss["lookup"]
+                + "\tbound_to\t"
+                + bound
+                + "\tfound\t"
+                + found
+                + "\tunbound\t"
+                + unbound
+            )
+    else:
+        lines.append("miss\tnone")
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pathnode",
+        description=(
+            "Given collection events (path, node id, fixture register, fixture lookup), "
+            "name whether the same path is still the same collection object and which "
+            "fixture is bound to which node."
+        ),
+    )
+    parser.add_argument(
+        "record",
+        nargs="?",
+        metavar="RECORD",
+        help="event file (default stdin)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record:
+            path = Path(args.record)
+            text = path.read_text(encoding="utf-8")
+            source = str(path)
+        else:
+            text = sys.stdin.read()
+            source = "<stdin>"
+        collects, registers, lookups = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"pathnode: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(collects, registers, lookups)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

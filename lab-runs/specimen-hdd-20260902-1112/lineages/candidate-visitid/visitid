@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Pointer vs value visit identity: name address-reuse skips of a distinct node."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+LIST_CAP = 32
+EMPTY = "-"
+HEX_DIGITS = re.compile(r"[0-9a-fA-F]+$")
+SCIENTIFIC = re.compile(r"\d+[eE]\d+$")
+BOM = "\ufeff"
+
+
+class Node:
+    """Short-lived CPython object for --live slot-reuse analog."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class Event:
+    __slots__ = ("name", "addr", "addr_text")
+
+    def __init__(self, name: str, addr: int, addr_text: str) -> None:
+        self.name = name
+        self.addr = addr
+        self.addr_text = addr_text
+
+
+class Skip:
+    __slots__ = ("name", "addr", "addr_text", "first_name", "kind", "later_addr_text")
+
+    def __init__(
+        self,
+        name: str,
+        addr: int,
+        addr_text: str,
+        first_name: str,
+        kind: str,
+        later_addr_text: str | None = None,
+    ) -> None:
+        self.name = name
+        self.addr = addr
+        self.addr_text = addr_text
+        self.first_name = first_name
+        self.kind = kind
+        self.later_addr_text = addr_text if later_addr_text is None else later_addr_text
+
+
+def parse_addr(token: str, *, source: str, lineno: int) -> tuple[int, str]:
+    text = token.strip()
+    if not text:
+        raise ValueError(f"{source}:{lineno}: empty address")
+    try:
+        if text[:2].lower() == "0x":
+            return int(text, 16), text
+        if SCIENTIFIC.fullmatch(text):
+            raise ValueError("scientific")
+        if HEX_DIGITS.fullmatch(text):
+            return int(text, 16), text
+    except ValueError as err:
+        raise ValueError(f"{source}:{lineno}: bad address {token!r}") from err
+    raise ValueError(f"{source}:{lineno}: bad address {token!r}")
+
+
+def require_name(token: str, *, source: str, lineno: int, what: str = "name") -> str:
+    if BOM in token:
+        raise ValueError(f"{source}:{lineno}: BOM in {what}")
+    if token == "":
+        raise ValueError(f"{source}:{lineno}: empty {what}")
+    if token.strip() != token:
+        raise ValueError(f"{source}:{lineno}: padded {what}")
+    if token == EMPTY:
+        raise ValueError(
+            f"{source}:{lineno}: {what} {token!r} is the empty-list token"
+        )
+    return token
+
+
+def parse_line_fields(line: str, *, source: str, lineno: int) -> list[str]:
+    if "\t" in line:
+        parts = line.split("\t")
+        if any(part == "" for part in parts):
+            raise ValueError(f"{source}:{lineno}: empty tab field")
+    else:
+        parts = line.split()
+        if not parts:
+            raise ValueError(f"{source}:{lineno}: empty line")
+    if parts[0] == "visit" and len(parts) >= 3:
+        fields = parts[1:]
+    else:
+        fields = parts
+    if len(fields) < 2:
+        raise ValueError(f"{source}:{lineno}: expected name and addr")
+    if len(fields) > 2:
+        raise ValueError(
+            f"{source}:{lineno}: extra field (NAME is the node key; "
+            "this CLI does not accept flake input names)"
+        )
+    return fields
+
+
+def parse_record(text: str, *, source: str = "<input>") -> list[Event]:
+    events: list[Event] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = parse_line_fields(line, source=source, lineno=lineno)
+        name = require_name(fields[0], source=source, lineno=lineno, what="name")
+        addr, addr_text = parse_addr(fields[1], source=source, lineno=lineno)
+        events.append(Event(name=name, addr=addr, addr_text=addr_text))
+    if not events:
+        raise ValueError(f"{source}: missing visit")
+    return events
+
+
+def walk_pointer(events: list[Event]) -> tuple[list[Event], list[Skip]]:
+    done: set[int] = set()
+    occupant: dict[int, tuple[str, str]] = {}
+    visited: list[Event] = []
+    skipped: list[Skip] = []
+    for event in events:
+        if event.addr in done:
+            first_name, first_text = occupant[event.addr]
+            kind = "address-reuse" if first_name != event.name else "same-pointer"
+            skipped.append(
+                Skip(
+                    name=event.name,
+                    addr=event.addr,
+                    addr_text=first_text,
+                    first_name=first_name,
+                    kind=kind,
+                    later_addr_text=event.addr_text,
+                )
+            )
+            continue
+        done.add(event.addr)
+        occupant[event.addr] = (event.name, event.addr_text)
+        visited.append(event)
+    return visited, skipped
+
+
+def walk_value(events: list[Event]) -> tuple[list[Event], list[Skip]]:
+    done: set[str] = set()
+    visited: list[Event] = []
+    skipped: list[Skip] = []
+    for event in events:
+        if event.name in done:
+            skipped.append(
+                Skip(
+                    name=event.name,
+                    addr=event.addr,
+                    addr_text=event.addr_text,
+                    first_name=event.name,
+                    kind="same-value",
+                )
+            )
+            continue
+        done.add(event.name)
+        visited.append(event)
+    return visited, skipped
+
+
+def never_fetched(pointer_skipped: list[Skip]) -> list[str]:
+    """Pointer address-reuse skips whose first occupant is a distinct value key."""
+    return [skip.name for skip in pointer_skipped if skip.kind == "address-reuse"]
+
+
+def skip_kinds(pointer_skipped: list[Skip], value_skipped: list[Skip]) -> list[str]:
+    kinds: list[str] = []
+    for skip in pointer_skipped + value_skipped:
+        if skip.kind not in kinds:
+            kinds.append(skip.kind)
+    return kinds
+
+
+def unique_in_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def inspect(events: list[Event]) -> dict:
+    pointer_visited, pointer_skipped = walk_pointer(events)
+    value_visited, value_skipped = walk_value(events)
+    names = unique_in_order([event.name for event in events])
+    seen_addrs: set[int] = set()
+    addrs: list[str] = []
+    for event in events:
+        if event.addr in seen_addrs:
+            continue
+        seen_addrs.add(event.addr)
+        addrs.append(event.addr_text)
+    fetched = never_fetched(pointer_skipped)
+    kinds = skip_kinds(pointer_skipped, value_skipped)
+    return {
+        "events": events,
+        "pointer_visited": pointer_visited,
+        "pointer_skipped": pointer_skipped,
+        "value_visited": value_visited,
+        "value_skipped": value_skipped,
+        "never_fetched": fetched,
+        "skip_kinds": kinds,
+        "unique_names": names,
+        "unique_addrs": addrs,
+    }
+
+
+def item_name(item: Event | Skip | str) -> str:
+    return item if isinstance(item, str) else item.name
+
+
+def join_capped(
+    items: list[Event] | list[Skip] | list[str],
+    *,
+    unique: bool = False,
+) -> tuple[str, int]:
+    names = [item_name(item) for item in items]
+    n = len(names)
+    if unique:
+        names = unique_in_order(names)
+    if n == 0:
+        return EMPTY, 0
+    return "\t".join(names[:LIST_CAP]), n
+
+
+def unique_skips_by_name(skips: list[Skip]) -> list[Skip]:
+    seen: set[str] = set()
+    out: list[Skip] = []
+    for skip in skips:
+        if skip.name in seen:
+            continue
+        seen.add(skip.name)
+        out.append(skip)
+    return out
+
+
+def predicate_rc(result: dict) -> int:
+    if result["never_fetched"] or "address-reuse" in result["skip_kinds"]:
+        return 1
+    return 0
+
+
+def format_report(result: dict, *, mode: str = "events", retain: bool | None = None) -> str:
+    events: list[Event] = result["events"]
+    names_cell, names_n = join_capped(result["unique_names"])
+    addrs_cell, addrs_n = join_capped(result["unique_addrs"])
+    ptr_vis, ptr_vis_n = join_capped(result["pointer_visited"])
+    ptr_skip, ptr_skip_n = join_capped(result["pointer_skipped"], unique=True)
+    val_vis, val_vis_n = join_capped(result["value_visited"])
+    val_skip, val_skip_n = join_capped(result["value_skipped"], unique=True)
+    fetched, fetched_n = join_capped(result["never_fetched"], unique=True)
+    kinds = result["skip_kinds"]
+    pointer_key = "slot" if mode == "cpython-slot" else "id"
+    lines = [
+        f"mode\t{mode}",
+        f"pointer_key\t{pointer_key}",
+        "value_key\tname",
+        "names\t" + names_cell,
+        "addrs\t" + addrs_cell,
+        "unique_names\t" + str(len(result["unique_names"])),
+        "unique_addrs\t" + str(len(result["unique_addrs"])),
+        "pointer_visited\t" + ptr_vis,
+        "pointer_skipped\t" + ptr_skip,
+        "value_visited\t" + val_vis,
+        "value_skipped\t" + val_skip,
+        "skip_kind\t" + ("\t".join(kinds) if kinds else EMPTY),
+    ]
+    if retain is not None:
+        lines.insert(1, "retain\t" + ("true" if retain else "false"))
+        lines.insert(2, "allocator\tcpython")
+    if names_n > LIST_CAP:
+        lines.append(f"names_n\t{names_n}")
+    if addrs_n > LIST_CAP:
+        lines.append(f"addrs_n\t{addrs_n}")
+    if ptr_skip_n > LIST_CAP:
+        lines.append(f"pointer_skipped_n\t{ptr_skip_n}")
+    if val_skip_n > LIST_CAP:
+        lines.append(f"value_skipped_n\t{val_skip_n}")
+    if ptr_vis_n > LIST_CAP:
+        lines.append(f"pointer_visited_n\t{ptr_vis_n}")
+    if val_vis_n > LIST_CAP:
+        lines.append(f"value_visited_n\t{val_vis_n}")
+    reuses = [skip for skip in result["pointer_skipped"] if skip.kind == "address-reuse"]
+    if reuses:
+        shown_reuses = unique_skips_by_name(reuses)
+        for skip in shown_reuses[:LIST_CAP]:
+            row = (
+                "reuse\t"
+                + skip.addr_text
+                + "\tfirst\t"
+                + skip.first_name
+                + "\tlater\t"
+                + skip.name
+            )
+            if skip.later_addr_text != skip.addr_text:
+                row += "\tlater-token\t" + skip.later_addr_text
+            lines.append(row)
+        if len(reuses) > LIST_CAP:
+            lines.append(f"reuse_n\t{len(reuses)}")
+    else:
+        lines.append("reuse\t" + EMPTY)
+    lines.append("never_fetched_n\t" + str(fetched_n))
+    lines.append("never_fetched\t" + fetched)
+    if mode == "cpython-slot":
+        n = len(events)
+        unique_n = len(result["unique_addrs"])
+        if retain:
+            lines.append("allocator_reuse\t" + EMPTY)
+        elif unique_n < n:
+            lines.append(
+                "allocator_reuse\tping-pong\tunique_addrs\t"
+                + str(unique_n)
+                + "\tof\t"
+                + str(n)
+            )
+        else:
+            lines.append("allocator_reuse\t" + EMPTY)
+    return "\n".join(lines) + "\n"
+
+
+def assign_slot_labels(events: list[Event]) -> None:
+    """Replace process-local 0x id() text with this-run slot0.. labels."""
+    labels: dict[int, str] = {}
+    next_i = 0
+    for event in events:
+        if event.addr not in labels:
+            labels[event.addr] = f"slot{next_i}"
+            next_i += 1
+        event.addr_text = labels[event.addr]
+
+
+def live_events(names: list[str], *, retain: bool) -> list[Event]:
+    keep: list[Node] = []
+    events: list[Event] = []
+    for name in names:
+        obj = Node(name)
+        ident = id(obj)
+        events.append(Event(name=name, addr=ident, addr_text=hex(ident)))
+        if retain:
+            keep.append(obj)
+    assign_slot_labels(events)
+    return events
+
+
+def validate_live_names(names: list[str]) -> list[str]:
+    if not names:
+        raise ValueError("--live needs at least one NAME")
+    out: list[str] = []
+    for name in names:
+        if BOM in name:
+            raise ValueError("--live BOM in NAME")
+        if name == "":
+            raise ValueError("--live empty NAME")
+        if name.strip() != name:
+            raise ValueError(f"--live padded NAME {name!r}")
+        if name == EMPTY:
+            raise ValueError(f"--live NAME {name!r} is the empty-list token")
+        path = Path(name)
+        # Refuse an existing regular file so `--live FILE` is not a NAME.
+        # A directory homonym (repo `root/`) is a lock-node NAME.
+        if path.is_file():
+            raise ValueError(
+                f"--live {name!r}: existing file is not a live NAME "
+                "(CPython slot reuse; omit --live to read a RECORD)"
+            )
+        out.append(name)
+    return out
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="visitid",
+        description=(
+            "Walk a visit sequence with a pointer done-set (set of id(obj)) and "
+            "a value done-set (set of NAME). Name address reuse that skips a "
+            "later node whose first occupant was distinct. NAME is the node key, "
+            "not a flake.lock input name; this CLI does not accept flake input "
+            "names as a column or as value identity. ADDR is hex (0x1000 and "
+            "1000 collapse); 1e2 is scientific, not an address."
+        ),
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "construct CPython Node temporaries and walk set(id(obj)) vs "
+            "set(NAME); printed addrs are this-run slot0.. labels, not "
+            "process-local 0x join keys. An existing regular file is not a "
+            "live NAME; a directory homonym is"
+        ),
+    )
+    parser.add_argument(
+        "--retain",
+        action="store_true",
+        help="with --live, keep objects alive so ids stay unique",
+    )
+    parser.add_argument(
+        "args",
+        nargs="*",
+        metavar="ARG",
+        help="RECORD file, or NAMEs with --live (default stdin unless --live)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.live:
+            names = validate_live_names(args.args)
+            events = live_events(names, retain=args.retain)
+            mode = "cpython-slot"
+            retain: bool | None = args.retain
+        else:
+            if args.retain:
+                raise ValueError("--retain requires --live")
+            if len(args.args) > 1:
+                raise ValueError("unexpected extra arguments")
+            if args.args:
+                path = Path(args.args[0])
+                text = path.read_text(encoding="utf-8")
+                source = str(path)
+            else:
+                text = sys.stdin.read()
+                source = "<stdin>"
+            events = parse_record(text, source=source)
+            mode = "events"
+            retain = None
+        result = inspect(events)
+    except (OSError, ValueError) as err:
+        print(f"visitid: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result, mode=mode, retain=retain))
+    return predicate_rc(result)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

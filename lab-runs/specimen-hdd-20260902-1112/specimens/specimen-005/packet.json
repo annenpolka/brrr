@@ -1,0 +1,11 @@
+{
+  "id": "specimen-005",
+  "manifest": "\nid: specimen-005\nkind: REAL_SOURCE_BACKED\nrepository: rust-lang/cargo\nfailing_ref: 84a7a403847019436b99266e592464a495d316da\nfixed_ref: bd1b85773cf0ed19f6068359b09b64bd5f85a86a\nsource_issue: https://github.com/rust-lang/cargo/issues/15695\nsource_pr: https://github.com/rust-lang/cargo/pull/17216\nmechanism_tags:\n  - cache-invalidation\n  - fingerprint\n  - missing-output\necosystem: rust\nreproduction_status: source-backed\nsafety_status: not-executed-on-host\npacket_tokens_estimate: 5500\nanswer_key_sealed: true\nparent_specimens: []\nmutations: [specimen-011]\n",
+  "task": "# TASK\n\nA crate is built once. A second build requests an extra artifact kind (SBOM precursor) for the same unit via `CARGO_BUILD_SBOM=true` and `-Zsbom`. Cargo reports the unit fresh. The extra artifact is missing from the target directory.\n\nThe developer wants to know what the cache considered \u201cthe same build\u201d and which requested outputs were not part of that identity.\n",
+  "observed": "# OBSERVED\n\nPublic rust-lang/cargo#15695 / PR 17216.\n\n1. Build without SBOM \u2014 succeeds, unit in cache.\n2. Rebuild same unit with SBOM requested.\n3. Cache hit. Expected SBOM precursor is not in top-level target output.\n\nRegression test on the PR: build once without SBOM, enable it, assert precursor appears. On the failing revision it does not.\n",
+  "commands": "# COMMANDS\n\n```\ncargo build\nCARGO_BUILD_SBOM=true cargo build -Zsbom\nls target/  # precursor missing on failing revision\n```\nDo not run cargo against untrusted checkouts on the host.\n",
+  "tree": "crate/\n  Cargo.toml\n  src/lib.rs\ntarget/   # unit cached; extra output kind absent\n",
+  "source": "pr: https://github.com/rust-lang/cargo/pull/17216\nissue: https://github.com/rust-lang/cargo/issues/15695\nfailing_ref: 84a7a403847019436b99266e592464a495d316da\nfixed_ref: bd1b85773cf0ed19f6068359b09b64bd5f85a86a\nmerged_at: 2026-07-16T19:20:13Z\n",
+  "answer_key": "KNOWN FIX (sealed): Cargo excluded SBOM outputs when calculating a unit fingerprint. Include SBOM in the output set used for fingerprints so enabling SBOM invalidates the earlier build. Unit output/uplift path otherwise unchanged.\n",
+  "curation": "ACCEPT_R1\n"
+}

@@ -1,0 +1,24 @@
+Registry / fixture:
+  clangd C++20 prerequisite module BMI
+  leftover BMI after header rewrite
+
+Case A (second parse, same header bytes):
+  current cache identity
+  not leftover-after-rewrite
+
+Case B (header rewritten, leftover BMI):
+  leftover: previous module / previous header bytes
+  ASTReader content validation omitted
+  canReuse true
+
+Case C (rebuild modules / no prior BMI):
+  fresh module identity
+  not leftover previous BMI
+
+Case D (ValidateASTInputFilesContent on ASTReader):
+  new BMI after header rewrite
+  not leftover previous module
+
+Not this packet:
+  bindname last-wins (specimen-013)
+  rustc incremental fingerprint (specimen-075)

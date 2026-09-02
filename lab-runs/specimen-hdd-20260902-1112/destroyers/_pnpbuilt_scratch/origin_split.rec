@@ -1,0 +1,34 @@
+Registry / fixture:
+  no-deps-scripted (in-tree PR 2801 test) — has install script
+  @sentry/cli@1.62.0 (public #2452) — install script fetches sentry-cli binary
+
+Case A (never built / first install):
+  yarn install
+  stdout contains YN0007 MUST_BUILD
+  PnP packageLocation = .yarn/unplugged/<slug>/
+  storedBuildState[locatorHash] = sha512(globalHash + baseHash + path strings)
+  unplugged prefix contains .ready
+
+Case B (second install, unplugged tree still on disk):
+  yarn install
+  no YN0007
+  storedBuildState.get(locatorHash) === getBuildHash(...)
+
+Case C (remove unplugged tree; package still a dependency):
+  rm -rf .yarn/unplugged
+  yarn install
+  unplugPackage recopies zip (no .ready)
+  getBuildHash unchanged (same path strings)
+  leftover storedBuildState matches → no YN0007
+  @sentry/cli: spawn …/sentry-cli ENOENT
+  PnP packageLocation still names the unplugged directory
+
+Case D (never installed):
+  no PnP registry ident for the package
+  no storedBuildState row
+  no .yarn/unplugged/<slug>/ directory
+
+Not this packet:
+  bun.lock leftover packages vs optionalPeers mention after bun remove (specimen-082)
+  leftover dependenciesMeta.unplugged after yarn remove (#1490, unfixed)
+  finalizeInstallWithPnp deleting unused unplugged dirs for locators that left the tree

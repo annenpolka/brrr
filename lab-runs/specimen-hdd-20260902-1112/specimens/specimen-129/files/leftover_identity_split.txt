@@ -1,0 +1,26 @@
+Registry / fixture:
+  mill JavaModule compile.dest/classes persistent
+  org.immutables:value annotation processor
+  leftover Immutable*.class after originating source deleted
+
+Case A (first compile, 3 sources):
+  generated classes written
+  not leftover
+
+Case B (delete originating source, leftover AP classes):
+  leftover: previous generated class identity
+  compile succeeds
+  zinc analysis omitted generated products
+
+Case C (rm -rf out/ then compile):
+  fresh dest
+  compile fails
+  not leftover generated identity
+
+Case D (plain Java source delete, analysis had mapping):
+  Zinc removes that .class
+  not this leftover
+
+Not this packet:
+  sbt leftover extra zinc Analysis last-write vs file identity (specimen-117)
+  mill#4642 out/ absolute-path serialization (job-0537 skip axis)

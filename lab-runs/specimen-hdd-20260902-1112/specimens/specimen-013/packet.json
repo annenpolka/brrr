@@ -1,0 +1,11 @@
+{
+  "id": "specimen-013",
+  "manifest": "\nid: specimen-013\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nmechanism_tags:\n  - identity-move\n  - rename-split\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2500\nanswer_key_sealed: true\nparent_specimens: [specimen-003]\nmutations: []\n",
+  "task": "# TASK\n\nA function `parse` lived in `pkg/util.py`. It was moved to `pkg/parse.py` and a similarly named `parse` helper was left behind in util (different body). Blame, tags, and grep disagree about which identity \u201cparse\u201d refers to. The developer wants to know which definition a failing test actually imported.\n",
+  "observed": "# OBSERVED\n\nOwned fixture: files/pkg_util.py and files/pkg_parse.py plus files/test_parse_identity.py.\n\n`from pkg_util import parse` vs `from pkg_parse import parse` bind different functions with the same name. A stale test import still hits the leftover helper.\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/test_parse_identity.py\n```\n",
+  "tree": "files/pkg_util.py\nfiles/pkg_parse.py\nfiles/test_parse_identity.py\n",
+  "source": "Derived identity-move/split from collection-identity family. Owned fixture.\n",
+  "answer_key": "KNOWN FIX (sealed): leftover same-name helper after move; import path decides identity. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\n"
+}

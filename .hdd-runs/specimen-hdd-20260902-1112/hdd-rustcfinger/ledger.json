@@ -1,0 +1,47 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "Two rustc binaries can share path and clamped mtime and still print different Fedora host strings in rustc -vV"
+  ],
+  "established": [
+    "Packet: rustc_fingerprint hashes resolved path + mtime only; Cache::load reuses .rustc_info.json on equal fingerprint and does not re-run -vV",
+    "Owned split: same /usr/bin/rustc and 2024-10-17 mtime, vv fc42 vs fc40"
+  ],
+  "rejected": [
+    "Invented Cache::load / cargo build transcripts are not host-executed"
+  ],
+  "constraints": [
+    "Owned two rustc identity records. No cargo/rustc required for the identity question."
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "whether two rustc identities collide on path+mtime fingerprint while verbose-version host strings differ"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name fingerprint collision vs -vV mismatch for two rustc identities",
+    "nearest_existing_operation": "diff two rustc -vV strings; compare path and mtime",
+    "observable_delta": "hidden_by_fingerprint when path+mtime match and vv differs",
+    "reason": "path/mtime equality and vv mismatch are two observations; the join is cache reuse hiding the compiler",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T15:29:12+09:00",
+      "summary": "Invented cargo source walk. Harvest whether path+mtime fingerprint collides while -vV host strings differ. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name fingerprint collision vs -vV mismatch for two rustc identities",
+        "nearest_existing_operation": "diff two rustc -vV strings; compare path and mtime",
+        "observable_delta": "hidden_by_fingerprint when path+mtime match and vv differs",
+        "reason": "path/mtime equality and vv mismatch are two observations; the join is cache reuse hiding the compiler",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

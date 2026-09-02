@@ -1,0 +1,39 @@
+Registry / fixture:
+  in-tree: git repo `dep` with path member `member` (PR 17204 regression shape)
+  public #15981: serde git+https://github.com/serde-rs/serde (workspace members)
+
+Git PackageId (both spellings, case B):
+  serde v1.0.225 (https://github.com/serde-rs/serde#ee3c2372)
+  member v0.1.0 (<dep-url>#<rev>)
+
+Case A (CARGO_HOME without ..):
+  cargo check
+  one checkout PathBuf
+  HashMap<PackageId, Vec<Package>> length 1 per id
+  no skipping-duplicate for member/dep/serde
+
+Case B (CARGO_HOME keeps ..):
+  CARGO_HOME=/home/kaspar/tmp/subfolder/../cargo
+  walk PathBuf retains subfolder/../cargo/git/checkouts/...
+  nested path= PathBuf is the collapsed tmp/cargo/git/checkouts/...
+  visited HashSet sees two keys
+  Vec<Package> length 2 for one git PackageId
+  warning lists both Cargo.toml spellings
+  build finishes (not `failed to find ... in path source`)
+
+Case C (true two-directory clash, clean CARGO_HOME):
+  duplicate1/Cargo.toml and duplicate2/Cargo.toml, same name
+  two different files
+  warning still fires
+
+Case D (local path dep, no git):
+  no $CARGO_HOME/git/checkouts walk of this crate
+
+GitSource::fingerprint on failing_ref:
+  locked git oid string (not the checkout path)
+
+Not this packet:
+  SBOM extra output omitted from unit identity (specimen-005)
+  rustc_fingerprint path+mtime of rustc (specimen-086)
+  SourceId Hash ignoring precise rev (cargo#12233 / unmerged #17275)
+  checkout short-id length vs core.abbrev (cargo#17289)

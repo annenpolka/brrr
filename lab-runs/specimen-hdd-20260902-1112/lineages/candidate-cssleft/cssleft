@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""cssleft: leftover CSS [contenthash] / stale css-url after PNG identity moved."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("css_name", "url_in_css", "png_emitted", "prev_css_name")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "css_name" not in fields or "url_in_css" not in fields or "png_emitted" not in fields:
+        raise ValueError(f"{source}: need css_name, url_in_css, png_emitted")
+    return fields
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    css = fields["css_name"]
+    url = fields["url_in_css"]
+    png = fields["png_emitted"]
+    prev = fields.get("prev_css_name") or ""
+    leftover_url = url != png
+    leftover_css = bool(prev) and css == prev
+    leftover = leftover_url or leftover_css
+    return {
+        "css_name": css,
+        "url_in_css": url,
+        "png_emitted": png,
+        "prev_css_name": prev or "-",
+        "leftover_url": leftover_url,
+        "leftover_css_hash": leftover_css,
+        "leftover": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"css_name\t{result['css_name']}",
+        f"url_in_css\t{result['url_in_css']}",
+        f"png_emitted\t{result['png_emitted']}",
+        f"prev_css_name\t{result['prev_css_name']}",
+        f"leftover_url\t{yn(result['leftover_url'])}",
+        f"leftover_css_hash\t{yn(result['leftover_css_hash'])}",
+        f"leftover\t{yn(result['leftover'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="cssleft",
+        description=(
+            "Name leftover CSS [contenthash] and stale css-url after a referenced "
+            "PNG hashed filename moved. grep of the CSS filename hits both compiles."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"cssleft: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

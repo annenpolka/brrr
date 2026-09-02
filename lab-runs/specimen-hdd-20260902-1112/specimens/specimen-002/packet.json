@@ -1,0 +1,11 @@
+{
+  "id": "specimen-002",
+  "manifest": "\nid: specimen-002\nkind: REAL_SOURCE_BACKED\nrepository: pytest-dev/pytest\nfailing_ref: ced9022c0ca87ae2a0a604c68d2e1c462f8a5c6f\nfixed_ref: 3258779fc9ab792ed95c55053f45853becd6fddf\nsource_issue: https://github.com/pytest-dev/pytest/issues/14683\nsource_pr: https://github.com/pytest-dev/pytest/pull/14694\nmechanism_tags:\n  - collection-identity\n  - config-scope\n  - fixture-visibility\necosystem: python\nreproduction_status: source-backed\nsafety_status: not-executed-on-host\npacket_tokens_estimate: 8000\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nA project runs pytest with `--rootdir` pointing at a *subdirectory* and collects tests/doctests from a *parent* path. Names injected via the rootdir conftest (including `doctest_namespace`) are missing: doctests fail `NameError`.\n\nThe same layout passed on pytest 9.0.3 and fails on 9.1.1.\n\nThe developer needs to see *which configuration objects actually apply* to the collected items, not a guess about versions.\n",
+  "observed": "# OBSERVED\n\nReporter invocation (xclim):\n\n```\npytest --rootdir src/xclim/testing --config-file=src/xclim/testing/conftest.py \\\n       --doctest-modules src/xclim\n```\n\n- pytest 9.0.3: pass\n- pytest 9.1.1: `NameError: name '...' is not defined` for names the rootdir conftest meant to inject\n\nPublic issue pytest-dev/pytest#14683 / PR 14694.\n",
+  "commands": "# COMMANDS\n\n```\npytest --rootdir <subdir> --config-file=<subdir>/conftest.py --doctest-modules <parent>\n```\n",
+  "tree": "src/xclim/testing/conftest.py\nsrc/xclim/  (modules collected from parent of rootdir)\n",
+  "source": "pr: https://github.com/pytest-dev/pytest/pull/14694\nissue: https://github.com/pytest-dev/pytest/issues/14683\nfailing_ref (PR base): ced9022c0ca87ae2a0a604c68d2e1c462f8a5c6f\nfixed_ref (PR head): 3258779fc9ab792ed95c55053f45853becd6fddf\nmerged_at: 2026-07-24T13:32:49Z\n",
+  "answer_key": "KNOWN FIX (sealed): pytest 9.1 changed conftest fixture visibility from nodeid-based to node-based (#14098). Rootdir conftest became scoped to its Directory node; items collected outside rootdir do not have that Directory as ancestor. Fix attaches rootdir conftest to Session in _flush_pending_conftests_to_session and pytest_make_collect_report.\n",
+  "curation": "ACCEPT_R1\n"
+}

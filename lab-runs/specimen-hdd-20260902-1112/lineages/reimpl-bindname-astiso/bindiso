@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""bindiso: for one import, the body that would run vs other same-name defs.
+
+Loads only the queried module via spec_from_file_location under a unique
+name. Sibling leftovers are collected from the AST and are not executed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import io
+import os
+import sys
+import types
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+ISO_PREFIX = "_bindiso_"
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox"}
+PROG = "bindiso"
+
+
+class QueryError(Exception):
+    pass
+
+
+class IsolatedImportError(Exception):
+    pass
+
+
+@dataclass
+class Binding:
+    import_stmt: str
+    bind: str
+    runs: str
+    kind: str
+    file: str
+    line: int
+    source: str
+
+
+@dataclass
+class StaticBind:
+    module: str
+    path: Path
+    kind: str
+    line: int
+    source: str
+    from_module: str | None = None
+    imported_name: str | None = None
+
+
+@dataclass
+class Miss:
+    where: str
+    reason: str
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"{PROG}: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def iter_py_files(root: Path) -> list[Path]:
+    root_abs = Path(os.path.abspath(root))
+    seen_dirs: set[tuple[int, int]] = set()
+    out: list[Path] = []
+    stack = [root_abs]
+    while stack:
+        current = stack.pop()
+        try:
+            st = current.stat()
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            if name in SKIP_DIRS or name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    stack.append(entry)
+                elif name.endswith(".py") and entry.is_file():
+                    out.append(entry)
+            except OSError:
+                continue
+    return sorted(out, key=lambda p: str(p))
+
+
+def module_name_for(root: Path, path: Path) -> str | None:
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except ValueError:
+        return None
+    if rel.startswith("..") or not rel.endswith(".py"):
+        return None
+    rel = rel[: -len(".py")]
+    parts = rel.split(os.sep)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts or parts == ["."]:
+        return None
+    if not all(part.isidentifier() for part in parts):
+        return None
+    return ".".join(parts)
+
+
+def module_path_for(root: Path, modname: str) -> Path | None:
+    parts = modname.split(".")
+    base = Path(os.path.abspath(root))
+    file_path = base.joinpath(*parts).with_suffix(".py")
+    if file_path.is_file():
+        return file_path
+    init_path = base.joinpath(*parts, "__init__.py")
+    if init_path.is_file():
+        return init_path
+    return None
+
+
+def rel_file(root: Path, path: Path | None) -> str:
+    if path is None:
+        return ""
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except ValueError:
+        return path_abs
+    if rel.startswith(".."):
+        return path_abs
+    return rel
+
+
+def node_source(text: str, node: ast.AST) -> str:
+    lineno = getattr(node, "lineno", None)
+    if lineno is None:
+        return ast.get_source_segment(text, node) or ""
+    lines = text.splitlines(keepends=True)
+    start = max(lineno - 1, 0)
+    end = getattr(node, "end_lineno", None) or lineno
+    return "".join(lines[start:end])
+
+
+def is_const_false(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value in (False, 0, None, "", b"")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        if isinstance(node.operand, ast.Constant):
+            return bool(node.operand.value)
+    return False
+
+
+def iter_module_stmts(body: list[ast.stmt], *, skip_dead_if: bool) -> list[ast.stmt]:
+    out: list[ast.stmt] = []
+
+    def walk(nodes: list[ast.stmt]) -> None:
+        for node in nodes:
+            if isinstance(node, ast.If):
+                if skip_dead_if and is_const_false(node.test):
+                    walk(node.orelse)
+                    continue
+                walk(node.body)
+                walk(node.orelse)
+                continue
+            if isinstance(node, ast.Try):
+                walk(node.body)
+                for handler in node.handlers:
+                    walk(handler.body)
+                walk(node.orelse)
+                walk(node.finalbody)
+                continue
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                walk(node.body)
+                walk(node.orelse)
+                continue
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                walk(node.body)
+                continue
+            out.append(node)
+
+    walk(body)
+    return out
+
+
+def _assigns_name(target: ast.AST, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_assigns_name(elt, name) for elt in target.elts)
+    return False
+
+
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        left = _dotted(node.value)
+        if left is None:
+            return None
+        return f"{left}.{node.attr}"
+    return None
+
+
+def resolve_from_module(modname: str, path: Path, node: ast.ImportFrom) -> str | None:
+    if node.level == 0:
+        return node.module
+    parts = modname.split(".")
+    if path.name != "__init__.py":
+        parts = parts[:-1]
+    drop = node.level - 1
+    if drop:
+        if drop > len(parts):
+            return node.module
+        parts = parts[:-drop]
+    if node.module:
+        parts = parts + node.module.split(".")
+    if not parts:
+        return node.module
+    return ".".join(parts)
+
+
+def read_parse(path: Path) -> tuple[str | None, ast.AST | None, str | None]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None, None, "not utf-8"
+    except OSError as err:
+        return None, None, err.strerror or str(err)
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as err:
+        return text, None, f"syntax error: {err.msg}"
+    return text, tree, None
+
+
+def last_bind(
+    modname: str,
+    path: Path,
+    text: str,
+    tree: ast.AST,
+    name: str,
+    *,
+    skip_dead_if: bool = True,
+) -> StaticBind | None:
+    aliases: dict[str, str] = {}
+    last: StaticBind | None = None
+    for node in iter_module_stmts(list(tree.body), skip_dead_if=skip_dead_if):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                aliases[local] = alias.name
+                if local == name:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="reexport",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=alias.name,
+                        imported_name=None,
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                target = resolve_from_module(modname, path, node)
+                if target:
+                    aliases[local] = f"{target}.{alias.name}"
+                if local == name:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="reexport",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=target,
+                        imported_name=alias.name,
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                last = StaticBind(
+                    module=modname,
+                    path=path,
+                    kind="def",
+                    line=node.lineno,
+                    source=node_source(text, node),
+                )
+        elif isinstance(node, ast.Assign):
+            if any(_assigns_name(t, name) for t in node.targets):
+                owner, attr = _attr_owner(node.value, aliases)
+                if owner:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="reexport",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=owner,
+                        imported_name=attr or name,
+                    )
+                else:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="def",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                    )
+        elif isinstance(node, ast.AnnAssign):
+            if _assigns_name(node.target, name) and node.value is not None:
+                owner, attr = _attr_owner(node.value, aliases)
+                if owner:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="reexport",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=owner,
+                        imported_name=attr or name,
+                    )
+                else:
+                    last = StaticBind(
+                        module=modname,
+                        path=path,
+                        kind="def",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                    )
+    return last
+
+
+def _attr_owner(node: ast.AST, aliases: dict[str, str]) -> tuple[str | None, str | None]:
+    if isinstance(node, ast.Attribute):
+        dotted = _dotted(node.value)
+        if dotted is None:
+            return None, None
+        owner = aliases.get(dotted, dotted)
+        if "." in owner and owner not in aliases:
+            # local -> "mod.attr" from a from-import; keep module part
+            pass
+        return owner, node.attr
+    return None, None
+
+
+def module_level_defs(tree: ast.AST, name: str) -> list[ast.AST]:
+    defs: list[ast.AST] = []
+    for node in iter_module_stmts(list(tree.body), skip_dead_if=True):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                defs.append(node)
+    return defs
+
+
+def _ensure_unique_parents(unique: str, root: Path, modname: str) -> None:
+    token, _, _rest = unique.partition(".")
+    if token not in sys.modules:
+        pkg = types.ModuleType(token)
+        pkg.__path__ = [os.path.abspath(root)]
+        pkg.__package__ = token
+        sys.modules[token] = pkg
+    parts = modname.split(".")[:-1]
+    acc_dir = Path(os.path.abspath(root))
+    acc_name = token
+    for part in parts:
+        acc_dir = acc_dir / part
+        acc_name = f"{acc_name}.{part}"
+        if acc_name not in sys.modules:
+            pkg = types.ModuleType(acc_name)
+            pkg.__path__ = [str(acc_dir)]
+            pkg.__package__ = acc_name
+            sys.modules[acc_name] = pkg
+
+
+def load_isolated(root: Path, modname: str, path: Path) -> tuple[object, str]:
+    """Load path as a unique module name. Does not touch sys.modules[modname]."""
+    saved_modules = sys.modules.copy()
+    saved_path = sys.path.copy()
+    unique = f"{ISO_PREFIX}{uuid.uuid4().hex}.{modname}"
+    try:
+        root_s = os.path.abspath(root)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
+        _ensure_unique_parents(unique, root, modname)
+        search = [str(path.parent)] if path.name == "__init__.py" else None
+        spec = importlib_spec_from_file_location(
+            unique,
+            str(path),
+            submodule_search_locations=search,
+        )
+        if spec is None or spec.loader is None:
+            raise IsolatedImportError(f"{modname}: no loader for {path}")
+        module = importlib_module_from_spec(spec)
+        sys.modules[unique] = module
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                spec.loader.exec_module(module)
+        except SystemExit as err:
+            raise IsolatedImportError(f"{modname}: sys.exit({err.code})") from err
+        except IsolatedImportError:
+            raise
+        except Exception as err:
+            raise IsolatedImportError(
+                f"{modname}: {type(err).__name__}: {err}"
+            ) from err
+        return module, unique
+    finally:
+        sys.path[:] = saved_path
+        for key in list(sys.modules):
+            if key not in saved_modules:
+                del sys.modules[key]
+        for key, value in saved_modules.items():
+            sys.modules[key] = value
+
+
+def importlib_spec_from_file_location(name: str, location: str, **kwargs):
+    import importlib.util
+
+    return importlib.util.spec_from_file_location(name, location, **kwargs)
+
+
+def importlib_module_from_spec(spec):
+    import importlib.util
+
+    return importlib.util.module_from_spec(spec)
+
+
+def follow_def(root: Path, modname: str | None, name: str, seen: set[str] | None = None) -> StaticBind | None:
+    if not modname:
+        return None
+    seen = seen if seen is not None else set()
+    if modname in seen:
+        return None
+    seen.add(modname)
+    path = module_path_for(root, modname)
+    if path is None:
+        return None
+    text, tree, err = read_parse(path)
+    if err or text is None or tree is None:
+        return None
+    last = last_bind(modname, path, text, tree, name)
+    if last is None:
+        return None
+    if last.kind == "def":
+        return last
+    imported = last.imported_name or name
+    return follow_def(root, last.from_module, imported, seen)
+
+
+def binding_from_last(root: Path, modname: str, name: str, last: StaticBind) -> Binding:
+    stmt = f"from {modname} import {name}"
+    bind = f"{modname}.{name}"
+    if last.kind == "def":
+        return Binding(
+            import_stmt=stmt,
+            bind=bind,
+            runs=f"{modname}.{name}",
+            kind="def",
+            file=rel_file(root, last.path),
+            line=last.line,
+            source=last.source,
+        )
+    imported = last.imported_name or name
+    target = last.from_module or ""
+    defn = follow_def(root, target, imported)
+    if defn is not None:
+        runs = f"{defn.module}.{imported}"
+        return Binding(
+            import_stmt=stmt,
+            bind=bind,
+            runs=runs,
+            kind="reexport",
+            file=rel_file(root, defn.path),
+            line=defn.line,
+            source=defn.source,
+        )
+    runs = f"{target}.{imported}" if target else imported
+    return Binding(
+        import_stmt=stmt,
+        bind=bind,
+        runs=runs,
+        kind="reexport",
+        file=rel_file(root, last.path),
+        line=last.line,
+        source=last.source,
+    )
+
+
+def resolve_query(root: Path, modname: str, name: str) -> Binding:
+    path = module_path_for(root, modname)
+    if path is None:
+        raise QueryError(f"no module {modname} under {root}")
+    text, tree, err = read_parse(path)
+    if err:
+        raise QueryError(f"{rel_file(root, path)}: {err}")
+    if text is None or tree is None:
+        raise QueryError(f"{rel_file(root, path)}: unreadable")
+    try:
+        module, _unique = load_isolated(root, modname, path)
+    except IsolatedImportError as err:
+        raise QueryError(f"import failed: {err}") from err
+    if not hasattr(module, name):
+        raise QueryError(f"{modname} has no name {name}")
+    last = last_bind(modname, path, text, tree, name)
+    if last is None:
+        raise QueryError(f"{modname} has no name {name}")
+    return binding_from_last(root, modname, name, last)
+
+
+def static_other_defs(
+    root: Path,
+    name: str,
+    exclude_module: str,
+    exclude_runs: str,
+) -> tuple[list[Binding], list[Miss]]:
+    others: list[Binding] = []
+    misses: list[Miss] = []
+    for path in iter_py_files(root):
+        mod = module_name_for(root, path)
+        if not mod or mod == exclude_module:
+            continue
+        text, tree, err = read_parse(path)
+        if err:
+            if err == "not utf-8":
+                continue
+            if text and f"def {name}" in text:
+                misses.append(Miss(rel_file(root, path), err))
+            continue
+        if text is None or tree is None:
+            continue
+        defs = module_level_defs(tree, name)
+        if not defs:
+            continue
+        node = defs[-1]
+        runs = f"{mod}.{name}"
+        if runs == exclude_runs:
+            continue
+        others.append(
+            Binding(
+                import_stmt=f"from {mod} import {name}",
+                bind=f"{mod}.{name}",
+                runs=runs,
+                kind="def",
+                file=rel_file(root, path),
+                line=getattr(node, "lineno", 0),
+                source=node_source(text, node),
+            )
+        )
+    others.sort(key=lambda b: b.runs)
+    return others, misses
+
+
+def bindings_for_name(root: Path, name: str) -> tuple[list[Binding], list[Miss]]:
+    found: list[Binding] = []
+    misses: list[Miss] = []
+    for path in iter_py_files(root):
+        mod = module_name_for(root, path)
+        if not mod:
+            continue
+        text, tree, err = read_parse(path)
+        if err:
+            if err == "not utf-8":
+                continue
+            if text and f"def {name}" in text:
+                misses.append(Miss(rel_file(root, path), err))
+            continue
+        if text is None or tree is None:
+            continue
+        last = last_bind(mod, path, text, tree, name)
+        if last is None:
+            continue
+        try:
+            module, _unique = load_isolated(root, mod, path)
+        except IsolatedImportError as err:
+            misses.append(Miss(mod, str(err)))
+            continue
+        if not hasattr(module, name):
+            misses.append(Miss(mod, f"{mod} has no name {name}"))
+            continue
+        found.append(binding_from_last(root, mod, name, last))
+    found.sort(key=lambda b: b.bind)
+    return found, misses
+
+
+def walk_module_level(nodes: list[ast.AST]):
+    for node in nodes:
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield from walk_module_level(list(ast.iter_child_nodes(node)))
+
+
+def uses_in_file(modname: str | None, path: Path, text: str, tree: ast.AST, name: str) -> list[tuple[str, str]]:
+    aliases: dict[str, str] = {}
+    queries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(module: str, attr: str) -> None:
+        key = (module, attr)
+        if module and key not in seen:
+            seen.add(key)
+            queries.append(key)
+
+    stmts = iter_module_stmts(list(tree.body), skip_dead_if=True)
+    for node in stmts:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                aliases[local] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                target = resolve_from_module(modname or "", path, node) if modname else node.module
+                if target:
+                    aliases[local] = target
+                    if local == name:
+                        add(target, alias.name)
+    for node in walk_module_level(stmts):
+        if isinstance(node, ast.Attribute) and node.attr == name:
+            dotted = _dotted(node.value)
+            if dotted is None:
+                continue
+            owner = aliases.get(dotted, dotted)
+            add(owner, name)
+    return queries
+
+
+def bindings_from_file(root: Path, path: Path, name: str) -> tuple[list[Binding], list[Miss]]:
+    path = Path(os.path.abspath(path))
+    text, tree, err = read_parse(path)
+    if err:
+        raise QueryError(f"{path}: {err}")
+    if text is None or tree is None:
+        raise QueryError(f"{path}: unreadable")
+    file_mod = module_name_for(root, path)
+    last = last_bind(file_mod or path.stem, path, text, tree, name)
+    misses: list[Miss] = []
+    if last is not None:
+        if last.kind == "def":
+            mod = file_mod or path.stem
+            return [binding_from_last(root, mod, name, last)], misses
+        target = last.from_module
+        imported = last.imported_name or name
+        if not target:
+            raise QueryError(f"no uses of {name} in {path}")
+        try:
+            binding = resolve_query(root, target, imported)
+        except QueryError as err:
+            raise QueryError(str(err)) from err
+        return [binding], misses
+    queries = uses_in_file(file_mod, path, text, tree, name)
+    out: list[Binding] = []
+    seen: set[str] = set()
+    for module, attr in queries:
+        key = f"{module}.{attr}"
+        if key in seen:
+            continue
+        try:
+            binding = resolve_query(root, module, attr)
+        except QueryError as err:
+            misses.append(Miss(key, str(err)))
+            continue
+        seen.add(key)
+        out.append(binding)
+    return out, misses
+
+
+def same_function(bindings: list[Binding], misses: list[Miss]) -> bool:
+    if misses:
+        return False
+    if len(bindings) <= 1:
+        return True
+    return len({b.runs for b in bindings}) == 1
+
+
+def other_defs(query: Binding, others: list[Binding]) -> list[Binding]:
+    return [b for b in others if b.runs != query.runs]
+
+
+def format_binding(binding: Binding) -> list[str]:
+    return [
+        f"import\t{binding.import_stmt}",
+        f"bind\t{binding.bind}",
+        f"runs\t{binding.runs}",
+        f"kind\t{binding.kind}",
+        f"file\t{binding.file}",
+        f"line\t{binding.line}",
+        f"source\t{binding.source!r}",
+    ]
+
+
+def format_list(name: str, bindings: list[Binding], misses: list[Miss]) -> str:
+    lines = [
+        f"name\t{name}",
+        f"count\t{len(bindings)}",
+        f"same_function\t{same_function(bindings, misses)}",
+    ]
+    for miss in misses:
+        lines.append(f"miss\t{miss.where}\t{miss.reason}")
+    for binding in bindings:
+        lines.append("")
+        lines.extend(format_binding(binding))
+    return "\n".join(lines) + "\n"
+
+
+def format_query(
+    query_stmt: str,
+    binding: Binding,
+    others: list[Binding],
+    misses: list[Miss],
+) -> str:
+    same = (not others) and (not misses)
+    lines = [f"query\t{query_stmt}"]
+    lines.extend(format_binding(binding))
+    for other in others:
+        lines.append(f"also\t{other.runs}")
+    for miss in misses:
+        lines.append(f"miss\t{miss.where}\t{miss.reason}")
+    lines.append(f"same_function\t{same}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_import_stmt(stmt: str) -> tuple[str, str]:
+    try:
+        tree = ast.parse(stmt)
+    except SyntaxError as err:
+        raise ValueError(f"not an import statement: {stmt}") from err
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.ImportFrom):
+        raise ValueError(f'expected "from MODULE import NAME", got {stmt!r}')
+    node = tree.body[0]
+    if not node.module or node.level:
+        raise ValueError(f'expected "from MODULE import NAME", got {stmt!r}')
+    if len(node.names) != 1 or node.names[0].name == "*":
+        raise ValueError("star imports do not bind one name")
+    alias = node.names[0]
+    return node.module, alias.asname or alias.name
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description=(
+            "For a name, print the import path and the body that would run. "
+            "Distinguishes a leftover same-name helper from a moved definition."
+        ),
+    )
+    parser.add_argument("name", metavar="NAME", nargs="?", help="name to resolve, or MODULE.NAME")
+    parser.add_argument(
+        "-C",
+        "--dir",
+        dest="root",
+        default=".",
+        metavar="DIR",
+        help="import root (default: .)",
+    )
+    parser.add_argument("--from", dest="from_module", metavar="MODULE", help="resolve 'from MODULE import NAME'")
+    parser.add_argument(
+        "--import",
+        dest="import_stmt",
+        metavar="STMT",
+        help="resolve an import statement, e.g. 'from pkg_util import parse'",
+    )
+    parser.add_argument(
+        "--file",
+        dest="importer",
+        metavar="PATH",
+        help="resolve the last binding of NAME in this file",
+    )
+    return parser.parse_args(argv)
+
+
+def note_misses(misses: list[Miss]) -> None:
+    for miss in misses:
+        print(f"{PROG}: miss {miss.where}: {miss.reason}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    root = Path(args.root)
+    if not root.is_dir():
+        print(f"{PROG}: not a directory: {root}", file=sys.stderr)
+        return 2
+
+    name = args.name
+    from_module = args.from_module
+
+    if args.import_stmt:
+        try:
+            stmt_mod, stmt_name = parse_import_stmt(args.import_stmt)
+        except ValueError as err:
+            print(f"{PROG}: {err}", file=sys.stderr)
+            return 2
+        if name and "." not in name and name != stmt_name:
+            print(
+                f"{PROG}: NAME {name!r} does not match import {stmt_name!r}",
+                file=sys.stderr,
+            )
+            return 2
+        from_module = stmt_mod
+        name = stmt_name
+
+    if name and "." in name and from_module is None and args.importer is None:
+        from_module, _, name = name.rpartition(".")
+
+    if not name:
+        print(f"{PROG}: NAME is required", file=sys.stderr)
+        return 2
+
+    if from_module and args.importer:
+        print(f"{PROG}: use --from/--import or --file, not both", file=sys.stderr)
+        return 2
+
+    if args.importer:
+        path = Path(args.importer)
+        if not path.is_file():
+            print(f"{PROG}: not a file: {path}", file=sys.stderr)
+            return 1
+        try:
+            bindings, misses = bindings_from_file(root, path, name)
+        except QueryError as err:
+            print(f"{PROG}: {err}", file=sys.stderr)
+            return 1
+        if not bindings:
+            print(f"{PROG}: no uses of {name} in {path}", file=sys.stderr)
+            return 1
+        note_misses(misses)
+        sys.stdout.write(format_list(name, bindings, misses))
+        return 0
+
+    if from_module:
+        try:
+            binding = resolve_query(root, from_module, name)
+        except QueryError as err:
+            print(f"{PROG}: {err}", file=sys.stderr)
+            return 1
+        others, misses = static_other_defs(root, name, from_module, binding.runs)
+        others = other_defs(binding, others)
+        query = args.import_stmt or f"from {from_module} import {name}"
+        note_misses(misses)
+        sys.stdout.write(format_query(query, binding, others, misses))
+        return 0
+
+    bindings, misses = bindings_for_name(root, name)
+    if not bindings:
+        print(f"{PROG}: no bindings for {name}", file=sys.stderr)
+        return 1
+    note_misses(misses)
+    sys.stdout.write(format_list(name, bindings, misses))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

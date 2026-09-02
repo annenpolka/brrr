@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""staleid: name FRESH same-key while binary buildid changed."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("status", "key", "buildid", "cached_buildid")
+
+
+def parse_event(text: str, *, source: str) -> dict:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        rest = rest.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest
+    for need in ("status", "key", "buildid"):
+        if need not in fields:
+            raise ValueError(f"{source}: missing {need}")
+    cached = fields.get("cached_buildid") or fields["buildid"]
+    return {
+        "status": fields["status"],
+        "key": fields["key"],
+        "buildid": fields["buildid"],
+        "cached_buildid": cached,
+        "source": source,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def inspect(first: dict, second: dict) -> dict:
+    same_key = first["key"] == second["key"]
+    buildid_changed = first["buildid"] != second["buildid"]
+    stale = (
+        same_key
+        and second["status"].upper() == "FRESH"
+        and second["cached_buildid"] != second["buildid"]
+    )
+    includes = first["key"] == second["key"] and not buildid_changed and first["key"] != ""
+    # key includes buildid only if a buildid change would have changed the key.
+    key_includes_buildid = (not same_key) and buildid_changed
+    if same_key and buildid_changed:
+        key_includes_buildid = False
+    if same_key and not buildid_changed:
+        key_includes_buildid = "unknown"
+    return {
+        "first": first,
+        "second": second,
+        "same_key": same_key,
+        "buildid_changed": buildid_changed,
+        "key_includes_buildid": key_includes_buildid,
+        "stale_binary": stale,
+        "fresh_same_key": same_key and second["status"].upper() == "FRESH",
+    }
+
+
+def fmt_inc(v) -> str:
+    if v is True:
+        return "yes"
+    if v is False:
+        return "no"
+    return "unknown"
+
+
+def format_report(result: dict) -> str:
+    first, second = result["first"], result["second"]
+    lines = [
+        f"key_a\t{first['key']}",
+        f"key_b\t{second['key']}",
+        f"same_key\t{yn(result['same_key'])}",
+        f"buildid_a\t{first['buildid']}",
+        f"buildid_b\t{second['buildid']}",
+        f"cached_buildid\t{second['cached_buildid']}",
+        f"first_status\t{first['status']}",
+        f"second_status\t{second['status']}",
+        f"buildid_changed\t{yn(result['buildid_changed'])}",
+        f"key_includes_buildid\t{fmt_inc(result['key_includes_buildid'])}",
+        f"stale_binary\t{yn(result['stale_binary'])}",
+        f"fresh_same_key\t{yn(result['fresh_same_key'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="staleid",
+        description=(
+            "Compare two cache events. Name FRESH same-key while binary "
+            "buildid changed."
+        ),
+    )
+    parser.add_argument("first")
+    parser.add_argument("second")
+    args = parser.parse_args(argv)
+    try:
+        first = parse_event(Path(args.first).read_text(encoding="utf-8"), source=args.first)
+        second = parse_event(Path(args.second).read_text(encoding="utf-8"), source=args.second)
+    except (OSError, ValueError) as err:
+        print(f"staleid: {err}", file=sys.stderr)
+        return 1
+    result = inspect(first, second)
+    sys.stdout.write(format_report(result))
+    return 1 if result["stale_binary"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

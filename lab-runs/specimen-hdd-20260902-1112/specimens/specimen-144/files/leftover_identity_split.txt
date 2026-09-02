@@ -1,0 +1,24 @@
+Registry / fixture:
+  skaffold artifact cache / lookupRemote
+  leftover Found Remotely after input change
+
+Case A (second build, same inputs, same digest):
+  current cache identity
+  not leftover-after-input-change
+
+Case B (Dockerfile/deps flipped, same tag, leftover remote):
+  leftover: previous image digest under that tag
+  digest compare omitted
+  Found Remotely
+
+Case C (--cache-artifacts=false):
+  fresh build identity
+  not leftover previous digest
+
+Case D (found only if cacheHit and digests equal):
+  rebuild after input change
+  not leftover previous remote image
+
+Not this packet:
+  buildkit leftover git-dir cache key omitting ref (specimen-097)
+  pants leftover vcs_version process cache (specimen-136)

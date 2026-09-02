@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""ordleak: run two tests in both orders; name what leaked when only order changed."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib.machinery
+import importlib.util
+import inspect
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+import types
+import uuid
+from pathlib import Path
+
+ABSENT = object()
+REPR_CAP = 500
+ORDER_TIMEOUT = 30
+ID_RE = re.compile(r" at 0x[0-9a-fA-F]+")
+CLI_PATH = Path(__file__).resolve()
+SKIP_COPY_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".mypy_cache",
+    ".hdd",
+    "__pycache__",
+    "node_modules",
+    "venv",
+}
+MAX_COPY_FILES = 200
+MAX_COPY_DEPTH = 6
+MAX_PARENT_ENTRIES = 60
+
+
+def _is_skipped(value: object) -> bool:
+    if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isbuiltin(value):
+        return True
+    if inspect.isclass(value):
+        return True
+    if inspect.ismodule(value):
+        return True
+    if isinstance(value, (classmethod, staticmethod, property)):
+        return True
+    if callable(value) and getattr(value, "__wrapped__", None) is not None:
+        return True
+    return False
+
+
+def is_data_name(name: str) -> bool:
+    return bool(name) and not name.startswith("__")
+
+
+def is_field_name(name: str) -> bool:
+    return bool(name) and not name.startswith("_")
+
+
+def slot_names(typ: type) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for cls in getattr(typ, "__mro__", ()):
+        slots = getattr(cls, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        try:
+            items = tuple(slots)
+        except TypeError:
+            continue
+        for slot in items:
+            if not isinstance(slot, str):
+                continue
+            if slot in ("__dict__", "__weakref__") or slot in seen:
+                continue
+            if not is_field_name(slot):
+                continue
+            seen.add(slot)
+            names.append(slot)
+    return names
+
+
+def instance_data_fields(value: object) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    d = getattr(value, "__dict__", None)
+    if isinstance(d, dict):
+        for key, item in d.items():
+            if is_field_name(key) and not _is_skipped(item):
+                fields[key] = item
+    for slot in slot_names(type(value)):
+        if slot in fields:
+            continue
+        try:
+            item = getattr(value, slot)
+        except AttributeError:
+            continue
+        if _is_skipped(item):
+            continue
+        fields[slot] = item
+    return fields
+
+
+def encode(value: object, *, depth: int = 0, seen: set[int] | None = None) -> object:
+    if seen is None:
+        seen = set()
+    if depth > 30:
+        return {"__ordleak__": "cap", "r": ID_RE.sub("", repr(value))[:120]}
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"__ordleak__": "nan"}
+        if math.isinf(value):
+            return {"__ordleak__": "inf", "sign": 1 if value > 0 else -1}
+        return value
+    if isinstance(value, bytes):
+        return {"__ordleak__": "bytes", "hex": value.hex()}
+    if isinstance(value, bytearray):
+        return {"__ordleak__": "bytes", "hex": bytes(value).hex()}
+    if isinstance(value, tuple):
+        return {"__ordleak__": "tuple", "v": [encode(x, depth=depth + 1, seen=seen) for x in value]}
+    if isinstance(value, list):
+        return [encode(x, depth=depth + 1, seen=seen) for x in value]
+    if isinstance(value, dict):
+        if all(isinstance(k, str) for k in value):
+            return {str(k): encode(v, depth=depth + 1, seen=seen) for k, v in value.items()}
+        return {
+            "__ordleak__": "dict",
+            "v": [
+                [encode(k, depth=depth + 1, seen=seen), encode(v, depth=depth + 1, seen=seen)]
+                for k, v in value.items()
+            ],
+        }
+    if isinstance(value, set):
+        items = [encode(x, depth=depth + 1, seen=seen) for x in value]
+        items.sort(key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return {"__ordleak__": "set", "v": items}
+    if isinstance(value, type):
+        return {"__ordleak__": "type", "c": value.__name__}
+    oid = id(value)
+    if oid in seen:
+        return {"__ordleak__": "cycle", "c": type(value).__name__}
+    seen.add(oid)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = {
+            f.name: encode(getattr(value, f.name), depth=depth + 1, seen=seen)
+            for f in dataclasses.fields(value)
+        }
+        return {"__ordleak__": "obj", "c": type(value).__name__, "f": fields}
+    fields = {
+        k: encode(v, depth=depth + 1, seen=seen) for k, v in instance_data_fields(value).items()
+    }
+    if fields or getattr(value, "__dict__", None) is not None or slot_names(type(value)):
+        return {"__ordleak__": "obj", "c": type(value).__name__, "f": fields}
+    return {
+        "__ordleak__": "repr",
+        "c": type(value).__name__,
+        "r": ID_RE.sub("", repr(value)),
+    }
+
+
+def display(value: object) -> str:
+    if value is ABSENT:
+        return "<absent>"
+    if isinstance(value, dict) and "__ordleak__" in value:
+        kind = value["__ordleak__"]
+        if kind == "nan":
+            return "nan"
+        if kind == "inf":
+            return "inf" if value.get("sign", 1) > 0 else "-inf"
+        if kind == "obj":
+            fields = value.get("f") or {}
+            inner = ", ".join(f"{k}={display(v)}" for k, v in fields.items())
+            return f"{value.get('c', 'obj')}({inner})"
+        if kind == "tuple":
+            inner = ", ".join(display(x) for x in (value.get("v") or []))
+            return f"({inner})"
+        if kind == "set":
+            inner = ", ".join(display(x) for x in (value.get("v") or []))
+            return f"{{{inner}}}"
+        if kind == "dict":
+            inner = ", ".join(
+                f"{display(k)}: {display(v)}" for k, v in (value.get("v") or [])
+            )
+            return "{" + inner + "}"
+        if kind == "bytes":
+            try:
+                return repr(bytes.fromhex(value.get("hex") or ""))
+            except ValueError:
+                return "b''"
+        if kind == "repr":
+            return str(value.get("r") or "")
+        if kind == "type":
+            return str(value.get("c") or "type")
+        if kind == "cap":
+            return str(value.get("r") or "<cap>")
+        if kind == "cycle":
+            return f"<cycle {value.get('c', '')}>"
+        if kind == "absent":
+            return "<absent>"
+        return kind
+    if isinstance(value, list):
+        return "[" + ", ".join(display(x) for x in value) + "]"
+    return repr(value)
+
+
+def fmt(value: object) -> str:
+    text = display(value)
+    if len(text) > REPR_CAP:
+        return text[: REPR_CAP - 3] + "..."
+    return text
+
+
+def tsv_escape(text: str) -> str:
+    if len(text) > REPR_CAP:
+        text = text[: REPR_CAP - 3] + "..."
+    return (
+        text.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def put_binding(out: dict[str, object], key: str, value: object) -> None:
+    if key in out or _is_skipped(value):
+        return
+    out[key] = encode(value)
+
+
+def snapshot_function(
+    out: dict[str, object], prefix: str, fn, seen_cells: set[int]
+) -> None:
+    try:
+        attrs = vars(fn)
+    except TypeError:
+        attrs = {}
+    for attr, aval in attrs.items():
+        if not is_data_name(attr):
+            continue
+        put_binding(out, f"{prefix}.{attr}", aval)
+    defaults = getattr(fn, "__defaults__", None)
+    if defaults:
+        for i, item in enumerate(defaults):
+            put_binding(out, f"{prefix}.__defaults__[{i}]", item)
+    kwdefaults = getattr(fn, "__kwdefaults__", None)
+    if kwdefaults:
+        for key, item in kwdefaults.items():
+            put_binding(out, f"{prefix}.__kwdefaults__.{key}", item)
+    closure = getattr(fn, "__closure__", None)
+    freevars = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+    if not closure or not freevars:
+        return
+    for cell_name, cell in zip(freevars, closure):
+        cid = id(cell)
+        if cid in seen_cells:
+            continue
+        try:
+            cell_val = cell.cell_contents
+        except ValueError:
+            continue
+        seen_cells.add(cid)
+        key = cell_name if cell_name not in out else f"{prefix}.{cell_name}"
+        put_binding(out, key, cell_val)
+
+
+def _in_import_tree(mod_file: str | None, file_path: str | None) -> bool:
+    if not mod_file or not file_path:
+        return False
+    file_dir = Path(file_path).resolve().parent
+    other = Path(mod_file).resolve()
+    if other.parent == file_dir:
+        return True
+    pkg_parent = file_dir.parent
+    try:
+        other.relative_to(pkg_parent)
+    except ValueError:
+        return False
+    return other.suffix == ".py"
+
+
+def snapshot(mod) -> dict[str, object]:
+    """FILE globals, class attrs, function-local state, copied-tree helper data."""
+    out: dict[str, object] = {}
+    seen_cells: set[int] = set()
+    try:
+        items = list(vars(mod).items())
+    except TypeError:
+        return out
+    file_path = getattr(mod, "__file__", None)
+    for name, value in items:
+        if inspect.ismodule(value):
+            if not is_data_name(name):
+                continue
+            other = getattr(value, "__file__", None)
+            if not _in_import_tree(other, file_path):
+                continue
+            try:
+                helper_items = vars(value).items()
+            except TypeError:
+                continue
+            for attr, aval in helper_items:
+                if not is_data_name(attr):
+                    continue
+                put_binding(out, f"{name}.{attr}", aval)
+            continue
+        if inspect.isclass(value):
+            if not is_data_name(name):
+                continue
+            try:
+                class_items = vars(value).items()
+            except TypeError:
+                continue
+            for attr, aval in class_items:
+                if not is_data_name(attr):
+                    continue
+                put_binding(out, f"{name}.{attr}", aval)
+            continue
+        if inspect.isfunction(value) or inspect.ismethod(value):
+            if not is_data_name(name):
+                continue
+            snapshot_function(out, name, value, seen_cells)
+            continue
+        if not is_data_name(name):
+            continue
+        put_binding(out, name, value)
+        for field, fval in instance_data_fields(value).items():
+            put_binding(out, f"{name}.{field}", fval)
+    return out
+
+
+def values_equal(left: object, right: object) -> bool:
+    if left is ABSENT or right is ABSENT:
+        return left is right
+    return left == right
+
+
+def _rewritten_import_error(err: BaseException) -> ImportError:
+    name = getattr(err, "name", None)
+    text = str(err)
+    if isinstance(err, ModuleNotFoundError):
+        label = repr(name) if name else text
+        return ImportError(
+            f"imported module {label} is outside the copied tree "
+            f"(FILE directory / package parent)"
+        )
+    if "relative import" in text.lower():
+        return ImportError(
+            f"relative import needs FILE loaded as a package member: {err}"
+        )
+    return ImportError(str(err))
+
+
+def load_module(path: Path):
+    path = path.resolve()
+    file_dir = path.parent
+    pkg_parent = file_dir.parent
+    for folder in (pkg_parent, file_dir):
+        s = str(folder)
+        if s in sys.path:
+            sys.path.remove(s)
+        sys.path.insert(0, s)
+    pkg_name = f"_ordleak_{uuid.uuid4().hex}"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(file_dir)]  # type: ignore[attr-defined]
+    pkg.__package__ = pkg_name
+    init_py = file_dir / "__init__.py"
+    if init_py.is_file():
+        pkg.__file__ = str(init_py)
+    else:
+        pkg.__file__ = str(file_dir)
+    sys.modules[pkg_name] = pkg
+    try:
+        if init_py.is_file():
+            init_loader = importlib.machinery.SourceFileLoader(pkg_name, str(init_py))
+            init_loader.exec_module(pkg)
+        mod_name = f"{pkg_name}.{path.stem}"
+        spec = importlib.util.spec_from_file_location(mod_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        mod = importlib.util.module_from_spec(spec)
+        mod.__package__ = pkg_name
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except ModuleNotFoundError as err:
+        raise _rewritten_import_error(err) from err
+    except ImportError as err:
+        rewritten = _rewritten_import_error(err)
+        if str(rewritten) != str(err):
+            raise rewritten from err
+        raise
+
+
+def _requires_args(fn) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.default is not inspect.Parameter.empty:
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        return True
+    return False
+
+
+def resolve_callable(mod, spec: str):
+    spec = spec.replace("::", ".")
+    if "." in spec:
+        cls_name, meth = spec.split(".", 1)
+        if "." in meth:
+            raise LookupError(f"no test callable {spec!r} in {getattr(mod, '__file__', '?')}")
+        cls = getattr(mod, cls_name, None)
+        if not inspect.isclass(cls):
+            raise LookupError(f"no test callable {spec!r} in {getattr(mod, '__file__', '?')}")
+        try:
+            inst = cls(meth)
+        except TypeError:
+            inst = cls()
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise LookupError(
+                f"cannot instantiate {cls_name}: {type(exc).__name__}: {exc}"
+            ) from exc
+        fn = getattr(inst, meth, None)
+        if not callable(fn) or inspect.isclass(fn):
+            raise LookupError(f"no test callable {spec!r} in {getattr(mod, '__file__', '?')}")
+        return fn
+    fn = getattr(mod, spec, None)
+    if not callable(fn) or inspect.isclass(fn):
+        raise LookupError(f"no test callable {spec!r} in {getattr(mod, '__file__', '?')}")
+    return fn
+
+
+def invoke(fn) -> tuple[str, str | None]:
+    if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+        return "ERROR", "async def is not a supported test (not a pytest runner)"
+    if inspect.isgeneratorfunction(fn) or inspect.isgenerator(fn):
+        return "ERROR", "generator tests are not supported (not a pytest runner)"
+    if _requires_args(fn):
+        return "ERROR", "not a pytest runner: test requires arguments"
+    try:
+        fn()
+    except AssertionError as exc:
+        return "FAIL", tsv_escape(str(exc))
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return "ERROR", tsv_escape(f"{type(exc).__name__}: {exc}")
+    return "PASS", None
+
+
+def run_order(path: Path, order: tuple[str, ...]) -> dict:
+    mod = load_module(path)
+    try:
+        steps = []
+        current = snapshot(mod)
+        for name in order:
+            fn = resolve_callable(mod, name)
+            before = current
+            status, detail = invoke(fn)
+            after = snapshot(mod)
+            steps.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "detail": detail,
+                    "before": before,
+                    "after": after,
+                }
+            )
+            current = after
+        return {"order": list(order), "steps": steps}
+    finally:
+        name = getattr(mod, "__name__", "")
+        pkg = getattr(mod, "__package__", "")
+        for key in list(sys.modules):
+            if key == name or (pkg and (key == pkg or key.startswith(pkg + "."))):
+                sys.modules.pop(key, None)
+
+
+def _copy_wide(parent: Path) -> bool:
+    try:
+        resolved = parent.resolve()
+    except OSError:
+        return False
+    if resolved == Path(resolved.anchor):
+        return False
+    try:
+        n = 0
+        for _ in parent.iterdir():
+            n += 1
+            if n > MAX_PARENT_ENTRIES:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _copy_py_tree(
+    src_dir: Path,
+    dest_dir: Path,
+    *,
+    depth: int = 0,
+    counter: list[int],
+) -> None:
+    if depth > MAX_COPY_DEPTH or counter[0] >= MAX_COPY_FILES:
+        return
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        items = list(src_dir.iterdir())
+    except OSError:
+        return
+    for item in items:
+        if counter[0] >= MAX_COPY_FILES:
+            return
+        if item.name in SKIP_COPY_DIRS or item.name.startswith("."):
+            continue
+        try:
+            if item.is_symlink():
+                continue
+            if item.is_file() and item.suffix == ".py":
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, dest_dir / item.name)
+                counter[0] += 1
+            elif item.is_dir():
+                if (item / "__init__.py").is_file() or any(
+                    child.suffix == ".py" and child.is_file() and not child.is_symlink()
+                    for child in item.iterdir()
+                ):
+                    _copy_py_tree(item, dest_dir / item.name, depth=depth + 1, counter=counter)
+        except OSError:
+            continue
+
+
+def _copy_order_tree(src: Path, dest: Path) -> Path:
+    """Copy FILE's importable tree (package dirs + parent helpers), not only sibling *.py."""
+    src = src.resolve()
+    file_dir = src.parent
+    parent = file_dir.parent
+    dest.mkdir(parents=True, exist_ok=True)
+    counter = [0]
+    if _copy_wide(parent):
+        _copy_py_tree(parent, dest, counter=counter)
+        copied = dest / file_dir.name / src.name
+    else:
+        nested = dest / file_dir.name
+        _copy_py_tree(file_dir, nested, counter=counter)
+        copied = nested / src.name
+    if not copied.is_file():
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, copied)
+    return copied
+
+
+def _decode_pipe(data: bytes | None) -> str:
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def run_order_isolated(path: Path, order: tuple[str, str]) -> dict:
+    path = path.resolve()
+    with tempfile.TemporaryDirectory(prefix="ordleak-") as tmp:
+        tmp_path = Path(tmp)
+        dest = tmp_path / "tree"
+        report = tmp_path / "order.json"
+        copied = _copy_order_tree(path, dest)
+        file_dir = copied.parent
+        path_root = file_dir.parent
+        cmd = [
+            sys.executable,
+            str(CLI_PATH),
+            "--exec-order",
+            "--report",
+            str(report),
+            str(copied),
+            *order,
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join([str(path_root), str(file_dir)])
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                cwd=str(file_dir),
+                env=env,
+                timeout=ORDER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError("order timed out") from exc
+        stderr = _decode_pipe(proc.stderr)
+        if report.is_file():
+            try:
+                payload = json.loads(report.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise OSError("order worker report is not JSON") from exc
+        else:
+            if proc.returncode != 0:
+                msg = stderr.strip() or f"order worker exit {proc.returncode}"
+                if msg.startswith("ordleak:"):
+                    msg = msg[len("ordleak:") :].strip()
+                raise OSError(msg)
+            raise OSError("order worker produced no report")
+        if proc.returncode != 0 and not payload:
+            msg = stderr.strip() or f"order worker exit {proc.returncode}"
+            raise OSError(msg)
+    payload["order"] = tuple(payload.get("order") or order)
+    return payload
+
+
+def start_maps(rec: dict) -> dict[str, dict[str, object]]:
+    return {step["name"]: step["before"] for step in rec["steps"]}
+
+
+def writer_of(rec: dict, victim: str, key: str) -> str | None:
+    last = None
+    for step in rec["steps"]:
+        if step["name"] == victim:
+            break
+        before = step["before"]
+        after = step["after"]
+        bv = before[key] if key in before else ABSENT
+        av = after[key] if key in after else ABSENT
+        if not values_equal(bv, av):
+            last = step["name"]
+    return last
+
+
+def leaked_bindings(ab: dict, ba: dict, left: str, right: str) -> list[dict]:
+    rows: list[dict] = []
+    for name in (left, right):
+        if ab["order"][0] == name:
+            rec_first, rec_second = ab, ba
+        else:
+            rec_first, rec_second = ba, ab
+        alone = start_maps(rec_first)[name]
+        after_other = start_maps(rec_second)[name]
+        keys = set(alone) | set(after_other)
+        for key in sorted(keys):
+            av = alone[key] if key in alone else ABSENT
+            bv = after_other[key] if key in after_other else ABSENT
+            if values_equal(av, bv):
+                continue
+            via = writer_of(rec_second, name, key)
+            if via is None:
+                # Import-time inequality (time_ns, object id, class identity) is not a leak.
+                continue
+            rows.append(
+                {
+                    "binding": key,
+                    "into": name,
+                    "alone": av,
+                    "after_other": bv,
+                    "via": via,
+                }
+            )
+    return rows
+
+
+def exposing_orders(ab: dict, ba: dict) -> list[tuple[str, str]]:
+    ab_status = {step["name"]: step["status"] for step in ab["steps"]}
+    ba_status = {step["name"]: step["status"] for step in ba["steps"]}
+    found: list[tuple[str, str]] = []
+    for name in (ab["order"][0], ab["order"][1]):
+        if ab_status[name] == ba_status[name]:
+            continue
+        if ab_status[name] != "PASS" and ab["order"] not in found:
+            found.append(ab["order"])
+        if ba_status[name] != "PASS" and ba["order"] not in found:
+            found.append(ba["order"])
+    return found
+
+
+def statuses_all_pass(ab: dict, ba: dict) -> bool:
+    for rec in (ab, ba):
+        for step in rec["steps"]:
+            if step["status"] != "PASS":
+                return False
+    return True
+
+
+def leak_verdict(leaked: list, exposing: list, ab: dict, ba: dict) -> str:
+    if leaked:
+        return "named"
+    if exposing:
+        return "unseen"
+    if not statuses_all_pass(ab, ba):
+        return "unseen"
+    return "none"
+
+
+def contrast(path: Path, left: str, right: str) -> dict:
+    path = path.resolve()
+    left = left.replace("::", ".")
+    right = right.replace("::", ".")
+    if left == right:
+        raise ValueError("left and right tests must be different")
+    ab = run_order_isolated(path, (left, right))
+    ba = run_order_isolated(path, (right, left))
+    leaked = leaked_bindings(ab, ba, left, right)
+    exposing = exposing_orders(ab, ba)
+    return {
+        "file": str(path),
+        "left": left,
+        "right": right,
+        "orders": [ab, ba],
+        "exposing_orders": exposing,
+        "leaked": leaked,
+        "leak_verdict": leak_verdict(leaked, exposing, ab, ba),
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"file\t{result['file']}",
+        f"pair\t{result['left']}\t{result['right']}",
+    ]
+    for rec in result["orders"]:
+        lines.append("order\t" + " ".join(rec["order"]))
+        for step in rec["steps"]:
+            row = f"status\t{step['name']}\t{step['status']}"
+            if step["detail"]:
+                row += f"\t{tsv_escape(str(step['detail']))}"
+            lines.append(row)
+    if result["exposing_orders"]:
+        for order in result["exposing_orders"]:
+            lines.append("exposing_order\t" + " ".join(order))
+    else:
+        lines.append("exposing_order\tnone")
+    if result["leaked"]:
+        for row in result["leaked"]:
+            lines.append(
+                "leaked\t"
+                f"{row['binding']}\tinto\t{row['into']}\t"
+                f"{fmt(row['alone'])}\t{fmt(row['after_other'])}\t"
+                f"via\t{row['via']}"
+            )
+    elif result["leak_verdict"] == "unseen":
+        lines.append("leaked\t<unseen>")
+    else:
+        lines.append("leaked\tnone")
+    return "\n".join(lines) + "\n"
+
+
+def parse_targets(targets: list[str]) -> tuple[Path, str, str]:
+    if len(targets) == 2 and all("::" in item for item in targets):
+        file_a, left = targets[0].split("::", 1)
+        file_b, right = targets[1].split("::", 1)
+        path_a, path_b = Path(file_a).resolve(), Path(file_b).resolve()
+        if path_a != path_b:
+            raise ValueError("nodeids must refer to the same file")
+        return path_a, left.replace("::", "."), right.replace("::", ".")
+    if len(targets) == 3:
+        return Path(targets[0]), targets[1].replace("::", "."), targets[2].replace("::", ".")
+    raise ValueError("usage: ordleak FILE LEFT RIGHT, or FILE::LEFT FILE::RIGHT")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ordleak",
+        description=(
+            "Run two tests in both orders and report bindings that differed "
+            "when only order changed. Names the leaked binding and the order "
+            "that exposes it. Exit 1 when a leak is found. Not a whole-suite "
+            "scanner."
+        ),
+    )
+    parser.add_argument(
+        "targets",
+        nargs="+",
+        help="FILE LEFT RIGHT, or FILE::LEFT FILE::RIGHT (Class.method allowed)",
+    )
+    return parser.parse_args(argv)
+
+
+def exec_order_main(argv: list[str]) -> int:
+    report_path: Path | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--report" and i + 1 < len(argv):
+            report_path = Path(argv[i + 1])
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    if len(rest) < 3:
+        print("ordleak: --exec-order FILE NAME NAME", file=sys.stderr)
+        return 2
+    path = Path(rest[0])
+    names = tuple(rest[1:])
+    if not path.is_file():
+        print(f"ordleak: not a file: {path}", file=sys.stderr)
+        return 1
+    try:
+        rec = run_order(path, names)
+    except (LookupError, ValueError, OSError, ImportError, SyntaxError) as err:
+        print(f"ordleak: {err}", file=sys.stderr)
+        return 1
+    except BaseException as err:
+        if isinstance(err, KeyboardInterrupt):
+            raise
+        print(f"ordleak: {type(err).__name__}: {err}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    blob = json.dumps(rec, allow_nan=False)
+    if report_path is not None:
+        report_path.write_text(blob + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(blob + "\n")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--exec-order":
+        return exec_order_main(argv[1:])
+    args = parse_args(argv)
+    try:
+        path, left, right = parse_targets(args.targets)
+    except ValueError as err:
+        print(f"ordleak: {err}", file=sys.stderr)
+        return 2
+    if not path.is_file():
+        print(f"ordleak: not a file: {path}", file=sys.stderr)
+        return 1
+    try:
+        result = contrast(path, left, right)
+    except (LookupError, ValueError, OSError, ImportError, SyntaxError) as err:
+        print(f"ordleak: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    if result["exposing_orders"] or result["leak_verdict"] != "none":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

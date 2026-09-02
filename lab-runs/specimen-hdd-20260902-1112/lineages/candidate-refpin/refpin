@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""refpin: name a default ref attached to a pinned rev, and whether identity changed.
+
+FIRST is earlier, SECOND is later. A harvest hit is same rev, a ref that
+attached only on SECOND, and a changed narHash. That conjunction is one
+verdict; other combinations get other names.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+IDENTITY_KEYS = ("rev", "narHash", "ref")
+META_KEYS = ("lastModified", "revCount")
+KNOWN = IDENTITY_KEYS + META_KEYS
+IGNORE_FIELDS = {
+    "url",
+    "type",
+    "owner",
+    "repo",
+    "dir",
+    "host",
+    "path",
+    "submodules",
+    "shallow",
+    "allRefs",
+    "name",
+    "originalRef",
+    "id",
+    "flake",
+    "narHashAlgo",
+    "inputs",
+    "original",
+    "locked",
+    "nodes",
+    "root",
+    "version",
+}
+NARHASH_MAX = 96
+OMITTED = "-"
+
+EXPECTED_LINE_RE = re.compile(
+    r"expected:\s+(\S+)\s+\((no ref field|ref=([^)]*))\)",
+    re.IGNORECASE,
+)
+GOT_LINE_RE = re.compile(
+    r"got:\s+(\S+)\s+\((no ref field|ref=([^)]*))\)",
+    re.IGNORECASE,
+)
+REV_BOTH_RE = re.compile(r"rev in both records:\s+(\S+)")
+JSON_FIELD_STR_RE = re.compile(r'"(narHash|rev|ref)"\s*:\s*"([^"]*)"')
+JSON_FIELD_NUM_RE = re.compile(r'"(lastModified|revCount)"\s*:\s*([0-9]+)')
+NIX_MISMATCH_BLOBS_RE = re.compile(
+    r"mismatch in field 'narHash' of input\s+'(\{.*?\})'\s*,\s*got\s+'(\{.*?\})'",
+    re.DOTALL,
+)
+
+
+@dataclass(frozen=True)
+class Opt:
+    present: bool
+    value: str = ""
+
+    def display(self) -> str:
+        if not self.present:
+            return OMITTED
+        return self.value
+
+
+@dataclass
+class Record:
+    source: str
+    kind: str
+    rev: str
+    narHash: str
+    ref: Opt
+    lastModified: Opt
+    revCount: Opt
+
+    def opt(self, key: str) -> Opt:
+        if key == "rev":
+            return Opt(True, self.rev)
+        if key == "narHash":
+            return Opt(True, self.narHash)
+        if key == "ref":
+            return self.ref
+        if key == "lastModified":
+            return self.lastModified
+        if key == "revCount":
+            return self.revCount
+        raise KeyError(key)
+
+
+def strip_bom(text: str) -> str:
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def cap_hash(value: str) -> tuple[str, bool]:
+    if len(value) > NARHASH_MAX:
+        return value[:NARHASH_MAX] + "…", True
+    return value, False
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else OMITTED
+
+
+def json_scalar(value: object) -> str:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("not a lock scalar")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, str):
+        return value
+    raise ValueError("not a lock scalar")
+
+
+def opt_from_mapping(obj: dict, key: str) -> Opt:
+    if key not in obj:
+        return Opt(False)
+    value = obj[key]
+    if value is None:
+        return Opt(False)
+    try:
+        return Opt(True, json_scalar(value))
+    except ValueError as err:
+        raise ValueError(f"field {key!r} is not a lock scalar") from err
+
+
+def locked_from_mapping(obj: object) -> dict | None:
+    if not isinstance(obj, dict):
+        return None
+    if "narHash" in obj and "rev" in obj:
+        return obj
+    locked = obj.get("locked")
+    if isinstance(locked, dict) and "narHash" in locked and "rev" in locked:
+        return locked
+    return None
+
+
+def locked_from_flake(obj: dict) -> dict:
+    nodes = obj.get("nodes")
+    if not isinstance(nodes, dict):
+        raise ValueError("not a lock record")
+    root = obj.get("root")
+    found: list[tuple[str, dict]] = []
+    for name, node in nodes.items():
+        if name == root:
+            continue
+        locked = locked_from_mapping(node)
+        if locked is not None:
+            found.append((str(name), locked))
+    if len(found) == 1:
+        return found[0][1]
+    if not found:
+        root_node = nodes.get(root) if isinstance(root, str) else None
+        locked = locked_from_mapping(root_node)
+        if locked is not None:
+            return locked
+        raise ValueError("not a lock record")
+    names = ", ".join(name for name, _ in found)
+    raise ValueError(
+        f"flake.lock has {len(found)} locked nodes ({names}); pass a single lock object"
+    )
+
+
+def record_from_locked(obj: dict, *, source: str, kind: str) -> Record:
+    rev = obj.get("rev")
+    nar_hash = obj.get("narHash")
+    if rev is None or rev == "":
+        raise ValueError(f"{source}: missing rev")
+    if nar_hash is None or nar_hash == "":
+        raise ValueError(f"{source}: missing narHash")
+    try:
+        rev_s = json_scalar(rev)
+        hash_s = json_scalar(nar_hash)
+    except ValueError as err:
+        raise ValueError(f"{source}: {err}") from err
+    if not rev_s:
+        raise ValueError(f"{source}: missing rev")
+    if not hash_s:
+        raise ValueError(f"{source}: missing narHash")
+    return Record(
+        source=source,
+        kind=kind,
+        rev=rev_s,
+        narHash=hash_s,
+        ref=opt_from_mapping(obj, "ref"),
+        lastModified=opt_from_mapping(obj, "lastModified"),
+        revCount=opt_from_mapping(obj, "revCount"),
+    )
+
+
+def parse_json_value(data: object, *, source: str) -> Record | tuple[Record, Record]:
+    if isinstance(data, list):
+        if len(data) == 2:
+            first = locked_from_mapping(data[0])
+            second = locked_from_mapping(data[1])
+            if first is None or second is None:
+                raise ValueError(f"{source}: not a lock record")
+            return (
+                record_from_locked(first, source=f"{source}[0]", kind="json"),
+                record_from_locked(second, source=f"{source}[1]", kind="json"),
+            )
+        if len(data) == 1:
+            data = data[0]
+        else:
+            raise ValueError(f"{source}: not a lock record")
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: not a lock record")
+    locked = locked_from_mapping(data)
+    if locked is None and "nodes" in data:
+        locked = locked_from_flake(data)
+    if locked is None:
+        raise ValueError(f"{source}: not a lock record")
+    return record_from_locked(locked, source=source, kind="json")
+
+
+def parse_json_text(text: str, *, source: str) -> Record | tuple[Record, Record]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{source}: not a lock record ({err.msg})") from err
+    try:
+        return parse_json_value(data, source=source)
+    except ValueError as err:
+        msg = str(err)
+        if msg.startswith(source):
+            raise
+        raise ValueError(f"{source}: {msg}") from err
+
+
+def parse_tsv_record(text: str, *, source: str) -> Record:
+    fields: dict[str, str] = {}
+    seen: set[str] = set()
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        parts = line.split("\t")
+        if len(parts) != 2:
+            raise ValueError(f"{source}:{lineno}: extra tab in value")
+        key, rest = parts
+        key = key.strip()
+        value = rest.strip()
+        if not key:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        if key in seen:
+            raise ValueError(f"{source}:{lineno}: duplicate field {key!r}")
+        seen.add(key)
+        if key in IGNORE_FIELDS:
+            continue
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = value
+    if "rev" not in fields or fields["rev"] == "":
+        raise ValueError(f"{source}: missing rev")
+    if "narHash" not in fields or fields["narHash"] == "":
+        raise ValueError(f"{source}: missing narHash")
+    ref = Opt(True, fields["ref"]) if "ref" in fields else Opt(False)
+    last_modified = (
+        Opt(True, fields["lastModified"]) if "lastModified" in fields else Opt(False)
+    )
+    rev_count = Opt(True, fields["revCount"]) if "revCount" in fields else Opt(False)
+    return Record(
+        source=source,
+        kind="tsv",
+        rev=fields["rev"],
+        narHash=fields["narHash"],
+        ref=ref,
+        lastModified=last_modified,
+        revCount=rev_count,
+    )
+
+
+def is_mismatch_log(text: str) -> bool:
+    if "mismatch in field 'narHash'" in text:
+        return True
+    if EXPECTED_LINE_RE.search(text) and GOT_LINE_RE.search(text):
+        return True
+    return False
+
+
+def fields_from_blob(blob: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in JSON_FIELD_STR_RE.finditer(blob):
+        out[match.group(1)] = match.group(2)
+    for match in JSON_FIELD_NUM_RE.finditer(blob):
+        out[match.group(1)] = match.group(2)
+    return out
+
+
+def ref_from_annotation(kind: str, captured: str | None) -> Opt:
+    if kind.lower() == "no ref field":
+        return Opt(False)
+    return Opt(True, captured or "")
+
+
+def parse_mismatch_pair(text: str, *, source: str) -> tuple[Record, Record]:
+    blobs = NIX_MISMATCH_BLOBS_RE.search(text)
+    expected_fields: dict[str, str] = {}
+    got_fields: dict[str, str] = {}
+    ref_a = Opt(False)
+    ref_b = Opt(False)
+    if blobs:
+        expected_fields = fields_from_blob(blobs.group(1))
+        got_fields = fields_from_blob(blobs.group(2))
+        if "ref" in expected_fields:
+            ref_a = Opt(True, expected_fields["ref"])
+        if "ref" in got_fields:
+            ref_b = Opt(True, got_fields["ref"])
+    expected_line = EXPECTED_LINE_RE.search(text)
+    got_line = GOT_LINE_RE.search(text)
+    if expected_line:
+        expected_fields["narHash"] = expected_line.group(1)
+        ref_a = ref_from_annotation(expected_line.group(2), expected_line.group(3))
+    if got_line:
+        got_fields["narHash"] = got_line.group(1)
+        ref_b = ref_from_annotation(got_line.group(2), got_line.group(3))
+    rev_both = REV_BOTH_RE.search(text)
+    if rev_both:
+        expected_fields.setdefault("rev", rev_both.group(1))
+        got_fields.setdefault("rev", rev_both.group(1))
+    rev_a = expected_fields.get("rev")
+    rev_b = got_fields.get("rev")
+    hash_a = expected_fields.get("narHash")
+    hash_b = got_fields.get("narHash")
+    if not rev_a or not rev_b:
+        raise ValueError(f"{source}: missing rev")
+    if not hash_a or not hash_b:
+        raise ValueError(f"{source}: missing narHash")
+    first = Record(
+        source=source,
+        kind="mismatch-log",
+        rev=rev_a,
+        narHash=hash_a,
+        ref=ref_a,
+        lastModified=opt_from_mapping(expected_fields, "lastModified"),
+        revCount=opt_from_mapping(expected_fields, "revCount"),
+    )
+    second = Record(
+        source=source,
+        kind="mismatch-log",
+        rev=rev_b,
+        narHash=hash_b,
+        ref=ref_b,
+        lastModified=opt_from_mapping(got_fields, "lastModified"),
+        revCount=opt_from_mapping(got_fields, "revCount"),
+    )
+    return first, second
+
+
+def parse_record(text: str, *, source: str = "<input>") -> Record:
+    text = strip_bom(text)
+    stripped = text.lstrip()
+    if not stripped.strip():
+        raise ValueError(f"{source}: not a lock record")
+    if is_mismatch_log(text):
+        raise ValueError(
+            f"{source}: mismatch log is a pair; pass it as the only argument"
+        )
+    if stripped.startswith("{") or stripped.startswith("["):
+        parsed = parse_json_text(text, source=source)
+        if isinstance(parsed, tuple):
+            raise ValueError(
+                f"{source}: json array of two lock objects is a pair; pass it as the only argument"
+            )
+        return parsed
+    has_tsv = any(
+        "\t" in line
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    if not has_tsv:
+        raise ValueError(f"{source}: not a lock record")
+    return parse_tsv_record(text, source=source)
+
+
+def parse_pair_text(
+    first_text: str,
+    second_text: str | None,
+    *,
+    first_source: str,
+    second_source: str | None,
+) -> tuple[Record, Record]:
+    first_text = strip_bom(first_text)
+    if second_text is None:
+        stripped = first_text.lstrip()
+        if is_mismatch_log(first_text):
+            return parse_mismatch_pair(first_text, source=first_source)
+        if stripped.startswith("[") or stripped.startswith("{"):
+            parsed = parse_json_text(first_text, source=first_source)
+            if isinstance(parsed, tuple):
+                return parsed
+            raise ValueError(f"{first_source}: need SECOND")
+        raise ValueError(f"{first_source}: need SECOND")
+    if is_mismatch_log(first_text):
+        raise ValueError(
+            f"{first_source}: mismatch log is a pair; do not pass SECOND"
+        )
+    return (
+        parse_record(first_text, source=first_source),
+        parse_record(second_text, source=second_source or "<input>"),
+    )
+
+
+def ref_attached_of(first: Record, second: Record) -> str:
+    a = first.ref
+    b = second.ref
+    if not a.present and b.present:
+        return "attached"
+    if a.present and not b.present:
+        return "ref_removed"
+    if a.present and b.present and a.value != b.value:
+        return "both-disagree"
+    if a.present and b.present:
+        return "both"
+    return "none"
+
+
+def classify_key(first: Record, second: Record, key: str) -> str:
+    a = first.opt(key)
+    b = second.opt(key)
+    if not a.present and not b.present:
+        return "absent"
+    if a.present and not b.present:
+        return "present-only-a"
+    if b.present and not a.present:
+        return "present-only-b"
+    if a.value == b.value:
+        return "equal"
+    return "value-diverged"
+
+
+def verdict_of(
+    *,
+    same_rev: bool,
+    identity_changed: bool,
+    attached: str,
+    meta_value: list[str],
+    meta_presence: list[str],
+) -> str:
+    if not same_rev:
+        return "rev-diverged"
+    if identity_changed and attached == "attached":
+        return "pinned-rev-default-ref-changed-hash"
+    if identity_changed and attached == "ref_removed":
+        return "pinned-rev-default-ref-removed-hash"
+    if identity_changed and attached == "none":
+        return "hash-changed-no-ref"
+    if attached == "both-disagree":
+        return "both-disagree"
+    if identity_changed and attached == "both":
+        return "both-same-ref-changed-hash"
+    if attached == "attached":
+        return "ref-attached-same-hash"
+    if attached == "ref_removed":
+        return "ref-removed-same-hash"
+    if meta_presence:
+        return "metadata-presence"
+    if meta_value:
+        return "lastModified-only"
+    return "identical"
+
+
+def inspect(first: Record, second: Record) -> dict:
+    same_rev = first.rev == second.rev
+    identity_changed = first.narHash != second.narHash
+    attached = ref_attached_of(first, second)
+    equal: list[str] = []
+    diverged: list[str] = []
+    present_only_a: list[str] = []
+    present_only_b: list[str] = []
+    for key in KNOWN:
+        kind = classify_key(first, second, key)
+        if kind == "equal":
+            equal.append(key)
+        elif kind == "value-diverged":
+            diverged.append(key)
+        elif kind == "present-only-a":
+            present_only_a.append(key)
+        elif kind == "present-only-b":
+            present_only_b.append(key)
+    meta_value = [key for key in META_KEYS if key in diverged]
+    meta_presence = [
+        key for key in META_KEYS if key in present_only_a or key in present_only_b
+    ]
+    verdict = verdict_of(
+        same_rev=same_rev,
+        identity_changed=identity_changed,
+        attached=attached,
+        meta_value=meta_value,
+        meta_presence=meta_presence,
+    )
+    attached_ref = second.ref.value if attached == "attached" else ""
+    removed_ref = first.ref.value if attached == "ref_removed" else ""
+    return {
+        "first": first,
+        "second": second,
+        "same_rev": same_rev,
+        "identity_changed": identity_changed,
+        "ref_attached": attached,
+        "verdict": verdict,
+        "equal": equal,
+        "diverged": diverged,
+        "present_only_a": present_only_a,
+        "present_only_b": present_only_b,
+        "attached_ref": attached_ref,
+        "removed_ref": removed_ref,
+    }
+
+
+def exit_status(verdict: str) -> int:
+    if verdict in {"identical", "lastModified-only", "metadata-presence"}:
+        return 0
+    return 1
+
+
+def format_report(result: dict) -> str:
+    first: Record = result["first"]
+    second: Record = result["second"]
+    hash_a, cap_a = cap_hash(first.narHash)
+    hash_b, cap_b = cap_hash(second.narHash)
+    lines = [
+        "time_axis\tFIRST=earlier SECOND=later",
+        f"verdict\t{result['verdict']}",
+        f"same_rev\t{'yes' if result['same_rev'] else 'no'}",
+        f"rev_a\t{first.rev}",
+        f"rev_b\t{second.rev}",
+    ]
+    if result["same_rev"]:
+        lines.insert(2, f"rev\t{first.rev}")
+    lines.extend(
+        [
+            f"narHash_a\t{hash_a}",
+            f"narHash_b\t{hash_b}",
+            f"identity_changed\t{'yes' if result['identity_changed'] else 'no'}",
+            f"ref_present_a\t{'yes' if first.ref.present else 'no'}",
+            f"ref_present_b\t{'yes' if second.ref.present else 'no'}",
+            f"ref_a\t{first.ref.display()}",
+            f"ref_b\t{second.ref.display()}",
+            f"ref_attached\t{result['ref_attached']}",
+            f"attached_ref\t{result['attached_ref'] or OMITTED}",
+            f"removed_ref\t{result['removed_ref'] or OMITTED}",
+            f"equal\t{fmt_list(result['equal'])}",
+            f"diverged\t{fmt_list(result['diverged'])}",
+            f"present_only_a\t{fmt_list(result['present_only_a'])}",
+            f"present_only_b\t{fmt_list(result['present_only_b'])}",
+            f"source_a\t{first.kind}",
+            f"source_b\t{second.kind}",
+        ]
+    )
+    if cap_a or cap_b:
+        lines.append("narHash_capped\tyes")
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="refpin",
+        description=(
+            "Compare two fetch/lock records. FIRST is earlier, SECOND is later. "
+            "Name whether a default ref attached to a pinned rev and whether "
+            "narHash identity changed. A single mismatch-log argument is a pair."
+        ),
+    )
+    parser.add_argument("first", metavar="FIRST")
+    parser.add_argument("second", nargs="?", metavar="SECOND")
+    return parser.parse_args(argv)
+
+
+def read_path(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).read_text(encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.first == "-" and args.second == "-":
+        print("refpin: cannot read stdin twice", file=sys.stderr)
+        return 1
+    try:
+        first_text = read_path(args.first)
+        second_text = None if args.second is None else read_path(args.second)
+        first, second = parse_pair_text(
+            first_text,
+            second_text,
+            first_source="<stdin>" if args.first == "-" else args.first,
+            second_source=(
+                None
+                if args.second is None
+                else ("<stdin>" if args.second == "-" else args.second)
+            ),
+        )
+    except (OSError, ValueError) as err:
+        print(f"refpin: {err}", file=sys.stderr)
+        return 1
+    result = inspect(first, second)
+    sys.stdout.write(format_report(result))
+    return exit_status(result["verdict"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

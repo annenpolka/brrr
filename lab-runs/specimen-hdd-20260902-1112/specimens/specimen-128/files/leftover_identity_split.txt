@@ -1,0 +1,25 @@
+Registry / fixture:
+  workspace myapp with member sub
+  leftover .dart_tool/package_config.json without pkg_b
+
+Case A (second dart run, unchanged workspace):
+  current mapping
+  not leftover-after-workspace-add
+
+Case B (add workspace member pkg_b, leftover package_config):
+  leftover: mapping without pkg_b
+  missing workspace member omitted from identity
+  treated as up-to-date
+
+Case C (delete package_config + lock then pub get):
+  fresh mapping including pkg_b
+  not leftover missing member
+
+Case D (missing member invalidates):
+  not leftover mapping without pkg_b
+
+Not this packet:
+  go work leftover replace graph (specimen-103)
+  swift registry TTL inverted (specimen-121)
+  npm leftover original across file: Link (specimen-126)
+  uv leftover extras marker simplified to true (specimen-125)

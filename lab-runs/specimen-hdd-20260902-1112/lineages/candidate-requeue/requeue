@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""requeue: name completed work units put back after a worker crash."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN = ("unit", "requeued", "assigned")
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def parse_done(token: str, *, source: str, lineno: int) -> bool:
+    v = token.strip().lower()
+    if v in {"yes", "true", "done"}:
+        return True
+    if v in {"no", "false", "open"}:
+        return False
+    raise ValueError(f"{source}:{lineno}: unit done must be yes|no, got {token!r}")
+
+
+def parse_record(text: str, *, source: str = "<input>"):
+    units: dict[str, bool] = {}
+    order: list[str] = []
+    requeued: list[str] = []
+    assigned: list[tuple[str, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        parts = [p for p in rest.split("\t") if p != ""]
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if key == "unit":
+            if len(parts) < 3 or parts[1] != "done":
+                raise ValueError(f"{source}:{lineno}: unit NAME done yes|no")
+            name = parts[0]
+            units[name] = parse_done(parts[2], source=source, lineno=lineno)
+            if name not in order:
+                order.append(name)
+        elif key == "requeued":
+            if not parts:
+                raise ValueError(f"{source}:{lineno}: requeued needs name")
+            requeued.append(parts[0])
+        elif key == "assigned":
+            if len(parts) < 2:
+                raise ValueError(f"{source}:{lineno}: assigned needs worker, name")
+            assigned.append((parts[0], parts[1]))
+    if not units:
+        raise ValueError(f"{source}: missing unit")
+    return units, order, unique(requeued), assigned
+
+
+def inspect(units, order, requeued, assigned) -> dict:
+    already = [n for n in requeued if units.get(n) is True]
+    unfinished = [n for n in requeued if units.get(n) is False]
+    unknown = [n for n in requeued if n not in units]
+    by_worker: dict[str, list[str]] = {}
+    for worker, name in assigned:
+        by_worker.setdefault(worker, []).append(name)
+    empty_assign = []
+    for worker, names in by_worker.items():
+        open_names = [n for n in names if not units.get(n)]
+        if names and not open_names:
+            empty_assign.append(worker)
+    return {
+        "already_done": already,
+        "unfinished": unfinished,
+        "unknown": unknown,
+        "empty_assign": empty_assign,
+        "requeued": requeued,
+    }
+
+
+def fmt(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"requeued\t{fmt(result['requeued'])}",
+        f"already_done\t{fmt(result['already_done'])}",
+        f"unfinished\t{fmt(result['unfinished'])}",
+        f"empty_assign\t{fmt(result['empty_assign'])}",
+    ]
+    if result["unknown"]:
+        lines.append(f"unknown\t{fmt(result['unknown'])}")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="requeue")
+    parser.add_argument("record", nargs="?")
+    args = parser.parse_args(argv)
+    try:
+        if args.record:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        else:
+            text = sys.stdin.read()
+            source = "<stdin>"
+        units, order, requeued, assigned = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"requeue: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(inspect(units, order, requeued, assigned)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

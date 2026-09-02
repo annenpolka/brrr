@@ -1,0 +1,30 @@
+{
+  "summary": "Used owned gocache_buildid.py (good). Did not invent a CLI. Preserve FRESH same key while buildid changed. Harvest key-includes-buildid vs stale binary. Stop.",
+  "preserve_add": [
+    "A test cache keyed only by test files can report FRESH after the binary buildid changes",
+    "same_key True with key_includes_buildid False is a stale binary, not a hit"
+  ],
+  "established_add": [
+    "Owned: first BUILT key 55e3acdd667f buildid-aaa; second FRESH same key buildid-bbb cached_buildid-aaa; stale_binary True"
+  ],
+  "rejected_add": [
+    "Proposed test_key() patch is not host evidence",
+    "go tool buildid was not run"
+  ],
+  "constraints_add": [
+    "Owned two cache events: key, buildid, cached_buildid, status. freshmiss is missing extra, not stale buildid"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether the cache key included the binary buildid, and whether FRESH reused a stale binary"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name FRESH same-key while buildid changed",
+    "nearest_existing_operation": "freshmiss / print cache key",
+    "observable_delta": "key_includes_buildid no; stale_binary yes",
+    "reason": "identity omitted buildid; extra-missing is a different absence"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground staleid on owned two events. Do not send the key-function patch back to R1."
+}

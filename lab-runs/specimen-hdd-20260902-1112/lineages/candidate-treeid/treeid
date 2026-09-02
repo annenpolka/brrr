@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""treeid: name whether a fileTree cache identity omitted member names."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("kind", "dir", "pattern", "names", "added", "stored_identity", "load_after_add")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "stored_identity" not in fields:
+        raise ValueError(f"{source}: need stored_identity")
+    return fields
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    ident = fields["stored_identity"]
+    omitted = ident in {"dir+pattern", "dir-pattern", "tree"}
+    load = fields.get("load_after_add", "") in {"yes", "true", "load"}
+    hidden = omitted and load
+    return {
+        "kind": fields.get("kind") or "-",
+        "stored_identity": ident,
+        "omitted_names": omitted,
+        "load_after_add": load,
+        "hidden_by_omitted_names": hidden,
+        "names": fields.get("names") or "-",
+        "added": fields.get("added") or "-",
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"kind\t{result['kind']}",
+        f"stored_identity\t{result['stored_identity']}",
+        f"names\t{result['names']}",
+        f"added\t{result['added']}",
+        f"omitted_names\t{yn(result['omitted_names'])}",
+        f"load_after_add\t{yn(result['load_after_add'])}",
+        f"hidden_by_omitted_names\t{yn(result['hidden_by_omitted_names'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="treeid",
+        description=(
+            "Name whether a fileTree configuration-cache identity omitted "
+            "member file names (dir+pattern only) so an added file still loads."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"treeid: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["hidden_by_omitted_names"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

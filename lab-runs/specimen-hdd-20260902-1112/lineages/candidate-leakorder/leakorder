@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""Name the binding whose start depended only on order, and the exposing split."""
+from __future__ import annotations
+
+import argparse
+import ast
+import inspect
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+import importlib.util
+from pathlib import Path
+
+ABSENT = {"t": "__absent__"}
+SKIP_DUNDER = {
+    "__name__",
+    "__file__",
+    "__dict__",
+    "__loader__",
+    "__spec__",
+    "__cached__",
+    "__builtins__",
+    "__doc__",
+    "__package__",
+    "__annotations__",
+    "__path__",
+    "__module__",
+    "__qualname__",
+    "__wrapped__",
+}
+ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
+REPR_CAP = 240
+LEFTOVER_CAP = 500
+ORDER_TIMEOUT = 20
+
+
+def cap_text(text: str, limit: int = REPR_CAP) -> str:
+    text = text.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def structured(value, depth: int = 0, seen: set[int] | None = None):
+    if depth > 10:
+        return {"t": "cap", "r": "…"}
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"t": "nan"}
+        if math.isinf(value):
+            return {"t": "inf", "s": int(math.copysign(1, value))}
+        return value
+    if isinstance(value, bytes):
+        return {"t": "bytes", "v": value[:120].decode("utf-8", "replace")}
+    seen = set() if seen is None else seen
+    oid = id(value)
+    if oid in seen:
+        return {"t": "cycle"}
+    if isinstance(value, (list, tuple)):
+        seen.add(oid)
+        return {"t": type(value).__name__, "v": [structured(x, depth + 1, seen) for x in value]}
+    if isinstance(value, set):
+        seen.add(oid)
+        items = [structured(x, depth + 1, seen) for x in value]
+        items.sort(key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return {"t": "set", "v": items}
+    if isinstance(value, dict):
+        seen.add(oid)
+        pairs = []
+        for key, item in value.items():
+            pairs.append([structured(key, depth + 1, seen), structured(item, depth + 1, seen)])
+        pairs.sort(key=lambda p: json.dumps(p[0], sort_keys=True, default=str))
+        return {"t": "dict", "v": pairs}
+    seen.add(oid)
+    fields = {}
+    try:
+        inst = vars(value)
+        if isinstance(inst, dict):
+            fields = {
+                k: structured(v, depth + 1, seen)
+                for k, v in inst.items()
+                if k not in SKIP_DUNDER and not k.startswith("__")
+            }
+    except TypeError:
+        fields = {}
+    slots_out = {}
+    slots = getattr(type(value), "__slots__", None)
+    if slots:
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot.startswith("__"):
+                continue
+            try:
+                slots_out[slot] = structured(getattr(value, slot), depth + 1, seen)
+            except Exception:
+                continue
+    if fields or slots_out:
+        rec = {"t": getattr(type(value), "__name__", "obj")}
+        if fields:
+            rec["d"] = fields
+        if slots_out:
+            rec["s"] = slots_out
+        return rec
+    text = ADDR_RE.sub("", repr(value))
+    return {"t": getattr(type(value), "__name__", "obj"), "r": cap_text(text)}
+
+
+def display(value):
+    if value is None or isinstance(value, (bool, int, str, float)):
+        return value
+    if not isinstance(value, dict) or "t" not in value:
+        return value
+    kind = value["t"]
+    if kind == "nan":
+        return float("nan")
+    if kind == "list":
+        return [display(x) for x in value.get("v", [])]
+    if kind == "tuple":
+        return tuple(display(x) for x in value.get("v", []))
+    if kind == "set":
+        return set(display(x) for x in value.get("v", []))
+    if kind == "dict":
+        out = {}
+        for key, item in value.get("v", []):
+            dk = display(key)
+            if isinstance(dk, (str, int, bool, tuple)):
+                out[dk] = display(item)
+            else:
+                out[repr(dk)] = display(item)
+        return out
+    if "d" in value:
+        return {k: display(v) for k, v in value["d"].items()}
+    if "s" in value:
+        return {k: display(v) for k, v in value["s"].items()}
+    if "r" in value:
+        return value["r"]
+    return value
+
+
+def values_equal(left, right) -> bool:
+    return left == right
+
+
+def put_data(out: dict, key: str, value) -> None:
+    if key in out:
+        return
+    if inspect.isclass(value) or inspect.ismodule(value):
+        return
+    if inspect.isfunction(value) or inspect.ismethod(value):
+        return
+    if isinstance(value, (classmethod, staticmethod, property)):
+        return
+    out[key] = structured(value)
+
+
+def snapshot_function(out: dict, prefix: str, fn, seen_cells: set[int]) -> None:
+    try:
+        attrs = vars(fn)
+    except TypeError:
+        attrs = {}
+    for attr, aval in attrs.items():
+        if attr in SKIP_DUNDER or attr.startswith("__"):
+            continue
+        put_data(out, f"{prefix}.{attr}", aval)
+    defaults = getattr(fn, "__defaults__", None)
+    if defaults:
+        for i, item in enumerate(defaults):
+            put_data(out, f"{prefix}.__defaults__[{i}]", item)
+    kwdefaults = getattr(fn, "__kwdefaults__", None)
+    if kwdefaults:
+        for key, item in kwdefaults.items():
+            put_data(out, f"{prefix}.__kwdefaults__.{key}", item)
+    closure = getattr(fn, "__closure__", None)
+    freevars = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+    if not closure or not freevars:
+        return
+    for cell_name, cell in zip(freevars, closure):
+        cid = id(cell)
+        if cid in seen_cells:
+            continue
+        try:
+            cell_val = cell.cell_contents
+        except ValueError:
+            continue
+        seen_cells.add(cid)
+        key = cell_name if cell_name not in out else f"{prefix}.{cell_name}"
+        put_data(out, key, cell_val)
+
+
+def is_local_module(mod, origin_dir: Path) -> bool:
+    file = getattr(mod, "__file__", None)
+    if not file:
+        return False
+    try:
+        return Path(file).resolve().parent == origin_dir.resolve()
+    except Exception:
+        return False
+
+
+def snapshot(mod, origin_dir: Path | None = None, *, _seen: set[int] | None = None) -> dict:
+    """FILE globals, class/function attrs, defaults, closures, sibling imports."""
+    origin_dir = origin_dir or Path(getattr(mod, "__file__", ".")).resolve().parent
+    seen = set() if _seen is None else _seen
+    mid = id(mod)
+    if mid in seen:
+        return {}
+    seen.add(mid)
+    out: dict = {}
+    seen_cells: set[int] = set()
+    try:
+        items = list(vars(mod).items())
+    except TypeError:
+        return out
+    for name, value in items:
+        if name in SKIP_DUNDER:
+            continue
+        if inspect.ismodule(value):
+            if is_local_module(value, origin_dir):
+                nested = snapshot(value, origin_dir, _seen=seen)
+                for key, item in nested.items():
+                    out.setdefault(f"{name}.{key}", item)
+            continue
+        if inspect.isclass(value):
+            try:
+                class_items = vars(value).items()
+            except TypeError:
+                continue
+            for attr, aval in class_items:
+                if attr in SKIP_DUNDER or attr.startswith("__"):
+                    continue
+                if inspect.isfunction(aval) or inspect.ismethod(aval):
+                    snapshot_function(out, f"{name}.{attr}", aval, seen_cells)
+                    continue
+                put_data(out, f"{name}.{attr}", aval)
+            continue
+        if inspect.isfunction(value) or inspect.ismethod(value):
+            snapshot_function(out, name, value, seen_cells)
+            continue
+        if callable(value) and hasattr(value, "cache_info"):
+            try:
+                put_data(out, f"{name}.cache_info.currsize", value.cache_info().currsize)
+            except Exception:
+                pass
+            snapshot_function(out, name, value, seen_cells)
+            continue
+        try:
+            inst = vars(value)
+        except TypeError:
+            inst = None
+        if isinstance(inst, dict) and inst:
+            for attr, aval in inst.items():
+                if attr in SKIP_DUNDER or attr.startswith("__"):
+                    continue
+                put_data(out, f"{name}.{attr}", aval)
+            continue
+        put_data(out, name, value)
+    return out
+
+
+def prepare_path(path: Path) -> None:
+    file_dir = str(path.resolve().parent)
+    parent = str(path.resolve().parent.parent)
+    for item in (parent, file_dir):
+        if item in sys.path:
+            sys.path.remove(item)
+        sys.path.insert(0, item)
+
+
+def load_fresh(path: Path):
+    path = path.resolve()
+    prepare_path(path)
+    name = f"_leakorder_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise OSError(f"leakorder: cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def discover_from_source(path: Path) -> list[str]:
+    src = path.read_bytes()
+    tree = ast.parse(src, filename=str(path))
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if name.startswith("test_") and name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    add(target.id)
+                elif isinstance(target, ast.Tuple):
+                    for elt in target.elts:
+                        if isinstance(elt, ast.Name):
+                            add(elt.id)
+    return names
+
+
+def resolve_callable(mod, name: str):
+    if "." in name:
+        head, tail = name.split(".", 1)
+        cls = getattr(mod, head, None)
+        if inspect.isclass(cls):
+            try:
+                inst = cls()
+            except BaseException as exc:
+                return None, f"cannot instantiate {head}: {type(exc).__name__}: {exc}"
+            meth = getattr(inst, tail, None)
+            if callable(meth) and not inspect.isclass(meth):
+                return meth, None
+        return None, f"no callable {name}"
+    fn = getattr(mod, name, None)
+    if callable(fn) and not inspect.isclass(fn):
+        return fn, None
+    return None, f"no callable {name}"
+
+
+def invoke(fn) -> tuple[str, str | None]:
+    if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+        return "ERROR", "async callable"
+    if inspect.isgeneratorfunction(fn):
+        return "ERROR", "generator callable"
+    try:
+        result = fn()
+    except AssertionError as exc:
+        return "FAIL", str(exc)
+    except BaseException as exc:
+        return "ERROR", f"{type(exc).__name__}: {exc}"
+    if inspect.iscoroutine(result):
+        result.close()
+        return "ERROR", "async callable"
+    if inspect.isgenerator(result) or inspect.isasyncgen(result):
+        result.close()
+        return "ERROR", "generator callable"
+    return "PASS", None
+
+
+def run_order(path: Path, order: list[str]) -> dict:
+    path = path.resolve()
+    prepare_path(path)
+    mod = load_fresh(path)
+    origin = path.parent
+    before = snapshot(mod, origin)
+    steps = []
+    results = []
+    writers: set[str] = set()
+    for name in order:
+        fn, miss = resolve_callable(mod, name)
+        pre = snapshot(mod, origin)
+        if fn is None:
+            status, detail = "MISSING", miss or f"no callable {name}"
+            post = pre
+        else:
+            status, detail = invoke(fn)
+            post = snapshot(mod, origin)
+            for key, val in post.items():
+                if key not in pre or not values_equal(pre[key], val):
+                    writers.add(key)
+        steps.append(
+            {
+                "name": name,
+                "status": status,
+                "detail": detail,
+                "before": pre,
+                "after": post,
+            }
+        )
+        results.append([name, status, detail])
+    after = snapshot(mod, origin)
+    leftover_struct = {
+        k: after[k] for k in after if k not in before or not values_equal(before[k], after[k])
+    }
+    return {
+        "order": list(order),
+        "results": results,
+        "steps": steps,
+        "leftover_struct": leftover_struct,
+        "writers": sorted(writers),
+        "failed": [n for n, s, _ in results if s != "PASS"],
+    }
+
+
+def leftover_display(rec: dict) -> dict:
+    return {k: display(v) for k, v in rec.get("leftover_struct", {}).items()}
+
+
+def run_order_isolated(path: Path, order: list[str], cli: Path | None = None) -> dict:
+    cli = cli or Path(__file__).resolve()
+    path = path.resolve()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "rec.json"
+        cmd = [
+            sys.executable,
+            str(cli),
+            "--worker",
+            "--file",
+            str(path),
+            "--order",
+            ",".join(order),
+            "--out",
+            str(out),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=ORDER_TIMEOUT,
+                cwd=str(path.parent),
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError("leakorder: timeout running order") from exc
+        if not out.is_file():
+            err = (proc.stderr or proc.stdout or "no report").strip()
+            raise OSError(f"leakorder: worker failed: {cap_text(err, 400)}")
+        rec = json.loads(out.read_text(encoding="utf-8"))
+        if rec.get("error"):
+            err = str(rec["error"])
+            if not err.startswith("leakorder:"):
+                err = f"leakorder: {err}"
+            raise OSError(err)
+        return rec
+
+
+def is_all_pass(rec: dict) -> bool:
+    rows = rec.get("results") or []
+    return bool(rows) and all(s == "PASS" for _, s, _ in rows)
+
+
+def has_real_failure(rec: dict) -> bool:
+    return any(s in ("FAIL", "ERROR") for _, s, _ in rec.get("results") or [])
+
+
+def is_all_missing(rec: dict) -> bool:
+    rows = rec.get("results") or []
+    return bool(rows) and all(s == "MISSING" for _, s, _ in rows)
+
+
+def sufficient(records: list[dict]) -> list[str] | None:
+    if len(records) < 2:
+        return None
+    if all(is_all_missing(rec) for rec in records):
+        return None
+    passers = [rec for rec in records if is_all_pass(rec)]
+    failers = [
+        rec
+        for rec in records
+        if has_real_failure(rec) and not any(s == "MISSING" for _, s, _ in rec["results"])
+    ]
+    if not passers or not failers:
+        return None
+    uniq = {tuple(rec["order"]) for rec in failers}
+    if len(uniq) != 1:
+        return None
+    return list(failers[0]["order"])
+
+
+def leaked_names(records: list[dict]) -> list[str]:
+    if len(records) < 2:
+        return []
+    writers: set[str] = set()
+    for rec in records:
+        writers.update(rec.get("writers") or [])
+        writers.update((rec.get("leftover_struct") or {}).keys())
+    names = records[0]["order"]
+    found: set[str] = set()
+    for name in names:
+        starts = []
+        for rec in records:
+            for step in rec.get("steps") or []:
+                if step["name"] == name:
+                    starts.append(step["before"])
+                    break
+        if len(starts) < 2:
+            continue
+        keys: set[str] = set()
+        for snap in starts:
+            keys.update(snap)
+        for key in keys:
+            if key not in writers:
+                continue
+            vals = [snap[key] if key in snap else ABSENT for snap in starts]
+            if any(not values_equal(vals[0], item) for item in vals[1:]):
+                found.add(key)
+    return sorted(found)
+
+
+def format_bit(name: str, status: str, detail) -> str:
+    if status == "PASS" or not detail:
+        return f"{name}={status}"
+    return f"{name}={status} {cap_text(str(detail))}"
+
+
+def leftover_text(leftover: dict) -> str:
+    return cap_text(repr(leftover), LEFTOVER_CAP)
+
+
+def analyze(records: list[dict]) -> dict:
+    expo = sufficient(records)
+    names = leaked_names(records)
+    if expo and not names:
+        leak_field = "unknown"
+        rc = 1
+    elif names:
+        leak_field = ",".join(names)
+        rc = 1
+    else:
+        leak_field = "none"
+        rc = 0
+    return {"exposing": expo, "leaked_names": names, "leak_field": leak_field, "rc": rc}
+
+
+def render(path: Path, orders: list[list[str]], *, isolated: bool = True) -> tuple[str, int]:
+    records = []
+    for order in orders:
+        rec = run_order_isolated(path, order) if isolated else run_order(path, order)
+        records.append(rec)
+    lines = [f"file  {path}"]
+    for rec in records:
+        order_s = ",".join(rec["order"])
+        bits = " ".join(format_bit(n, s, d) for n, s, d in rec["results"])
+        leftover = leftover_display(rec)
+        rec["leftover"] = leftover
+        rec["failed"] = [n for n, s, _ in rec["results"] if s != "PASS"]
+        lines.append(f"order {order_s}  {bits}  leftover={leftover_text(leftover)}")
+    info = analyze(records)
+    lines.append(f"leaked_names  {info['leak_field']}")
+    expo = info["exposing"]
+    lines.append(f"sufficient_exposing_order  {','.join(expo) if expo else 'none'}")
+    failing = [",".join(r["order"]) for r in records if r.get("failed")]
+    passing = [",".join(r["order"]) for r in records if not r.get("failed")]
+    lines.append(f"order_axis  fail={failing or ['none']} pass={passing or ['none']}")
+    return "\n".join(lines) + "\n", info["rc"]
+
+
+def parse_orders(raw: list[str], discovered: list[str]) -> list[list[str]]:
+    if not raw:
+        if len(discovered) >= 2:
+            return [list(discovered), list(reversed(discovered))]
+        if discovered:
+            return [list(discovered)]
+        return []
+    out = []
+    for item in raw:
+        parts = [p.strip() for p in item.split(",") if p.strip()]
+        if parts:
+            out.append(parts)
+    return out
+
+
+def worker_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="leakorder-worker")
+    parser.add_argument("--file", required=True)
+    parser.add_argument("--order", required=True)
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args(argv)
+    path = Path(args.file)
+    order = [p.strip() for p in args.order.split(",") if p.strip()]
+    out = Path(args.out)
+    try:
+        os.chdir(path.resolve().parent)
+        rec = run_order(path, order)
+        out.write_text(json.dumps(rec), encoding="utf-8")
+        return 0
+    except BaseException as exc:
+        payload = {"error": f"leakorder: {type(exc).__name__}: {exc}"}
+        try:
+            out.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--worker":
+        return worker_main(argv[1:])
+    parser = argparse.ArgumentParser(prog="leakorder")
+    parser.add_argument("file", help="python file with test_* callables and module state")
+    parser.add_argument(
+        "--order",
+        action="append",
+        default=[],
+        help="comma-separated callable names (repeatable). Default: discovered test_* and reverse",
+    )
+    args = parser.parse_args(argv)
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"leakorder: file not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        discovered = discover_from_source(path)
+    except SyntaxError as exc:
+        print(f"leakorder: SyntaxError: {exc}", file=sys.stderr)
+        return 1
+    except (UnicodeDecodeError, ValueError) as exc:
+        print(f"leakorder: {exc}", file=sys.stderr)
+        return 1
+    orders = parse_orders(args.order, discovered)
+    if not orders:
+        sys.stdout.write(
+            f"file  {path}\n"
+            "leaked_names  none\n"
+            "sufficient_exposing_order  none\n"
+            "order_axis  fail=['none'] pass=['none']\n"
+        )
+        return 0
+    try:
+        text, rc = render(path, orders, isolated=True)
+    except OSError as exc:
+        msg = str(exc)
+        if not msg.startswith("leakorder:"):
+            msg = f"leakorder: {msg}"
+        print(msg, file=sys.stderr)
+        return 1
+    sys.stdout.write(text)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

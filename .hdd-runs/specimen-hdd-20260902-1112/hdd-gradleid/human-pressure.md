@@ -1,0 +1,1 @@
+- No Gradle. Continue on two threads and one lock. Show owner vs waiter.

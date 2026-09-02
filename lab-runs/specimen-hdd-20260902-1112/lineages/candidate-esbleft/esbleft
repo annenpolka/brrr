@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""esbleft: leftover uniqueKey-sized bytesInOutput after substituted hashed path."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("uniquekey_len", "bytes_in_output", "substituted_bytes")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "bytes_in_output" not in fields or "substituted_bytes" not in fields:
+        raise ValueError(f"{source}: need bytes_in_output, substituted_bytes")
+    return fields
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    bio = fields["bytes_in_output"]
+    sub = fields["substituted_bytes"]
+    uk = fields.get("uniquekey_len") or ""
+    leftover = bool(uk) and bio == uk and sub != bio
+    return {
+        "uniquekey_len": uk or "-",
+        "bytes_in_output": bio,
+        "substituted_bytes": sub,
+        "leftover_uniquekey": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"uniquekey_len\t{result['uniquekey_len']}",
+        f"bytes_in_output\t{result['bytes_in_output']}",
+        f"substituted_bytes\t{result['substituted_bytes']}",
+        f"leftover_uniquekey\t{yn(result['leftover_uniquekey'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="esbleft",
+        description=(
+            "Name leftover uniqueKey-sized bytesInOutput after the written file "
+            "already substituted the hashed path."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"esbleft: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_uniquekey"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

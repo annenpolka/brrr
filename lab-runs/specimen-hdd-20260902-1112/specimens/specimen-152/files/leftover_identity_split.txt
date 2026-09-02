@@ -1,0 +1,25 @@
+Registry / fixture:
+  rules_distroless apt mctx.facts
+  leftover snapshot facts after URL upgrade
+
+Case A (second fetch, same snapshot URLs):
+  current cache identity
+  not leftover-after-upgrade
+
+Case B (snapshot URL upgraded, leftover facts hit):
+  leftover: previous integrity / stale packages
+  snapshot URL omitted from fact key
+  same dist/component/arch
+
+Case C (facts empty / rolling suite):
+  fresh index identity
+  not leftover previous facts
+
+Case D (snapshot URLs in the fact key):
+  new facts after snapshot upgrade
+  not leftover previous packages
+
+Not this packet:
+  bazel#29298 env_inherit local vs remote (SKIP unfixed)
+  nix leftover (specimen-064/070)
+  pants leftover vcs_version (specimen-136)

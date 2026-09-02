@@ -1,0 +1,25 @@
+Registry / fixture:
+  ARG something
+  CACHE --id $something /id-test
+  leftover cache mount identity = literal $something
+
+Case A (first CACHE, ARG something=foo):
+  writes cache under unexpanded token
+  not leftover yet
+
+Case B (later CACHE, ARG something=bar, leftover foo mount):
+  leftover: foo cache under $something
+  expanded ARG omitted from cacheID
+
+Case C (CACHE --id foo vs CACHE --id bar constants):
+  two identities
+  not this leftover
+
+Case D (delete cache mount then ARG=bar):
+  fresh identity
+  not leftover
+
+Not this packet:
+  go-task leftover wildcard fingerprint omitting MATCH (specimen-115)
+  pixi leftover task-cache filename env+name omitting args (specimen-119)
+  docker/buildkit leftover layers (066/097)

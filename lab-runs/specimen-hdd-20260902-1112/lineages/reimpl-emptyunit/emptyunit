@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Replay crash requeue, then drain send_runtest_some of pending indexes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DONE = frozenset({"done", "true", "yes", "1", "completed"})
+OPEN = frozenset({"open", "false", "no", "0", "incomplete"})
+
+
+def completed_flag(token: str) -> bool:
+    key = token.strip().lower()
+    if key in DONE:
+        return True
+    if key in OPEN:
+        return False
+    raise ValueError(f"unknown completed flag {token!r}")
+
+
+def names(items: list[str]) -> str:
+    return "\t".join(items) if items else "none"
+
+
+def send_tuple(indexes: list[int]) -> str:
+    if not indexes:
+        return "()"
+    return "(" + ",".join(str(i) for i in indexes) + ")"
+
+
+def yesno(flag: bool) -> str:
+    return "yes" if flag else "no"
+
+
+@dataclass
+class Send:
+    """One _assign_work_unit: a popped scope and the indexes it would send."""
+
+    scope: str
+    unit: dict[str, bool]
+    indexes: list[int]
+    missing: list[str]
+
+    @property
+    def nodeids(self) -> list[str]:
+        return list(self.unit)
+
+    @property
+    def done(self) -> list[str]:
+        return [nodeid for nodeid, flag in self.unit.items() if flag]
+
+    @property
+    def pending(self) -> list[str]:
+        return [nodeid for nodeid, flag in self.unit.items() if not flag]
+
+    @property
+    def completed_only(self) -> bool:
+        return bool(self.unit) and not self.pending
+
+    @property
+    def empty_send(self) -> bool:
+        return not self.indexes
+
+
+class LoadScopeQueue:
+    """Two-pass replica of loadscope remove_node + _assign_work_unit.
+
+    Pass 1 (`requeue`): crashed node's whole assigned dict goes back onto
+    the FIFO, including scopes whose tests are already True.
+
+    Pass 2 (`drain`): pop each unit and build
+    `[collection.index(n) for n, done in unit.items() if not done]`,
+    then `send_runtest_some(indexes)`. An empty index list is hang_risk.
+    """
+
+    def __init__(self) -> None:
+        self.collection: list[str] = []
+        self.assigned: dict[str, dict[str, bool]] = {}
+        self._fifo: deque[tuple[str, dict[str, bool]]] = deque()
+        self.trace: list[dict[str, Any]] = []
+        self.sends: list[Send] = []
+
+    def apply(self, event: dict[str, Any]) -> None:
+        op = event.get("op")
+        if op == "collect":
+            nodeid = event["nodeid"]
+            if nodeid not in self.collection:
+                self.collection.append(nodeid)
+            self.trace.append({"op": "collect", "nodeid": nodeid})
+            return
+        if op == "mark":
+            scope = event["scope"]
+            nodeid = event["nodeid"]
+            flag = bool(event["completed"])
+            self.assigned.setdefault(scope, {})[nodeid] = flag
+            self.trace.append(
+                {"op": "mark", "scope": scope, "nodeid": nodeid, "completed": flag}
+            )
+            return
+        if op == "crash":
+            self.requeue()
+            return
+        if op == "drain":
+            self.drain()
+            return
+        raise ValueError(f"unknown event op {op!r}")
+
+    def requeue(self) -> None:
+        workload = {scope: dict(unit) for scope, unit in self.assigned.items()}
+        self.trace.append({"op": "update", "scopes": list(workload)})
+        for scope, unit in workload.items():
+            self._fifo.append((scope, unit))
+
+    def _indexes_for(self, unit: dict[str, bool]) -> tuple[list[int], list[str]]:
+        indexes: list[int] = []
+        missing: list[str] = []
+        for nodeid, flag in unit.items():
+            if nodeid not in self.collection:
+                missing.append(nodeid)
+                continue
+            if flag:
+                continue
+            indexes.append(self.collection.index(nodeid))
+        return indexes, missing
+
+    def drain(self) -> None:
+        while self._fifo:
+            scope, unit = self._fifo.popleft()
+            indexes, missing = self._indexes_for(unit)
+            self.trace.append(
+                {
+                    "op": "send_runtest_some",
+                    "scope": scope,
+                    "indexes": list(indexes),
+                    "empty": not indexes,
+                }
+            )
+            self.sends.append(
+                Send(scope=scope, unit=unit, indexes=indexes, missing=missing)
+            )
+
+    def run(self, events: Iterable[dict[str, Any]]) -> None:
+        saw_crash = False
+        for event in events:
+            if event.get("op") == "crash":
+                saw_crash = True
+            self.apply(event)
+        if not saw_crash and self.assigned:
+            self.requeue()
+        if self._fifo:
+            self.drain()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "collection": list(self.collection),
+            "completed_only": [send.scope for send in self.sends if send.completed_only],
+            "incomplete_scopes": [send.scope for send in self.sends if send.pending],
+            "hang_risk": any(send.empty_send for send in self.sends),
+            "sends": self.sends,
+        }
+
+
+def render(result: dict[str, Any]) -> str:
+    lines = [
+        f"collection\t{names(result['collection'])}",
+        f"completed_only\t{names(result['completed_only'])}",
+        f"incomplete_scopes\t{names(result['incomplete_scopes'])}",
+        f"hang_risk\t{yesno(result['hang_risk'])}",
+    ]
+    for send in result["sends"]:
+        lines += [
+            f"scope\t{send.scope}",
+            f"items\t{names(send.nodeids)}",
+            f"completed\t{names(send.done)}",
+            f"incomplete\t{names(send.pending)}",
+            f"missing\t{names(send.missing)}",
+            f"send\t{send_tuple(send.indexes)}",
+            f"empty_send\t{yesno(send.empty_send)}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def tsv_events(text: str, *, source: str) -> list[dict[str, Any]]:
+    collects: list[dict[str, Any]] = []
+    marks: list[dict[str, Any]] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key == "collection":
+            for nodeid in rest.split("\t"):
+                if nodeid and nodeid != "none":
+                    collects.append({"op": "collect", "nodeid": nodeid})
+        elif key == "unit":
+            parts = rest.split("\t")
+            if len(parts) < 3:
+                raise ValueError(
+                    f"{source}:{lineno}: unit needs scope, nodeid, done|open"
+                )
+            marks.append(
+                {
+                    "op": "mark",
+                    "scope": parts[0],
+                    "nodeid": parts[1],
+                    "completed": completed_flag(parts[2]),
+                }
+            )
+        else:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+    if not marks:
+        raise ValueError(f"{source}: no unit rows")
+    if not collects:
+        seen: set[str] = set()
+        for mark in marks:
+            nodeid = mark["nodeid"]
+            if nodeid in seen:
+                continue
+            seen.add(nodeid)
+            collects.append({"op": "collect", "nodeid": nodeid})
+    return collects + marks + [{"op": "crash"}]
+
+
+def json_events(text: str, *, source: str) -> list[dict[str, Any]]:
+    blob = text.strip()
+    if not blob:
+        raise ValueError(f"{source}: empty json")
+    if blob[0] == "[":
+        payload = json.loads(blob)
+        if not isinstance(payload, list):
+            raise ValueError(f"{source}: json array required")
+        events = payload
+    else:
+        events = []
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError as err:
+                raise ValueError(f"{source}:{lineno}: {err}") from err
+    if not events:
+        raise ValueError(f"{source}: no events")
+    for event in events:
+        if not isinstance(event, dict) or "op" not in event:
+            raise ValueError(f"{source}: event needs op")
+    return events
+
+
+def first_payload_line(text: str) -> str:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def load_events(text: str, *, source: str) -> list[dict[str, Any]]:
+    start = first_payload_line(text)
+    if start.startswith("{") or start.startswith("["):
+        return json_events(text, source=source)
+    return tsv_events(text, source=source)
+
+
+def replay(text: str, *, source: str) -> dict[str, Any]:
+    queue = LoadScopeQueue()
+    queue.run(load_events(text, source=source))
+    return queue.snapshot()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="emptyunit",
+        description=(
+            "Drive a two-pass loadscope queue from TSV or JSON events. "
+            "Name completed-only units whose send_runtest_some is ()."
+        ),
+    )
+    parser.add_argument("record", nargs="?", default="-", help="record path or -")
+    args = parser.parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        result = replay(text, source=source)
+    except (OSError, ValueError, json.JSONDecodeError, KeyError) as err:
+        print(f"emptyunit: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(render(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

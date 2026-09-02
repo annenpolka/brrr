@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""pathdup: leftover lexical PathBuf with .. vs collapsed path for one package id."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path, PurePosixPath
+
+KNOWN = ("package", "path_a", "path_b")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "package" not in fields or "path_a" not in fields or "path_b" not in fields:
+        raise ValueError(f"{source}: need package, path_a, path_b")
+    return fields
+
+
+def collapse(p: str) -> str:
+    return os.path.normpath(p)
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    a = fields["path_a"]
+    b = fields["path_b"]
+    ca = collapse(a)
+    cb = collapse(b)
+    lexical_dup = a != b
+    same_after = ca == cb
+    leftover_dotdot = lexical_dup and same_after
+    true_clash = lexical_dup and not same_after
+    return {
+        "package": fields["package"],
+        "path_a": a,
+        "path_b": b,
+        "collapsed_a": ca,
+        "collapsed_b": cb,
+        "lexical_dup": lexical_dup,
+        "same_after_collapse": same_after,
+        "leftover_dotdot": leftover_dotdot,
+        "true_clash": true_clash,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"package\t{result['package']}",
+        f"path_a\t{result['path_a']}",
+        f"path_b\t{result['path_b']}",
+        f"collapsed_a\t{result['collapsed_a']}",
+        f"collapsed_b\t{result['collapsed_b']}",
+        f"lexical_dup\t{yn(result['lexical_dup'])}",
+        f"same_after_collapse\t{yn(result['same_after_collapse'])}",
+        f"leftover_dotdot\t{yn(result['leftover_dotdot'])}",
+        f"true_clash\t{yn(result['true_clash'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pathdup",
+        description=(
+            "Name leftover lexical PathBuf with .. vs collapsed path for one "
+            "package id. grep of the package name hits both warning lines."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"pathdup: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_dotdot"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

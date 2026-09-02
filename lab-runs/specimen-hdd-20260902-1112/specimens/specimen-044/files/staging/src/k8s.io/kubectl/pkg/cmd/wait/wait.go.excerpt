@@ -1,0 +1,62 @@
+// excerpt @ 50f27d9ef496fe69da6d2969134df6dd2f9aa9b3
+// staging/src/k8s.io/kubectl/pkg/cmd/wait/wait.go
+
+type WaitFlags struct {
+	RESTClientGetter     genericclioptions.RESTClientGetter
+	PrintFlags           *genericclioptions.PrintFlags
+	ResourceBuilderFlags *genericclioptions.ResourceBuilderFlags
+	Timeout         time.Duration
+	ForCondition    string
+	WaitForCreation bool
+	genericiooptions.IOStreams
+}
+
+func NewWaitFlags(...) *WaitFlags {
+	return &WaitFlags{
+		// ...
+		Timeout:         30 * time.Second,
+		WaitForCreation: true,
+	}
+}
+
+func (flags *WaitFlags) AddFlags(cmd *cobra.Command) {
+	cmd.Flags().DurationVar(&flags.Timeout, "timeout", flags.Timeout,
+		"The length of time to wait before giving up.  Zero means check once and don't wait, negative means wait for a week.")
+	cmd.Flags().BoolVar(&flags.WaitForCreation, "wait-for-creation", flags.WaitForCreation,
+		"The default value is true. If set to true, also wait for creation of objects if they do not already exist. This flag is ignored in --for=delete")
+}
+
+func (o *WaitOptions) RunWait() error {
+	ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), o.Timeout)
+	defer cancel()
+
+	isForDelete := strings.ToLower(o.ForCondition) == "delete"
+	if o.WaitForCreation && o.Timeout == 0 {
+		return fmt.Errorf("--wait-for-creation requires a timeout value greater than 0")
+	}
+
+	if o.WaitForCreation && !isForDelete {
+		err := func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("context deadline is exceeded while waiting for the creation of the resources")
+				default:
+					err := o.ResourceFinder.Do().Visit(func(info *resource.Info, err error) error {
+						return nil
+					})
+					if err == nil {
+						return nil
+					}
+					if !apierrors.IsNotFound(err) {
+						return err
+					}
+				}
+			}
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	// ... condition visit ...
+}

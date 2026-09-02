@@ -1,0 +1,2240 @@
+#!/usr/bin/env python3
+"""bindname: for a name, show the import path and the body that would run."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import functools
+import importlib.util
+import inspect
+import io
+import os
+import subprocess
+import sys
+import tokenize
+import types
+import _imp
+from dataclasses import dataclass
+from pathlib import Path
+
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox"}
+
+
+@dataclass
+class Binding:
+    import_stmt: str
+    bind: str
+    runs: str
+    kind: str
+    file: str
+    line: int
+    source: str
+    obj_id: int | None
+
+
+@dataclass
+class StaticHit:
+    module: str
+    path: Path
+    kind: str
+    line: int
+    source: str
+    from_module: str | None = None
+    orig_name: str | None = None
+
+
+@dataclass
+class Miss:
+    file: str
+    reason: str
+
+
+def iter_py_files(root: Path) -> list[Path]:
+    """Walk .py files. Directory inodes are visited once; file names are kept."""
+    files: list[Path] = []
+    seen_dirs: set[tuple[int, int]] = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            st = current.stat()
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in sorted(entries, reverse=True):
+            if entry.name in SKIP_DIRS or entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    stack.append(entry)
+                elif entry.suffix == ".py" and entry.is_file():
+                    files.append(entry)
+            except OSError:
+                continue
+    return sorted(files)
+
+
+def module_name_for(root: Path, path: Path) -> str | None:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        try:
+            rel = Path(os.path.relpath(path, root))
+        except ValueError:
+            return None
+    if ".." in rel.parts:
+        return None
+    parts = list(rel.parts)
+    if not parts or not parts[-1].endswith(".py"):
+        return None
+    parts[-1] = parts[-1][:-3]
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return ".".join(parts)
+
+
+def module_path_for(root: Path, modname: str) -> Path | None:
+    parts = modname.split(".")
+    file_path = root.joinpath(*parts).with_suffix(".py")
+    if file_path.is_file():
+        return file_path
+    init_path = root.joinpath(*parts, "__init__.py")
+    if init_path.is_file():
+        return init_path
+    return None
+
+
+def rel_display(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            return str(path)
+        if rel.startswith(".."):
+            return str(path)
+        return rel
+
+
+def read_py_text(path: Path) -> str:
+    """Read source with the same encoding exec would use (cookie / BOM)."""
+    with path.open("rb") as fh:
+        encoding, _consumed = tokenize.detect_encoding(fh.readline)
+    return path.read_text(encoding=encoding)
+
+
+def node_source(text: str, node: ast.AST) -> str:
+    segment = ast.get_source_segment(text, node)
+    if segment is not None:
+        return segment
+    lines = text.splitlines(True)
+    start = getattr(node, "lineno", 1) - 1
+    end = getattr(node, "end_lineno", start + 1)
+    return "".join(lines[start:end])
+
+
+def resolve_from_module(current: str, node: ast.ImportFrom) -> str | None:
+    if node.level == 0:
+        return node.module
+    parts = current.split(".")[:-1]
+    up = node.level - 1
+    if up > len(parts):
+        return node.module
+    if up:
+        parts = parts[: len(parts) - up]
+    base = ".".join(parts)
+    if node.module:
+        return f"{base}.{node.module}" if base else node.module
+    return base or None
+
+
+_MISSING = object()
+
+
+class _TruthyEmptyIter:
+    """Generator objects are truthy even when they would yield nothing."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __iter__(self):
+        return iter(())
+
+
+class _TruthyRows:
+    """Const-evaluated generator: always truthy; iterates produced values."""
+
+    __slots__ = ("_rows",)
+
+    def __init__(self, rows: list[object]):
+        self._rows = list(rows)
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+_GENEXP = _TruthyEmptyIter()
+_ATTR_MISSING = object()
+
+
+class _Cls:
+    """Const class namespace. Instance lookup follows later class-attr assigns."""
+
+    __slots__ = ("_attrs", "_has_init")
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_attrs", {})
+        object.__setattr__(self, "_has_init", False)
+
+    def __getattr__(self, k: str):
+        try:
+            return self._attrs[k]
+        except KeyError:
+            raise AttributeError(k) from None
+
+    def __setattr__(self, k: str, v: object) -> None:
+        if k in ("_attrs", "_has_init"):
+            object.__setattr__(self, k, v)
+            return
+        self._attrs[k] = v
+
+    def __delattr__(self, k: str) -> None:
+        try:
+            del self._attrs[k]
+        except KeyError:
+            raise AttributeError(k) from None
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class _Inst:
+    """Instance: own attrs, then class namespace."""
+
+    __slots__ = ("_cls", "_own")
+
+    def __init__(self, cls: _Cls) -> None:
+        object.__setattr__(self, "_cls", cls)
+        object.__setattr__(self, "_own", {})
+
+    def __getattr__(self, k: str):
+        if k in self._own:
+            return self._own[k]
+        return getattr(self._cls, k)
+
+    def __setattr__(self, k: str, v: object) -> None:
+        if k in ("_cls", "_own"):
+            object.__setattr__(self, k, v)
+            return
+        self._own[k] = v
+
+    def __delattr__(self, k: str) -> None:
+        if k in self._own:
+            del self._own[k]
+            return
+        raise AttributeError(k)
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class _ChainEnv(dict):
+    """Class-body env: writes stay local; reads fall through to the outer env."""
+
+    def __init__(self, parent: dict[str, object]):
+        super().__init__()
+        self._parent = parent
+
+    def __contains__(self, key: object) -> bool:
+        return dict.__contains__(self, key) or key in self._parent
+
+    def __getitem__(self, key: str):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._parent[key]
+
+    def get(self, key: str, default: object = None):
+        if key in self:
+            try:
+                return self[key]
+            except KeyError:
+                return default
+        return default
+
+
+def is_false_const(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and node.value in (False, 0):
+        return True
+    return False
+
+
+def is_true_const(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and node.value in (True, 1):
+        return True
+    return False
+
+
+def is_type_checking(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name) and node.id == "TYPE_CHECKING":
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING":
+        return True
+    return False
+
+
+def unwrap_not(node: ast.AST) -> tuple[int, ast.AST]:
+    n_not = 0
+    cur = node
+    while isinstance(cur, ast.UnaryOp) and isinstance(cur.op, ast.Not):
+        n_not += 1
+        cur = cur.operand
+    return n_not, cur
+
+
+def is_dead_test(node: ast.AST) -> bool:
+    return is_false_const(node) or is_type_checking(node)
+
+
+def _cmp_op(op: ast.cmpop, left: object, right: object):
+    if isinstance(op, ast.Eq):
+        return left == right
+    if isinstance(op, ast.NotEq):
+        return left != right
+    if isinstance(op, ast.Is):
+        return left is right
+    if isinstance(op, ast.IsNot):
+        return left is not right
+    if isinstance(op, ast.Lt):
+        return left < right
+    if isinstance(op, ast.LtE):
+        return left <= right
+    if isinstance(op, ast.Gt):
+        return left > right
+    if isinstance(op, ast.GtE):
+        return left >= right
+    if isinstance(op, ast.In):
+        try:
+            return left in right
+        except TypeError:
+            return _MISSING
+    if isinstance(op, ast.NotIn):
+        try:
+            return left not in right
+        except TypeError:
+            return _MISSING
+    return _MISSING
+
+
+def static_const(node: ast.AST, env: dict[str, object]):
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id == "__debug__":
+            return __debug__
+        if node.id in env:
+            return env[node.id]
+        if node.id == "TYPE_CHECKING":
+            return False
+        return _MISSING
+    if isinstance(node, ast.Attribute):
+        if node.attr == "TYPE_CHECKING":
+            return False
+        val = static_const(node.value, env)
+        if val is _MISSING:
+            return _MISSING
+        if node.attr.startswith("_bindname"):
+            return _MISSING
+        try:
+            return getattr(val, node.attr)
+        except (AttributeError, TypeError):
+            return _ATTR_MISSING
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = static_const(node.operand, env)
+        if inner is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if inner is not _MISSING and isinstance(inner, (int, float)):
+            return -inner
+        return _MISSING
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        inner = static_const(node.operand, env)
+        if inner is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if inner is not _MISSING and isinstance(inner, (int, float)):
+            return +inner
+        return _MISSING
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+        inner = static_const(node.operand, env)
+        if inner is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if inner is _MISSING:
+            return _MISSING
+        try:
+            return ~inner  # type: ignore[operator]
+        except TypeError:
+            return _MISSING
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        inner = static_const(node.operand, env)
+        if inner is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if inner is not _MISSING:
+            return not inner
+        return _MISSING
+    if isinstance(node, ast.NamedExpr):
+        val = static_const(node.value, env)
+        if isinstance(node.target, ast.Name):
+            if val is _MISSING:
+                env.pop(node.target.id, None)
+            else:
+                env[node.target.id] = val
+        return val
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            last: object = True
+            for value in node.values:
+                val = static_const(value, env)
+                if val is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if val is _MISSING:
+                    return _MISSING
+                last = val
+                if not val:
+                    return val
+            return last
+        if isinstance(node.op, ast.Or):
+            last = False
+            for value in node.values:
+                val = static_const(value, env)
+                if val is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if val is _MISSING:
+                    return _MISSING
+                last = val
+                if val:
+                    return val
+            return last
+        return _MISSING
+    if isinstance(node, ast.Compare):
+        left = static_const(node.left, env)
+        if left is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if left is _MISSING:
+            return _MISSING
+        cur = left
+        for op, comparator in zip(node.ops, node.comparators):
+            right = static_const(comparator, env)
+            if right is _ATTR_MISSING:
+                return _ATTR_MISSING
+            if right is _MISSING:
+                return _MISSING
+            try:
+                ok = _cmp_op(op, cur, right)
+            except TypeError:
+                return _MISSING
+            if ok is _MISSING:
+                return _MISSING
+            if not ok:
+                return False
+            cur = right
+        return True
+    if isinstance(node, ast.BinOp):
+        left = static_const(node.left, env)
+        right = static_const(node.right, env)
+        if left is _ATTR_MISSING or right is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if left is _MISSING or right is _MISSING:
+            return _MISSING
+        return _eval_binop(node.op, left, right)
+    if isinstance(node, ast.IfExp):
+        test = static_const(node.test, env)
+        if test is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if test is _MISSING:
+            return _MISSING
+        return static_const(node.body if test else node.orelse, env)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        vals: list[object] = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                inner = static_const(elt.value, env)
+                if inner is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if inner is _MISSING:
+                    return _MISSING
+                try:
+                    vals.extend(list(inner))  # type: ignore[arg-type]
+                except TypeError:
+                    return _MISSING
+            else:
+                v = static_const(elt, env)
+                if v is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if v is _MISSING:
+                    return _MISSING
+                vals.append(v)
+        if isinstance(node, ast.List):
+            return vals
+        if isinstance(node, ast.Tuple):
+            return tuple(vals)
+        return set(vals)
+    if isinstance(node, ast.Dict):
+        out: dict[object, object] = {}
+        for k, v in zip(node.keys, node.values):
+            if k is None:
+                inner = static_const(v, env)
+                if inner is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if inner is _MISSING or not isinstance(inner, dict):
+                    return _MISSING
+                out.update(inner)
+                continue
+            ck = static_const(k, env)
+            cv = static_const(v, env)
+            if ck is _ATTR_MISSING or cv is _ATTR_MISSING:
+                return _ATTR_MISSING
+            if ck is _MISSING or cv is _MISSING:
+                return _MISSING
+            out[ck] = cv
+        return out
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for v in node.values:
+            if isinstance(v, ast.Constant):
+                parts.append("" if v.value is None else str(v.value))
+            elif isinstance(v, ast.FormattedValue):
+                inner = static_const(v.value, env)
+                if inner is _ATTR_MISSING:
+                    return _ATTR_MISSING
+                if inner is _MISSING:
+                    return _MISSING
+                spec = ""
+                if v.format_spec is not None:
+                    spec_s = static_const(v.format_spec, env)
+                    if spec_s is _MISSING or not isinstance(spec_s, str):
+                        return _MISSING
+                    spec = spec_s
+                try:
+                    if v.conversion == 114:
+                        inner = repr(inner)
+                    elif v.conversion == 97:
+                        inner = ascii(inner)
+                    elif v.conversion == 115:
+                        inner = str(inner)
+                    if spec:
+                        parts.append(format(inner, spec))
+                    else:
+                        parts.append(inner if isinstance(inner, str) else str(inner))
+                except (TypeError, ValueError):
+                    return _MISSING
+            else:
+                return _MISSING
+        return "".join(parts)
+    if isinstance(node, ast.Subscript):
+        val = static_const(node.value, env)
+        if val is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if val is _MISSING:
+            return _MISSING
+        sl = node.slice
+        try:
+            if isinstance(sl, ast.Slice):
+                lower = None if sl.lower is None else static_const(sl.lower, env)
+                upper = None if sl.upper is None else static_const(sl.upper, env)
+                step = None if sl.step is None else static_const(sl.step, env)
+                if _ATTR_MISSING in (lower, upper, step):
+                    return _ATTR_MISSING
+                if _MISSING in (lower, upper, step):
+                    return _MISSING
+                return val[slice(lower, upper, step)]
+            idx = static_const(sl, env)
+            if idx is _ATTR_MISSING:
+                return _ATTR_MISSING
+            if idx is _MISSING:
+                return _MISSING
+            return val[idx]
+        except (TypeError, IndexError, KeyError):
+            return _MISSING
+    if isinstance(node, ast.ListComp):
+        rows = _eval_comprehension(node.generators, node.elt, env)
+        if rows is _ATTR_MISSING:
+            return _ATTR_MISSING
+        return _MISSING if rows is _MISSING else rows
+    if isinstance(node, ast.SetComp):
+        rows = _eval_comprehension(node.generators, node.elt, env)
+        if rows is _ATTR_MISSING:
+            return _ATTR_MISSING
+        return _MISSING if rows is _MISSING else set(rows)
+    if isinstance(node, ast.DictComp):
+        pairs = _eval_comprehension_pairs(node.generators, node.key, node.value, env)
+        if pairs is _ATTR_MISSING:
+            return _ATTR_MISSING
+        return _MISSING if pairs is _MISSING else dict(pairs)
+    if isinstance(node, ast.GeneratorExp):
+        rows = _eval_comprehension(node.generators, node.elt, env)
+        if rows is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if rows is _MISSING:
+            return _GENEXP
+        return _TruthyRows(rows)
+    if isinstance(node, ast.Lambda):
+        return True
+    if isinstance(node, ast.Call) and not node.args and not node.keywords:
+        func = static_const(node.func, env)
+        if isinstance(func, _Cls):
+            if func._has_init:
+                return _MISSING
+            return _Inst(func)
+        return _MISSING
+    return _MISSING
+
+
+def _eval_comprehension(generators: list[ast.comprehension], elt: ast.AST, env: dict[str, object]):
+    if not generators:
+        v = static_const(elt, env)
+        if v is _ATTR_MISSING:
+            return _ATTR_MISSING
+        return _MISSING if v is _MISSING else [v]
+    gen = generators[0]
+    it = static_const(gen.iter, env)
+    if it is _ATTR_MISSING:
+        return _ATTR_MISSING
+    if it is _MISSING:
+        return _MISSING
+    try:
+        seq = list(it)  # type: ignore[arg-type]
+    except TypeError:
+        return _MISSING
+    rows: list[object] = []
+    for item in seq:
+        local = dict(env)
+        _bind_target(local, gen.target, item)
+        skip = False
+        for iff in gen.ifs:
+            pred = static_const(iff, local)
+            if pred is _ATTR_MISSING:
+                return _ATTR_MISSING
+            if pred is _MISSING:
+                return _MISSING
+            if not pred:
+                skip = True
+                break
+        if skip:
+            continue
+        rest = _eval_comprehension(generators[1:], elt, local)
+        if rest is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if rest is _MISSING:
+            return _MISSING
+        rows.extend(rest)
+    return rows
+
+
+def _eval_comprehension_pairs(
+    generators: list[ast.comprehension],
+    key: ast.AST,
+    value: ast.AST,
+    env: dict[str, object],
+):
+    if not generators:
+        k = static_const(key, env)
+        v = static_const(value, env)
+        if k is _ATTR_MISSING or v is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if k is _MISSING or v is _MISSING:
+            return _MISSING
+        return [(k, v)]
+    gen = generators[0]
+    it = static_const(gen.iter, env)
+    if it is _ATTR_MISSING:
+        return _ATTR_MISSING
+    if it is _MISSING:
+        return _MISSING
+    try:
+        seq = list(it)  # type: ignore[arg-type]
+    except TypeError:
+        return _MISSING
+    pairs: list[tuple[object, object]] = []
+    for item in seq:
+        local = dict(env)
+        _bind_target(local, gen.target, item)
+        skip = False
+        for iff in gen.ifs:
+            pred = static_const(iff, local)
+            if pred is _ATTR_MISSING:
+                return _ATTR_MISSING
+            if pred is _MISSING:
+                return _MISSING
+            if not pred:
+                skip = True
+                break
+        if skip:
+            continue
+        rest = _eval_comprehension_pairs(generators[1:], key, value, local)
+        if rest is _ATTR_MISSING:
+            return _ATTR_MISSING
+        if rest is _MISSING:
+            return _MISSING
+        pairs.extend(rest)
+    return pairs
+
+
+def _eval_binop(op: ast.operator, left: object, right: object):
+    try:
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right
+        if isinstance(op, ast.FloorDiv):
+            return left // right
+        if isinstance(op, ast.Mod):
+            return left % right
+        if isinstance(op, ast.Pow):
+            return left ** right
+        if isinstance(op, ast.BitAnd):
+            return left & right
+        if isinstance(op, ast.BitOr):
+            return left | right
+        if isinstance(op, ast.BitXor):
+            return left ^ right
+        if isinstance(op, ast.LShift):
+            return left << right
+        if isinstance(op, ast.RShift):
+            return left >> right
+    except (TypeError, ZeroDivisionError, OverflowError, ValueError):
+        return _MISSING
+    return _MISSING
+
+
+def test_polarity(node: ast.AST, env: dict[str, object] | None = None) -> str | None:
+    """'dead' = body cannot run; 'live' = orelse cannot run; None = both can."""
+    if env is None:
+        env = {}
+    val = static_const(node, env)
+    if val is _ATTR_MISSING:
+        return "fail"
+    if val is not _MISSING:
+        return "live" if val else "dead"
+    n_not, inner = unwrap_not(node)
+    inner_dead = is_false_const(inner) or is_type_checking(inner)
+    inner_live = is_true_const(inner)
+    if inner_dead:
+        return "live" if n_not % 2 else "dead"
+    if inner_live:
+        return "dead" if n_not % 2 else "live"
+    return None
+
+
+def _clear_target(env: dict[str, object], target: ast.AST) -> None:
+    if isinstance(target, ast.Name):
+        env.pop(target.id, None)
+    elif isinstance(target, ast.Starred) and isinstance(target.value, ast.Name):
+        env.pop(target.value.id, None)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _clear_target(env, elt)
+
+
+def _bind_target(env: dict[str, object], target: ast.AST, val: object) -> None:
+    if val is _MISSING:
+        _clear_target(env, target)
+        return
+    if isinstance(target, ast.Name):
+        env[target.id] = val
+        return
+    if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+        _set_namespace_attr(env, target, val)
+        return
+    if isinstance(target, ast.Starred) and isinstance(target.value, ast.Name):
+        try:
+            env[target.value.id] = list(val)  # type: ignore[arg-type]
+        except TypeError:
+            env.pop(target.value.id, None)
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        elts = target.elts
+        starred = [i for i, e in enumerate(elts) if isinstance(e, ast.Starred)]
+        try:
+            seq = list(val)  # type: ignore[arg-type]
+        except TypeError:
+            _clear_target(env, target)
+            return
+        if len(starred) > 1:
+            _clear_target(env, target)
+            return
+        if len(starred) == 1:
+            i = starred[0]
+            n_before = i
+            n_after = len(elts) - i - 1
+            if len(seq) < n_before + n_after:
+                _clear_target(env, target)
+                return
+            for e, v in zip(elts[:i], seq[:n_before]):
+                _bind_target(env, e, v)
+            mid = seq[n_before : len(seq) - n_after] if n_after else seq[n_before:]
+            _bind_target(env, elts[i], mid)
+            if n_after:
+                for e, v in zip(elts[i + 1 :], seq[-n_after:]):
+                    _bind_target(env, e, v)
+            return
+        if len(elts) != len(seq):
+            _clear_target(env, target)
+            return
+        for e, v in zip(elts, seq):
+            _bind_target(env, e, v)
+        return
+    _clear_target(env, target)
+
+
+def _set_namespace_attr(env: dict[str, object], target: ast.AST, val: object) -> bool:
+    if not isinstance(target, ast.Attribute) or not isinstance(target.value, ast.Name):
+        return False
+    obj = env.get(target.value.id, _MISSING)
+    if not isinstance(obj, (_Cls, _Inst)):
+        return False
+    if val is _MISSING:
+        try:
+            delattr(obj, target.attr)
+        except AttributeError:
+            pass
+    else:
+        setattr(obj, target.attr, val)
+    return True
+
+
+def update_const_env(env: dict[str, object], node: ast.AST) -> None:
+    if isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name == "TYPE_CHECKING":
+                env[alias.asname or alias.name] = False
+        return
+    if isinstance(node, ast.Delete):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                env[target.id] = _ATTR_MISSING
+            else:
+                _set_namespace_attr(env, target, _MISSING)
+        return
+    names: list[str] = []
+    value: ast.AST | None = None
+    if isinstance(node, ast.Assign):
+        val = static_const(node.value, env)
+        for target in node.targets:
+            _bind_target(env, target, val)
+        return
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        if isinstance(node.target, ast.Attribute):
+            _set_namespace_attr(env, node.target, static_const(node.value, env))
+            return
+        if not isinstance(node.target, ast.Name):
+            return
+        names = [node.target.id]
+        value = node.value
+    if not names or value is None:
+        return
+    val = static_const(value, env)
+    for name in names:
+        if val is _MISSING:
+            env.pop(name, None)
+        else:
+            env[name] = val
+
+
+def is_irrefutable_pattern(pattern: ast.AST) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.pattern is None:
+            return True
+        return is_irrefutable_pattern(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(is_irrefutable_pattern(p) for p in pattern.patterns)
+    return False
+
+
+def _match_all(results: list[object]):
+    if any(r is False for r in results):
+        return False
+    if any(r is _MISSING or r is _ATTR_MISSING for r in results):
+        return _MISSING
+    return True
+
+
+def pattern_matches(pattern: ast.AST, value: object, env: dict[str, object]):
+    if isinstance(pattern, ast.MatchValue):
+        pv = static_const(pattern.value, env)
+        if pv is _ATTR_MISSING or pv is _MISSING:
+            return _MISSING
+        return pv == value
+    if isinstance(pattern, ast.MatchSingleton):
+        return pattern.value == value
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.pattern is None:
+            return True
+        return pattern_matches(pattern.pattern, value, env)
+    if isinstance(pattern, ast.MatchOr):
+        results = [pattern_matches(p, value, env) for p in pattern.patterns]
+        if True in results:
+            return True
+        if all(r is False for r in results):
+            return False
+        return _MISSING
+    if isinstance(pattern, ast.MatchSequence):
+        if not isinstance(value, (list, tuple)):
+            return False
+        try:
+            seq = list(value)
+        except TypeError:
+            return False
+        pats = list(pattern.patterns)
+        starred = [i for i, p in enumerate(pats) if isinstance(p, ast.MatchStar)]
+        if len(starred) > 1:
+            return _MISSING
+        if not starred:
+            if len(pats) != len(seq):
+                return False
+            return _match_all([pattern_matches(p, v, env) for p, v in zip(pats, seq)])
+        i = starred[0]
+        n_before = i
+        n_after = len(pats) - i - 1
+        if len(seq) < n_before + n_after:
+            return False
+        before = seq[:n_before]
+        after = seq[len(seq) - n_after :] if n_after else []
+        parts = [pattern_matches(p, v, env) for p, v in zip(pats[:i], before)]
+        parts.extend(pattern_matches(p, v, env) for p, v in zip(pats[i + 1 :], after))
+        return _match_all(parts)
+    if isinstance(pattern, ast.MatchMapping):
+        if not isinstance(value, dict):
+            return False
+        parts: list[object] = []
+        for k_node, p in zip(pattern.keys, pattern.patterns):
+            ck = static_const(k_node, env)
+            if ck is _ATTR_MISSING or ck is _MISSING:
+                return _MISSING
+            if ck not in value:
+                return False
+            parts.append(pattern_matches(p, value[ck], env))
+        return _match_all(parts)
+    if isinstance(pattern, ast.MatchStar):
+        return True
+    return _MISSING
+
+
+def bind_match_pattern(pattern: ast.AST, value: object, env: dict[str, object]) -> None:
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.pattern is not None:
+            bind_match_pattern(pattern.pattern, value, env)
+        if pattern.name:
+            env[pattern.name] = value
+        return
+    if isinstance(pattern, ast.MatchStar):
+        if pattern.name:
+            env[pattern.name] = value
+        return
+    if isinstance(pattern, ast.MatchSequence) and isinstance(value, (list, tuple)):
+        try:
+            seq = list(value)
+        except TypeError:
+            return
+        pats = list(pattern.patterns)
+        starred = [i for i, p in enumerate(pats) if isinstance(p, ast.MatchStar)]
+        if len(starred) > 1:
+            return
+        if not starred:
+            if len(pats) != len(seq):
+                return
+            for p, v in zip(pats, seq):
+                bind_match_pattern(p, v, env)
+            return
+        i = starred[0]
+        n_after = len(pats) - i - 1
+        before = seq[:i]
+        mid = seq[i : len(seq) - n_after] if n_after else seq[i:]
+        after = seq[len(seq) - n_after :] if n_after else []
+        for p, v in zip(pats[:i], before):
+            bind_match_pattern(p, v, env)
+        bind_match_pattern(pats[i], mid, env)
+        for p, v in zip(pats[i + 1 :], after):
+            bind_match_pattern(p, v, env)
+        return
+    if isinstance(pattern, ast.MatchMapping) and isinstance(value, dict):
+        for k_node, p in zip(pattern.keys, pattern.patterns):
+            ck = static_const(k_node, env)
+            if ck is _MISSING or ck is _ATTR_MISSING or ck not in value:
+                continue
+            bind_match_pattern(p, value[ck], env)
+        if pattern.rest:
+            used = set()
+            for k_node in pattern.keys:
+                ck = static_const(k_node, env)
+                if ck is not _MISSING and ck is not _ATTR_MISSING:
+                    used.add(ck)
+            env[pattern.rest] = {k: v for k, v in value.items() if k not in used}
+        return
+    if isinstance(pattern, ast.MatchOr):
+        for p in pattern.patterns:
+            if pattern_matches(p, value, env) is True:
+                bind_match_pattern(p, value, env)
+                return
+
+
+def case_match_status(case: ast.match_case, subject, env: dict[str, object]) -> str:
+    if subject is _MISSING:
+        if case.guard is None and is_irrefutable_pattern(case.pattern):
+            return "yes"
+        return "maybe"
+    matched = pattern_matches(case.pattern, subject, env)
+    if matched is False:
+        return "no"
+    if matched is True:
+        if case.guard is None:
+            return "yes"
+        guard = static_const(case.guard, env)
+        if guard is _MISSING:
+            return "maybe"
+        return "yes" if guard else "no"
+    return "maybe"
+
+
+def iter_match_bind_nodes(node: ast.Match, env: dict[str, object]):
+    subject = static_const(node.subject, env)
+    taken = False
+    for case in node.cases:
+        if taken:
+            continue
+        status = case_match_status(case, subject, env)
+        if status == "no":
+            continue
+        body_env = dict(env)
+        if status == "yes" and subject is not _MISSING and subject is not _ATTR_MISSING:
+            bind_match_pattern(case.pattern, subject, body_env)
+        yield from iter_bind_nodes(case.body, body_env)
+        if status == "yes":
+            taken = True
+
+
+def walk_const_stmts(env: dict[str, object], body: list[ast.stmt]) -> None:
+    """Apply const-known If/For/Match/assigns onto env. Does not yield binds."""
+    for stmt in body:
+        walk_const_stmt(env, stmt)
+
+
+def walk_const_stmt(env: dict[str, object], node: ast.AST) -> None:
+    if isinstance(node, ast.If):
+        polarity = test_polarity(node.test, env)
+        if polarity == "fail":
+            return
+        if polarity == "dead":
+            walk_const_stmts(env, node.orelse)
+        elif polarity == "live":
+            walk_const_stmts(env, node.body)
+        else:
+            walk_const_stmts(env, node.body)
+            walk_const_stmts(env, node.orelse)
+        return
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        it = static_const(node.iter, env)
+        if it is _MISSING or it is _ATTR_MISSING:
+            return
+        if it:
+            try:
+                iterator = iter(it)  # type: ignore[arg-type]
+            except TypeError:
+                return
+            first = next(iterator, _MISSING)
+            if first is _MISSING:
+                walk_const_stmts(env, node.orelse)
+                return
+            _bind_target(env, node.target, first)
+            walk_const_stmts(env, node.body)
+            walk_const_stmts(env, node.orelse)
+        else:
+            walk_const_stmts(env, node.orelse)
+        return
+    if isinstance(node, ast.Match):
+        subject = static_const(node.subject, env)
+        if subject is _ATTR_MISSING:
+            return
+        taken = False
+        for case in node.cases:
+            if taken:
+                continue
+            status = case_match_status(case, subject, env)
+            if status == "no":
+                continue
+            if status == "yes":
+                if subject is not _MISSING and subject is not _ATTR_MISSING:
+                    bind_match_pattern(case.pattern, subject, env)
+                walk_const_stmts(env, case.body)
+                taken = True
+            else:
+                return
+        return
+    update_const_env(env, node)
+
+
+def iter_bind_nodes(body: list[ast.stmt], env: dict[str, object] | None = None):
+    """Module-level bindings that can run. Nested functions, dead If/match skipped."""
+    if env is None:
+        env = {}
+    env = dict(env)
+    for node in body:
+        if isinstance(node, ast.If):
+            polarity = test_polarity(node.test, env)
+            if polarity == "fail":
+                continue
+            if polarity == "dead":
+                yield from iter_bind_nodes(node.orelse, dict(env))
+            elif polarity == "live":
+                yield from iter_bind_nodes(node.body, dict(env))
+            else:
+                yield from iter_bind_nodes(node.body, dict(env))
+                yield from iter_bind_nodes(node.orelse, dict(env))
+        elif isinstance(node, ast.Try):
+            yield from iter_bind_nodes(node.body, dict(env))
+            for handler in node.handlers:
+                yield from iter_bind_nodes(handler.body, dict(env))
+            yield from iter_bind_nodes(node.orelse, dict(env))
+            yield from iter_bind_nodes(node.finalbody, dict(env))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            yield from iter_bind_nodes(node.body, dict(env))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            it = static_const(node.iter, env)
+            if it is _MISSING:
+                yield from iter_bind_nodes(node.body, dict(env))
+                yield from iter_bind_nodes(node.orelse, dict(env))
+            elif it:
+                try:
+                    iterator = iter(it)  # type: ignore[arg-type]
+                except TypeError:
+                    continue
+                first = next(iterator, _MISSING)
+                if first is _MISSING:
+                    yield from iter_bind_nodes(node.orelse, dict(env))
+                    continue
+                body_env = dict(env)
+                _bind_target(body_env, node.target, first)
+                yield from iter_bind_nodes(node.body, body_env)
+                # for-else runs when the loop does not break; we do not prove break.
+                yield from iter_bind_nodes(node.orelse, dict(env))
+            else:
+                yield from iter_bind_nodes(node.orelse, dict(env))
+        elif isinstance(node, ast.Match):
+            yield from iter_match_bind_nodes(node, env)
+        else:
+            if isinstance(node, ast.ClassDef):
+                inner: dict[str, object] = _ChainEnv(env)
+                has_init = False
+                for stmt in node.body:
+                    if (
+                        isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and stmt.name == "__init__"
+                    ):
+                        has_init = True
+                    walk_const_stmt(inner, stmt)
+                ns = _Cls()
+                ns._has_init = has_init
+                for k, v in dict.items(inner):
+                    if isinstance(k, str) and v is not _ATTR_MISSING:
+                        setattr(ns, k, v)
+                env[node.name] = ns
+                yield node
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                env.pop(node.name, None)
+            else:
+                update_const_env(env, node)
+            yield node
+
+
+def iter_static_nodes(body: list[ast.stmt]):
+    yield from iter_bind_nodes(body)
+
+
+def iter_live_nodes(body: list[ast.stmt]):
+    yield from iter_bind_nodes(body)
+
+
+def is_partial_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "partial":
+        return isinstance(func.value, ast.Name) and func.value.id == "functools"
+    if isinstance(func, ast.Name) and func.id == "partial":
+        return True
+    return False
+
+
+def wrapped_from_partial_call(node: ast.Call) -> tuple[str | None, str | None]:
+    if not node.args:
+        return None, None
+    arg = node.args[0]
+    if isinstance(arg, ast.Name):
+        return None, arg.id
+    if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
+        return arg.value.id, arg.attr
+    return None, None
+
+
+def getattr_name_attr(value: ast.AST) -> tuple[str | None, str | None]:
+    """module-local name and attr for getattr(module, 'NAME')."""
+    if not isinstance(value, ast.Call) or len(value.args) < 2:
+        return None, None
+    func = value.func
+    is_getattr = (isinstance(func, ast.Name) and func.id == "getattr") or (
+        isinstance(func, ast.Attribute) and func.attr == "getattr"
+    )
+    if not is_getattr:
+        return None, None
+    obj, attr = value.args[0], value.args[1]
+    if not isinstance(obj, ast.Name):
+        return None, None
+    if not isinstance(attr, ast.Constant) or not isinstance(attr.value, str):
+        return None, None
+    return obj.id, attr.value
+
+
+def alias_attr_bind(
+    value: ast.AST, aliases: dict[str, str] | None = None
+) -> tuple[str, str | None, str | None]:
+    """kind, from_module, orig_name for NAME = module.NAME / getattr / alias / partial."""
+    aliases = aliases or {}
+
+    def resolve_mod(local: str) -> str | None:
+        if local in aliases:
+            return aliases[local]
+        if aliases:
+            return None
+        return local
+
+    if isinstance(value, ast.Name) and value.id in aliases:
+        mapped = aliases[value.id]
+        from_mod, sep, orig = mapped.rpartition(".")
+        if sep and from_mod:
+            return "reexport", from_mod, orig
+        return "assign", None, None
+    if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+        resolved = resolve_mod(value.value.id)
+        if resolved:
+            return "reexport", resolved, value.attr
+        return "assign", None, None
+    g_mod, g_attr = getattr_name_attr(value)
+    if g_mod and g_attr:
+        resolved = resolve_mod(g_mod)
+        if resolved:
+            return "reexport", resolved, g_attr
+        return "assign", None, None
+    if is_partial_call(value):
+        from_mod, orig = wrapped_from_partial_call(value)
+        if orig:
+            if from_mod:
+                resolved = resolve_mod(from_mod)
+                if resolved:
+                    return "reexport", resolved, orig
+                if aliases:
+                    return "assign", None, None
+                return "reexport", from_mod, orig
+            return "assign", None, orig
+    return "assign", None, None
+
+
+def _hits_from_node(
+    node: ast.AST,
+    *,
+    modname: str,
+    path: Path,
+    text: str,
+    name: str,
+) -> list[StaticHit]:
+    hits: list[StaticHit] = []
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if node.name == name:
+            hits.append(
+                StaticHit(
+                    module=modname,
+                    path=path,
+                    kind="def",
+                    line=node.lineno,
+                    source=node_source(text, node),
+                )
+            )
+    elif isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                kind, from_mod, orig = alias_attr_bind(node.value)
+                hits.append(
+                    StaticHit(
+                        module=modname,
+                        path=path,
+                        kind=kind,
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=from_mod,
+                        orig_name=orig,
+                    )
+                )
+    elif isinstance(node, ast.AnnAssign):
+        if isinstance(node.target, ast.Name) and node.target.id == name:
+            if node.value is None:
+                return hits
+            kind, from_mod, orig = alias_attr_bind(node.value)
+            hits.append(
+                StaticHit(
+                    module=modname,
+                    path=path,
+                    kind=kind,
+                    line=node.lineno,
+                    source=node_source(text, node),
+                    from_module=from_mod,
+                    orig_name=orig,
+                )
+            )
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            local = alias.asname or alias.name
+            if local == name:
+                hits.append(
+                    StaticHit(
+                        module=modname,
+                        path=path,
+                        kind="import",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=resolve_from_module(modname, node),
+                        orig_name=alias.name,
+                    )
+                )
+    return hits
+
+
+def submodule_bind_hit(modname: str, path: Path, name: str, text: str) -> StaticHit | None:
+    parent, sep, child = modname.rpartition(".")
+    if not sep or child != name:
+        return None
+    return StaticHit(
+        module=parent,
+        path=path,
+        kind="module",
+        line=1,
+        source=text,
+    )
+
+
+_FALLBACK_PREIMPORTED = frozenset(
+    {
+        "encodings",
+        "codecs",
+        "types",
+        "functools",
+        "collections",
+        "posixpath",
+        "genericpath",
+        "stat",
+        "_collections_abc",
+        "_sitebuiltins",
+        "os",
+        "copyreg",
+        "enum",
+        "keyword",
+        "linecache",
+        "operator",
+        "re",
+        "reprlib",
+        "site",
+        "sitecustomize",
+        "abc",
+        "zipimport",
+        "io",
+    }
+)
+_PREIMPORTED: frozenset[str] | None = None
+
+
+def interpreter_preimported() -> frozenset[str]:
+    """Names a fresh interpreter already has in sys.modules (cwd cannot shadow)."""
+    global _PREIMPORTED
+    if _PREIMPORTED is not None:
+        return _PREIMPORTED
+    names: set[str] = set()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys; print('\\n'.join(sys.modules))"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd="/",
+        )
+    except OSError:
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        names = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    if not names:
+        names = set(_FALLBACK_PREIMPORTED)
+    _PREIMPORTED = frozenset(names)
+    return _PREIMPORTED
+
+
+def unshadowable_reason(modname: str) -> str | None:
+    """Why a leftover file cannot bind this import name, or None if it can."""
+    if not modname:
+        return None
+    top = modname.split(".", 1)[0]
+    if top in sys.builtin_module_names:
+        return "builtin"
+    try:
+        # Full name first: leftover importlib.util is frozen while leftover
+        # importlib (top) is path-shadowable.
+        if _imp.is_frozen(modname):
+            return "imported"
+        if top != modname and _imp.is_frozen(top):
+            return "imported"
+    except (AttributeError, RuntimeError):
+        pass
+    if top in interpreter_preimported():
+        return "imported"
+    return None
+
+
+def is_unshadowable(modname: str) -> bool:
+    """Leftover file cannot bind this import name (builtin / frozen / preimported)."""
+    return unshadowable_reason(modname) is not None
+
+
+def static_scan(root: Path, name: str) -> tuple[list[StaticHit], list[Miss]]:
+    hits: list[StaticHit] = []
+    misses: list[Miss] = []
+    for path in iter_py_files(root):
+        modname = module_name_for(root, path)
+        if not modname:
+            continue
+        rel = rel_display(root, path)
+        reason = unshadowable_reason(modname)
+        if reason:
+            misses.append(Miss(file=rel, reason=reason))
+            continue
+        try:
+            text = read_py_text(path)
+        except UnicodeDecodeError:
+            misses.append(Miss(file=rel, reason="UnicodeDecodeError"))
+            continue
+        except SyntaxError:
+            misses.append(Miss(file=rel, reason="SyntaxError"))
+            continue
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
+            misses.append(Miss(file=rel, reason="SyntaxError"))
+            continue
+        for node in iter_static_nodes(tree.body):
+            hits.extend(
+                _hits_from_node(
+                    node, modname=modname, path=path, text=text, name=name
+                )
+            )
+        parent_hit = submodule_bind_hit(modname, path, name, text)
+        if parent_hit is not None:
+            hits.append(parent_hit)
+    return hits, misses
+
+
+def last_hits_by_module(hits: list[StaticHit]) -> dict[str, StaticHit]:
+    by_mod: dict[str, StaticHit] = {}
+    for hit in hits:
+        prev = by_mod.get(hit.module)
+        if prev is None or hit.line >= prev.line:
+            by_mod[hit.module] = hit
+    return by_mod
+
+
+def object_identity(obj) -> tuple[str, int, str | None, str | None]:
+    """defining-module, line, file, source."""
+    defining = inspect.getmodule(obj)
+    def_mod = defining.__name__ if defining is not None else type(obj).__name__
+    file = None
+    line = 0
+    source = None
+    try:
+        file = inspect.getsourcefile(obj) or inspect.getfile(obj)
+    except TypeError:
+        file = None
+    try:
+        lines, line = inspect.getsourcelines(obj)
+        source = "".join(lines)
+    except (OSError, TypeError, AttributeError):
+        try:
+            line = int(obj.__code__.co_firstlineno)
+        except AttributeError:
+            line = 0
+    return def_mod, line, file, source
+
+
+def rel_file(root: Path, file: str | None, fallback: Path | None = None) -> str:
+    path: Path | None = None
+    if file:
+        path = Path(file)
+    elif fallback is not None:
+        path = fallback
+    if path is None:
+        return ""
+    return rel_display(root, path)
+
+
+def binding_from_static(root: Path, hit: StaticHit, name: str) -> Binding:
+    orig = hit.orig_name or name
+    if hit.kind == "module":
+        runs = f"{hit.module}.{name}"
+        kind = "module"
+    elif hit.kind in {"import", "reexport"} and hit.from_module:
+        runs = f"{hit.from_module}.{orig}"
+        kind = "reexport"
+    elif hit.orig_name:
+        runs = f"{hit.module}.{hit.orig_name}"
+        kind = hit.kind
+    else:
+        runs = f"{hit.module}.{name}"
+        kind = "def" if hit.kind == "def" else hit.kind
+    return Binding(
+        import_stmt=f"from {hit.module} import {name}",
+        bind=f"{hit.module}.{name}",
+        runs=runs,
+        kind=kind,
+        file=rel_file(root, None, hit.path),
+        line=hit.line,
+        source=hit.source,
+        obj_id=None,
+    )
+
+
+def unwrap_partial(obj):
+    hops = 0
+    wrapped = obj
+    while isinstance(wrapped, functools.partial) and hops < 8:
+        inner = getattr(wrapped, "func", None)
+        if inner is None:
+            break
+        wrapped = inner
+        hops += 1
+    return wrapped, hops
+
+
+def binding_from_partial(
+    root: Path,
+    logical: str,
+    name: str,
+    obj,
+    loaded_name: str,
+    hit: StaticHit | None,
+    path: Path,
+) -> Binding:
+    wrapped, hops = unwrap_partial(obj)
+    w_mod, _w_line, _w_file, _w_source = object_identity(wrapped)
+    w_name = getattr(wrapped, "__name__", None)
+    file = rel_file(root, str(path), path)
+    line = hit.line if hit is not None else 0
+    source = hit.source if hit is not None else ""
+    if not hops or not w_name:
+        runs = f"{logical}.{name}"
+        kind = "assign"
+    else:
+        report_mod = w_mod
+        if report_mod == loaded_name:
+            report_mod = logical
+        if report_mod in {logical, loaded_name}:
+            kind = "assign"
+            runs = f"{logical}.{w_name}"
+        else:
+            kind = "reexport"
+            runs = f"{report_mod}.{w_name}" if report_mod else w_name
+    return Binding(
+        import_stmt=f"from {logical} import {name}",
+        bind=f"{logical}.{name}",
+        runs=runs,
+        kind=kind,
+        file=file,
+        line=line,
+        source=source,
+        obj_id=id(obj),
+    )
+
+
+def binding_from_loaded(
+    root: Path,
+    logical: str,
+    name: str,
+    obj,
+    module: types.ModuleType,
+    loaded_name: str,
+    hit: StaticHit | None,
+    path: Path,
+) -> Binding:
+    if isinstance(obj, types.ModuleType):
+        _def_mod, line, file, source = object_identity(obj)
+        fallback = Path(getattr(obj, "__file__", "") or path)
+        return Binding(
+            import_stmt=f"from {logical} import {name}",
+            bind=f"{logical}.{name}",
+            runs=obj.__name__,
+            kind="module",
+            file=rel_file(root, file, fallback),
+            line=line or 1,
+            source=source or (hit.source if hit is not None else ""),
+            obj_id=id(obj),
+        )
+    if isinstance(obj, functools.partial):
+        return binding_from_partial(
+            root, logical, name, obj, loaded_name, hit, path
+        )
+    def_mod, line, file, source = object_identity(obj)
+    defined_here = inspect.getmodule(obj) is module or getattr(obj, "__module__", None) in {
+        loaded_name,
+        logical,
+    }
+    if defined_here:
+        kind = "def"
+        runs_name = name
+        try:
+            runs_name = obj.__name__
+        except AttributeError:
+            runs_name = name
+        runs = f"{logical}.{runs_name}"
+    else:
+        kind = "reexport"
+        runs_name = name
+        try:
+            runs_name = obj.__name__
+        except AttributeError:
+            runs_name = name
+        report_mod = def_mod
+        if report_mod == loaded_name:
+            report_mod = logical
+        runs = f"{report_mod}.{runs_name}" if report_mod else runs_name
+    if source is None and hit is not None and hit.kind == "def":
+        source = hit.source
+        line = hit.line
+        file = str(hit.path)
+    if not line and hit is not None:
+        line = hit.line
+    if not file:
+        file = str(path)
+    return Binding(
+        import_stmt=f"from {logical} import {name}",
+        bind=f"{logical}.{name}",
+        runs=runs,
+        kind=kind,
+        file=rel_file(root, file, path),
+        line=line or 0,
+        source=source or (hit.source if hit is not None else ""),
+        obj_id=id(obj),
+    )
+
+
+def may_drop_cached(modname: str) -> bool:
+    if not modname or is_unshadowable(modname):
+        return False
+    if modname == "importlib" or modname.startswith("importlib."):
+        return False
+    if modname.startswith("_frozen_importlib"):
+        return False
+    return True
+
+
+def drop_module_tree(modname: str) -> None:
+    if not may_drop_cached(modname):
+        return
+    for key in list(sys.modules):
+        if key == modname or key.startswith(modname + "."):
+            del sys.modules[key]
+
+
+def cached_module_file(modname: str) -> Path | None:
+    existing = sys.modules.get(modname)
+    if existing is None:
+        return None
+    file = getattr(existing, "__file__", None)
+    if not file:
+        return None
+    return Path(file)
+
+
+def is_same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def drop_foreign_cache(modname: str, path: Path) -> None:
+    cached = cached_module_file(modname)
+    if cached is not None and is_same_file(path, cached):
+        return
+    drop_module_tree(modname)
+
+
+def drop_shadowed_modules(root: Path) -> None:
+    for path in iter_py_files(root):
+        modname = module_name_for(root, path)
+        if not modname:
+            continue
+        drop_foreign_cache(modname, path)
+
+
+@contextlib.contextmanager
+def isolated_import(root: Path):
+    root_s = str(root)
+    saved_path = sys.path.copy()
+    saved_modules = sys.modules.copy()
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    try:
+        sys.path.insert(0, root_s)
+        drop_shadowed_modules(root)
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            yield
+    finally:
+        sys.path[:] = saved_path
+        current = set(sys.modules)
+        saved = set(saved_modules)
+        for key in current - saved:
+            del sys.modules[key]
+        for key, value in saved_modules.items():
+            sys.modules[key] = value
+
+
+def ensure_package_parents(root: Path, modname: str) -> None:
+    parts = modname.split(".")[:-1]
+    acc: list[str] = []
+    for part in parts:
+        acc.append(part)
+        parent = ".".join(acc)
+        if parent in sys.modules:
+            continue
+        path = module_path_for(root, parent)
+        pkg_dir = root.joinpath(*acc)
+        if path is None:
+            pkg = types.ModuleType(parent)
+            pkg.__package__ = parent
+            if pkg_dir.is_dir():
+                pkg.__path__ = [str(pkg_dir)]
+            sys.modules[parent] = pkg
+            continue
+        search = [str(path.parent)] if path.name == "__init__.py" else None
+        spec = importlib.util.spec_from_file_location(
+            parent,
+            path,
+            submodule_search_locations=search,
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[parent] = module
+        try:
+            spec.loader.exec_module(module)
+        except SystemExit as exc:
+            raise RuntimeError(f"SystemExit({exc.code})") from exc
+
+
+def load_query(root: Path, modname: str, path: Path) -> tuple[types.ModuleType, str]:
+    """Load one file via spec_from_file_location under its logical import name."""
+    if is_unshadowable(modname):
+        raise ImportError(f"cannot bind leftover {modname}: builtin")
+    drop_foreign_cache(modname, path)
+    ensure_package_parents(root, modname)
+    search = [str(path.parent)] if path.name == "__init__.py" else None
+    spec = importlib.util.spec_from_file_location(
+        modname,
+        path,
+        submodule_search_locations=search,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    parent = modname.rpartition(".")[0]
+    if path.name == "__init__.py":
+        module.__package__ = modname
+    else:
+        module.__package__ = parent
+    sys.modules[modname] = module
+    try:
+        spec.loader.exec_module(module)
+    except SystemExit as exc:
+        raise RuntimeError(f"SystemExit({exc.code})") from exc
+    return module, modname
+
+
+def load_named_submodule(
+    root: Path,
+    parent: types.ModuleType,
+    parent_name: str,
+    name: str,
+) -> types.ModuleType | None:
+    subname = f"{parent_name}.{name}"
+    path = module_path_for(root, subname)
+    if path is None:
+        return None
+    module, _logical = load_query(root, subname, path)
+    setattr(parent, name, module)
+    return module
+
+
+def namespace_dir(root: Path, modname: str) -> Path | None:
+    pkg_dir = root.joinpath(*modname.split("."))
+    if pkg_dir.is_dir() and pkg_dir.resolve() != root.resolve():
+        return pkg_dir
+    return None
+
+
+def scan_name(root: Path, name: str) -> tuple[list[Binding], list[Miss]]:
+    hits, misses = static_scan(root, name)
+    by_mod = last_hits_by_module(hits)
+    bindings = [binding_from_static(root, by_mod[key], name) for key in sorted(by_mod)]
+    return bindings, misses
+
+
+def bindings_for_name(
+    root: Path,
+    name: str,
+    extra_modules: list[str] | None = None,
+) -> list[Binding]:
+    del extra_modules
+    bindings, _misses = scan_name(root, name)
+    return bindings
+
+
+def resolve_from_import(
+    root: Path,
+    module: str,
+    name: str,
+) -> tuple[Binding | None, list[Binding], list[Miss], str | None]:
+    path = module_path_for(root, module)
+    hits, misses = static_scan(root, name)
+    by_mod = last_hits_by_module(hits)
+    ns_dir = None if path is not None else namespace_dir(root, module)
+    if path is None and ns_dir is None:
+        return None, [], misses, f"{module} has no name {name}"
+    if module and is_unshadowable(module):
+        return None, [], misses, f"{module} has no name {name}"
+    hit = by_mod.get(module)
+    try:
+        with isolated_import(root):
+            if path is not None:
+                loaded, logical = load_query(root, module, path)
+                bind_path = path
+            else:
+                assert ns_dir is not None
+                loaded = types.ModuleType(module)
+                loaded.__package__ = module
+                loaded.__path__ = [str(ns_dir)]
+                sys.modules[module] = loaded
+                logical = module
+                bind_path = ns_dir
+            if not hasattr(loaded, name):
+                sub = load_named_submodule(root, loaded, module, name)
+                if sub is None:
+                    return None, [], misses, f"{module} has no name {name}"
+                obj = sub
+                sub_file = getattr(sub, "__file__", None)
+                if sub_file:
+                    bind_path = Path(sub_file)
+            else:
+                obj = getattr(loaded, name)
+            binding = binding_from_loaded(
+                root, module, name, obj, loaded, logical, hit, bind_path
+            )
+    except Exception as exc:
+        return (
+            None,
+            [],
+            misses,
+            f"import failed: {module}: {type(exc).__name__}: {exc}",
+        )
+    others = [
+        binding_from_static(root, by_mod[key], name)
+        for key in sorted(by_mod)
+        if key != module and by_mod[key].kind == "def"
+    ]
+    return binding, [binding, *others], misses, None
+
+
+def binding_from_import(
+    root: Path, module: str, name: str
+) -> tuple[Binding | None, list[Binding]]:
+    binding, bindings, _misses, _err = resolve_from_import(root, module, name)
+    return binding, bindings
+
+
+@dataclass
+class FileBind:
+    kind: str
+    line: int
+    source: str
+    from_module: str | None = None
+    orig_name: str | None = None
+
+
+def analyze_importer(path: Path, name: str) -> tuple[FileBind | None, list[tuple[str, str]]]:
+    text = read_py_text(path)
+    tree = ast.parse(text, filename=str(path))
+    aliases: dict[str, str] = {}
+    last: FileBind | None = None
+    uses: list[tuple[str, str]] = []
+    seen_uses: set[tuple[str, str]] = set()
+
+    def add_use(module: str, attr: str) -> None:
+        key = (module, attr)
+        if key not in seen_uses:
+            seen_uses.add(key)
+            uses.append(key)
+
+    for node in iter_live_nodes(tree.body):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                aliases[local] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                aliases[local] = f"{node.module}.{alias.name}"
+                if local == name:
+                    last = FileBind(
+                        kind="import",
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=node.module,
+                        orig_name=alias.name,
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                last = FileBind(
+                    kind="def",
+                    line=node.lineno,
+                    source=node_source(text, node),
+                )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    kind, from_mod, orig = alias_attr_bind(node.value, aliases)
+                    last = FileBind(
+                        kind=kind,
+                        line=node.lineno,
+                        source=node_source(text, node),
+                        from_module=from_mod,
+                        orig_name=orig,
+                    )
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == name
+                and node.value is not None
+            ):
+                kind, from_mod, orig = alias_attr_bind(node.value, aliases)
+                last = FileBind(
+                    kind=kind,
+                    line=node.lineno,
+                    source=node_source(text, node),
+                    from_module=from_mod,
+                    orig_name=orig,
+                )
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Attribute) and child.attr == name:
+                    if isinstance(child.value, ast.Name) and child.value.id in aliases:
+                        add_use(aliases[child.value.id], name)
+    return last, uses
+
+
+def bindings_from_file(root: Path, path: Path, name: str) -> list[Binding]:
+    last, uses = analyze_importer(path, name)
+    if last is not None:
+        if last.kind in {"import", "reexport"} and last.from_module:
+            binding, _bindings, _misses, err = resolve_from_import(
+                root, last.from_module, last.orig_name or name
+            )
+            if binding is None:
+                raise RuntimeError(err or f"{last.from_module} has no name {name}")
+            return [binding]
+        file_mod = module_name_for(root, path) or path.stem
+        kind = "def" if last.kind == "def" else last.kind
+        runs_name = last.orig_name or name
+        return [
+            Binding(
+                import_stmt=f"from {file_mod} import {name}",
+                bind=f"{file_mod}.{name}",
+                runs=f"{file_mod}.{runs_name}",
+                kind=kind,
+                file=rel_display(root, path),
+                line=last.line,
+                source=last.source,
+                obj_id=None,
+            )
+        ]
+    out: list[Binding] = []
+    seen: set[str] = set()
+    for module, attr in uses:
+        key = f"{module}.{attr}"
+        if key in seen:
+            continue
+        binding, _bindings, _misses, _err = resolve_from_import(root, module, attr)
+        if binding is None:
+            continue
+        seen.add(key)
+        out.append(binding)
+    return out
+
+
+def same_function(bindings: list[Binding]) -> bool:
+    """Same defining identity. Do not use recycled id() after isolated_import."""
+    runs = {b.runs for b in bindings}
+    return len(runs) <= 1
+
+
+def defining_bindings(bindings: list[Binding]) -> list[Binding]:
+    seen: set[str] = set()
+    out: list[Binding] = []
+    for binding in bindings:
+        if binding.kind == "reexport":
+            continue
+        if binding.runs in seen:
+            continue
+        seen.add(binding.runs)
+        out.append(binding)
+    if out:
+        return out
+    for binding in bindings:
+        if binding.runs not in seen:
+            seen.add(binding.runs)
+            out.append(binding)
+    return out
+
+
+def other_defs(query: Binding, all_bindings: list[Binding]) -> list[Binding]:
+    others: list[Binding] = []
+    for binding in defining_bindings(all_bindings):
+        if query.obj_id is not None and binding.obj_id is not None:
+            if binding.obj_id == query.obj_id:
+                continue
+        elif binding.runs == query.runs:
+            continue
+        others.append(binding)
+    others.sort(key=lambda b: b.runs)
+    return others
+
+
+def format_binding(binding: Binding) -> list[str]:
+    return [
+        f"import\t{binding.import_stmt}",
+        f"bind\t{binding.bind}",
+        f"runs\t{binding.runs}",
+        f"kind\t{binding.kind}",
+        f"file\t{binding.file}",
+        f"line\t{binding.line}",
+        f"source\t{binding.source!r}",
+    ]
+
+
+def format_misses(misses: list[Miss]) -> list[str]:
+    return [f"miss\t{m.file}\t{m.reason}" for m in misses]
+
+
+def format_list(name: str, bindings: list[Binding], misses: list[Miss] | None = None) -> str:
+    misses = misses or []
+    same = same_function(bindings) and not misses
+    lines = [
+        f"name\t{name}",
+        f"count\t{len(bindings)}",
+        f"same_function\t{same}",
+    ]
+    lines.extend(format_misses(misses))
+    lines.append("")
+    for index, binding in enumerate(bindings):
+        if index:
+            lines.append("")
+        lines.extend(format_binding(binding))
+    return "\n".join(lines) + "\n"
+
+
+def format_query(
+    query_stmt: str,
+    binding: Binding,
+    others: list[Binding],
+    misses: list[Miss] | None = None,
+) -> str:
+    misses = misses or []
+    ids = [binding.obj_id] + [b.obj_id for b in others]
+    if binding.obj_id is not None and any(b.obj_id is not None for b in others):
+        same = all(i == binding.obj_id for i in ids if i is not None)
+    else:
+        same = not others
+    if misses:
+        same = False
+    lines = [f"query\t{query_stmt}"]
+    lines.extend(format_binding(binding))
+    for other in others:
+        lines.append(f"also\t{other.runs}")
+    lines.extend(format_misses(misses))
+    lines.append(f"same_function\t{same}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_import_stmt(stmt: str) -> tuple[str, str]:
+    tree = ast.parse(stmt)
+    if len(tree.body) != 1:
+        raise ValueError(f"expected one import statement, got {stmt!r}")
+    node = tree.body[0]
+    if isinstance(node, ast.ImportFrom) and node.module and len(node.names) == 1:
+        alias = node.names[0]
+        if alias.name == "*":
+            raise ValueError("star imports do not bind one name")
+        return node.module, alias.name
+    raise ValueError(f"expected 'from MODULE import NAME', got {stmt!r}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="bindname",
+        description=(
+            "For a name, print the import path and the body that would run. "
+            "Distinguishes a leftover same-name helper from a moved definition."
+        ),
+    )
+    parser.add_argument(
+        "name",
+        metavar="NAME",
+        nargs="?",
+        help="name to resolve, or MODULE.NAME",
+    )
+    parser.add_argument(
+        "-C",
+        "--dir",
+        dest="root",
+        default=".",
+        metavar="DIR",
+        help="import root (default: .)",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_module",
+        metavar="MODULE",
+        help="resolve 'from MODULE import NAME'",
+    )
+    parser.add_argument(
+        "--import",
+        dest="import_stmt",
+        metavar="STMT",
+        help="resolve an import statement, e.g. 'from pkg_util import parse'",
+    )
+    parser.add_argument(
+        "--file",
+        dest="importer",
+        metavar="PATH",
+        help="resolve the last binding of NAME in this file",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    root = Path(args.root)
+    if not root.is_dir():
+        print(f"bindname: not a directory: {root}", file=sys.stderr)
+        return 2
+    root = root.absolute()
+
+    name = args.name
+    from_module = args.from_module
+
+    if args.import_stmt:
+        try:
+            stmt_mod, stmt_name = parse_import_stmt(args.import_stmt)
+        except (ValueError, SyntaxError) as err:
+            print(f"bindname: {err}", file=sys.stderr)
+            return 2
+        if name and "." not in name and name != stmt_name:
+            print(
+                f"bindname: NAME {name!r} does not match import {stmt_name!r}",
+                file=sys.stderr,
+            )
+            return 2
+        from_module = stmt_mod
+        name = stmt_name
+
+    if name and "." in name and from_module is None and args.importer is None:
+        from_module, _, name = name.rpartition(".")
+
+    if not name:
+        print("bindname: NAME is required", file=sys.stderr)
+        return 2
+
+    if from_module and args.importer:
+        print("bindname: use --from/--import or --file, not both", file=sys.stderr)
+        return 2
+
+    if args.importer:
+        path = Path(args.importer)
+        if not path.is_file():
+            print(f"bindname: not a file: {path}", file=sys.stderr)
+            return 1
+        try:
+            bindings = bindings_from_file(root, path, name)
+        except UnicodeDecodeError as err:
+            print(f"bindname: UnicodeDecodeError: {err}", file=sys.stderr)
+            return 1
+        except (OSError, SyntaxError, RuntimeError) as err:
+            print(f"bindname: {err}", file=sys.stderr)
+            return 1
+        if not bindings:
+            print(f"bindname: no uses of {name} in {path}", file=sys.stderr)
+            return 1
+        sys.stdout.write(format_list(name, bindings))
+        return 0
+
+    if from_module:
+        binding, bindings, misses, err = resolve_from_import(root, from_module, name)
+        if binding is None:
+            print(
+                f"bindname: {err or f'{from_module} has no name {name}'}",
+                file=sys.stderr,
+            )
+            return 1
+        others = other_defs(binding, bindings)
+        query = args.import_stmt or f"from {from_module} import {name}"
+        sys.stdout.write(format_query(query, binding, others, misses))
+        return 0
+
+    bindings, misses = scan_name(root, name)
+    if not bindings and not misses:
+        print(f"bindname: no bindings for {name}", file=sys.stderr)
+        return 1
+    if not bindings:
+        sys.stdout.write(format_list(name, bindings, misses))
+        return 1
+    sys.stdout.write(format_list(name, bindings, misses))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

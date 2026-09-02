@@ -1,0 +1,26 @@
+Registry / fixture:
+  compose-go Normalize environment resolve
+  leftover image ENV default after listed-without-equals dropped
+
+Case A (listed FOO, user env FOO=bar):
+  current resolved identity
+  not leftover-after-drop
+
+Case B (listed FOO, no user env, leftover drop):
+  leftover: previous image ENV default
+  listed-without-equals omitted from service environment
+  container still has image default
+
+Case C (listed FOO= empty string):
+  empty-string identity
+  not unset; not leftover image default
+
+Case D (environment keepEmpty):
+  listed-without-equals kept as nil / bare name
+  container unsets
+  not leftover image default
+
+Not this packet:
+  local-fixture env-empty-vs-unset (specimen-010)
+  pip empty user proxy vs global (specimen-031)
+  helm null vs omitempty (specimen-079)

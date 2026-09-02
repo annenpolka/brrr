@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""procpath: extra processorpath identity — local-repo hit vs omitted/fail while reactor sibling exists."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("gav", "reactor_present", "local_repo", "compile_classpath", "processorpath")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "gav" not in fields or "processorpath" not in fields:
+        raise ValueError(f"{source}: need gav, processorpath")
+    return fields
+
+
+def yn_in(val: str) -> bool:
+    return val in {"yes", "true", "1", "present"}
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    reactor = yn_in(fields.get("reactor_present") or "")
+    local = yn_in(fields.get("local_repo") or "")
+    compile_cp = yn_in(fields.get("compile_classpath") or "")
+    ppath = fields["processorpath"]
+    omitted_fail = reactor and not local and ppath in {"fail", "omitted", "missing"}
+    return {
+        "gav": fields["gav"],
+        "reactor_present": reactor,
+        "local_repo": local,
+        "compile_classpath": compile_cp,
+        "processorpath": ppath,
+        "omitted_fail": omitted_fail,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"gav\t{result['gav']}",
+        f"reactor_present\t{yn(result['reactor_present'])}",
+        f"local_repo\t{yn(result['local_repo'])}",
+        f"compile_classpath\t{yn(result['compile_classpath'])}",
+        f"processorpath\t{result['processorpath']}",
+        f"omitted_fail\t{yn(result['omitted_fail'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="procpath",
+        description=(
+            "Name extra processorpath identity: local-repo jar versus omitted/fail "
+            "while a reactor sibling exists."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"procpath: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["omitted_fail"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

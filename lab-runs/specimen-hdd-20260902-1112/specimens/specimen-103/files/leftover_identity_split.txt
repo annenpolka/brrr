@@ -1,0 +1,30 @@
+Registry / fixture:
+  go.work use ./a ./b
+  a replace syncreplace v1.1.0 => v1.0.0
+  b no replace
+  syncreplace v1.0.0 requires rsc.io/quote v1.0.0
+  syncreplace v1.1.0 requires rsc.io/quote v1.1.0
+
+Case A (GOWORK=off in b):
+  quote identity = v1.1.0
+  no leftover workspace replace
+
+Case B (go work sync, failing_ref):
+  workspace graph applies a's replace
+  mustSelectFor[b] has quote v1.0.0
+  EnterModule(b) has no replace
+  EditBuildList can err; continue
+  leftover: b/go.mod still quote v1.0.0
+
+Case C (every module has the same replace):
+  no replace skew
+  not leftover
+
+Case D (go.work replace override shared):
+  graphs agree
+  not silent-continue leftover
+
+Not this packet:
+  golang/mod sumdb tree-extension leftover (specimen-084)
+  derived go.sum zip vs mod (specimen-083)
+  cargo lock SHA vs checkout (cargo#14230 unfixed)

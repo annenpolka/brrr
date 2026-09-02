@@ -1,0 +1,30 @@
+{
+  "summary": "Invented vitest run theater. Harvest leftover fsModuleCache key minted for a module that is then externalized. Stop.",
+  "preserve_add": [
+    "experimental.fsModuleCache can mint a hashed identity for a module that the run then treats as external"
+  ],
+  "established_add": [
+    "Packet: getCachePath runs before shouldExternalize; resolver is not in hashString; saveCachedModule skipped when externalized so no disk write",
+    "Other externalize paths never mint that identity"
+  ],
+  "rejected_add": [
+    "Invented vitest run transcripts are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned labeled cache-key records. No vitest."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether a leftover cache key H_ext was minted for an externalized module (memory yes, disk no)"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name leftover fsModuleCache key minted before shouldExternalize",
+    "nearest_existing_operation": "grep DEBUG vitest:cache:memory write vs fs empty",
+    "observable_delta": "leftover_key = memory key present and disk write no when externalize yes",
+    "reason": "grep of the module id hits both logs; the leftover is H_ext without a file"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned cache-key records. Do not send vitest theater back to R1.",
+  "next_action": "HARVEST_NOW"
+}

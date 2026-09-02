@@ -1,0 +1,1 @@
+NEXT_ACTION=KILL. leftover directory= vs git+subdirectory is two greps of uv.lock. Do not harvest a uvgitdir TSV. Do not send uv theater back to R1. Distinct from 006/022/023. Dreamer used the fixed revision.

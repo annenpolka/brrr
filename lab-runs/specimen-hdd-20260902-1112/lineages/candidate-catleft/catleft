@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""catleft: leftover catalog: join rewritten to a range while catalog object holds old version."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("package", "member_spec", "catalog_range")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "member_spec" not in fields or "catalog_range" not in fields:
+        raise ValueError(f"{source}: need member_spec, catalog_range")
+    return fields
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    member = fields["member_spec"]
+    catalog = fields["catalog_range"]
+    leftover = member != "catalog:" and bool(catalog) and member != catalog
+    return {
+        "package": fields.get("package") or "-",
+        "member_spec": member,
+        "catalog_range": catalog,
+        "leftover_detach": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"package\t{result['package']}",
+        f"member_spec\t{result['member_spec']}",
+        f"catalog_range\t{result['catalog_range']}",
+        f"leftover_detach\t{yn(result['leftover_detach'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="catleft",
+        description=(
+            "Name leftover catalog: join rewritten to a range while the "
+            "catalog object still holds the old version."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"catleft: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_detach"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

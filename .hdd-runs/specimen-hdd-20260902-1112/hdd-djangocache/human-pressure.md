@@ -1,0 +1,1 @@
+- No Django. Continue on the owned cache_page.py fixture only. Show which pipeline stage was frozen in the cached object.

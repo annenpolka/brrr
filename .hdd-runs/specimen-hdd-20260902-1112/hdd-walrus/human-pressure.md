@@ -1,0 +1,1 @@
+- This environment cannot dump rewritten bytecode or AST. A companion fixture exists where a display helper re-invokes the expression after the real evaluation. Use the same tool on both. Show which numbers came from the live call versus the display path.

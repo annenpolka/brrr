@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""emptyunit: name a completed-only work unit a replacement is sent as send_runtest_some([])."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+EMPTY = "-"
+# Safety bound, not a pytest or xdist collection ceiling. 257 loadgroup units is legal.
+MAX_COLLECTION = 8192
+KNOWN_DIST = ("loadgroup", "loadscope")
+# xdist _reschedule: assign one more unit unless _pending_of(assigned) > 2.
+RESCHEDULE_WATERMARK = 2
+_MISSING = object()
+
+
+def parse_truth(value: str) -> bool:
+    v = value.strip().lower()
+    if v in {"done", "true", "yes", "1", "completed"}:
+        return True
+    if v in {"open", "false", "no", "0", "incomplete"}:
+        return False
+    raise ValueError(f"unknown completed flag {value!r}")
+
+
+def as_completed(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return parse_truth(value)
+    raise ValueError(f"unknown completed flag {value!r}")
+
+
+def split_scope(nodeid: str, dist: str) -> str:
+    if dist == "loadgroup":
+        if nodeid.rfind("@") > nodeid.rfind("]"):
+            return nodeid.split("@")[-1]
+        return nodeid
+    if dist == "loadscope":
+        return nodeid.rsplit("::", 1)[0]
+    raise ValueError(f"unknown dist {dist!r}")
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else EMPTY
+
+
+def fmt_indexes(indexes: list[int] | None) -> str:
+    if indexes is None:
+        return EMPTY
+    if not indexes:
+        return "()"
+    return "(" + ",".join(str(i) for i in indexes) + ")"
+
+
+def yesno(flag: bool) -> str:
+    return "yes" if flag else "no"
+
+
+def check_identity(name: str, kind: str) -> str:
+    if name == "":
+        raise ValueError(f"empty {kind}")
+    if name != name.strip():
+        raise ValueError(f"{kind} has surrounding whitespace {name!r}")
+    return name
+
+
+def require_nodeid(value: object, kind: str, source: str) -> str:
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        raise ValueError(f"{source}: {kind} must be a string, got {value!r}")
+    if not isinstance(value, str):
+        raise ValueError(f"{source}: {kind} must be a string, got {type(value).__name__}")
+    name = check_identity(value, kind)
+    if name == EMPTY:
+        raise ValueError(f"{source}: {kind} {name!r} collides with empty sentinel")
+    return name
+
+
+def convert_ast(node: ast.AST) -> object:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id == "True":
+            return True
+        if node.id == "False":
+            return False
+        if node.id == "None":
+            return None
+        raise ValueError("not a JSON/Python workqueue dump")
+    if isinstance(node, ast.List):
+        return [convert_ast(elt) for elt in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(convert_ast(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        out: OrderedDict[object, object] = OrderedDict()
+        for key_node, val_node in zip(node.keys, node.values):
+            if key_node is None:
+                raise ValueError("not a JSON/Python workqueue dump")
+            out[convert_ast(key_node)] = convert_ast(val_node)
+        return out
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        value = convert_ast(node.operand)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return -value
+        raise ValueError("not a JSON/Python workqueue dump")
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = None
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            name = func.attr
+        if name not in {"OrderedDict", "dict"}:
+            raise ValueError("not a JSON/Python workqueue dump")
+        if node.keywords:
+            raise ValueError("not a JSON/Python workqueue dump")
+        if not node.args:
+            return OrderedDict()
+        if len(node.args) != 1:
+            raise ValueError("not a JSON/Python workqueue dump")
+        arg = convert_ast(node.args[0])
+        result: OrderedDict[object, object] = OrderedDict()
+        if isinstance(arg, dict):
+            for key, val in arg.items():
+                result[key] = val
+            return result
+        if isinstance(arg, (list, tuple)):
+            for item in arg:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError("not a JSON/Python workqueue dump")
+                result[item[0]] = item[1]
+            return result
+        raise ValueError("not a JSON/Python workqueue dump")
+    raise ValueError("not a JSON/Python workqueue dump")
+
+
+def parse_python_docs(text: str) -> list[object]:
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        tree = ast.parse(text, mode="eval")
+        return [convert_ast(tree.body)]
+    except (SyntaxError, ValueError):
+        pass
+    try:
+        mod = ast.parse(text, mode="exec")
+    except SyntaxError as err:
+        raise ValueError("not a JSON/Python workqueue dump") from err
+    docs: list[object] = []
+    envelope: dict[str, object] | None = None
+    for stmt in mod.body:
+        if isinstance(stmt, ast.Expr):
+            if envelope is not None:
+                docs.append(envelope)
+                envelope = None
+            docs.append(convert_ast(stmt.value))
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            key = stmt.targets[0].id
+            val = convert_ast(stmt.value)
+            if envelope is None:
+                envelope = {}
+            envelope[key] = val
+            continue
+        raise ValueError("not a JSON/Python workqueue dump")
+    if envelope is not None:
+        docs.append(envelope)
+    if not docs:
+        raise ValueError("not a JSON/Python workqueue dump")
+    return docs
+
+
+def consume_json_docs(text: str) -> tuple[list[object], str]:
+    decoder = json.JSONDecoder()
+    s = text.lstrip()
+    docs: list[object] = []
+    while s and (s.startswith("{") or s.startswith("[")):
+        val, idx = decoder.raw_decode(s)
+        docs.append(val)
+        s = s[idx:].lstrip()
+    return docs, s
+
+
+def parse_all_docs(text: str, source: str) -> list[object]:
+    s = text.strip()
+    if not s:
+        raise ValueError(f"{source}: not a JSON/Python workqueue dump")
+    if s.startswith("{") or s.startswith("["):
+        try:
+            docs, leftover = consume_json_docs(s)
+        except json.JSONDecodeError:
+            try:
+                return parse_python_docs(s)
+            except ValueError as err:
+                raise ValueError(f"{source}: not a JSON/Python workqueue dump") from err
+        leftover = leftover.strip()
+        if leftover:
+            try:
+                docs.extend(parse_python_docs(leftover))
+            except ValueError as err:
+                raise ValueError(f"{source}: not a JSON/Python workqueue dump") from err
+        return docs
+    try:
+        return parse_python_docs(s)
+    except ValueError as err:
+        raise ValueError(f"{source}: not a JSON/Python workqueue dump") from err
+
+
+def parse_python_or_json(text: str, loc: str) -> object:
+    docs = parse_all_docs(text, loc)
+    if len(docs) != 1:
+        raise ValueError(f"{loc}: workqueue is not JSON/Python")
+    return docs[0]
+
+
+def is_envelope(data: dict) -> bool:
+    return any(key in data for key in ("collection", "workqueue", "assigned"))
+
+
+def pick_payload(data: dict, source: str) -> dict:
+    workqueue = data.get("workqueue", _MISSING)
+    assigned = data.get("assigned", _MISSING)
+    if workqueue is _MISSING:
+        payload = assigned
+    elif (
+        isinstance(workqueue, dict)
+        and len(workqueue) == 0
+        and assigned is not _MISSING
+        and assigned is not None
+    ):
+        payload = assigned
+    else:
+        payload = workqueue
+    if payload is _MISSING or payload is None:
+        raise ValueError(f"{source}: workqueue dump needs workqueue or assigned")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: workqueue must be {{scope: {{nodeid: completed}}}}")
+    return payload
+
+
+def parse_collection_list(raw: object, source: str) -> list[str]:
+    if isinstance(raw, (str, bytes)):
+        raise ValueError(f"{source}: collection must be a list of nodeids")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{source}: collection must be a list of nodeids")
+    collection: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        nodeid = require_nodeid(item, "collection nodeid", source)
+        if nodeid in seen:
+            raise ValueError(f"{source}: duplicate collection nodeid {nodeid!r}")
+        seen.add(nodeid)
+        collection.append(nodeid)
+    return collection
+
+
+def flatten_workqueue(payload: dict, source: str) -> "OrderedDict[str, bool]":
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: workqueue must be {{scope: {{nodeid: completed}}}}")
+    if not payload:
+        return OrderedDict()
+    values = list(payload.values())
+    nested = all(isinstance(value, dict) for value in values)
+    flat = all(not isinstance(value, dict) for value in values)
+    flags: "OrderedDict[str, bool]" = OrderedDict()
+    if nested:
+        for _scope, unit in payload.items():
+            if not isinstance(unit, dict):
+                raise ValueError(
+                    f"{source}: workqueue must be {{scope: {{nodeid: completed}}}}"
+                )
+            for nodeid_raw, flag in unit.items():
+                nodeid = require_nodeid(nodeid_raw, "nodeid", source)
+                if nodeid in flags:
+                    raise ValueError(f"{source}: duplicate nodeid {nodeid!r}")
+                flags[nodeid] = as_completed(flag)
+        return flags
+    if flat:
+        for nodeid_raw, flag in payload.items():
+            nodeid = require_nodeid(nodeid_raw, "nodeid", source)
+            if nodeid in flags:
+                raise ValueError(f"{source}: duplicate nodeid {nodeid!r}")
+            flags[nodeid] = as_completed(flag)
+        return flags
+    raise ValueError(f"{source}: workqueue must be {{scope: {{nodeid: completed}}}}")
+
+
+def regroup(
+    flags: "OrderedDict[str, bool]", dist: str, source: str
+) -> "OrderedDict[str, OrderedDict[str, bool]]":
+    if dist not in KNOWN_DIST:
+        raise ValueError(f"{source}: dist must be loadgroup|loadscope, got {dist!r}")
+    units: "OrderedDict[str, OrderedDict[str, bool]]" = OrderedDict()
+    for nodeid, completed in flags.items():
+        scope = split_scope(nodeid, dist)
+        units.setdefault(scope, OrderedDict())
+        units[scope][nodeid] = completed
+    return units
+
+
+def parse_object(data: object, source: str) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: workqueue dump must be an object")
+    if is_envelope(data):
+        dist = data.get("dist", "loadgroup")
+        if dist not in KNOWN_DIST:
+            raise ValueError(f"{source}: dist must be loadgroup|loadscope, got {dist!r}")
+        payload = pick_payload(data, source)
+        flags = flatten_workqueue(payload, source)
+        if "collection" not in data or data["collection"] is None:
+            collection = list(flags)
+        else:
+            collection = parse_collection_list(data["collection"], source)
+        units = regroup(flags, dist, source)
+        return finish_record(collection, units, dist, source)
+    flags = flatten_workqueue(data, source)
+    collection = list(flags)
+    units = regroup(flags, "loadgroup", source)
+    return finish_record(collection, units, "loadgroup", source)
+
+
+def docs_to_record(docs: list[object], source: str) -> dict:
+    if not docs:
+        raise ValueError(f"{source}: not a JSON/Python workqueue dump")
+    if len(docs) == 1:
+        return parse_object(docs[0], source)
+    if len(docs) == 2:
+        first, second = docs
+        if isinstance(first, (list, tuple)) and isinstance(second, dict):
+            return parse_object({"collection": list(first), "workqueue": second}, source)
+        raise ValueError(f"{source}: not a JSON/Python workqueue dump")
+    raise ValueError(f"{source}: not a JSON/Python workqueue dump")
+
+
+def parse_dump_text(text: str, *, source: str) -> dict:
+    return docs_to_record(parse_all_docs(text, source), source)
+
+
+def finish_record(
+    collection: list[str],
+    units: "OrderedDict[str, OrderedDict[str, bool]]",
+    dist: str,
+    source: str,
+) -> dict:
+    if not units:
+        raise ValueError(f"{source}: no workqueue units")
+    if len(collection) > MAX_COLLECTION:
+        raise ValueError(
+            f"{source}: collection exceeds safety cap ({MAX_COLLECTION}); "
+            "not a pytest collection ceiling"
+        )
+    seen: set[str] = set()
+    for nodeid in collection:
+        check_identity(nodeid, "collection nodeid")
+        if nodeid in seen:
+            raise ValueError(f"{source}: duplicate collection nodeid {nodeid!r}")
+        seen.add(nodeid)
+    return {
+        "collection": collection,
+        "units": units,
+        "dist": dist,
+        "source": source,
+    }
+
+
+def looks_like_tsv(text: str) -> bool:
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "\t" not in raw.lstrip(" "):
+            return False
+        key = raw.lstrip(" ").split("\t", 1)[0].strip()
+        return key in {"collection", "dist", "unit", "workqueue", "assigned"}
+    return False
+
+
+def parse_tsv(text: str, *, source: str) -> dict:
+    collection: list[str] | None = None
+    dist = "loadgroup"
+    saw_dist = False
+    flags: "OrderedDict[str, bool]" = OrderedDict()
+    saw_dump = False
+    saw_unit = False
+    python_chunks: list[str] = []
+    python_loc = source
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip("\r")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        line = line.lstrip(" ")
+        loc = f"{source}:{lineno}"
+        if "\t" not in line:
+            low = stripped.lower()
+            if "replacing crashed worker" in low or low.startswith("collecting:"):
+                raise ValueError(f"{source}: not a workqueue dump (hang log)")
+            if not python_chunks:
+                python_loc = loc
+            python_chunks.append(stripped)
+            continue
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key == "collection":
+            if collection is not None:
+                raise ValueError(f"{loc}: duplicate collection row")
+            names = [] if rest == "" else rest.split("\t")
+            collection = [require_nodeid(n, "collection nodeid", loc) for n in names]
+        elif key == "dist":
+            if saw_dist:
+                raise ValueError(f"{loc}: duplicate dist row")
+            token = rest.strip()
+            if token not in KNOWN_DIST:
+                raise ValueError(f"{loc}: dist must be loadgroup|loadscope, got {token!r}")
+            dist = token
+            saw_dist = True
+        elif key in {"workqueue", "assigned"}:
+            if saw_unit:
+                raise ValueError(f"{loc}: workqueue dump after unit rows")
+            if saw_dump:
+                raise ValueError(f"{loc}: duplicate workqueue")
+            payload = parse_python_or_json(rest, loc)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{loc}: workqueue must be {{scope: {{nodeid: completed}}}}")
+            extra = flatten_workqueue(payload, loc)
+            for nodeid, flag in extra.items():
+                if nodeid in flags:
+                    raise ValueError(f"{loc}: duplicate nodeid {nodeid!r}")
+                flags[nodeid] = flag
+            saw_dump = True
+        elif key == "unit":
+            if saw_dump:
+                raise ValueError(f"{loc}: unit rows after workqueue dump")
+            parts = rest.split("\t")
+            if len(parts) < 3:
+                raise ValueError(f"{loc}: unit needs scope, nodeid, done|open")
+            if len(parts) > 3:
+                raise ValueError(f"{loc}: extra unit fields")
+            _scope, nodeid_raw, flag = parts[0], parts[1], parts[2]
+            nodeid = require_nodeid(nodeid_raw, "nodeid", loc)
+            if nodeid in flags:
+                raise ValueError(f"{loc}: duplicate nodeid {nodeid!r}")
+            flags[nodeid] = parse_truth(flag)
+            saw_unit = True
+        else:
+            raise ValueError(f"{loc}: unknown field {key!r}")
+    if python_chunks:
+        if saw_unit or saw_dump:
+            raise ValueError(f"{python_loc}: workqueue dump after unit rows")
+        rec = docs_to_record(parse_all_docs("\n".join(python_chunks), python_loc), python_loc)
+        for _scope, items in rec["units"].items():
+            for nodeid, flag in items.items():
+                if nodeid in flags:
+                    raise ValueError(f"{python_loc}: duplicate nodeid {nodeid!r}")
+                flags[nodeid] = flag
+        if collection is None:
+            collection = rec["collection"]
+        if not saw_dist:
+            dist = rec["dist"]
+        saw_dump = True
+    if collection is None:
+        if not flags:
+            raise ValueError(f"{source}: collection is required")
+        collection = list(flags)
+    units = regroup(flags, dist, source)
+    return finish_record(collection, units, dist, source)
+
+
+def parse_record(text: str, *, source: str = "<input>") -> dict:
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    stripped = text.lstrip()
+    if not stripped:
+        raise ValueError(f"{source}: not a JSON/Python workqueue dump")
+    low = stripped.lower()
+    if "replacing crashed worker" in low or stripped.startswith("collecting:"):
+        raise ValueError(f"{source}: not a workqueue dump (hang log)")
+    if looks_like_tsv(stripped):
+        return parse_tsv(stripped, source=source)
+    return parse_dump_text(stripped, source=source)
+
+
+def replacement_burst(scopes: list[dict]) -> tuple[list[dict], bool]:
+    """Units a replacement receives at schedule: FIFO first, then one more.
+
+    xdist `_reschedule` assigns another unit when `_pending_of(assigned) <= 2`.
+    Completions are not simulated. An empty send hangs; nothing after it is
+    received.
+    """
+    if not scopes:
+        return [], False
+    assigned = [scopes[0]]
+    if assigned[0]["empty_send"]:
+        return assigned, False
+    pending_of = len(assigned[0]["incomplete"])
+    if pending_of <= RESCHEDULE_WATERMARK and len(scopes) > 1:
+        assigned.append(scopes[1])
+        return assigned, True
+    return assigned, False
+
+
+def inspect(record: dict) -> dict:
+    collection: list[str] = record["collection"]
+    dist: str = record["dist"]
+    index_of: dict[str, int] = {nodeid: i for i, nodeid in enumerate(collection)}
+    scopes = []
+    missing_index: list[str] = []
+    pending = 0
+    for scope, items in record["units"].items():
+        completed = [n for n, done in items.items() if done]
+        incomplete = [n for n, done in items.items() if not done]
+        missing = [n for n in items if n not in index_of]
+        indexes: list[int] = []
+        for nodeid, done in items.items():
+            if done:
+                continue
+            pending += 1
+            if nodeid not in index_of:
+                missing_index.append(nodeid)
+                continue
+            indexes.append(index_of[nodeid])
+        completed_only = bool(items) and not incomplete
+        # send () is the empty index list, not a rename of completed_only.
+        empty_send = len(indexes) == 0
+        scopes.append(
+            {
+                "scope": scope,
+                "items": list(items),
+                "completed": completed,
+                "incomplete": incomplete,
+                "missing": missing,
+                "send": indexes,
+                "completed_only": completed_only,
+                "empty_send": empty_send,
+            }
+        )
+    if missing_index:
+        names = ", ".join(repr(n) for n in missing_index)
+        raise ValueError(f"{record['source']}: index-error: {names} not in collection")
+    requeued = pending > 0
+    if requeued:
+        assigned, rescheduled = replacement_burst(scopes)
+        first = assigned[0]
+        first_assigned = first["scope"]
+        would_send: list[int] | None = first["send"]
+        hang = any(unit["empty_send"] for unit in assigned)
+        hang_unit = next(
+            (unit["scope"] for unit in assigned if unit["empty_send"]),
+            EMPTY,
+        )
+    else:
+        assigned = []
+        rescheduled = False
+        first_assigned = EMPTY
+        would_send = None
+        hang = False
+        hang_unit = EMPTY
+    return {
+        "collection": collection,
+        "dist": dist,
+        "pending": pending,
+        "requeued": requeued,
+        "scopes": scopes,
+        "assigned": [unit["scope"] for unit in assigned],
+        "reschedule": rescheduled,
+        "hang_unit": hang_unit,
+        "hang_risk": hang,
+        "first_assigned": first_assigned,
+        "would_send": would_send,
+        "completed_only": [s["scope"] for s in scopes if s["completed_only"]],
+        "incomplete_scopes": [s["scope"] for s in scopes if s["incomplete"]],
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"collection\t{fmt_list(result['collection'])}",
+        f"dist\t{result['dist']}",
+        f"pending\t{result['pending']}",
+        f"requeued\t{yesno(result['requeued'])}",
+        f"completed_only_n\t{len(result['completed_only'])}",
+        f"completed_only\t{fmt_list(result['completed_only'])}",
+        f"incomplete_scopes\t{fmt_list(result['incomplete_scopes'])}",
+        f"first_assigned\t{result['first_assigned']}",
+        f"would_send\t{fmt_indexes(result['would_send'])}",
+        f"assigned\t{fmt_list(result['assigned'])}",
+        f"reschedule\t{yesno(result['reschedule'])}",
+        f"hang_unit\t{result['hang_unit']}",
+        f"hang_risk\t{yesno(result['hang_risk'])}",
+        f"scopes_n\t{len(result['scopes'])}",
+    ]
+    for scope in result["scopes"]:
+        lines += [
+            f"scope\t{scope['scope']}",
+            f"items\t{fmt_list(scope['items'])}",
+            f"completed\t{fmt_list(scope['completed'])}",
+            f"incomplete\t{fmt_list(scope['incomplete'])}",
+            f"missing\t{fmt_list(scope['missing'])}",
+            f"send\t{fmt_indexes(scope['send'])}",
+            f"empty_send\t{yesno(scope['empty_send'])}",
+            f"completed_only_unit\t{yesno(scope['completed_only'])}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="emptyunit",
+        description=(
+            "Read a worker collection plus workqueue dump. Group by dist, then name "
+            "a completed-only unit a replacement would be sent as send_runtest_some([]), "
+            "including the _reschedule second assign when assigned pending <= 2."
+        ),
+    )
+    parser.add_argument("record", nargs="?", default="-", help="dump path or - for stdin")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.buffer.read().decode("utf-8")
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        record = parse_record(text, source=source)
+        result = inspect(record)
+    except (OSError, ValueError, UnicodeDecodeError) as err:
+        print(f"emptyunit: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    return 1 if result["hang_risk"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

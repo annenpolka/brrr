@@ -1,0 +1,65 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "A FRESH hit can keep an extra file that exists only as a 0-byte hashing stub",
+    "A cache keyed only by inputs can write an empty extra stub on first miss, then report FRESH when a later request asks for that extra"
+  ],
+  "established": [
+    "Host: first BUILT extra_exists True extra_bytes 0; second FRESH extra_requested True extra_bytes 0 same key 9280cc7e16e9 stub_leftover True",
+    "Owned cache_build_stub.py: first BUILT extra_requested False extra_exists True extra_bytes 0 key 9280cc7e16e9; second FRESH extra_requested True extra_exists True extra_bytes 0; same_key True; stub_leftover True"
+  ],
+  "rejected": [
+    "cachetool is not installed",
+    "Invented cachetool inspect/build transcripts and hashes are not host evidence"
+  ],
+  "constraints": [
+    "Transfer onto freshmiss; bytes NAME 0; no new binary",
+    "No cachetool. Owned two events: extra_requested vs extra_bytes vs same key. extraedge is poetry extras, not this leftover stub"
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "FRESH extra present with zero bytes is a stub leftover, not FRESH-complete",
+    "whether the extra file was produced for this request or leftover from the identity write, and which requested outputs were outside that identity"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name leftover extra stub on FRESH vs extra produced for this request",
+    "nearest_existing_operation": "extraedge / print cache key",
+    "observable_delta": "leftover_stub yes; produced_for_request no; extra_outside_identity yes",
+    "reason": "adjacent to extra identity but leftover bytes vs declared extras",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:49:44+09:00",
+      "summary": "Used owned cache_build_stub.py (good). Invented cachetool. Harvest FRESH-but-stub: extra present as leftover empty bytes. Transfer onto mutated freshmiss. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name a FRESH extra that exists only as leftover empty stub bytes",
+        "nearest_existing_operation": "freshmiss FRESH-but-missing",
+        "observable_delta": "FRESH-but-stub vs FRESH-complete",
+        "reason": "presence hid the empty leftover",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T13:59:34+09:00",
+      "summary": "Invented cachetool with fake hashes. Preserve leftover empty extra from the identity write vs extra requested on a FRESH hit. Harvest leftover stub. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name leftover extra stub on FRESH vs extra produced for this request",
+        "nearest_existing_operation": "extraedge / print cache key",
+        "observable_delta": "leftover_stub yes; produced_for_request no; extra_outside_identity yes",
+        "reason": "adjacent to extra identity but leftover bytes vs declared extras",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

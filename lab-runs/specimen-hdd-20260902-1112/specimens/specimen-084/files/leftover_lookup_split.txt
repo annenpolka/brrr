@@ -1,0 +1,33 @@
+Honest log (TestClientLookup fixtures):
+  rsc.io/sampler@v1.3.0
+    rsc.io/sampler v1.3.0 h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=
+    rsc.io/sampler v1.3.0/go.mod h1:T1hPZKmBbMNahiBKFy5HrXp6adAjACjK9JXDnKaTXpA=
+
+Case A (module is in the log):
+  Lookup("rsc.io/sampler", "v1.3.0")
+  mustLookup expects the h1 zip line above; err=nil
+
+Case B (module is not in the log; lookup URL names bad):
+  authenticated record text:
+    golang.org/x/good v1.0.0 h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=
+  signed tree note extension (after FormatTree, before signatures):
+    golang.org/x/bad v1.0.0 h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=
+  ParseRecord validates the good record via checkRecord
+  ParseTree ignores the extra line
+  Lookup prefix "golang.org/x/bad v1.0.0 " is scanned over the cache payload
+  (full HTTP body on this revision: record id + text + blank + signed note)
+
+Case C (GONOSUMDB):
+  Lookup of a matching prefix -> ErrGONOSUMDB, no lines
+
+Case D (fork):
+  Lookup -> ErrSecurity
+
+Case E (cmd/go checkSumDB over Lookup lines):
+  exact path vers h -> accept
+  other path vers h1: -> sumdbMismatch
+  no matching line -> sumdbAbsent
+
+Public #80745:
+  coordinating GOPROXY + GOSUMDB can serve module content not in the transparency log
+  affect check: rm -r go.sum go.work.sum vendor/ && go mod tidy

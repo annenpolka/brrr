@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): when an extra is requested, take Dependency objects from the extras mapping if a reused package’s requires list no longer contains them. Pair A is the fresh-inspect object; pair B is the lock-reused pruned object. Do not tell Dreamers.

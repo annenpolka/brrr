@@ -1,0 +1,24 @@
+Registry / fixture:
+  concretizer:concretization_cache enable
+  leftover spec hash after package.py change
+
+Case A (second spack spec, same package.py):
+  current cache identity
+  not leftover-after-package-change
+
+Case B (package.py flipped, leftover cache):
+  leftover: previous dag_hash / fully-finalized spec
+  package-hash recompute omitted on cache hit
+  same mo2ogtq
+
+Case C (cache disabled / spack clean -m):
+  fresh hash identity
+  not leftover previous spec
+
+Case D (store before finalization, re-finalize on hit):
+  new hash after package.py change
+  not leftover previous dag_hash
+
+Not this packet:
+  pants leftover vcs_version process cache (specimen-136)
+  rush leftover downstream phase cache (specimen-140)

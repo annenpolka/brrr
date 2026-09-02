@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""silentadd: report inserts that returned ok while a file/dir collision remained."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+
+def insert_pos(entries: list[str], name: str) -> int:
+    for i, item in enumerate(entries):
+        if item >= name:
+            return i
+    return len(entries)
+
+
+def is_ordered(entries: list[str]) -> bool:
+    return all(entries[i] <= entries[i + 1] for i in range(len(entries) - 1))
+
+
+def dir_prefix_hits(entries: list[str], name: str) -> list[str]:
+    prefix = name.rstrip("/")
+    n = len(prefix)
+    hits: list[str] = []
+    for item in entries:
+        if len(item) > n and item.startswith(prefix) and item[n] == "/":
+            hits.append(item)
+    return hits
+
+
+def same_path_hits(entries: list[str], name: str) -> list[str]:
+    """File occupying the path when NAME is a directory (trailing slash)."""
+    prefix = name.rstrip("/")
+    if name == prefix:
+        return []
+    hits: list[str] = []
+    for item in entries:
+        if item == prefix:
+            hits.append(item)
+    return hits
+
+
+def parent_file_hits(entries: list[str], name: str) -> list[str]:
+    parts = name.rstrip("/").split("/")
+    parents = ["/".join(parts[:i]) for i in range(1, len(parts))]
+    hits: list[str] = []
+    seen: set[str] = set()
+    for parent in parents:
+        for item in entries:
+            if item in seen:
+                continue
+            if item == parent:
+                hits.append(item)
+                seen.add(item)
+    return hits
+
+
+def remain_rows(entries: list[str], name: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in dir_prefix_hits(entries, name):
+        if item not in seen:
+            rows.append((item, "dir"))
+            seen.add(item)
+    for item in same_path_hits(entries, name):
+        if item not in seen:
+            kind = "dir" if item.endswith("/") else "file"
+            rows.append((item, kind))
+            seen.add(item)
+    for item in parent_file_hits(entries, name):
+        if item not in seen:
+            rows.append((item, "file"))
+            seen.add(item)
+    return rows
+
+
+def scan_dir_from(entries: list[str], name: str, start: int) -> str | None:
+    prefix = name.rstrip("/")
+    n = len(prefix)
+    if start < 0:
+        start = 0
+    for item in entries[start:]:
+        if not item.startswith(prefix):
+            return None
+        if len(item) > n and item[n] == "/":
+            return item
+    return None
+
+
+def first_hide(entries: list[str], name: str, start: int) -> str | None:
+    """First non-prefix entry that aborts the directory-prefix walk."""
+    prefix = name.rstrip("/")
+    n = len(prefix)
+    if start < 0:
+        start = 0
+    dir_hits = set(dir_prefix_hits(entries, name))
+    for item in entries[start:]:
+        if item in dir_hits:
+            return None
+        if not item.startswith(prefix):
+            return item
+        if len(item) > n and item[n] != "/":
+            continue
+    return None
+
+
+def resolve_scan_start(scan: str, pos: int) -> int:
+    if scan == "pos":
+        return pos
+    try:
+        value = int(scan)
+    except ValueError as exc:
+        raise ValueError(f"scan start must be an integer or 'pos', got {scan!r}") from exc
+    if value < 0:
+        raise ValueError(f"scan start must be >= 0, got {value}")
+    return value
+
+
+def inspect(entries: list[str], name: str, scan: str = "0") -> dict:
+    pos = insert_pos(entries, name)
+    start = resolve_scan_start(scan, pos)
+    remain = remain_rows(entries, name)
+    dir_hit = scan_dir_from(entries, name, start)
+    parent_hit = parent_file_hits(entries, name)
+    same_hit = same_path_hits(entries, name)
+    add_ok = dir_hit is None and not parent_hit and not same_hit
+    collision = bool(remain)
+    return {
+        "name": name,
+        "entries": list(entries),
+        "insert_pos": pos,
+        "scan_start": start,
+        "ordered": "yes" if is_ordered(entries) else "no",
+        "add": "ok" if add_ok else "fail",
+        "collision": "present" if collision else "absent",
+        "remain": remain,
+        "hide": first_hide(entries, name, start),
+        "scan0": "hit" if scan_dir_from(entries, name, 0) else "miss",
+        "scan_pos": "hit" if scan_dir_from(entries, name, pos) else "miss",
+        "silent": "yes" if add_ok and collision else "no",
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [f"name\t{result['name']}"]
+    if result["entries"]:
+        lines.append("index\t" + "\t".join(result["entries"]))
+    else:
+        lines.append("index\tnone")
+    lines.append(f"insert_pos\t{result['insert_pos']}")
+    lines.append(f"scan_start\t{result['scan_start']}")
+    lines.append(f"ordered\t{result['ordered']}")
+    lines.append(f"add\t{result['add']}")
+    lines.append(f"collision\t{result['collision']}")
+    if result["remain"]:
+        for entry, kind in result["remain"]:
+            lines.append(f"remain\t{entry}\t{kind}")
+    else:
+        lines.append("remain\tnone")
+    lines.append(f"hide\t{result['hide'] or 'none'}")
+    lines.append(f"scan0\t{result['scan0']}")
+    lines.append(f"scan_pos\t{result['scan_pos']}")
+    lines.append(f"silent\t{result['silent']}")
+    return "\n".join(lines) + "\n"
+
+
+def read_entries_file(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    return parse_entries_text(text)
+
+
+def parse_entries_text(text: str) -> list[str]:
+    entries: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append(line)
+    return entries
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="silentadd",
+        description=(
+            "Report an insert that returned ok while a file/dir collision "
+            "remained, including scan start."
+        ),
+    )
+    parser.add_argument("name", metavar="NAME", help="path being inserted")
+    parser.add_argument(
+        "entries",
+        metavar="ENTRY",
+        nargs="*",
+        help="ordered index entries (paths)",
+    )
+    parser.add_argument(
+        "--file",
+        dest="file",
+        metavar="PATH",
+        help="read entries, one per line (# comments and blanks skipped)",
+    )
+    parser.add_argument(
+        "--scan",
+        default="0",
+        metavar="START",
+        help="collision scan start: integer, or 'pos' for insertion position (default 0)",
+    )
+    return parser.parse_args(argv)
+
+
+def load_entries(args: argparse.Namespace) -> list[str]:
+    if args.file is not None and args.entries:
+        raise ValueError("pass entries as arguments or --file, not both")
+    if args.file is not None:
+        return read_entries_file(args.file)
+    if args.entries:
+        return list(args.entries)
+    if sys.stdin.isatty():
+        raise ValueError("no entries given (pass ENTRY... or --file PATH)")
+    return parse_entries_text(sys.stdin.read())
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        entries = load_entries(args)
+        result = inspect(entries, args.name, scan=args.scan)
+    except ValueError as err:
+        print(f"silentadd: {err}", file=sys.stderr)
+        return 2
+    except OSError as err:
+        print(f"silentadd: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

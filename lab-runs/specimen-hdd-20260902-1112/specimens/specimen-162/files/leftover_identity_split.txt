@@ -1,0 +1,25 @@
+Registry / fixture:
+  direnv use_nix values_to_restore
+  leftover NIX_ATTRS_* paths after leaving the nix shell
+
+Case A (still inside structuredAttrs nix shell):
+  current path identity
+  not leftover-after-leave
+
+Case B (after leave / nested non-pure, leftover paths):
+  leftover: previous NIX_ATTRS_* paths
+  names omitted from the restore/unset map
+
+Case C (never entered use_nix):
+  unset identity
+  not leftover previous paths
+
+Case D (names listed in values_to_restore):
+  unset after leave
+  not leftover previous paths
+
+Not this packet:
+  local-fixture env-empty-vs-unset (specimen-010)
+  compose listed-without-equals (specimen-149)
+  systemd empty :: cwd (specimen-150)
+  vcpkg Windows sz==0 JOIN (specimen-158)

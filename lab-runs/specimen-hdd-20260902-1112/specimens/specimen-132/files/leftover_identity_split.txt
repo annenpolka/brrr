@@ -1,0 +1,25 @@
+Registry / fixture:
+  eslint --cache with eslint-plugin-react 7.37.1
+  leftover .eslintcache after upgrade to 7.37.7
+
+Case A (second lint, same plugin version):
+  current cache identity
+  not leftover-after-plugin-upgrade
+
+Case B (plugin upgrade, leftover cache):
+  leftover: previous plugin version results
+  plugin name@version omitted from serialized config
+  new-rule offenses not reported
+
+Case C (delete .eslintcache):
+  fresh cache identity
+  not leftover previous plugin
+
+Case D (plugin meta in serialized config):
+  cache miss after upgrade
+  not leftover previous plugin results
+
+Not this packet:
+  ruff leftover cache vs nested pyproject (specimen-114)
+  pytest leftover cache-dir supporting files (specimen-107)
+  dart leftover package_config missing workspace member (specimen-128)

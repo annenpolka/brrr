@@ -1,0 +1,94 @@
+{
+  "iteration": 2,
+  "preserve": [
+    "A child can treat CTRL-C as a clean exit 0 outside the session runner",
+    "The same CTRL-C under the session runner can make the session exit 130",
+    "Parent interrupt and child interrupt can produce different session outcomes",
+    "Parent interrupt and child interrupt can disagree about session outcome"
+  ],
+  "established": [
+    "Packet: nox -s app Interrupted... / Session interrupted; Nox exits 130; child flask run exits 0 when started outside Nox",
+    "Packet: nox child process termination",
+    "Packet: nox child termination"
+  ],
+  "rejected": [
+    "pstree PIDs, kill experiments, and CHILD EXIT STATUS 143 were not captured on this host",
+    "A recommended SIGTERM-before-wait patch is not specimen evidence",
+    "pstree PIDs and flask run logs are Dreamer-generated",
+    "Invented child_ignore_sigint scripts are not host evidence until owned"
+  ],
+  "constraints": [
+    "No flask/nox checkout required",
+    "An owned parent/child interrupt fixture is the world",
+    "No nox/flask",
+    "subprocess Popen fixture only",
+    "Ground with subprocess Popen fixture"
+  ],
+  "open_questions": [],
+  "human_pressure": [
+    "No nox. Continue on a subprocess that ignores SIGINT vs one that does not. Did wait look at the child?"
+  ],
+  "harvest_candidates": [
+    "Ask whether the child exited successfully, which signal the parent sent after interrupt, and why session status disagrees",
+    "Did wait look at the child, or only at the parent's signal?",
+    "Did wait look at the child or only at the parent signal"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "distinguish parent-signal abort from child-observed exit",
+    "nearest_existing_operation": "ps and wait",
+    "observable_delta": "names who was observed",
+    "reason": "exit 130 conflates those cases",
+    "iteration": 2
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:19:41+09:00",
+      "summary": "Preserve child-vs-session interrupt disagreement. Invented nox/flask/pstree runs, CHILD EXIT STATUS 143, and a terminate-before-wait patch are Dreamer-generated. Harvest the signal/status question. Do not ask for more novelty.",
+      "pressure": [
+        "There is no live flask app. Continue only on an owned parent/child interrupt fixture."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "for a session interrupt, report child exit, parent-sent signal, and session status as three labeled facts",
+        "nearest_existing_operation": "echo $? after nox plus a standalone child run",
+        "observable_delta": "one query that treats the three-status disagreement as the object",
+        "reason": "130 looks like the whole tree failed; the remainder is the child's own exit",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:21:11+09:00",
+      "summary": "Preserve whether a parent wait observed the child or only its own signal. pstree/kill transcripts unverified. Adjacent to k8s wait semantics. Continue on owned subprocess fixture.",
+      "pressure": [
+        "No nox. Continue on a subprocess that ignores SIGINT vs one that does not."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "distinguish parent-signal abort from child-observed exit",
+        "nearest_existing_operation": "ps and wait",
+        "observable_delta": "names who was observed",
+        "reason": "exit 130 conflates those cases",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 2,
+      "at": "2026-09-02T12:27:26+09:00",
+      "summary": "Turn 2 invents parent_test.py. Harvest parent-signal vs child-observed exit. Stop.",
+      "pressure": [],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "distinguish parent-signal abort from child-observed exit",
+        "nearest_existing_operation": "ps and wait",
+        "observable_delta": "names who was observed",
+        "reason": "exit 130 conflates those cases",
+        "iteration": 2
+      }
+    }
+  ],
+  "last_pressure": [],
+  "pending": null
+}

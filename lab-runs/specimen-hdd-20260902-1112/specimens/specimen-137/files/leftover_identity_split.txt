@@ -1,0 +1,25 @@
+Registry / fixture:
+  --disallow-untyped-calls --untyped-calls-exclude
+  leftover .mypy_cache after exclude string change
+
+Case A (second mypy, same exclude):
+  current cache identity
+  not leftover-after-exclude-change
+
+Case B (exclude flipped Super -> bug -> Super, leftover cache):
+  leftover: previous success identity
+  untyped_calls_exclude omitted from OPTIONS_AFFECTING_CACHE
+  Super-exclude stays success
+
+Case C (rmdir .mypy_cache):
+  fresh cache identity
+  Super-exclude errors
+
+Case D (untyped_calls_exclude in OPTIONS_AFFECTING_CACHE):
+  cache miss after exclude change
+  not leftover previous success
+
+Not this packet:
+  mypy leftover sentinels (specimen-067)
+  rustc incremental (specimen-075)
+  pants vcs_version process cache (specimen-136)

@@ -1,0 +1,30 @@
+State instance (all cases unless noted):
+  aws_instance.web
+  AttrsJSON: {"id":"foo","foo":"bar"}
+  IdentitySchemaVersion: 0
+  IdentityJSON: {"id": "foo"}
+  Status: ready
+
+providers.Schema case A (no resource identity on current provider):
+  Body: aws_instance { id computed string, foo optional/computed string }
+  Identity: nil
+  IdentityVersion: 0
+
+providers.Schema case B (identity schema present):
+  Body: same as A
+  Identity: Object { id required string, NestingSingle }
+  IdentityVersion: 0
+
+providers.Schema case C:
+  same as A, but IdentityJSON is nil / empty
+
+In-tree refresh subtests on failing_ref (all use case-B-like IdentityTypes):
+  "no previous identity": IdentityJSON empty + identity schema with id
+    -> after refresh-only plan, identity {id: "foo"}
+  "identity type mismatch": IdentityJSON {"arn":"foo"} + identity schema with only id
+    -> failed to decode identity: unsupported attribute "arn"...
+
+Decode on failing_ref, leftover IdentityJSON vs case A:
+  takes IdentityJSON != nil branch
+  calls schema.Identity.ImpliedType()
+  Object.specType on nil receiver returns cty.EmptyObject

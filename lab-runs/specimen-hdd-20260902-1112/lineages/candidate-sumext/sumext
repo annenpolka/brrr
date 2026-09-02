@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""sumext: leftover go.sum identity in tree-note extension vs authenticated record."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("record", "extension")
+
+
+def parse_payload(text: str, *, source: str) -> dict[str, list[tuple[str, str]]]:
+    """Return {record, extension} lists of (module, version). Hashes are not identity."""
+    out: dict[str, list[tuple[str, str]]] = {"record": [], "extension": []}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected region<TAB>module<TAB>version")
+        parts = line.split("\t")
+        if len(parts) < 3:
+            raise ValueError(f"{source}:{lineno}: expected region<TAB>module<TAB>version")
+        region, module, version = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if region not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown region {region!r}")
+        if not module or not version or module == "-" or version == "-":
+            raise ValueError(f"{source}:{lineno}: not a legal NAME")
+        out[region].append((module, version))
+    return out
+
+
+def inspect(payload: dict[str, list[tuple[str, str]]], module: str, version: str) -> dict:
+    key = (module, version)
+    in_record = key in payload["record"]
+    in_extension = key in payload["extension"]
+    leftover = in_extension and not in_record
+    return {
+        "module": module,
+        "version": version,
+        "in_record": in_record,
+        "in_extension": in_extension,
+        "leftover_identity": leftover,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"module\t{result['module']}",
+        f"version\t{result['version']}",
+        f"in_record\t{yn(result['in_record'])}",
+        f"in_extension\t{yn(result['in_extension'])}",
+        f"leftover_identity\t{yn(result['leftover_identity'])}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="sumext",
+        description=(
+            "Name whether a module version's go.sum line is leftover in an "
+            "unauthenticated tree-note extension, or present in the authenticated record. "
+            "grep of the path hits both regions in a raw lookup body."
+        ),
+    )
+    parser.add_argument("payload")
+    parser.add_argument("--module", required=True)
+    parser.add_argument("--version", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.payload == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.payload).read_text(encoding="utf-8")
+            source = args.payload
+        payload = parse_payload(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"sumext: {err}", file=sys.stderr)
+        return 1
+    result = inspect(payload, args.module, args.version)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_identity"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

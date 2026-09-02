@@ -1,0 +1,25 @@
+Registry / fixture:
+  tasks:
+    build-*:
+      method: checksum
+  leftover .task/checksum from build-foo
+
+Case A (first build-foo):
+  checksum written for template name
+  not leftover yet
+
+Case B (later build-bar, leftover foo checksum):
+  leftover: up-to-date identity of foo
+  MATCH bar omitted
+
+Case C (non-wildcard build):
+  unique key
+  not this leftover
+
+Case D (delete .task/checksum):
+  fresh identity
+  not leftover fingerprint
+
+Not this packet:
+  gradle compiler fingerprints (specimen-076/088/104)
+  pants leftover fingerprint (no merged pair)

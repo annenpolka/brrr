@@ -1,0 +1,1 @@
+- libgit2 cannot be rebuilt here. A sorted path-list fixture of the same file/dir collision is present. Use the same tool. Show why add reported ok and which entries still collide when the scan does not start at zero. Do not apply a known C patch.

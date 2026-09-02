@@ -1,0 +1,26 @@
+Registry / fixture:
+  orig/ java-library with .gradle/configuration-cache
+  copy/ of orig including CC
+  leftover named source files orig/lib/src/main/java/...
+
+Case A (second assemble in orig):
+  same location
+  not leftover-after-relocate
+
+Case B (assemble in copy, leftover CC):
+  leftover: named-file absolute paths from orig
+  build location omitted from CC identity
+  UP-TO-DATE on leftover orig files
+
+Case C (delete copy/.gradle/configuration-cache):
+  fresh CC identity
+  not leftover named files
+
+Case D (location in CC identity):
+  cannot be reused because location changed
+  not leftover named-file paths
+
+Not this packet:
+  named FileCollection leftover root base dir (specimen-104)
+  fileTree query observation omitted (specimen-088)
+  earthly leftover CACHE --id (specimen-123/124)

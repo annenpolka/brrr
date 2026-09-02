@@ -1,0 +1,14 @@
+# TASK
+
+CI checks out a merge commit (detached HEAD) and evaluates `builtins.fetchGit` with a pinned `rev`. Fetch fails with a `narHash` mismatch. The log first says it could not read HEAD and used `master`.
+
+```
+warning: could not read HEAD ref from repo at '/workspace/build/buildkite', using 'master'
+error:
+       … while fetching the input 'git+file:///workspace/build/buildkite?rev=e374a4ebd0dbf7b23e077a94fd5cefb7a9d65ffa'
+       error: mismatch in field 'narHash' of input '{...,"narHash":"sha256-UEzJabo6ObaQc0Rc5XJOf43NR5Rp3e0WwpWi55c79R8=","rev":"e374a4ebd0dbf7b23e077a94fd5cefb7a9d65ffa",...}', got '{...,"narHash":"sha256-q2mgMIPLqHSx0pSEJ42rrZpYxcjkgL1U1UvCTHTw+Oo=","ref":"master","rev":"e374a4ebd0dbf7b23e077a94fd5cefb7a9d65ffa",...}'
+```
+
+The two records share `rev` and `lastModified` and `revCount`. They disagree on `narHash` and on whether `ref` is present.
+
+The developer wants to know which ref the fetcher actually resolved for a fully pinned revision, and how that ref changed the tree that was hashed.

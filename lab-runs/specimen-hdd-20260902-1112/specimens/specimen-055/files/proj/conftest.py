@@ -1,0 +1,1 @@
+helper = 'from-rootdir-conftest'

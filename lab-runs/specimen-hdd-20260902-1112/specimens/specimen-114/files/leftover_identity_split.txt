@@ -1,0 +1,24 @@
+Registry / fixture:
+  nested baz/pyproject.toml ignore F821
+  leftover ruff cache after commenting ignore
+
+Case A (ruff clean, nested ignore present):
+  no diagnostics
+  no leftover
+
+Case B (nested ignore commented, leftover cache):
+  leftover: t2.py still ignored
+  t3.py may report
+
+Case C (--no-cache after nested change):
+  t2.py and t3.py
+  current nested identity
+
+Case D (ruff clean then check):
+  fresh identity
+  not leftover cache
+
+Not this packet:
+  pytest assertion/collection/fixture (specimen-001/002/003)
+  pytest leftover cache-dir without gitignore (specimen-107)
+  ruff#1589 flake8-pytest-style hash (different leftover)

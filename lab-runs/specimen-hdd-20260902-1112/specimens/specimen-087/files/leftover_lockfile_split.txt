@@ -1,0 +1,30 @@
+Selector: is-positive@1.0.0
+Patch file: patches/is-positive@1.0.0.patch
+Hash: <patchFileHash> from createHexHashFromFile
+
+Case A (parent 60d3a328bc047c211f75936d54003323ee7ee245 write):
+  patchedDependencies:
+    is-positive@1.0.0:
+      path: patches/is-positive@1.0.0.patch
+      hash: <patchFileHash>
+  in-tree patch.ts expects that object
+  snapshot: is-positive@1.0.0(patch_hash=${patchFileHash})
+
+Case B (223b9b2e993fcd8766fb0681fc03a349462f1916 write):
+  patchedDependencies:
+    is-positive@1.0.0: <patchFileHash>
+  in-tree patch.ts expects the bare string
+  PatchFile type gone; PatchInfo is { hash: string }
+
+Case C (223b9b2 read of case A yaml):
+  convertToLockfileObject spreads rest.patchedDependencies
+  no rewrite of { path, hash } values to strings
+  groupPatchedDependencies: const hash = patchedDependencies[key]
+  getOutdatedLockfileSetting ramda.equals leftover object vs current hash strings
+
+Case D:
+  selector omitted from patchedDependencies; patch file still on disk
+
+Not this identity:
+  #4961 / PR 4969 — hash of patch-file bytes, CRLF vs LF, same object shape
+  #8366 — merger drops the whole patchedDependencies field

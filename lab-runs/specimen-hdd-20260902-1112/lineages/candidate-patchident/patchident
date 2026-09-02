@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""patchident: name patchedDependencies identity (object vs hash-only vs empty vs omitted)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+EMPTY = "-"
+
+
+def parse_lock(text: str, *, source: str) -> dict[str, dict]:
+    """Map selector -> {shape, path, hash} from a tiny patchedDependencies YAML excerpt."""
+    entries: dict[str, dict] = {}
+    in_block = False
+    current: str | None = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        if raw.startswith("patchedDependencies:"):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if raw.startswith(" ") and current is not None:
+            line = raw.strip()
+            if ":" not in line:
+                raise ValueError(f"{source}:{lineno}: expected path/hash field")
+            key, _, rest = line.partition(":")
+            val = rest.strip().strip('"').strip("'")
+            key = key.strip()
+            if key == "path":
+                entries[current]["path"] = val
+                entries[current]["shape"] = "object"
+            elif key == "hash":
+                entries[current]["hash"] = val
+                entries[current]["shape"] = "object"
+            else:
+                raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+            continue
+        line = raw.strip()
+        if ":" not in line:
+            raise ValueError(f"{source}:{lineno}: expected selector: value")
+        sel, _, rest = line.partition(":")
+        sel = sel.strip()
+        val = rest.strip().strip('"').strip("'")
+        if not sel or sel == EMPTY:
+            raise ValueError(f"{source}:{lineno}: not a legal NAME")
+        current = sel
+        if val == "":
+            entries[sel] = {"shape": "empty", "path": "", "hash": ""}
+        else:
+            entries[sel] = {"shape": "string", "path": "", "hash": val}
+    return entries
+
+
+def inspect(entries: dict[str, dict], selector: str) -> dict:
+    rec = entries.get(selector)
+    if rec is None:
+        identity = "omitted"
+        path = ""
+        hash_v = ""
+        shape = "omitted"
+        legacy = ""
+    else:
+        shape = rec["shape"]
+        path = rec.get("path") or ""
+        hash_v = rec.get("hash") or ""
+        if shape == "object":
+            identity = "object"
+            legacy = hash_v
+        elif shape == "empty" or hash_v == "":
+            identity = "empty"
+            legacy = ""
+        else:
+            identity = "hash-only"
+            legacy = ""  # originalPatchFile?.hash on a string
+    return {
+        "selector": selector,
+        "identity": identity,
+        "shape": shape,
+        "path": path or EMPTY,
+        "hash": hash_v or EMPTY,
+        "legacy_dot_hash": legacy or EMPTY,
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"selector\t{result['selector']}",
+        f"identity\t{result['identity']}",
+        f"shape\t{result['shape']}",
+        f"path\t{result['path']}",
+        f"hash\t{result['hash']}",
+        f"legacy_dot_hash\t{result['legacy_dot_hash']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="patchident",
+        description=(
+            "Name which identity a patchedDependencies selector has: "
+            "path+hash object, hash-only string, empty, or omitted. "
+            "legacy_dot_hash is empty on a string (the .hash miss)."
+        ),
+    )
+    parser.add_argument("lockfile")
+    parser.add_argument("--selector", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.lockfile == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.lockfile).read_text(encoding="utf-8")
+            source = args.lockfile
+        entries = parse_lock(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"patchident: {err}", file=sys.stderr)
+        return 1
+    result = inspect(entries, args.selector)
+    sys.stdout.write(format_report(result))
+    return 0 if result["identity"] == "object" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,421 @@
+
+===== OWNED 003 =====
+-- 003-collect.rec rc=0
+paths	dir1	dir2	dir1
+nodes	n1	n2	n3
+dup_path	dir1	nodes	n1	n3	same_node	no
+shared_node	none
+miss	shared_fixture	lookup	n3	bound_to	n1	found	no	unbound	yes
+replica_eq=True
+
+===== UNSEEN same-node twice =====
+-- unseen-collect.rec rc=0
+paths	pkg/tests	pkg/tests
+nodes	a	a
+dup_path	pkg/tests	nodes	a	same_node	yes
+shared_node	none
+miss	none
+replica_eq=True
+
+===== KILL leftover (1): found lookup never registered =====
+-- unbound-found rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	none	found	yes	unbound	yes
+replica_eq=True
+still_miss_none=False has_miss_row=True unbound_yes=True rc=0
+
+===== KILL leftover (1b): harvest shape with found bit flipped =====
+-- found-on-later-node rc=0
+paths	d	d
+nodes	n1	n3
+dup_path	d	nodes	n1	n3	same_node	no
+shared_node	none
+miss	fx	lookup	n3	bound_to	n1	found	yes	unbound	yes
+replica_eq=True
+flipped-found still_miss_none=False rc=0
+
+===== KILL leftover (2): two paths, one node id =====
+-- two-paths-one-node rc=0
+paths	a	b
+nodes	n1	n1
+dup_path	none
+shared_node	n1	paths	a	b
+miss	none
+replica_eq=True
+dup_path_none=True shared_node_none=False has_shared_n1=True rc=0
+
+===== KILL leftover (7): miss still rc=0, no --check =====
+owned miss rc=0
+--check rc=2 stderr='usage: pathnode [-h] [RECORD]\npathnode: error: unrecognized arguments: --check'
+unbound-found rc=0
+
+===== labeled-missing-but-bound (caller lie) =====
+-- caller-lie-missing-but-bound rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	n1	found	no	unbound	no
+replica_eq=True
+still formatted as miss rc=0
+
+===== path identity ./dir1 vs dir1 =====
+-- dir1-vs-dot-dir1 rc=0
+paths	dir1	./dir1
+nodes	n1	n3
+dup_path	none
+shared_node	none
+miss	fx	lookup	n3	bound_to	n1	found	no	unbound	yes
+replica_eq=True
+dup_path_none=False
+
+===== path identity dir1 vs dir1/ =====
+-- dir1-vs-dir1-slash rc=0
+paths	dir1	dir1/
+nodes	n1	n3
+dup_path	none
+shared_node	none
+miss	fx	lookup	n3	bound_to	n1	found	no	unbound	yes
+replica_eq=True
+
+===== leading space path =====
+-- leading-space rc=0
+paths	 dir1	dir1
+nodes	n1	n3
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== n1 vs N1 =====
+-- n1-vs-N1 rc=0
+paths	dir1	dir1
+nodes	n1	N1
+dup_path	dir1	nodes	n1	N1	same_node	no
+shared_node	none
+miss	none
+replica_eq=True
+
+===== empty tab fields slide =====
+-- empty-node-then-n99 rc=0
+paths	dir1
+nodes	n99
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+node became n99? False rc=0
+-- double-empty-then-n99 rc=0
+paths	dir1
+nodes	n99
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+-- extra-collect-field rc=0
+paths	dir1
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+-- extra-lookup-field rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	none	found	no	unbound	yes
+replica_eq=True
+
+===== newline in path =====
+-- newline-in-path rc=1
+STDERR: pathnode: <stdin>:1: collect needs path, node
+
+===== ghost register =====
+-- ghost-register rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	n99	found	no	unbound	yes
+replica_eq=True
+ghost rc=0
+
+===== ghost lookup never collected never registered =====
+-- ghost-lookup rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n3	bound_to	none	found	no	unbound	yes
+replica_eq=True
+
+===== no register, lookup missing =====
+-- no-register-missing rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	none	found	no	unbound	yes
+replica_eq=True
+
+===== register no lookup =====
+-- register-no-lookup rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== duplicate register fx on n1 then n3, lookup n3 missing =====
+-- dup-register rc=0
+paths	d	d
+nodes	n1	n3
+dup_path	d	nodes	n1	n3	same_node	no
+shared_node	none
+miss	fx	lookup	n3	bound_to	n1	n3	found	no	unbound	no
+replica_eq=True
+
+===== none-as-fixture =====
+-- fixture-named-none rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none	lookup	n1	bound_to	none	found	no	unbound	yes
+replica_eq=True
+
+===== path named none, two nodes =====
+-- path-named-none rc=0
+paths	none	none
+nodes	n1	n2
+dup_path	none	nodes	n1	n2	same_node	no
+shared_node	none
+miss	none
+replica_eq=True
+
+===== harvest without lookup missing row (only n1 found) =====
+-- harvest-without-n3-lookup rc=0
+paths	dir1	dir2	dir1
+nodes	n1	n2	n3
+dup_path	dir1	nodes	n1	n3	same_node	no
+shared_node	none
+miss	none
+replica_eq=True
+If miss none here, harvest miss still requires caller lookup on n3
+
+===== NUL in path =====
+-- nul-in-path rc=0
+paths	d\x00x	d
+nodes	n1	n3
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== YES/true/FALSE/miss/maybe =====
+token='YES' rc=0 last=miss	none
+token='true' rc=0 last=miss	none
+token='FALSE' rc=0 last=miss	fx	lookup	n1	bound_to	n1	found	no	unbound	no
+token='miss' rc=0 last=miss	fx	lookup	n1	bound_to	n1	found	no	unbound	no
+token='maybe' rc=1 last=pathnode: <stdin>:3: lookup result must be found|missing, got 'maybe'
+token='Found' rc=0 last=miss	none
+token='MISSING' rc=0 last=miss	fx	lookup	n1	bound_to	n1	found	no	unbound	no
+
+===== BOM =====
+-- utf8-bom rc=1
+STDERR: pathnode: <stdin>:1: unknown field '\ufeffcollect'
+
+===== CRLF =====
+-- crlf rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== comments and blanks =====
+-- comments rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== empty stdin /dev/null =====
+-- dev-null rc=1
+STDERR: pathnode: /dev/null: missing collect
+
+===== missing path =====
+-- missing-file rc=1
+STDERR: pathnode: [Errno 2] No such file or directory: '/no/such/pathnode.rec'
+
+===== directory as record =====
+-- directory rc=1
+STDERR: pathnode: [Errno 21] Is a directory: '/Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260902-1112/lineages/candidate-pathnode/fixtures'
+
+===== two positional =====
+-- two-args rc=2
+STDERR: usage: pathnode [-h] [RECORD]
+pathnode: error: unrecognized arguments: b
+
+===== JSON object =====
+-- json rc=1
+STDERR: pathnode: <stdin>:1: expected key<TAB>value
+
+===== dash as RECORD =====
+-- dash-record rc=1
+STDERR: pathnode: [Errno 2] No such file or directory: '-'
+
+===== spaces in path / unicode =====
+-- space-and-unicode rc=0
+paths	my dir	テスト
+nodes	n1	n2
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== FIFO =====
+-- fifo rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== symlink =====
+-- symlink rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== filename with space =====
+-- space-filename rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== process substitution equivalent (python pipe) =====
+-- stdin rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	none
+replica_eq=True
+
+===== three collects dir1 as n1 n2 n3 =====
+-- three-nodes rc=0
+paths	dir1	dir1	dir1
+nodes	n1	n2	n3
+dup_path	dir1	nodes	n1	n2	n3	same_node	no
+shared_node	none
+miss	none
+replica_eq=True
+
+===== crossed fixtures =====
+-- crossed rc=0
+paths	a	b
+nodes	n1	n3
+dup_path	none
+shared_node	none
+miss	fx	lookup	n3	bound_to	n1	found	no	unbound	yes
+miss	other	lookup	n1	bound_to	n3	found	no	unbound	yes
+replica_eq=True
+
+===== duplicate register same node uniqued =====
+-- dup-register-same-node rc=0
+paths	d
+nodes	n1
+dup_path	none
+shared_node	none
+miss	fx	lookup	n1	bound_to	n1	found	no	unbound	no
+replica_eq=True
+
+===== shared_node plus dup_path together =====
+-- shared-and-dup rc=0
+paths	a	b	a
+nodes	n1	n1	n2
+dup_path	a	nodes	n1	n2	same_node	no
+shared_node	n1	paths	a	b
+miss	none
+replica_eq=True
+
+===== 2000-char not needed; modest huge path =====
+huge-path rc=0 stdout_bytes=6082 has_dup=True
+huge replica_eq=True
+
+===== REPLICA GRID =====
+GRID 003: stdout_eq=True rc_eq=True rc=0
+GRID unseen: stdout_eq=True rc_eq=True rc=0
+GRID unbound-found: stdout_eq=True rc_eq=True rc=0
+GRID flip-found: stdout_eq=True rc_eq=True rc=0
+GRID two-paths: stdout_eq=True rc_eq=True rc=0
+GRID lie: stdout_eq=True rc_eq=True rc=0
+GRID dot: stdout_eq=True rc_eq=True rc=0
+GRID slash: stdout_eq=True rc_eq=True rc=0
+GRID empty-tab: stdout_eq=True rc_eq=True rc=0
+GRID ghost-reg: stdout_eq=True rc_eq=True rc=0
+GRID ghost-lu: stdout_eq=True rc_eq=True rc=0
+GRID none-fx: stdout_eq=True rc_eq=True rc=0
+GRID none-path: stdout_eq=True rc_eq=True rc=0
+GRID no-lu: stdout_eq=True rc_eq=True rc=0
+GRID harvest-no-n3: stdout_eq=True rc_eq=True rc=0
+GRID single: stdout_eq=True rc_eq=True rc=0
+GRID space: stdout_eq=True rc_eq=True rc=0
+GRID jp: stdout_eq=True rc_eq=True rc=0
+GRID three: stdout_eq=True rc_eq=True rc=0
+GRID crossed: stdout_eq=True rc_eq=True rc=0
+GRID dup-reg: stdout_eq=True rc_eq=True rc=0
+GRID same-reg: stdout_eq=True rc_eq=True rc=0
+GRID shared-dup: stdout_eq=True rc_eq=True rc=0
+GRID crlf: stdout_eq=True rc_eq=True rc=0
+GRID comment: stdout_eq=True rc_eq=True rc=0
+GRID lead-space: stdout_eq=True rc_eq=True rc=0
+GRID case-node: stdout_eq=True rc_eq=True rc=0
+GRID extra-col: stdout_eq=True rc_eq=True rc=0
+GRID extra-lu: stdout_eq=True rc_eq=True rc=0
+GRID nul: stdout_eq=True rc_eq=True rc=0
+GRID double-empty: stdout_eq=True rc_eq=True rc=0
+GRID yes-token: stdout_eq=True rc_eq=True rc=0
+GRID false-token: stdout_eq=True rc_eq=True rc=0
+GRID unbound-missing: stdout_eq=True rc_eq=True rc=0
+GRID found-bound: stdout_eq=True rc_eq=True rc=0
+GRID two-fx-one-node: stdout_eq=True rc_eq=True rc=0
+GRID unbound-other-fx: stdout_eq=True rc_eq=True rc=0
+GRID same-path-same-node: stdout_eq=True rc_eq=True rc=0
+GRID shared-three-paths: stdout_eq=True rc_eq=True rc=0
+GRID register-order: stdout_eq=True rc_eq=True rc=0
+
+===== ERROR GRID (replica should also fail parse; CLI rc=1) =====
+ERR empty: cli_rc=1 replica_raises=True match=True
+ERR json: cli_rc=1 replica_raises=True match=True
+ERR incomplete-collect: cli_rc=1 replica_raises=True match=True
+ERR incomplete-lookup: cli_rc=1 replica_raises=True match=True
+ERR maybe: cli_rc=1 replica_raises=True match=True
+ERR unknown: cli_rc=1 replica_raises=True match=True
+ERR no-tab: cli_rc=1 replica_raises=True match=True
+ERR hash-only: cli_rc=1 replica_raises=True match=True
+ERR register-only: cli_rc=1 replica_raises=True match=True
+
+===== HONOR-KILL CHECKLIST =====
+1 found-never-registered still miss none: still=False  (still miss none (not unbound/miss))
+2 two-paths-one-node still no shared_node: still=False  (still dup_path none / no shared_node)
+7 miss still always rc=0 no --check: still=True  (miss rc=0 and --check unrecognized)
+
+replica_grid_ok=41 replica_grid_fail=0 err_grid_match=9/9
+DONE

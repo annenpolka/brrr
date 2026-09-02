@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""bindpath: for a name, show the import path and the body that would run."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib
+import inspect
+import os
+import sys
+from dataclasses import dataclass
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"bindpath: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+@dataclass
+class Bound:
+    module: str
+    name: str
+    obj: object
+    kind: str
+    runs: str
+    file: str
+    line: int
+    source: str
+
+    @property
+    def bind(self) -> str:
+        return f"{self.module}.{self.name}"
+
+    @property
+    def import_stmt(self) -> str:
+        return f"from {self.module} import {self.name}"
+
+
+def iter_py_files(root: str):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames if d != "__pycache__" and not d.startswith(".")
+        ]
+        for filename in filenames:
+            if filename.endswith(".py"):
+                yield os.path.join(dirpath, filename)
+
+
+def module_name_for(root: str, path: str) -> str | None:
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except ValueError:
+        return None
+    if rel.startswith(".."):
+        return None
+    if not rel.endswith(".py"):
+        return None
+    rel = rel[: -len(".py")]
+    parts = rel.split(os.sep)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts or parts == ["."]:
+        return None
+    if not all(part.isidentifier() for part in parts):
+        return None
+    return ".".join(parts)
+
+
+def _assigns_name(target: ast.AST, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_assigns_name(elt, name) for elt in target.elts)
+    return False
+
+
+def module_level_binds(tree: ast.AST, name: str) -> bool:
+    """True when `name` is bound at module level (def, assign, or from-import)."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return True
+        elif isinstance(node, ast.Assign):
+            if any(_assigns_name(t, name) for t in node.targets):
+                return True
+        elif isinstance(node, ast.AnnAssign):
+            if _assigns_name(node.target, name):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                if local == name:
+                    return True
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                if local == name:
+                    return True
+    return False
+
+
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        left = _dotted(node.value)
+        if left is None:
+            return None
+        return f"{left}.{node.attr}"
+    return None
+
+
+class FileUseCollector(ast.NodeVisitor):
+    """Imports and module.NAME uses that would bind `name` from PATH."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.aliases: dict[str, str] = {}
+        self.modules: list[str] = []
+
+    def _add(self, module: str) -> None:
+        if module and module not in self.modules:
+            self.modules.append(module)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.asname:
+                self.aliases[alias.asname] = alias.name
+            else:
+                self.aliases[alias.name] = alias.name
+                top = alias.name.split(".")[0]
+                self.aliases.setdefault(top, top)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if not node.module or node.level:
+            self.generic_visit(node)
+            return
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            local = alias.asname or alias.name
+            if alias.name == self.name or local == self.name:
+                self._add(node.module)
+            self.aliases[local] = f"{node.module}.{alias.name}"
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == self.name:
+            dotted = _dotted(node.value)
+            if dotted is not None:
+                self._add(self.aliases.get(dotted, dotted))
+        self.generic_visit(node)
+
+
+def uses_in_file(path: str, name: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        die(f"file not found: {path}")
+    except IsADirectoryError:
+        die(f"is a directory: {path}")
+    except UnicodeDecodeError:
+        die(f"not utf-8: {path}")
+    except OSError as err:
+        die(f"cannot read {path}: {err.strerror or err}")
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as err:
+        die(f"syntax error in {path}: {err.msg}")
+    collector = FileUseCollector(name)
+    collector.visit(tree)
+    return collector.modules
+
+
+def parse_from_import(stmt: str) -> tuple[str, str]:
+    try:
+        tree = ast.parse(stmt)
+    except SyntaxError:
+        die(f"not an import statement: {stmt}")
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.ImportFrom):
+        die(f'expected "from MODULE import NAME", got {stmt!r}')
+    node = tree.body[0]
+    if not node.module or node.level:
+        die(f'expected "from MODULE import NAME", got {stmt!r}')
+    if len(node.names) != 1 or node.names[0].name == "*":
+        die(f'expected "from MODULE import NAME", got {stmt!r}')
+    alias = node.names[0]
+    return node.module, alias.asname or alias.name
+
+
+def discover_binders(root: str, name: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for path in iter_py_files(root):
+        mod = module_name_for(root, path)
+        if not mod or mod in seen:
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            tree = ast.parse(text, filename=path)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        if module_level_binds(tree, name):
+            seen.add(mod)
+            found.append(mod)
+    return found
+
+
+def load_module(modname: str):
+    try:
+        return importlib.import_module(modname)
+    except Exception as err:
+        raise ImportError(f"{modname}: {err}") from err
+
+
+def classify(module: str, name: str, obj: object) -> tuple[str, str]:
+    origin = getattr(obj, "__module__", None)
+    obj_name = getattr(obj, "__name__", name)
+    if origin and origin != module:
+        return "reexport", f"{origin}.{obj_name}"
+    return "def", f"{module}.{obj_name}"
+
+
+def body_location(obj: object) -> tuple[str, int, str]:
+    try:
+        src_file = inspect.getsourcefile(obj) or inspect.getfile(obj)
+        lines, start = inspect.getsourcelines(obj)
+        return os.path.basename(src_file), start, "".join(lines)
+    except (OSError, TypeError):
+        return "-", 0, ""
+
+
+def resolve(modname: str, name: str, *, required: bool) -> Bound | None:
+    try:
+        mod = load_module(modname)
+    except ImportError as err:
+        if required:
+            die(f"cannot import {err}")
+        return None
+    if not hasattr(mod, name):
+        if required:
+            die(f"{modname} has no name {name}")
+        return None
+    obj = getattr(mod, name)
+    kind, runs = classify(modname, name, obj)
+    file, line, source = body_location(obj)
+    return Bound(
+        module=modname,
+        name=name,
+        obj=obj,
+        kind=kind,
+        runs=runs,
+        file=file,
+        line=line,
+        source=source,
+    )
+
+
+def resolve_many(modnames: list[str], name: str, *, required: bool) -> list[Bound]:
+    out: list[Bound] = []
+    for modname in modnames:
+        bound = resolve(modname, name, required=required)
+        if bound is not None:
+            out.append(bound)
+    return out
+
+
+def same_object(bounds: list[Bound]) -> bool:
+    if not bounds:
+        return True
+    first = bounds[0].obj
+    return all(item.obj is first for item in bounds)
+
+
+def independent_defs(query: Bound, world: list[Bound]) -> list[str]:
+    names: list[str] = []
+    for item in world:
+        if item.bind == query.bind:
+            continue
+        if item.kind != "def":
+            continue
+        if item.obj is query.obj:
+            continue
+        names.append(item.bind)
+    return sorted(names)
+
+
+def emit_bound(bound: Bound) -> None:
+    print(f"import\t{bound.import_stmt}")
+    print(f"bind\t{bound.bind}")
+    print(f"runs\t{bound.runs}")
+    print(f"kind\t{bound.kind}")
+    print(f"file\t{bound.file}")
+    print(f"line\t{bound.line}")
+    print(f"source\t{bound.source!r}")
+
+
+def emit_list(name: str, bounds: list[Bound]) -> None:
+    print(f"name\t{name}")
+    print(f"count\t{len(bounds)}")
+    print(f"same_function\t{same_object(bounds)}")
+    for bound in bounds:
+        print()
+        emit_bound(bound)
+
+
+def emit_query(bound: Bound, world: list[Bound]) -> None:
+    combined = list(world)
+    if not any(item.bind == bound.bind for item in combined):
+        combined.append(bound)
+    print(f"query\t{bound.import_stmt}")
+    emit_bound(bound)
+    also = independent_defs(bound, combined)
+    if also:
+        print("also\t" + "\t".join(also))
+    print(f"same_function\t{same_object(combined)}")
+
+
+def prepare_root(root: str) -> str:
+    root_abs = os.path.abspath(root)
+    if not os.path.isdir(root_abs):
+        die(f"not a directory: {root}")
+    if root_abs not in sys.path:
+        sys.path.insert(0, root_abs)
+    return root_abs
+
+
+def split_qualified(token: str) -> tuple[str, str] | None:
+    if "." not in token:
+        return None
+    module, _, name = token.rpartition(".")
+    if not module or not name:
+        return None
+    return module, name
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="bindpath",
+        description="Show the import path and the body that would run for a name.",
+    )
+    parser.add_argument(
+        "-C",
+        dest="root",
+        default=".",
+        metavar="DIR",
+        help="import root (default: .)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--from", dest="from_mod", metavar="MODULE")
+    mode.add_argument("--import", dest="import_stmt", metavar="STMT")
+    mode.add_argument("--file", dest="src_file", metavar="PATH")
+    parser.add_argument("name", nargs="?", help="NAME or MODULE.NAME")
+    args = parser.parse_args(argv)
+    if args.import_stmt:
+        if args.name:
+            die("NAME is taken from --import; extra argument given")
+    elif not args.name:
+        parser.error("NAME is required")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    root = prepare_root(args.root)
+
+    if args.import_stmt:
+        module, name = parse_from_import(args.import_stmt)
+        world = resolve_many(discover_binders(root, name), name, required=False)
+        bound = resolve(module, name, required=True)
+        emit_query(bound, world or [bound])
+        return 0
+
+    name_token: str = args.name
+    if args.from_mod:
+        name = name_token
+        module = args.from_mod
+        world = resolve_many(discover_binders(root, name), name, required=False)
+        bound = resolve(module, name, required=True)
+        emit_query(bound, world or [bound])
+        return 0
+
+    if args.src_file:
+        name = name_token
+        modules = uses_in_file(args.src_file, name)
+        bounds = resolve_many(modules, name, required=True)
+        emit_list(name, bounds)
+        return 0
+
+    qualified = split_qualified(name_token)
+    if qualified:
+        module, name = qualified
+        world = resolve_many(discover_binders(root, name), name, required=False)
+        bound = resolve(module, name, required=True)
+        emit_query(bound, world or [bound])
+        return 0
+
+    name = name_token
+    modules = sorted(discover_binders(root, name))
+    bounds = resolve_many(modules, name, required=False)
+    bounds.sort(key=lambda item: item.bind)
+    emit_list(name, bounds)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

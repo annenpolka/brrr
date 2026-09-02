@@ -1,0 +1,11 @@
+{
+  "id": "specimen-080",
+  "manifest": "\nid: specimen-080\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nfailing_ref: fixture-extra-ignores-marker\nfixed_ref: fixture-extra-honors-marker\nmechanism_tags: [extras, environment-marker, skip]\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 1200\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nA package extra `bar` is gated by an environment marker that is false on this interpreter (`python_version < \"3\"` on 3.14). Install still materializes the extra.\n\nThe developer wants to know whether the extra was installed even though its marker failed, and which extra should have been skipped.\n",
+  "observed": "# OBSERVED\n\nOwned files/marker_extra.py. Host-executed:\n\nextra bar\nmarker_ok False\ninstalled True\nshould_skip True\nwrongly_installed True\n",
+  "commands": "# COMMANDS\n\npython3 files/marker_extra.py\n",
+  "tree": "TREE\n\nfiles/marker_extra.py\n",
+  "curation": "ACCEPT_R1\n\ncontrastiveness: high\nreproducibility: owned fixture\nsafety: owned-fixture\n",
+  "answer_key": "# FIX\n\nHonor the extra's environment marker. A false marker means skip the extra, not install it.\nDo not show this to Dreamers.\n",
+  "source": "# SOURCE\n\nDerived analog of pip/poetry extra environment-marker skip. Owned fixture; pip is not executed.\n"
+}

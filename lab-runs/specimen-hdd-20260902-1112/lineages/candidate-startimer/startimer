@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""startimer: name the armed start-interval timer vs the start-period boundary."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+
+def parse_dur(text: str) -> float:
+    raw = text.strip().lower()
+    if raw.endswith("ms"):
+        return float(raw[:-2]) / 1000.0
+    if raw.endswith("s"):
+        return float(raw[:-1])
+    return float(raw)
+
+
+def fmt_dur(seconds: float) -> str:
+    if abs(seconds - round(seconds)) < 1e-9:
+        return f"{int(round(seconds))}s"
+    return f"{seconds:.3f}s".rstrip("0").rstrip(".") + "s"
+
+
+def inspect(
+    start_period: float,
+    start_interval: float,
+    interval: float,
+    retries: int,
+) -> dict:
+    if start_period < 0 or start_interval < 0 or interval < 0:
+        raise ValueError("durations must be >= 0")
+    if retries < 1:
+        raise ValueError("retries must be >= 1")
+    # Failing getInterval: while t < startPeriod and status=starting, return startInterval.
+    # monitor arms that timer at t=0 and does not reset at the period boundary.
+    armed_kind = "start-interval"
+    armed_at = 0.0
+    armed = start_interval
+    period_end = start_period
+    remaining = max(armed - period_end, 0.0)
+    reset_at_period_end = False
+    first_probe = armed_at + armed
+    # Failures before period_end do not count. After period_end, retries failing probes
+    # at `interval` would apply *if* the timer had been reset. Here the first probe is
+    # the original start-interval fire, which is after period_end on the owned packet.
+    first_counted = first_probe if first_probe >= period_end else period_end
+    unhealthy_at = first_counted + (retries - 1) * interval
+    expected_first = period_end + interval
+    expected_unhealthy = expected_first + (retries - 1) * interval
+    return {
+        "start_period": start_period,
+        "start_interval": start_interval,
+        "interval": interval,
+        "retries": retries,
+        "armed_at": armed_at,
+        "armed_kind": armed_kind,
+        "armed": armed,
+        "period_end": period_end,
+        "remaining_at_period_end": remaining,
+        "reset_at_period_end": reset_at_period_end,
+        "first_probe": first_probe,
+        "first_counted": first_counted,
+        "unhealthy_at": unhealthy_at,
+        "expected_unhealthy": expected_unhealthy,
+        "gap": unhealthy_at - expected_unhealthy,
+    }
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"armed_at\t{fmt_dur(result['armed_at'])}",
+        f"armed\t{result['armed_kind']}\t{fmt_dur(result['armed'])}",
+        f"period_end\t{fmt_dur(result['period_end'])}",
+        f"remaining_at_period_end\t{fmt_dur(result['remaining_at_period_end'])}",
+        f"reset_at_period_end\t{'yes' if result['reset_at_period_end'] else 'no'}",
+        f"first_probe\t{fmt_dur(result['first_probe'])}",
+        f"first_counted\t{fmt_dur(result['first_counted'])}",
+        f"unhealthy_at\t{fmt_dur(result['unhealthy_at'])}",
+        f"expected_unhealthy\t{fmt_dur(result['expected_unhealthy'])}",
+        f"gap\t{fmt_dur(result['gap'])}",
+        f"retries\t{result['retries']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="startimer",
+        description=(
+            "Given StartPeriod, StartInterval, Interval, Retries, name the "
+            "timer armed while starting, remaining time at period end, and "
+            "when the first counted failure fires."
+        ),
+    )
+    parser.add_argument("--start-period", required=True)
+    parser.add_argument("--start-interval", required=True)
+    parser.add_argument("--interval", required=True)
+    parser.add_argument("--retries", type=int, default=1)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        result = inspect(
+            parse_dur(args.start_period),
+            parse_dur(args.start_interval),
+            parse_dur(args.interval),
+            args.retries,
+        )
+    except (ValueError, argparse.ArgumentTypeError) as err:
+        print(f"startimer: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

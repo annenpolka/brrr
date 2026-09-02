@@ -1,0 +1,38 @@
+Registry / fixture:
+  json-server@^0.17.0 (public #5850)
+  nested override: json-server.package-json = 7.0.0
+  in-tree: root overrides baz=1.0.0; bar depends on baz; baz depends on buzz
+
+Case A (never nested-overridden):
+  npm install
+  package-json lockfile identity = json-server's original range
+  npm audit reports that original identity
+  no overridden annotation for package-json
+  in-tree: baz.overrides undefined (or parent generic set with no baz value)
+
+Case B (first install, empty stores, nested override present):
+  rm -rf node_modules package-lock.json && npm install
+  package-json lockfile identity = 7.0.0
+  npm audit: 0 vulnerabilities
+  in-tree: baz.overridden true when version is 1.0.0
+
+Case C (second install; nested override still in package.json):
+  npm install
+  leftover original package-json identity (matches case A, not 7.0.0)
+  npm audit: 5 vulnerabilities
+  rm -rf node_modules && npm install  → still leftover (lockfile)
+  rm package-lock.json && npm install → still leftover (node_modules)
+  npm update                          → 7.0.0 again
+
+Case D (in-tree detach of the override-carrying incoming edge):
+  Edge.detach / reload: edgesIn.delete only
+  leftover: baz.overrides still the copied set
+  leftover: baz.edgesOut.get('buzz').overrides still names that set
+  Node.overridden still true if name+value match
+
+Not this packet:
+  optional-peer packument fetch of unmet peers (specimen-004 / 033, npm/cli#9876)
+  bun.lock leftover packages vs optionalPeers mention after bun remove (specimen-082)
+  leftover overridden versions after deleting the overrides field (#8986, unfixed)
+  leftover generic OverrideSet forwarded through a Link with no matching rule (#9359)
+  top-level (non-nested) override, which does apply on subsequent installs

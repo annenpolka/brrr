@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): re-collection with handle_dupes=False created fresh Directory children; fixture matching uses node identity (`fixturedef.node in parent_nodes`). Fix: after re-collection, replace freshly-created Directory children with previously-seen instances for the same path. Module/File nodes still recreated for --keep-duplicates.

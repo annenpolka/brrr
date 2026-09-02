@@ -1,0 +1,25 @@
+Registry / fixture:
+  two phases _phase:first -> _phase:second
+  leftover downstream cache after upstream CLI/env/file change
+
+Case A (second rush build, same flags):
+  current cache identity
+  not leftover-after-upstream-phase-change
+
+Case B (upstream phase flag/env/file flipped, leftover downstream cache):
+  leftover: previous _phase:second outputs
+  operation-graph inputs omitted (npm project deps only)
+  downstream cache hit
+
+Case C (empty cache / rebuild):
+  fresh cache identity
+  not leftover previous downstream phase
+
+Case D (operation-graph cache IDs):
+  cache miss after upstream phase identity change
+  not leftover previous downstream outputs
+
+Not this packet:
+  pants leftover vcs_version process cache (specimen-136)
+  moon leftover .env task inputs (specimen-134)
+  nx leftover .env (no merged leftover-identity pair this run)

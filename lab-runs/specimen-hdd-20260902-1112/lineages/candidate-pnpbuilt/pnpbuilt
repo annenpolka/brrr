@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""pnpbuilt: leftover already-built storedBuildState after unplugged tree gone."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+KNOWN = ("locator", "stored_hash", "unplugged_ready", "binary")
+
+
+def parse_record(text: str, *, source: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        fields[key] = rest.strip()
+    if "locator" not in fields:
+        raise ValueError(f"{source}: need locator")
+    return fields
+
+
+def yn_in(val: str) -> bool:
+    return val in {"yes", "true", "1", "present"}
+
+
+def inspect(fields: dict[str, str]) -> dict:
+    stored = yn_in(fields.get("stored_hash") or "")
+    ready = yn_in(fields.get("unplugged_ready") or "")
+    binary = yn_in(fields.get("binary") or "")
+    leftover = stored and not ready
+    identity = "leftover-built" if leftover else ("built" if stored and ready else ("never-built" if not stored else "ready-without-hash"))
+    return {
+        "locator": fields["locator"],
+        "stored_hash": stored,
+        "unplugged_ready": ready,
+        "binary": binary,
+        "leftover_built": leftover,
+        "identity": identity,
+    }
+
+
+def yn(v: bool) -> str:
+    return "yes" if v else "no"
+
+
+def format_report(result: dict) -> str:
+    lines = [
+        f"locator\t{result['locator']}",
+        f"stored_hash\t{yn(result['stored_hash'])}",
+        f"unplugged_ready\t{yn(result['unplugged_ready'])}",
+        f"binary\t{yn(result['binary'])}",
+        f"leftover_built\t{yn(result['leftover_built'])}",
+        f"identity\t{result['identity']}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pnpbuilt",
+        description=(
+            "Name leftover already-built storedBuildState after the unplugged "
+            "tree is gone. grep of the locator hits build-state; the miss is .ready."
+        ),
+    )
+    parser.add_argument("record")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        fields = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"pnpbuilt: {err}", file=sys.stderr)
+        return 1
+    result = inspect(fields)
+    sys.stdout.write(format_report(result))
+    return 1 if result["leftover_built"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

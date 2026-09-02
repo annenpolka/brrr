@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""poslayer: name which layer expanded a template token vs leftover CLI args."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+
+DEFAULT_TOKEN = "{posargs}"
+
+
+def subst(template: str, leftover: list[str], token: str) -> str:
+    return template.replace(token, " ".join(leftover))
+
+
+def to_argv(command: str) -> list[str]:
+    return command.split()
+
+
+def token_state(template: str, argv: list[str], token: str) -> str:
+    if token in argv:
+        return "literal"
+    if token in template:
+        return "expanded"
+    return "absent"
+
+
+def leftover_present(leftover: list[str], argv: list[str]) -> list[str]:
+    """Leftover items that appear as argv elements (string membership)."""
+    counts: dict[str, int] = {}
+    for item in argv:
+        counts[item] = counts.get(item, 0) + 1
+    present: list[str] = []
+    used: dict[str, int] = {}
+    for item in leftover:
+        used[item] = used.get(item, 0) + 1
+        if used[item] <= counts.get(item, 0):
+            present.append(item)
+    return present
+
+
+def inspect(
+    file_template: str,
+    override_template: str,
+    leftover: list[str],
+    token: str = DEFAULT_TOKEN,
+    exit_code: int = 0,
+    subst_override: bool = False,
+) -> dict:
+    file_argv = to_argv(subst(file_template, leftover, token))
+    if subst_override:
+        override_argv = to_argv(subst(override_template, leftover, token))
+    else:
+        override_argv = to_argv(override_template)
+    file_state = token_state(file_template, file_argv, token)
+    override_state = token_state(override_template, override_argv, token)
+    entered: list[str] = []
+    if token in file_template:
+        entered.append("file")
+    override_took_leftover = subst_override and token in override_template
+    if override_took_leftover:
+        entered.append("override")
+    missed = [] if override_took_leftover else list(leftover)
+    silent = override_state == "literal" and exit_code == 0
+    return {
+        "token": token,
+        "leftover": list(leftover),
+        "file_template": file_template,
+        "override_template": override_template,
+        "file_argv": file_argv,
+        "override_argv": override_argv,
+        "file": file_state,
+        "override": override_state,
+        "entered": entered,
+        "in_override": leftover_present(leftover, override_argv),
+        "missed": missed,
+        "exit": exit_code,
+        "ran_against": override_argv[-1] if override_argv else "",
+        "silent": "yes" if silent else "no",
+        "subst_override": subst_override,
+    }
+
+
+def format_cells(cells: list[str]) -> str:
+    return "\t".join(cells)
+
+
+def format_list(items: list[str]) -> list[str]:
+    return items if items else ["-"]
+
+
+def format_result(result: dict) -> str:
+    lines = [
+        format_cells(["token", result["token"]]),
+        format_cells(["leftover", *format_list(result["leftover"])]),
+        format_cells(["file", result["file"], *result["file_argv"]]),
+        format_cells(["override", result["override"], *result["override_argv"]]),
+        format_cells(["entered", *format_list(result["entered"])]),
+        format_cells(["in_override", *format_list(result["in_override"])]),
+        format_cells(["missed", *format_list(result["missed"])]),
+        format_cells(["ran_against", result["ran_against"] or "-"]),
+        format_cells(["exit", str(result["exit"])]),
+        format_cells(["silent", result["silent"]]),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def file_error(path: str, err: BaseException) -> str:
+    if isinstance(err, FileNotFoundError) or (
+        isinstance(err, OSError) and getattr(err, "errno", None) == 2 and not os.path.exists(path)
+    ):
+        return f"file not found: {path}"
+    if isinstance(err, IsADirectoryError) or os.path.isdir(path):
+        return f"is a directory: {path}"
+    if isinstance(err, UnicodeDecodeError):
+        return f"not utf-8: {path}"
+    if isinstance(err, OSError):
+        reason = err.strerror or err.__class__.__name__
+        return f"cannot read {path}: {reason}"
+    return f"cannot read {path}"
+
+
+def read_template(path: str) -> str:
+    if os.path.isdir(path):
+        raise IsADirectoryError(path)
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        raise ValueError(f"empty template: {path}")
+    return text
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="poslayer",
+        description=(
+            "Show which layer expanded a template token and which leftover "
+            "CLI args never entered the override argv."
+        ),
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="file-backed template (one line; trailing newline stripped)",
+    )
+    parser.add_argument(
+        "--file-template",
+        metavar="TEXT",
+        help="file-backed template string (instead of --file)",
+    )
+    parser.add_argument(
+        "--override",
+        metavar="TEXT",
+        help="CLI override template; default is the file-backed spelling",
+    )
+    parser.add_argument(
+        "--token",
+        default=DEFAULT_TOKEN,
+        help="substitution token (default: {posargs})",
+    )
+    parser.add_argument(
+        "--exit",
+        dest="exit_code",
+        type=int,
+        default=0,
+        metavar="N",
+        help="reported override exit code (default: 0)",
+    )
+    parser.add_argument(
+        "--subst-override",
+        action="store_true",
+        help="run leftover substitution on the override layer too",
+    )
+    parser.add_argument(
+        "leftover",
+        nargs="*",
+        help="leftover CLI args (the values that would replace the token)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.file and args.file_template is not None:
+        print("poslayer: use --file or --file-template, not both", file=sys.stderr)
+        return 2
+    if not args.file and args.file_template is None:
+        print("poslayer: --file or --file-template is required", file=sys.stderr)
+        return 2
+
+    if args.file is not None:
+        try:
+            file_template = read_template(args.file)
+        except ValueError as err:
+            print(f"poslayer: {err}", file=sys.stderr)
+            return 1
+        except (OSError, UnicodeDecodeError) as err:
+            print(f"poslayer: {file_error(args.file, err)}", file=sys.stderr)
+            return 1
+    else:
+        file_template = args.file_template
+        if file_template == "":
+            print("poslayer: empty template", file=sys.stderr)
+            return 1
+
+    override_template = file_template if args.override is None else args.override
+    result = inspect(
+        file_template,
+        override_template,
+        list(args.leftover),
+        token=args.token,
+        exit_code=args.exit_code,
+        subst_override=args.subst_override,
+    )
+    sys.stdout.write(format_result(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

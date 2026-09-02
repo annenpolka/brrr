@@ -1,0 +1,24 @@
+Registry / fixture:
+  Kotlin/Native CacheBuilder / CacheMetadata
+  leftover IC cache after external dep rollback
+
+Case A (same deps, same compiler, source unchanged):
+  current cache identity
+  not leftover-after-rollback
+
+Case B (dep rolled back to already-cached version, leftover IC):
+  leftover: previous per-file cache built against the newer dep
+  dependencies fingerprint omitted
+
+Case C (clean / missing cache directory):
+  fresh cache
+  not leftover previous dep
+
+Case D (dependenciesFingerprint compared):
+  full rebuild after rollback
+  not leftover previous cache
+
+Not this packet:
+  gradle incremental (specimen-104)
+  rust incremental leftover (specimen-075)
+  go work-sync leftover replace (specimen-103)

@@ -1,0 +1,24 @@
+Registry / fixture:
+  .terragrunt-cache download dir
+  leftover previous source after ?ref= / file change
+
+Case A (second run, same source):
+  current cache identity
+  not leftover-after-source-change
+
+Case B (ref= or files flipped, leftover dest):
+  leftover: previous stale.tf / previous clone path
+  ref omitted from encodeSourceName
+  same encoded folder
+
+Case C (rm -rf .terragrunt-cache / --terragrunt-source-update):
+  fresh source identity
+  not leftover previous tree
+
+Case D (copy manifest Clean before recopy):
+  stale.tf gone after source update
+  not leftover previous files
+
+Not this packet:
+  terraform leftover identity omitted from apply state (specimen-118)
+  terragrunt#6468 leftover deleted git-module files (OPEN)

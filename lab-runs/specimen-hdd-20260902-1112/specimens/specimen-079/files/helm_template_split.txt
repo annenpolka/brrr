@@ -1,0 +1,22 @@
+Chart values.yaml (case A):
+  data: {}
+
+Chart values.yaml (case B):
+  data: ~
+
+User values.yaml (both cases):
+  data:
+    foo: bar
+    baz: ~
+
+templates/foo.yaml:
+  data: {{.Values.data | quote}}
+
+helm v4.0.2 template, case A:
+  data: "map[foo:bar]"
+
+helm v3.19.3 template, case A:
+  data: "map[baz:<nil> foo:bar]"
+
+helm v4.0.2 template, case B:
+  data: "map[baz:<nil> foo:bar]"

@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""swallowecho: name a command whose nonzero exit was hidden by || success."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass, field
+
+
+SAFE_HEADS = {"true", "false", "echo", "printf", ":", "set", "[["}
+
+
+class ParseError(ValueError):
+    pass
+
+
+class StatusNeeded(ValueError):
+    def __init__(self, command: str) -> None:
+        super().__init__(command)
+        self.command = command
+
+
+@dataclass
+class Token:
+    kind: str  # WORD or OP
+    value: str
+    start: int
+    end: int
+
+
+@dataclass
+class Simple:
+    words: list[str]
+    source: str
+
+
+@dataclass
+class Pipeline:
+    commands: list[Simple]
+
+    @property
+    def source(self) -> str:
+        return " | ".join(cmd.source for cmd in self.commands)
+
+
+@dataclass
+class AndOr:
+    first: Pipeline
+    rest: list[tuple[str, Pipeline]]
+
+
+@dataclass
+class IfCmd:
+    cond: list
+    then: list
+    else_: list | None
+    source: str
+
+
+@dataclass
+class Event:
+    kind: str  # ran, recorded, skip
+    text: str
+    status: int | None = None
+    reason: str | None = None
+
+
+@dataclass
+class Swallow:
+    command: str
+    status: int
+    hid_by: str
+    hid_status: int
+
+
+@dataclass
+class Result:
+    step_status: int
+    swallows: list[Swallow] = field(default_factory=list)
+    events: list[Event] = field(default_factory=list)
+
+    @property
+    def swallow(self) -> bool:
+        return bool(self.swallows) and self.step_status == 0
+
+
+def display_word(word: str) -> str:
+    if word == "" or any(ch.isspace() for ch in word) or any(
+        ch in word for ch in "|&;<>()$`\\\"'"
+    ):
+        return "'" + word.replace("'", "'\\''") + "'"
+    return word
+
+
+def display_words(words: list[str]) -> str:
+    return " ".join(display_word(w) for w in words)
+
+
+def tokenize(src: str) -> list[Token]:
+    tokens: list[Token] = []
+    i = 0
+    n = len(src)
+    bracket = 0
+    while i < n:
+        ch = src[i]
+        if ch in " \t\r" or (ch == "\n" and bracket):
+            i += 1
+            continue
+        if ch == "\n":
+            tokens.append(Token("OP", ";", i, i + 1))
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or src[i - 1] in " \t\n;"):
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if src.startswith("||", i):
+            kind = "WORD" if bracket else "OP"
+            tokens.append(Token(kind, "||", i, i + 2))
+            i += 2
+            continue
+        if src.startswith("&&", i):
+            kind = "WORD" if bracket else "OP"
+            tokens.append(Token(kind, "&&", i, i + 2))
+            i += 2
+            continue
+        if ch == "|" and not bracket:
+            tokens.append(Token("OP", "|", i, i + 1))
+            i += 1
+            continue
+        if ch == ";" and not bracket:
+            tokens.append(Token("OP", ";", i, i + 1))
+            i += 1
+            continue
+        if ch in "<>(){}":
+            raise ParseError(f"unsupported shell syntax near {src[i:i + 8]!r}")
+        if ch == "&":
+            raise ParseError("unsupported & (background); use &&")
+        word, end = read_word(src, i)
+        tokens.append(Token("WORD", word, i, end))
+        if word == "[[":
+            bracket += 1
+        elif word == "]]" and bracket:
+            bracket -= 1
+        i = end
+    return tokens
+
+
+def read_word(src: str, i: int) -> tuple[str, int]:
+    n = len(src)
+    parts: list[str] = []
+    start = i
+    while i < n:
+        ch = src[i]
+        if ch in " \t\r\n;":
+            break
+        if src.startswith("||", i) or src.startswith("&&", i):
+            break
+        if ch == "|":
+            break
+        if ch == "#":
+            break
+        if ch in "<>(){}":
+            break
+        if ch == "&":
+            break
+        if ch == "'":
+            i += 1
+            begin = i
+            while i < n and src[i] != "'":
+                i += 1
+            if i >= n:
+                raise ParseError("unterminated single quote")
+            parts.append(src[begin:i])
+            i += 1
+            continue
+        if ch == '"':
+            i += 1
+            chunk: list[str] = []
+            while i < n and src[i] != '"':
+                if src[i] == "\\" and i + 1 < n:
+                    chunk.append(src[i + 1])
+                    i += 2
+                    continue
+                chunk.append(src[i])
+                i += 1
+            if i >= n:
+                raise ParseError("unterminated double quote")
+            parts.append("".join(chunk))
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            parts.append(src[i + 1])
+            i += 2
+            continue
+        parts.append(ch)
+        i += 1
+    if i == start and not parts:
+        raise ParseError(f"empty word near {src[start:start + 8]!r}")
+    return "".join(parts), i
+
+
+def tokens_from_argv(argv: list[str]) -> list[Token]:
+    tokens: list[Token] = []
+    col = 0
+    for item in argv:
+        if item in ("||", "&&", "|", ";"):
+            tokens.append(Token("OP", item, col, col + len(item)))
+        else:
+            tokens.append(Token("WORD", item, col, col + len(item)))
+        col += len(item) + 1
+    return tokens
+
+
+class Parser:
+    def __init__(self, tokens: list[Token], src: str = "") -> None:
+        self.tokens = tokens
+        self.src = src
+        self.i = 0
+
+    def peek(self) -> Token | None:
+        if self.i >= len(self.tokens):
+            return None
+        return self.tokens[self.i]
+
+    def peek_op(self) -> str | None:
+        tok = self.peek()
+        if tok is not None and tok.kind == "OP":
+            return tok.value
+        return None
+
+    def take(self) -> Token:
+        tok = self.tokens[self.i]
+        self.i += 1
+        return tok
+
+    def skip_semicolons(self) -> None:
+        while self.peek_op() == ";":
+            self.take()
+
+    def at_word(self, names: set[str]) -> bool:
+        tok = self.peek()
+        return tok is not None and tok.kind == "WORD" and tok.value in names
+
+    def expect_word(self, name: str) -> Token:
+        tok = self.peek()
+        if tok is None or tok.kind != "WORD" or tok.value != name:
+            got = tok.value if tok is not None else "end of input"
+            raise ParseError(f"expected {name}, got {got}")
+        return self.take()
+
+    def source_of(self, words: list[str], start: int, end: int) -> str:
+        if self.src:
+            return self.src[start:end].strip()
+        return display_words(words)
+
+    def parse_script(self, stop: set[str] | None = None, *, allow_empty: bool = False):
+        stop = stop or set()
+        parts: list[AndOr | IfCmd] = []
+        self.skip_semicolons()
+        while self.peek() is not None:
+            if self.at_word(stop):
+                break
+            if self.at_word({"if"}):
+                parts.append(self.parse_if())
+            else:
+                parts.append(self.parse_andor())
+            self.skip_semicolons()
+        if not parts and not allow_empty:
+            raise ParseError("empty command")
+        return parts
+
+    def parse_if(self) -> IfCmd:
+        start_tok = self.expect_word("if")
+        cond = self.parse_script(stop={"then"}, allow_empty=False)
+        self.expect_word("then")
+        then = self.parse_script(stop={"else", "fi"}, allow_empty=True)
+        else_body = None
+        if self.at_word({"else"}):
+            self.take()
+            else_body = self.parse_script(stop={"fi"}, allow_empty=True)
+        fi = self.expect_word("fi")
+        source = self.src[start_tok.start : fi.end].strip() if self.src else "if ... fi"
+        return IfCmd(cond, then, else_body, source)
+
+    def parse_andor(self) -> AndOr:
+        first = self.parse_pipeline()
+        rest: list[tuple[str, Pipeline]] = []
+        while self.peek_op() in ("||", "&&"):
+            op = self.take().value
+            rest.append((op, self.parse_pipeline()))
+        return AndOr(first, rest)
+
+    def parse_pipeline(self) -> Pipeline:
+        commands = [self.parse_simple()]
+        while self.peek_op() == "|":
+            self.take()
+            commands.append(self.parse_simple())
+        return Pipeline(commands)
+
+    def parse_simple(self) -> Simple:
+        words: list[str] = []
+        start = None
+        end = None
+        while True:
+            tok = self.peek()
+            if tok is None or tok.kind != "WORD":
+                break
+            self.take()
+            words.append(tok.value)
+            if start is None:
+                start = tok.start
+            end = tok.end
+        if not words:
+            near = self.peek()
+            got = near.value if near else "end of input"
+            raise ParseError(f"expected command, got {got}")
+        assert start is not None and end is not None
+        return Simple(words, self.source_of(words, start, end))
+
+
+def parse_snippet(src: str) -> list[AndOr]:
+    return Parser(tokenize(src), src).parse_script()
+
+
+def parse_argv(argv: list[str]) -> list[AndOr]:
+    text = " ".join(argv)
+    return Parser(tokens_from_argv(argv), text).parse_script()
+
+
+@dataclass
+class RunState:
+    errexit: bool = False
+    statuses: list[int] = field(default_factory=list)
+    events: list[Event] = field(default_factory=list)
+    swallows: list[Swallow] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+    def take_status(self, command: str) -> int:
+        if not self.statuses:
+            raise StatusNeeded(command)
+        return self.statuses.pop(0)
+
+
+def expand_word(word: str, env: dict[str, str]) -> str:
+    if word.startswith("${") and word.endswith("}") and len(word) > 3:
+        name = word[2:-1]
+        if name.isidentifier():
+            return env.get(name, "")
+        return word
+    if word.startswith("$") and len(word) > 1:
+        name = word[1:]
+        if name.isidentifier():
+            return env.get(name, "")
+    return word
+
+
+def eval_test_or(tokens: list[str], env: dict[str, str]) -> bool:
+    parts: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok == "||":
+            parts.append([])
+        else:
+            parts[-1].append(tok)
+    return any(eval_test_and(part, env) for part in parts)
+
+
+def eval_test_and(tokens: list[str], env: dict[str, str]) -> bool:
+    parts: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok == "&&":
+            parts.append([])
+        else:
+            parts[-1].append(tok)
+    return all(eval_test_primary(part, env) for part in parts)
+
+
+def eval_test_primary(tokens: list[str], env: dict[str, str]) -> bool:
+    if not tokens:
+        raise ParseError("empty [[ test")
+    if tokens[0] == "!":
+        return not eval_test_primary(tokens[1:], env)
+    if tokens[0] in ("-z", "-n") and len(tokens) == 2:
+        value = expand_word(tokens[1], env)
+        empty = value == ""
+        return empty if tokens[0] == "-z" else not empty
+    raise ParseError("unsupported [[ test: " + " ".join(tokens))
+
+
+def eval_bracket(words: list[str], env: dict[str, str]) -> int:
+    if len(words) < 2 or words[0] != "[[" or words[-1] != "]]":
+        raise ParseError("malformed [[ ]]")
+    return 0 if eval_test_or(words[1:-1], env) else 1
+
+
+def head_of(simple: Simple) -> str:
+    return simple.words[0] if simple.words else ""
+
+
+def pipeline_is_safe(pipe: Pipeline) -> bool:
+    return all(head_of(cmd) in SAFE_HEADS for cmd in pipe.commands)
+
+
+def run_builtin(simple: Simple, state: RunState) -> int:
+    head = head_of(simple)
+    args = simple.words[1:]
+    if head == "true" or head == ":":
+        return 0
+    if head == "false":
+        return 1
+    if head == "echo":
+        return 0
+    if head == "printf":
+        return 0
+    if head == "[[":
+        return eval_bracket(simple.words, state.env)
+    if head == "set":
+        for flag in args:
+            if flag.startswith("-") and "e" in flag[1:]:
+                state.errexit = True
+            if flag.startswith("+") and "e" in flag[1:]:
+                state.errexit = False
+        return 0
+    raise StatusNeeded(simple.source)
+
+
+def run_pipeline(pipe: Pipeline, state: RunState) -> int:
+    if not pipeline_is_safe(pipe):
+        status = state.take_status(pipe.source)
+        state.events.append(Event("recorded", pipe.source, status))
+        return status
+    if len(pipe.commands) == 1:
+        status = run_builtin(pipe.commands[0], state)
+        state.events.append(Event("ran", pipe.source, status))
+        return status
+    # No pipefail: pipeline status is the last command.
+    last = 0
+    failed_earlier = False
+    for cmd in pipe.commands:
+        last = run_builtin(cmd, state)
+        state.events.append(Event("ran", cmd.source, last))
+        if last != 0:
+            failed_earlier = True
+    if failed_earlier and last == 0:
+        # Last-status lie inside a pipe is not this primitive.
+        pass
+    return last
+
+
+def eval_andor(node: AndOr, state: RunState) -> int:
+    status = run_pipeline(node.first, state)
+    last_fail_text = node.first.source if status != 0 else None
+    last_fail_status = status if status != 0 else None
+    for op, pipe in node.rest:
+        if op == "||":
+            if status == 0:
+                state.events.append(
+                    Event("skip", pipe.source, reason="left_succeeded")
+                )
+                continue
+            right = run_pipeline(pipe, state)
+            if right == 0 and last_fail_text is not None and last_fail_status is not None:
+                state.swallows.append(
+                    Swallow(last_fail_text, last_fail_status, pipe.source, right)
+                )
+            status = right
+            if status != 0:
+                last_fail_text = pipe.source
+                last_fail_status = status
+            else:
+                last_fail_text = None
+                last_fail_status = None
+            continue
+        if op == "&&":
+            if status != 0:
+                state.events.append(Event("skip", pipe.source, reason="left_failed"))
+                continue
+            status = run_pipeline(pipe, state)
+            if status != 0:
+                last_fail_text = pipe.source
+                last_fail_status = status
+            else:
+                last_fail_text = None
+                last_fail_status = None
+            continue
+    return status
+
+
+def eval_if(node: IfCmd, state: RunState) -> int:
+    cond_status = eval_list(node.cond, state)
+    if cond_status == 0:
+        return eval_list(node.then, state) if node.then else 0
+    if node.else_:
+        return eval_list(node.else_, state)
+    return 0
+
+
+def eval_list(parts: list[AndOr | IfCmd], state: RunState) -> int:
+    status = 0
+    for node in parts:
+        if isinstance(node, IfCmd):
+            status = eval_if(node, state)
+            if state.errexit and status != 0:
+                return status
+            continue
+        status = eval_andor(node, state)
+        # set -e aborts a failing bare pipeline, not a failing command
+        # that is the left-hand side of || or &&.
+        if state.errexit and status != 0 and not node.rest:
+            return status
+    return status
+
+
+def analyze(
+    parts: list[AndOr | IfCmd],
+    statuses: list[int] | None = None,
+    env: dict[str, str] | None = None,
+) -> Result:
+    state = RunState(statuses=list(statuses or []), env=dict(env or {}))
+    step = eval_list(parts, state)
+    swallows = state.swallows if step == 0 else []
+    return Result(step_status=step, swallows=swallows, events=state.events)
+
+
+def format_report(result: Result) -> str:
+    lines = [
+        f"step_status\t{result.step_status}",
+        f"swallow\t{'yes' if result.swallow else 'no'}",
+    ]
+    if result.swallow:
+        hit = result.swallows[-1]
+        lines.append(f"swallowed\t{hit.command}")
+        lines.append(f"swallowed_status\t{hit.status}")
+        lines.append(f"hid_by\t{hit.hid_by}")
+        lines.append(f"hid_status\t{hit.hid_status}")
+        lines.append("operator\t||")
+    for event in result.events:
+        if event.kind == "skip":
+            lines.append(f"skip\t{event.text}\t{event.reason}")
+        else:
+            lines.append(f"{event.kind}\t{event.text}\t{event.status}")
+    return "\n".join(lines) + "\n"
+
+
+def read_file(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    if os.path.isdir(path):
+        raise OSError(f"is a directory: {path}")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError as err:
+        raise OSError(f"file not found: {path}") from err
+    except UnicodeDecodeError as err:
+        raise OSError(f"not utf-8: {path}") from err
+    except OSError as err:
+        reason = err.strerror or err.__class__.__name__
+        raise OSError(f"cannot read {path}: {reason}") from err
+
+
+def split_argv_list(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Options before -- ; tokens after -- are an argv command list."""
+    if "--" not in argv:
+        return argv, None
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
+
+
+def parse_args(argv: list[str] | None, prog: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=(
+            "Report whether a compound command exited 0 after a later "
+            "success hid an earlier nonzero exit (|| echo last-status lie)."
+        ),
+    )
+    parser.add_argument(
+        "snippet",
+        nargs="?",
+        help="shell snippet (simple commands, ||, &&, |, ;)",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="read snippet from PATH (use - for stdin)",
+    )
+    parser.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        metavar="N",
+        help="recorded exit status for the next unexecuted pipeline (repeatable)",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="set NAME for [[ -z $NAME ]] tests (repeatable)",
+    )
+    parser.add_argument(
+        "--unset",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="unset NAME for [[ tests (repeatable)",
+    )
+    parser.add_argument(
+        "--no-process-env",
+        action="store_true",
+        help="start [[ environment empty instead of copying this process",
+    )
+    return parser.parse_args(argv)
+
+
+def coerce_statuses(values: list[str], prog: str) -> list[int]:
+    out: list[int] = []
+    for raw in values:
+        try:
+            out.append(int(raw, 10))
+        except ValueError as err:
+            raise ValueError(f"{prog}: --status must be an integer, got {raw!r}") from err
+    return out
+
+
+def build_env(
+    overlays: list[str],
+    unset: list[str],
+    *,
+    from_process: bool,
+    prog: str,
+) -> dict[str, str]:
+    env = dict(os.environ) if from_process else {}
+    for name in unset:
+        env.pop(name, None)
+    for item in overlays:
+        if "=" not in item:
+            raise ValueError(f"{prog}: --env must be NAME=VALUE, got {item!r}")
+        key, _, value = item.partition("=")
+        if not key:
+            raise ValueError(f"{prog}: empty name in --env {item!r}")
+        env[key] = value
+    return env
+
+
+def load_parts(
+    args: argparse.Namespace, prog: str, argv_tokens: list[str] | None
+) -> list[AndOr]:
+    snippet = args.snippet
+    if snippet == "-":
+        args.file = args.file or "-"
+        snippet = None
+
+    n_sources = sum(
+        [
+            snippet is not None,
+            args.file is not None,
+            argv_tokens is not None,
+        ]
+    )
+    if n_sources == 0:
+        raise ValueError(f"{prog}: need a snippet, --file PATH, or -- WORD ...")
+    if n_sources > 1:
+        raise ValueError(f"{prog}: use only one of snippet, --file, or -- argv list")
+    if argv_tokens is not None:
+        if not argv_tokens:
+            raise ParseError("empty command")
+        return parse_argv(argv_tokens)
+    text = snippet if snippet is not None else read_file(args.file)
+    if not text.strip():
+        raise ParseError("empty command")
+    return parse_snippet(text)
+
+
+def main(argv: list[str] | None = None) -> int:
+    prog = os.path.basename(sys.argv[0]) or "swallowecho"
+    if prog.endswith(".py"):
+        prog = "swallowecho"
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        option_argv, argv_tokens = split_argv_list(raw)
+        args = parse_args(option_argv, prog)
+        statuses = coerce_statuses(args.status, prog)
+        env = build_env(
+            args.env,
+            args.unset,
+            from_process=not args.no_process_env,
+            prog=prog,
+        )
+        parts = load_parts(args, prog, argv_tokens)
+        result = analyze(parts, statuses, env)
+    except ParseError as err:
+        print(f"{prog}: parse error: {err}", file=sys.stderr)
+        return 2
+    except StatusNeeded as err:
+        print(f"{prog}: no status for: {err.command}", file=sys.stderr)
+        print(
+            f"{prog}: pass --status N for each unexecuted pipeline, in order",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as err:
+        print(str(err) if str(err).startswith(prog) else f"{prog}: {err}", file=sys.stderr)
+        return 2
+    except OSError as err:
+        print(f"{prog}: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

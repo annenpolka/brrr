@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""extraedge: name a declared extra whose mapped extra-edge did not attach."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+KNOWN_FIELDS = ("package", "version", "declared", "resolved", "extra")
+EMPTY = "."
+MAX_INPUT = 64_000
+MAX_IDENTITY = 1024
+MAX_NAME = 256
+MAX_EXTRAS = 256
+
+
+class Record:
+    def __init__(
+        self,
+        package: str,
+        version: str,
+        declared: list[str],
+        resolved: list[str],
+        extras: dict[str, list[str]],
+        source: str,
+    ) -> None:
+        self.package = package
+        self.version = version
+        self.declared = declared
+        self.resolved = resolved
+        self.extras = extras
+        self.source = source
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def split_names(rest: str, *, source: str, lineno: int) -> list[str]:
+    if rest in {"", EMPTY}:
+        return []
+    parts = rest.split("\t")
+    names: list[str] = []
+    for part in parts:
+        name = part.strip()
+        if name == "":
+            raise ValueError(f"{source}:{lineno}: empty extra name")
+        if name == EMPTY:
+            raise ValueError(f"{source}:{lineno}: empty-list marker cannot mix with names")
+        if "\x00" in name:
+            raise ValueError(f"{source}:{lineno}: NUL in extra name")
+        if len(name) > MAX_NAME:
+            raise ValueError(f"{source}:{lineno}: extra name exceeds {MAX_NAME} characters")
+        names.append(name)
+    if len(names) > MAX_EXTRAS:
+        raise ValueError(f"{source}:{lineno}: more than {MAX_EXTRAS} extras")
+    return unique(names)
+
+
+def parse_identity(rest: str, *, field: str, source: str, lineno: int) -> str:
+    parts = rest.split("\t")
+    if len(parts) != 1:
+        raise ValueError(f"{source}:{lineno}: extra columns on {field}")
+    value = parts[0].strip()
+    if not value:
+        raise ValueError(f"{source}:{lineno}: empty {field}")
+    if "\x00" in value:
+        raise ValueError(f"{source}:{lineno}: NUL in {field}")
+    if len(value) > MAX_IDENTITY:
+        raise ValueError(f"{source}:{lineno}: {field} exceeds {MAX_IDENTITY} characters")
+    return value
+
+
+def parse_extra_line(rest: str, *, source: str, lineno: int) -> tuple[str, list[str]]:
+    parts = rest.split("\t")
+    names: list[str] = []
+    for part in parts:
+        name = part.strip()
+        if name == "":
+            raise ValueError(f"{source}:{lineno}: empty extra name")
+        if name == EMPTY:
+            raise ValueError(f"{source}:{lineno}: empty-list marker cannot mix with names")
+        if "\x00" in name:
+            raise ValueError(f"{source}:{lineno}: NUL in extra name")
+        if len(name) > MAX_NAME:
+            raise ValueError(f"{source}:{lineno}: extra name exceeds {MAX_NAME} characters")
+        names.append(name)
+    if len(names) < 2:
+        raise ValueError(f"{source}:{lineno}: extra needs name and extra-edge target")
+    if len(names) - 1 > MAX_EXTRAS:
+        raise ValueError(f"{source}:{lineno}: more than {MAX_EXTRAS} extra-edge targets")
+    extra_name, targets = names[0], unique(names[1:])
+    return extra_name, targets
+
+
+def parse_record(text: str, *, source: str = "<input>") -> Record:
+    if len(text) > MAX_INPUT:
+        raise ValueError(f"{source}: input exceeds {MAX_INPUT} bytes")
+    package = None
+    version = None
+    declared: list[str] | None = None
+    resolved: list[str] | None = None
+    extras: dict[str, list[str]] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if "\t" not in raw:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = raw.split("\t", 1)
+        key = key.strip()
+        if key not in KNOWN_FIELDS:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+        if key == "package":
+            if package is not None:
+                raise ValueError(f"{source}:{lineno}: duplicate package")
+            package = parse_identity(rest, field="package", source=source, lineno=lineno)
+        elif key == "version":
+            if version is not None:
+                raise ValueError(f"{source}:{lineno}: duplicate version")
+            version = parse_identity(rest, field="version", source=source, lineno=lineno)
+        elif key == "declared":
+            if declared is not None:
+                raise ValueError(f"{source}:{lineno}: duplicate declared")
+            declared = split_names(rest, source=source, lineno=lineno)
+        elif key == "resolved":
+            if resolved is not None:
+                raise ValueError(f"{source}:{lineno}: duplicate resolved")
+            resolved = split_names(rest, source=source, lineno=lineno)
+        elif key == "extra":
+            name, targets = parse_extra_line(rest, source=source, lineno=lineno)
+            if name in extras:
+                raise ValueError(f"{source}:{lineno}: duplicate extra {name!r}")
+            extras[name] = targets
+    if package is None:
+        raise ValueError(f"{source}: missing package")
+    if version is None:
+        raise ValueError(f"{source}: missing version")
+    if resolved is None:
+        raise ValueError(f"{source}: missing resolved")
+    if declared is None:
+        declared = []
+    if len(extras) > MAX_EXTRAS:
+        raise ValueError(f"{source}: more than {MAX_EXTRAS} extras")
+    return Record(package, version, unique(declared), unique(resolved), extras, source)
+
+
+def merge_extras(first: Record, second: Record) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for rec in (first, second):
+        for name, targets in rec.extras.items():
+            prev = out.get(name)
+            if prev is not None and prev != targets:
+                raise ValueError(
+                    f"conflicting extra-edge map for {name!r}: "
+                    f"{prev} vs {targets}"
+                )
+            out[name] = list(targets)
+    return out
+
+
+def missed_declared(declared: list[str], resolved: list[str], extras: dict[str, list[str]]) -> list[str]:
+    present = set(resolved)
+    missed: list[str] = []
+    for extra in declared:
+        targets = extras[extra]
+        if not any(target in present for target in targets):
+            missed.append(extra)
+    return missed
+
+
+def inspect(first: Record, second: Record) -> dict:
+    same = first.package == second.package and first.version == second.version
+    result = {
+        "first": first,
+        "second": second,
+        "same_package": same,
+        "extras": {},
+        "unmapped": [],
+        "missed_first": [],
+        "missed_second": [],
+        "attached_only_second": [],
+    }
+    if not same:
+        return result
+    extras = merge_extras(first, second)
+    result["extras"] = extras
+    declared = unique(first.declared + second.declared)
+    unmapped = [name for name in declared if name not in extras]
+    result["unmapped"] = unmapped
+    if unmapped:
+        return result
+    result["missed_first"] = missed_declared(first.declared, first.resolved, extras)
+    result["missed_second"] = missed_declared(second.declared, second.resolved, extras)
+    extra_edges = {target for targets in extras.values() for target in targets}
+    first_resolved = set(first.resolved)
+    result["attached_only_second"] = [
+        edge for edge in second.resolved if edge not in first_resolved and edge in extra_edges
+    ]
+    return result
+
+
+def fmt_list(items: list[str]) -> str:
+    return "\t".join(items) if items else EMPTY
+
+
+def format_report(result: dict) -> str:
+    first: Record = result["first"]
+    second: Record = result["second"]
+    lines = [
+        f"package_a\t{first.package}",
+        f"version_a\t{first.version}",
+        f"package_b\t{second.package}",
+        f"version_b\t{second.version}",
+        f"same_package\t{'yes' if result['same_package'] else 'no'}",
+    ]
+    if not result["same_package"]:
+        lines.append("identity\tmismatch")
+        lines.append(f"declared\t{EMPTY}")
+        lines.append(f"resolved_a\t{EMPTY}")
+        lines.append(f"resolved_b\t{EMPTY}")
+        lines.append(f"missed_a\t{EMPTY}")
+        lines.append(f"missed_b\t{EMPTY}")
+        lines.append(f"attached_b\t{EMPTY}")
+        return "\n".join(lines) + "\n"
+    extras: dict[str, list[str]] = result["extras"]
+    for name, targets in extras.items():
+        lines.append("map\t" + "\t".join([name, *targets]))
+    lines.append(f"declared\t{fmt_list(unique(first.declared + second.declared))}")
+    lines.append(f"resolved_a\t{fmt_list(first.resolved)}")
+    lines.append(f"resolved_b\t{fmt_list(second.resolved)}")
+    if result["unmapped"]:
+        lines.append(f"unmapped\t{fmt_list(result['unmapped'])}")
+        lines.append(f"missed_a\t{EMPTY}")
+        lines.append(f"missed_b\t{EMPTY}")
+        lines.append(f"attached_b\t{EMPTY}")
+        return "\n".join(lines) + "\n"
+    lines.append(f"missed_a\t{fmt_list(result['missed_first'])}")
+    lines.append(f"missed_b\t{fmt_list(result['missed_second'])}")
+    lines.append(f"attached_b\t{fmt_list(result['attached_only_second'])}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="extraedge",
+        description=(
+            "Compare two records of one package version. Name declared extras "
+            "whose mapped extra-edge targets are absent from resolved, and "
+            "extra-edges that attached only on the second record. Unmapped "
+            "extras are refused. Identity mismatch is not a join."
+        ),
+    )
+    parser.add_argument("first", metavar="FIRST")
+    parser.add_argument("second", metavar="SECOND")
+    return parser.parse_args(argv)
+
+
+def read_source(path: str) -> str:
+    if path == "-":
+        data = sys.stdin.read()
+    else:
+        data = Path(path).read_text(encoding="utf-8")
+    if len(data) > MAX_INPUT:
+        raise ValueError(f"{path}: input exceeds {MAX_INPUT} bytes")
+    return data
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.first == "-" and args.second == "-":
+        print("extraedge: stdin used twice", file=sys.stderr)
+        return 1
+    src_first = "<stdin>" if args.first == "-" else args.first
+    src_second = "<stdin>" if args.second == "-" else args.second
+    try:
+        first = parse_record(read_source(args.first), source=src_first)
+        second = parse_record(read_source(args.second), source=src_second)
+        result = inspect(first, second)
+    except (OSError, ValueError) as err:
+        print(f"extraedge: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(format_report(result))
+    if (
+        not result["same_package"]
+        or result["unmapped"]
+        or result["missed_first"]
+        or result["missed_second"]
+    ):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,1 @@
+- No nox. Continue on a subprocess that ignores SIGINT vs one that does not. Did wait look at the child?

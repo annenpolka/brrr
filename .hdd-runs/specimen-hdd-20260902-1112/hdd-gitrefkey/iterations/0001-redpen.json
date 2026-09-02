@@ -1,0 +1,29 @@
+{
+  "summary": "Invented code-inspection theater. Harvest leftover SHA+.git cache key that omitted the named ref so two tags at one commit collide. Stop.",
+  "preserve_add": [
+    "A keep-git-dir git source cache key can be only commit SHA plus .git, so two named refs at one commit share one snapshot whose .git may lack the second ref"
+  ],
+  "established_add": [
+    "Packet: shaToCacheKey(sha) is SHA [+ .git] [+ :subdir]; CacheKey after ls-remote does not pass usedRef; keepGitDir false keys equal on identical trees",
+    "Case C raw SHA identifier still has no named ref; case D different commits already split"
+  ],
+  "rejected_add": [
+    "Invented BuildKit runtime / git rev-parse transcripts are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned labeled sha/ref/key records. No buildkit."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether keep-git-dir cache key stored leftover SHA-only so two refs collide, SHA#ref so they split, or omitted like keepGitDir false"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name leftover SHA-only keep-git-dir cache key that omitted the named ref",
+    "nearest_existing_operation": "diff two cache keys and git rev-parse the second ref in the snapshot",
+    "observable_delta": "leftover_ref = keep_git_dir and pin_equal and key_a == key_b and ref_a != ref_b",
+    "reason": "grep of the SHA hits both keys; the leftover is the named ref omitted from the key"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned sha/ref/key records. Do not send buildkit theater back to R1. Distinct from 066/007/091."
+}

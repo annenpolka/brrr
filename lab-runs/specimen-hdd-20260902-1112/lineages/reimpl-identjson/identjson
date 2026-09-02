@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Two-pass identity decode: ImpliedType, then unmarshal leftover JSON."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+NIL_SCHEMA = frozenset({"nil", "-", "none", "empty"})
+EMPTY_OBJECT_SCHEMA = frozenset({"{}", "empty-object"})
+OMITTED_JSON = frozenset({"", "-", "none", "nil"})
+
+
+class UnsupportedAttribute(Exception):
+    """ctyjson extra key against the ImpliedType object."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f'unsupported attribute "{name}"')
+
+
+@dataclass(frozen=True)
+class ObjectType:
+    """cty object type produced by ImpliedType."""
+
+    attributes: tuple[tuple[str, str], ...] = ()
+
+    def names(self) -> frozenset[str]:
+        return frozenset(name for name, _typ in self.attributes)
+
+    def is_empty(self) -> bool:
+        return not self.attributes
+
+    def without_optional(self) -> ObjectType:
+        return self
+
+
+@dataclass(frozen=True)
+class Object:
+    """configschema.Object holding identity attribute types."""
+
+    attributes: tuple[tuple[str, str], ...] = ()
+
+    def spec_type(self) -> ObjectType:
+        return ObjectType(self.attributes)
+
+
+@dataclass(frozen=True)
+class Schema:
+    identity: Object | None = None
+    identity_version: int = 0
+
+
+@dataclass(frozen=True)
+class InstanceObjectSrc:
+    identity_json: bytes | None = None
+    identity_schema_version: int = 0
+
+
+@dataclass(frozen=True)
+class Report:
+    schema: str
+    json: str
+    decode: str
+    error_class: str
+
+    def tsv(self) -> str:
+        return (
+            f"schema\t{self.schema}\n"
+            f"json\t{self.json}\n"
+            f"decode\t{self.decode}\n"
+            f"error_class\t{self.error_class}\n"
+        )
+
+
+def spec_type(identity: Object | None) -> ObjectType:
+    if identity is None:
+        return ObjectType()
+    return identity.spec_type()
+
+
+def implied_type(identity: Object | None) -> ObjectType:
+    """Nil *Object specType is EmptyObject; optional attrs are a no-op here."""
+    return spec_type(identity).without_optional()
+
+
+def unmarshal(raw: bytes, ty: ObjectType) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"identity_json: {err}") from err
+    if not isinstance(payload, dict):
+        raise ValueError("identity_json must be a JSON object")
+    allowed = ty.names()
+    for key in payload:
+        if key not in allowed:
+            raise UnsupportedAttribute(str(key))
+    return payload
+
+
+def decode(src: InstanceObjectSrc, schema: Schema) -> Report:
+    """IdentityJSON != nil → ImpliedType, then unmarshal."""
+    schema_label = "nil" if schema.identity is None else "present"
+    if src.identity_json is None:
+        return Report(
+            schema=schema_label,
+            json="omitted",
+            decode="omitted" if schema.identity is None else "typed-null",
+            error_class="-",
+        )
+    ty = implied_type(schema.identity)
+    try:
+        value = unmarshal(src.identity_json, ty)
+    except UnsupportedAttribute:
+        return Report(
+            schema=schema_label,
+            json="present",
+            decode="error",
+            error_class="unsupported-attribute",
+        )
+    if not value and schema.identity is None:
+        return Report(
+            schema=schema_label,
+            json="empty-object",
+            decode="empty-object",
+            error_class="-",
+        )
+    return Report(
+        schema=schema_label,
+        json="present",
+        decode="object",
+        error_class="-",
+    )
+
+
+def first_payload_line(text: str) -> str:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def json_blob(text: str, *, source: str) -> str:
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if line.startswith("{"):
+            return "\n".join(lines[index:])
+    raise ValueError(f"{source}: no JSON object")
+
+
+def attr_type(spec: Any) -> str:
+    if spec is None:
+        return "string"
+    if isinstance(spec, str):
+        return spec or "string"
+    if isinstance(spec, dict):
+        return str(spec.get("type") or spec.get("Type") or "string")
+    return "string"
+
+
+def identity_spec(token: str) -> Any:
+    name = token.strip()
+    if name in NIL_SCHEMA:
+        return None
+    if name in EMPTY_OBJECT_SCHEMA:
+        return {}
+    fields = [part for part in name.replace(",", " ").split() if part]
+    return {field: {"type": "string"} for field in fields}
+
+
+def object_from_json(value: Any, *, source: str) -> Object | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        spec = identity_spec(value)
+        if spec is None:
+            return None
+        value = spec
+    if isinstance(value, list):
+        attrs = tuple((str(name), "string") for name in value if name not in ("", None))
+        return Object(attrs)
+    if isinstance(value, dict):
+        attrs = tuple((str(name), attr_type(spec)) for name, spec in value.items())
+        return Object(attrs)
+    raise ValueError(f"{source}: identity must be null, object, list, or name string")
+
+
+def omitted_token(token: str | None) -> bool:
+    if token is None:
+        return True
+    return token.strip() in OMITTED_JSON
+
+
+def identity_bytes(value: Any, *, source: str) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        return None if omitted_token(raw.decode("utf-8")) else raw
+    if isinstance(value, str):
+        if omitted_token(value):
+            return None
+        return value.encode("utf-8")
+    if isinstance(value, dict):
+        return json.dumps(value, separators=(",", ":")).encode("utf-8")
+    raise ValueError(f"{source}: identity_json must be object, string, or null")
+
+
+@dataclass
+class RecordBuilder:
+    source: str
+    schema_token: str | None = None
+    identity_json_token: str | None = None
+
+    def take(self, key: str, rest: str, *, lineno: int) -> None:
+        if key == "schema":
+            self.schema_token = rest
+            return
+        if key in {"identity_json", "IdentityJSON"}:
+            self.identity_json_token = rest
+            return
+        raise ValueError(f"{self.source}:{lineno}: unknown field {key!r}")
+
+    def document(self) -> dict[str, Any]:
+        if self.schema_token is None:
+            raise ValueError(f"{self.source}: missing schema")
+        raw = None if omitted_token(self.identity_json_token) else self.identity_json_token
+        return {
+            "schema": {"identity": identity_spec(self.schema_token)},
+            "state": {"identity_json": raw},
+        }
+
+
+def compile_tsv(text: str, *, source: str) -> dict[str, Any]:
+    builder = RecordBuilder(source=source)
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        builder.take(key.strip(), rest.strip(), lineno=lineno)
+    return builder.document()
+
+
+def load_document(text: str, *, source: str) -> dict[str, Any]:
+    start = first_payload_line(text)
+    if start.startswith("{"):
+        try:
+            doc = json.loads(json_blob(text, source=source))
+        except json.JSONDecodeError as err:
+            raise ValueError(f"{source}: {err}") from err
+        if not isinstance(doc, dict):
+            raise ValueError(f"{source}: JSON object required")
+        return doc
+    return compile_tsv(text, source=source)
+
+
+def schema_and_src(doc: dict[str, Any], *, source: str) -> tuple[Schema, InstanceObjectSrc]:
+    if "schema" not in doc or "state" not in doc:
+        raise ValueError(f"{source}: needs schema and state")
+    schema_doc = doc["schema"]
+    state_doc = doc["state"]
+    if not isinstance(schema_doc, dict) or not isinstance(state_doc, dict):
+        raise ValueError(f"{source}: schema and state must be objects")
+    identity = object_from_json(schema_doc.get("identity"), source=source)
+    try:
+        ident_ver = int(schema_doc.get("identity_version") or 0)
+        state_ver = int(state_doc.get("identity_schema_version") or 0)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"{source}: identity version must be an integer") from err
+    schema = Schema(identity=identity, identity_version=ident_ver)
+    src = InstanceObjectSrc(
+        identity_json=identity_bytes(state_doc.get("identity_json"), source=source),
+        identity_schema_version=state_ver,
+    )
+    return schema, src
+
+
+def report_for(text: str, *, source: str) -> Report:
+    schema, src = schema_and_src(load_document(text, source=source), source=source)
+    return decode(src, schema)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="identjson",
+        description=(
+            "Compile leftover identity JSON to schema+state objects, then "
+            "ImpliedType and unmarshal. Names object, omitted/typed-null, or "
+            "unsupported-attribute error."
+        ),
+    )
+    parser.add_argument("record", nargs="?", default="-", help="record path or -")
+    args = parser.parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        result = report_for(text, source=source)
+    except (OSError, ValueError, KeyError) as err:
+        print(f"identjson: {err}", file=sys.stderr)
+        return 1
+    sys.stdout.write(result.tsv())
+    return 1 if result.decode == "error" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

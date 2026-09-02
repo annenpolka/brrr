@@ -1,0 +1,1 @@
+- No CRD generator. Continue on a tiny struct-tag fixture. Show omitempty vs identity marker.

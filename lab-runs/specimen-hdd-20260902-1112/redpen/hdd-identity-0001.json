@@ -1,0 +1,33 @@
+{
+  "summary": "Preserve same-name split identity: a leftover parse in util vs a moved parse with a different body. Host fixture already prints util=('legacy', '  z  ') vs parse=('moved', 'z') and stale_test_would_see legacy. trace-import, bytecode signatures, and memory addresses are Dreamer-generated. Do not ask for more novelty.",
+  "preserve_add": [
+    "Two functions can share the name parse after a move and still be different objects",
+    "A stale import binds the leftover helper, not the moved body"
+  ],
+  "established_add": [
+    "Host fixture: util ('legacy', '  z  '); parse ('moved', 'z'); same_function False; stale_test_would_see legacy"
+  ],
+  "rejected_add": [
+    "trace-import is not installed; --version/--provenance/--diff/--resolve output is Dreamer-generated",
+    "Bytecode signature 1a2e1550, function addresses, and tool version 2.8.3 are unsupported precision"
+  ],
+  "constraints_add": [
+    "No import tracer, no bytecode signature oracle, no hidden load-path inspector",
+    "Observable evidence is which module the test imported and the two function results"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Ask which file/body the name parse actually bound for the failing import"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "given two same-named functions after a move, report which definition a stale import actually bound",
+    "nearest_existing_operation": "python -c import plus inspect.getfile / printing both results",
+    "observable_delta": "one query that names the bound file and body for the imported name instead of grepping every parse",
+    "reason": "grep/blame list candidates; the surviving question is which identity the test executed"
+  },
+  "pressure": [
+    "There is no trace-import. Continue only if the bound module and return tuple can be emitted from the two functions already in the fixture."
+  ],
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Classification USEFUL_COMPOSITION. Ground independently; do not implement trace-import."
+}

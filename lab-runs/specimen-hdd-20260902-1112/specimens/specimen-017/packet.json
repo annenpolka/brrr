@@ -1,0 +1,11 @@
+{
+  "id": "specimen-017",
+  "manifest": "\nid: specimen-017\nkind: PAIRED_SPECIMEN\nrepository: local-fixture\nfailing_ref: fixture-pruned-requires\nfixed_ref: fixture-fresh-requires\nmechanism_tags:\n  - extras-reuse\n  - pruned-requires\n  - paired-pass-fail\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2300\nanswer_key_sealed: true\nparent_specimens: [specimen-021]\nmutations: []\n",
+  "task": "# TASK\n\nPaired completions of the same extra request `A[foo]`. Extra map is identical: `foo \u2192 B`. Pair A\u2019s package object still lists `B` in `requires`. Pair B\u2019s package object has an empty `requires` list. One pair\u2019s extra dependency is in the resolved set; the other pair\u2019s is not.\n\nThe developer wants one question that names that difference without reading both traces by hand.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/pair_extras.py. Pair A PASS / pair B FAIL. Same extras map, same requested extra. Only observed difference: whether `requires` still contains the extra\u2019s dependency.\n\nGrounded in the same extra-request mismatch family as python-poetry/poetry#10314: extras map lists B, one object still has B in requires, the other does not.\n\n## Captured host execution (stdlib, no third-party packages)\n```\npair_A_fresh_requires recognized ['B'] resolved_extra_deps ['B'] PASS\npair_B_pruned_requires recognized ['B'] resolved_extra_deps [] FAIL\nonly_axis requires_contains_extra_dep\nrequest A[foo]\n```\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/pair_extras.py\n```\n",
+  "tree": "files/pair_extras.py\n",
+  "source": "PAIRED_SPECIMEN. One axis: requires still lists the extra dependency vs pruned/empty requires.\nParent: specimen-021 (python-poetry/poetry#10314 / PR 10987 extras missing on lock reuse).\nOwned fixture; executed on lab host. Poetry was not installed.\n",
+  "answer_key": "KNOWN FIX (sealed): when an extra is requested, take Dependency objects from the extras mapping if a reused package\u2019s requires list no longer contains them. Pair A is the fresh-inspect object; pair B is the lock-reused pruned object. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\nControlled PASS/FAIL pair; single axis is requires membership for a requested extra.\n"
+}

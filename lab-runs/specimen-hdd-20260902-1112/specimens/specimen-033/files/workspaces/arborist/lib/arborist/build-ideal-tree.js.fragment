@@ -1,0 +1,32 @@
+# failing_ref 51c2bf81fa2c31547d0fec44fff2aaac3d9a9862
+# Arborist.#loadPeerSet (excerpt)
+
+  async #loadPeerSet (node, required) {
+    const peerEdges = [...node.edgesOut.values()]
+      // we typically only install non-optional peers, but we have to
+      // factor them into the peerSet so that we can avoid conflicts
+      .filter(e => e.peer && !(e.valid && e.to))
+      .sort(({ name: a }, { name: b }) => localeCompare(a, b))
+
+    for (const edge of peerEdges) {
+      if (!node.parent) {
+        break
+      }
+      if (edge.valid && edge.to) {
+        continue
+      }
+
+      const parentEdge = node.parent.edgesOut.get(edge.name)
+      const { isProjectRoot, isWorkspace } = node.parent.sourceReference
+      const isMine = isProjectRoot || isWorkspace
+      const conflictOK = this.options.force || !isMine && !this.#strictPeerDeps
+
+      if (!edge.to) {
+        if (!parentEdge) {
+          // easy, just put the thing there
+          await this.#nodeFromEdge(edge, node.parent, null, required)
+          continue
+        }
+      }
+    }
+  }

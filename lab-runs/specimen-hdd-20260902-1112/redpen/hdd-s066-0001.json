@@ -1,0 +1,30 @@
+{
+  "summary": "Invented dockersim CLI. Harvest which timer was armed while status=starting, remaining time when start-period ended, and when the first counted failure fired. Stop.",
+  "preserve_add": [
+    "While status is starting and time.Since(started) < startPeriod, getInterval returns the full startInterval even if only a sliver of start period remains",
+    "The monitor arms a timer once; period end does not reset it"
+  ],
+  "established_add": [
+    "Packet: StartPeriod 2s, StartInterval 30s, Interval 2s, Retries 1, Test CMD /bin/false",
+    "Observed unhealthy ~30s after start; expected within one Interval after StartPeriod (~4s)"
+  ],
+  "rejected_add": [
+    "dockersim is not installed; Docker runtime was not executed"
+  ],
+  "constraints_add": [
+    "Owned timer numbers from getInterval. No dockerd."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "Which timer was armed during starting, remaining at period end, and when the first counted failure fires"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name the armed start-interval timer versus the start-period boundary versus first counted failure",
+    "nearest_existing_operation": "print the four duration fields",
+    "observable_delta": "armed 30s at t=0, remaining 28s at period end, unhealthy at 30s not 4s",
+    "reason": "the four numbers do not name that the timer is not reset at the period boundary"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned timer numbers. Do not send dockersim back to R1."
+}

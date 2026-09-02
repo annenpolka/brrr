@@ -1,0 +1,11 @@
+{
+  "id": "specimen-010",
+  "manifest": "\nid: specimen-010\nkind: DERIVED_VERIFIED\nrepository: local-fixture\nmechanism_tags:\n  - env-empty-vs-unset\n  - config-precedence\necosystem: python\nreproduction_status: verified\nsafety_status: owned-fixture\npacket_tokens_estimate: 2500\nanswer_key_sealed: true\nparent_specimens: []\nmutations: []\n",
+  "task": "# TASK\n\nProcess inherits `KEY=/x`. A dotenv-style file contains `KEY=`. After load, some tools still see `/x`, some see empty, some fall back to a default. The developer wants to know which layer treated empty as \u201cunset\u201d and which value actually won.\n",
+  "observed": "# OBSERVED\n\nOwned fixture files/loader.py:\n\nInherited KEY=/x plus file `KEY=` (empty assignment).\n\nNaive loader that skips falsey values leaves inherited `/x`.\nA loader that always assigns stores empty string.\n\nSee COMMANDS for captured prints.\n",
+  "commands": "# COMMANDS\n\n```\npython3 files/loader.py\n```\n",
+  "tree": "files/loader.py\n",
+  "source": "Synthetic-grounded / derived: empty-vs-unset dotenv precedence. Owned fixture.\n",
+  "answer_key": "KNOWN FIX (sealed): `if v:` treats empty assignment as absent, so inherited KEY survives. Distinguishing unset vs empty requires `if k in mapping` / explicit empty string assignment. Do not tell Dreamers.\n",
+  "curation": "ACCEPT_R1\n"
+}

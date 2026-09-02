@@ -1,0 +1,25 @@
+Registry / fixture:
+  vcpkg get_environment_variable Windows
+  leftover unset after empty FOO= JOIN
+
+Case A (FOO unset):
+  unset identity
+  not leftover-empty-as-unset
+
+Case B (FOO= empty string, leftover JOIN):
+  leftover: unset / nullopt
+  GetEnvironmentVariableW sz==0
+
+Case C (FOO=bar present):
+  current string identity
+  not leftover unset
+
+Case D (empty present kept):
+  has_value empty string
+  not leftover unset
+
+Not this packet:
+  local-fixture env-empty-vs-unset (specimen-010)
+  pip empty user proxy vs global (specimen-031)
+  compose listed-without-equals vs image ENV (specimen-149)
+  systemd empty :: cwd search path (specimen-150)

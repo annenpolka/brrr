@@ -1,0 +1,1 @@
+KNOWN FIX (sealed): track Cargo fingerprint use during cache-refreshing builds and remove only superseded artifacts for affected workspace members; keep current workspace outputs and external dependencies.

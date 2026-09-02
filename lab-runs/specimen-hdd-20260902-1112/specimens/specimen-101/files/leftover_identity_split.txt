@@ -1,0 +1,29 @@
+Fixture:
+  git dependency dep1 with submodule submod
+  .gitmodules url = git@github.com:foo/bar.git
+  cargo fetch (GIT_SSH_COMMAND=false)
+
+Case A (https or ssh:// WHATWG submodule URL):
+  into_url succeeds
+  fetch identity equals .gitmodules
+  no leftover
+
+Case B (SCP-like git@github.com:foo/bar.git):
+  absolute_submodule_url emits ssh://git@github.com/foo/bar.git
+  GitRemote stores that Url
+  fetch and stderr use ssh://
+  .gitmodules still names git@github.com:foo/bar.git
+  leftover: converted ssh:// is the live fetch identity
+  path semantics: SCP-like is home-relative; ssh:// is absolute /foo/bar.git
+
+Case C (relative ./ or ../ against SCP-like parent):
+  join then convert
+  failing_ref tests expect ssh://..././ form
+
+Case D (GitHub/GitLab intercept both spellings):
+  leftover rewrite still happens; host hides the path split
+
+Not this packet:
+  cargo PathBuf .. duplicate package (specimen-091)
+  cargo rustc_fingerprint (086)
+  cargo#16727 parse failure before any fetch identity

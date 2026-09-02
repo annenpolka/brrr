@@ -1,0 +1,33 @@
+{
+  "summary": "Preserve layer-wise empty-vs-unset contrast. The fixture stdout is specimen-observed. envprobe attach/trace and the claim that POSIX always converts empty to unset are magic or false. Harvest the user-visible operation.",
+  "preserve_add": [
+    "Empty assignment in a file is not the same event as an unset key",
+    "Different loaders disagree: skip-empty keeps inherited /x; assign stores empty"
+  ],
+  "established_add": [
+    "Host-captured fixture output: skip_empty '/x' '2' ; assign '' '2' ; process KEY unset in this run"
+  ],
+  "rejected_add": [
+    "envprobe is not installed; attach/simulate/trace output is Dreamer-generated",
+    "The claim that POSIX always turns empty strings into unset is not a specimen fact (Python os.environ can hold empty strings)"
+  ],
+  "constraints_add": [
+    "No process attachment, no tracer, no hidden OS oracle",
+    "Only the two loader return dicts and os.environ.get prints are observable"
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "For one KEY, show inherited, file text, skip-empty result, assign result, and process env, labeled by layer"
+  ],
+  "pressure": [
+    "There is no envprobe. Continue only if you can emit the layer table from the two loader functions and os.environ without attaching to a process."
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "ask which value won for a key across inherited, file (including empty), loader policy, and process env",
+    "nearest_existing_operation": "printenv plus reading the dotenv file plus reading loader source",
+    "observable_delta": "one query that distinguishes empty assignment from unset and names the winning layer",
+    "reason": "ordinary tools conflate missing and empty; the surviving question is layer provenance of a single key"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Classification USEFUL_COMPOSITION. Ground independently; do not implement envprobe."
+}

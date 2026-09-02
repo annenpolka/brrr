@@ -1,0 +1,30 @@
+{
+  "summary": "Invented nix eval/sqlite theater. Harvest leftover fetcher-cache mapping of rev fingerprint to stale narHash after lock correction. Stop.",
+  "preserve_add": [
+    "A fetcher cache can map git rev fingerprint R2 to NAR H_nar1 after a poisoned lock, then fail when the lock later names H_nar2"
+  ],
+  "established_add": [
+    "Packet: cache keys on rev fingerprint; substitution can serve H_nar1 store path while fingerprint is R2; later H_nar2 correction mismatches",
+    "Fresh cache with consistent R2/H_nar2 evals rev2"
+  ],
+  "rejected_add": [
+    "Invented nix eval / sqlite transcripts are not host-executed"
+  ],
+  "constraints_add": [
+    "Owned labeled rev/narHash records. No nix daemon."
+  ],
+  "open_questions_add": [],
+  "harvest_candidates_add": [
+    "whether the substitution cache keyed the input by lock rev or lock narHash, and which NAR that key mapped to after poison"
+  ],
+  "pressure": [],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name leftover cache NAR for a rev fingerprint vs lock narHash after correction",
+    "nearest_existing_operation": "diff flake.lock narHash vs sqlite cache value for that rev",
+    "observable_delta": "leftover_stale_nar = cache_nar != lock_nar for same rev",
+    "reason": "grep of the rev hits both lock and cache; the leftover is H_nar1 still bound to R2"
+  },
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Ground on owned rev/narHash records. Do not send nix theater back to R1.",
+  "next_action": "HARVEST_NOW"
+}

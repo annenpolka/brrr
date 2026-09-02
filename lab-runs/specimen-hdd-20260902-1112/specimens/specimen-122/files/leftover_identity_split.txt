@@ -1,0 +1,25 @@
+Registry / fixture:
+  subprojects/wrap_git.wrap revision = master then not-master
+  leftover subprojects/<dir>/meson.build
+  no .meson-subproject-wrap-hash.txt on failing_ref
+
+Case A (first meson setup):
+  checkout matches wrap
+  wrap-hash omitted (no file)
+
+Case B (wrap file edited, leftover meson.build):
+  leftover: previous wrap-file checkout
+  current wrap-file identity is new revision
+  resolve returns leftover directory
+
+Case C (delete subprojects/<dir> then setup):
+  fresh fetch
+  not leftover checkout
+
+Case D (cmake leftover CMakeLists.txt):
+  leftover cmake checkout
+  wrap-file identity still omitted
+
+Not this packet:
+  nix NAR leftover vs rev (specimen-064/070/092)
+  meson#10159 CI packagecache discussion (no PR)

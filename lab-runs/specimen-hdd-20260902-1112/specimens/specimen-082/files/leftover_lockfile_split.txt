@@ -1,0 +1,38 @@
+Registry fixtures (Verdaccio):
+  optional-peer-deps@1.0.0
+    peerDependencies: { no-deps: "*" }
+    optionalPeers: ["no-deps"]
+  no-deps@1.0.0
+    no dependencies
+  one-dep@1.0.0
+    hard dependency no-deps@1.0.1
+
+Case A (never install the peer):
+  bun add -D optional-peer-deps@1.0.0
+  bun.lock has NO packages entry prefix "no-deps": ["no-deps@"
+  name no-deps still appears inside optional-peer-deps metadata
+
+Case B (add then remove as a direct dep):
+  after bun add no-deps@1.0.0:
+    bun.lock contains
+      "no-deps": ["no-deps@1.0.0", "...", {}, "sha512-..."]
+      "optional-peer-deps": [..., { peerDependencies: { no-deps: "*" }, optionalPeers: ["no-deps"] }, ...]
+  after bun remove no-deps:
+    package.json no longer lists no-deps
+    Package::clone walks every resolution slot including the optional-peer slot
+    unmapped slots are pushed onto clone_queue as PendingResolution
+
+Case C (hard dep remains):
+  package.json: optional-peer-deps@1.0.0 and one-dep@1.0.0
+  bun add no-deps@1.0.1 then bun remove no-deps
+  bun.lock still contains a packages entry for no-deps
+  lockfile is byte-identical to the pre-add baseline on the released build
+
+Case D:
+  same leftover path as B, via editing package.json + bun install
+  (other entry into Lockfile::clean_with_logger)
+
+Public #8662 comment 3379529330:
+  @tanstack/router-plugin optional peer @tanstack/react-router
+  after add-then-remove, bun.lock differed from step-1; package remained in node_modules
+  npm and yarn 1.22.22 returned lockfile to pre-add state

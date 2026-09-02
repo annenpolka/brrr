@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""keyorder: label displayed mappings as sorted-keys vs insertion-order."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import re
+import sys
+
+ASSIGN_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
+
+OWNED_OBJ = {1: 0, 0: 0}
+
+
+def format_mapping(mapping: dict) -> str:
+    inner = ", ".join(f"{k!r}: {v!r}" for k, v in mapping.items())
+    return "{" + inner + "}"
+
+
+def print_sorted(mapping: dict) -> str:
+    inner = ", ".join(f"{k!r}: {mapping[k]!r}" for k in sorted(mapping))
+    return "{" + inner + "}"
+
+
+def print_insertion(mapping: dict) -> str:
+    inner = ", ".join(f"{k!r}: {mapping[k]!r}" for k in mapping)
+    return "{" + inner + "}"
+
+
+def strip_display_prefix(text: str) -> str:
+    """Accept pytest `d = {…}` and Hypothesis `d={…}` / trailing commas."""
+    raw = text.strip()
+    while True:
+        match = ASSIGN_RE.match(raw)
+        if not match:
+            break
+        rest = raw[match.end() :]
+        if rest.startswith("{"):
+            raw = rest
+            continue
+        break
+    if raw.endswith(",") and raw.startswith("{"):
+        candidate = raw[:-1].rstrip()
+        if candidate.endswith("}"):
+            raw = candidate
+    return raw
+
+
+def parse_mapping(text: str) -> dict:
+    raw = strip_display_prefix(text)
+    if not raw:
+        raise ValueError("empty mapping")
+    try:
+        obj = ast.literal_eval(raw)
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(f"not a mapping literal: {text!r}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"not a mapping: {text!r}")
+    return obj
+
+
+def sorted_key_tuple(mapping: dict) -> tuple | None:
+    try:
+        return tuple(sorted(mapping))
+    except TypeError:
+        return None
+
+
+def classify(mapping: dict, obj: dict | None) -> str:
+    keys = tuple(mapping)
+    sk = sorted_key_tuple(mapping)
+    if sk is None:
+        if obj is not None and keys == tuple(obj):
+            return "insertion-order"
+        return "unsortable"
+    is_sorted = keys == sk
+    if obj is None:
+        return "sorted-keys" if is_sorted else "insertion-order"
+    is_insertion = keys == tuple(obj)
+    if is_sorted and is_insertion:
+        return "sorted-keys"
+    if is_sorted:
+        return "sorted-keys"
+    if is_insertion:
+        return "insertion-order"
+    return "other"
+
+
+def parse_file_text(text: str) -> tuple[str | None, list[tuple[str, str]]]:
+    obj_text = None
+    displays: list[tuple[str, str]] = []
+    anon = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "\t" in line:
+            name, mapping = line.split("\t", 1)
+            name = name.strip()
+            mapping = mapping.strip()
+            if name == "obj":
+                obj_text = mapping
+                continue
+            displays.append((name, mapping))
+        else:
+            displays.append((str(anon), stripped))
+            anon += 1
+    return obj_text, displays
+
+
+def inspect(
+    displays: list[tuple[str, dict]],
+    obj: dict | None = None,
+) -> dict:
+    rows: list[tuple] = []
+    parsed = [(name, mapping) for name, mapping in displays]
+    if obj is not None:
+        rows.append(("obj", format_mapping(obj)))
+        rows.append(("obj_keys", *(repr(k) for k in obj)))
+        sk = sorted_key_tuple(obj)
+        if sk is None:
+            rows.append(("sorted_keys", "unsortable"))
+        else:
+            rows.append(("sorted_keys", *(repr(k) for k in sk)))
+
+    labels: list[str] = []
+    for name, mapping in parsed:
+        label = classify(mapping, obj)
+        labels.append(label)
+        rows.append(("display", name, format_mapping(mapping), label))
+
+    item_sets = [frozenset(m.items()) for _, m in parsed]
+    if obj is not None:
+        try:
+            item_sets.append(frozenset(obj.items()))
+        except TypeError:
+            item_sets.append(None)  # type: ignore[arg-type]
+    hashable = all(s is not None for s in item_sets)
+    same = bool(item_sets) and hashable and all(s == item_sets[0] for s in item_sets)
+    rows.append(("same_items", "yes" if same else "no"))
+
+    orders = [tuple(m) for _, m in parsed]
+    disagree = len(set(orders)) > 1
+    rows.append(("disagree", "yes" if disagree else "no"))
+
+    if same and parsed:
+        obj_keys = tuple(obj) if obj is not None else None
+        if obj_keys is None:
+            unsorted = []
+            for _, mapping in parsed:
+                keys = tuple(mapping)
+                sk = sorted_key_tuple(mapping)
+                if sk is None or keys != sk:
+                    unsorted.append(keys)
+            uniq = list(dict.fromkeys(unsorted))
+            if len(uniq) == 1:
+                obj_keys = uniq[0]
+        if obj_keys is not None:
+            sk = None
+            try:
+                sample = dict(parsed[0][1])
+                sk = sorted_key_tuple(sample)
+            except TypeError:
+                sk = None
+            reordered: list[str] = []
+            faithful: list[str] = []
+            for name, mapping in parsed:
+                keys = tuple(mapping)
+                if keys == obj_keys:
+                    faithful.append(name)
+                elif sk is not None and keys == sk:
+                    reordered.append(name)
+            rows.append(("reordered", *(reordered if reordered else ("none",))))
+            rows.append(("faithful", *(faithful if faithful else ("none",))))
+
+    return {"rows": rows, "labels": labels, "disagree": disagree, "same_items": same}
+
+
+def format_rows(result: dict) -> str:
+    lines = []
+    for row in result["rows"]:
+        lines.append("\t".join(str(part) for part in row))
+    return "\n".join(lines) + "\n"
+
+
+def load_file(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="keyorder",
+        description=(
+            "Label each displayed mapping as sorted-keys vs insertion-order "
+            "when those views disagree."
+        ),
+    )
+    parser.add_argument(
+        "displays",
+        nargs="*",
+        metavar="MAPPING",
+        help="displayed mapping literal (repeatable)",
+    )
+    parser.add_argument(
+        "--obj",
+        metavar="MAPPING",
+        help="original mapping in insertion order",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="lines of MAPPING or NAME<TAB>MAPPING; NAME obj sets --obj",
+    )
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help="owned {1: 0, 0: 0}: pretty=sorted keys, repr=insertion",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    obj_text = args.obj
+    displays: list[tuple[str, str]] = []
+
+    if args.fixture:
+        obj_text = format_mapping(OWNED_OBJ)
+        displays.append(("pretty", print_sorted(OWNED_OBJ)))
+        displays.append(("repr", print_insertion(OWNED_OBJ)))
+
+    if args.file is not None:
+        try:
+            text = load_file(args.file)
+        except FileNotFoundError:
+            print(f"keyorder: file not found: {args.file}", file=sys.stderr)
+            return 1
+        except IsADirectoryError:
+            print(f"keyorder: is a directory: {args.file}", file=sys.stderr)
+            return 1
+        except (OSError, UnicodeDecodeError) as err:
+            print(f"keyorder: cannot read {args.file}: {err}", file=sys.stderr)
+            return 1
+        file_obj, file_displays = parse_file_text(text)
+        if file_obj is not None and obj_text is None:
+            obj_text = file_obj
+        displays.extend(file_displays)
+
+    for i, item in enumerate(args.displays):
+        displays.append((str(i), item))
+
+    if not displays:
+        print("keyorder: need a mapping display, --file, or --fixture", file=sys.stderr)
+        return 2
+
+    try:
+        obj = parse_mapping(obj_text) if obj_text is not None else None
+        parsed = [(name, parse_mapping(text)) for name, text in displays]
+    except ValueError as err:
+        print(f"keyorder: {err}", file=sys.stderr)
+        return 2
+
+    result = inspect(parsed, obj=obj)
+    sys.stdout.write(format_rows(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

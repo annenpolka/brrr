@@ -1,0 +1,74 @@
+{
+  "iteration": 1,
+  "preserve": [
+    "Flatten deserialize can accept a unit variant as a map key with null value",
+    "Flatten serialize can reject that same unit variant",
+    "Flatten of a unit-like variant can be untested while other flatten shapes pass"
+  ],
+  "established": [
+    "Packet: de of {\"Unit\":null} passes; ser panics can only flatten structs and maps (got an enum)",
+    "Packet: serde flatten unit variant"
+  ],
+  "rejected": [
+    "serde-tokens is not installed; token traces are Dreamer-generated",
+    "In-tree cargo test transcripts were not produced on this host",
+    "cargo test transcripts are Dreamer-generated"
+  ],
+  "constraints": [
+    "No serde checkout, no cargo",
+    "The user snippet and the packet error string are the world",
+    "No cargo/serde checkout"
+  ],
+  "open_questions": [],
+  "human_pressure": [],
+  "harvest_candidates": [
+    "Ask which direction of the format boundary accepted the unit variant and which rejected it",
+    "Ask which flatten shape has no roundtrip"
+  ],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name which flattened variant shape does not roundtrip",
+    "nearest_existing_operation": "write one more unit test",
+    "observable_delta": "one query that lists missing flatten shapes vs passing ones",
+    "reason": "test pass/fail on other variants hides the missing unit case",
+    "iteration": 1
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:01:31+09:00",
+      "summary": "Preserve flatten unit-variant format-boundary asymmetry: JSON {\"Unit\":null} deserializes, serializing the value fails. cargo test runs, serde-tokens CLI, and precise ser.rs line numbers are Dreamer-generated. Harvest. Do not ask for more novelty.",
+      "pressure": [
+        "There is no serde-tokens and no crate checkout. Continue only from the packet snippet and error string."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "for one flatten unit-variant value, name which direction accepted it, which rejected it, and the token sequence each side implies",
+        "nearest_existing_operation": "run de and ser tests and read the panic",
+        "observable_delta": "one query that treats ser/de disagreement as the object, not a missing test",
+        "reason": "sibling variants already round-trip; the remainder is the unit-variant boundary",
+        "iteration": 1
+      }
+    },
+    {
+      "iteration": 1,
+      "at": "2026-09-02T12:02:02+09:00",
+      "summary": "Preserve flatten+unit-variant hole. cargo test output unverified. Continue on an owned flatten dict fixture.",
+      "pressure": [
+        "No crate checkout. Continue on a tiny flatten roundtrip table with a missing unit shape."
+      ],
+      "affordance_assessment": {
+        "classification": "USEFUL_COMPOSITION",
+        "core_operation": "name which flattened variant shape does not roundtrip",
+        "nearest_existing_operation": "write one more unit test",
+        "observable_delta": "one query that lists missing flatten shapes vs passing ones",
+        "reason": "test pass/fail on other variants hides the missing unit case",
+        "iteration": 1
+      }
+    }
+  ],
+  "last_pressure": [
+    "No crate checkout. Continue on a tiny flatten roundtrip table with a missing unit shape."
+  ],
+  "pending": null
+}

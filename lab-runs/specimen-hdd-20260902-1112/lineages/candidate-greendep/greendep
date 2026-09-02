@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""greendep: name a green query whose own changed dependency was unrecorded."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+EMPTY = "-"
+LEGAL_COLORS = {"green", "red"}
+LIST_CAP = 32
+NAME_CAP = 256
+
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def unique_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def check_name(name: str, *, source: str, lineno: int, kind: str) -> str:
+    if not name or name == EMPTY:
+        raise ValueError(f"{source}:{lineno}: {kind} {name!r} is not a legal NAME")
+    return name
+
+
+def parse_record(text: str, *, source: str) -> dict:
+    queries: "OrderedDict[str, str]" = OrderedDict()
+    recorded: dict[str, list[str]] = {}
+    changed_pairs: list[tuple[str, str]] = []
+    shorthand: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Do not strip trailing tabs: changed<TAB> is changed=∅, not a missing tab.
+        line = raw.rstrip("\r")
+        if "\t" not in line:
+            if "->" in stripped:
+                raise ValueError(
+                    f"{source}:{lineno}: rustc-shaped q -> d dump is not an input; "
+                    "use query/dep/changed TSV"
+                )
+            raise ValueError(f"{source}:{lineno}: expected key<TAB>value")
+        key, rest = line.split("\t", 1)
+        key = key.strip()
+        raw_parts = [] if rest == "" else rest.split("\t")
+        if any(part == "" for part in raw_parts):
+            raise ValueError(f"{source}:{lineno}: empty {key} field")
+        parts = raw_parts
+        if key == "query":
+            if len(parts) != 2:
+                raise ValueError(f"{source}:{lineno}: query needs name and color")
+            name = check_name(parts[0], source=source, lineno=lineno, kind="query")
+            color = parts[1].lower()
+            if color not in LEGAL_COLORS:
+                raise ValueError(
+                    f"{source}:{lineno}: color {parts[1]!r} is not green or red"
+                )
+            queries[name] = color
+        elif key == "dep":
+            if len(parts) != 2:
+                raise ValueError(f"{source}:{lineno}: dep needs query and dep name")
+            q = check_name(parts[0], source=source, lineno=lineno, kind="query")
+            d = check_name(parts[1], source=source, lineno=lineno, kind="dep")
+            recorded.setdefault(q, []).append(d)
+        elif key == "changed":
+            if not parts:
+                continue
+            if len(parts) == 1:
+                shorthand.append(
+                    check_name(parts[0], source=source, lineno=lineno, kind="dep")
+                )
+            elif len(parts) == 2:
+                changed_pairs.append(
+                    (
+                        check_name(parts[0], source=source, lineno=lineno, kind="query"),
+                        check_name(parts[1], source=source, lineno=lineno, kind="dep"),
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"{source}:{lineno}: changed is QUERY<TAB>DEP "
+                    "(not a global list of identities)"
+                )
+        else:
+            raise ValueError(f"{source}:{lineno}: unknown field {key!r}")
+    if not queries:
+        raise ValueError(f"{source}: no query rows")
+    if shorthand:
+        greens = [q for q, color in queries.items() if color == "green"]
+        if len(greens) != 1:
+            raise ValueError(
+                f"{source}: changed DEP without query is only legal with exactly one green"
+            )
+        owner = greens[0]
+        for dep in shorthand:
+            changed_pairs.append((owner, dep))
+    for query, dep in changed_pairs:
+        if query not in queries:
+            raise ValueError(f"{source}: changed query {query!r} is not a listed query")
+    return {
+        "queries": queries,
+        "recorded": {query: unique(deps) for query, deps in recorded.items()},
+        "changed": unique_pairs(changed_pairs),
+        "source": source,
+    }
+
+
+def inspect(rec: dict) -> dict:
+    green = [q for q, color in rec["queries"].items() if color == "green"]
+    red = [q for q, color in rec["queries"].items() if color != "green"]
+    own: dict[str, list[str]] = {}
+    for query, dep in rec["changed"]:
+        own.setdefault(query, []).append(dep)
+    unrecorded_changed: list[tuple[str, str]] = []
+    invalidation: list[tuple[str, str]] = []
+    false_green: list[str] = []
+    for query in green:
+        recs = set(rec["recorded"].get(query, []))
+        missing: list[str] = []
+        recorded_changed: list[str] = []
+        for dep in own.get(query, []):
+            if dep in recs:
+                recorded_changed.append(dep)
+            else:
+                missing.append(dep)
+        if missing:
+            false_green.append(query)
+            for dep in missing:
+                unrecorded_changed.append((query, dep))
+        for dep in recorded_changed:
+            invalidation.append((query, dep))
+    incomplete = bool(green) and not rec["changed"]
+    return {
+        "green": green,
+        "red": red,
+        "false_green": unique(false_green),
+        "unrecorded_changed": unique_pairs(unrecorded_changed),
+        "invalidation": unique_pairs(invalidation),
+        "changed": rec["changed"],
+        "incomplete": incomplete,
+    }
+
+
+def cap_name(name: str) -> str:
+    if len(name) <= NAME_CAP:
+        return name
+    return name[:NAME_CAP] + "..."
+
+
+def fmt_list(items: list[str]) -> str:
+    if not items:
+        return EMPTY
+    return "\t".join(cap_name(item) for item in items[:LIST_CAP])
+
+
+def fmt_pair_rows(tag: str, pairs: list[tuple[str, str]]) -> list[str]:
+    lines = [f"{tag}_n\t{len(pairs)}"]
+    if not pairs:
+        lines.append(f"{tag}\t{EMPTY}")
+        return lines
+    for query, dep in pairs[:LIST_CAP]:
+        lines.append(f"{tag}\tquery\t{cap_name(query)}\tdep\t{cap_name(dep)}")
+    return lines
+
+
+def format_report(result: dict) -> str:
+    green = result["green"]
+    red = result["red"]
+    lines = [
+        f"green\t{fmt_list(green)}",
+    ]
+    if len(green) > LIST_CAP:
+        lines.append(f"green_n\t{len(green)}")
+    lines.append(f"red\t{fmt_list(red)}")
+    if len(red) > LIST_CAP:
+        lines.append(f"red_n\t{len(red)}")
+    lines.extend(fmt_pair_rows("changed", result["changed"]))
+    lines.append(f"false_green_n\t{len(result['false_green'])}")
+    lines.append(f"false_green\t{fmt_list(result['false_green'])}")
+    lines.extend(fmt_pair_rows("unrecorded_changed", result["unrecorded_changed"]))
+    lines.extend(fmt_pair_rows("invalidation", result["invalidation"]))
+    lines.append(f"incomplete\t{'yes' if result['incomplete'] else 'no'}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="greendep",
+        description=(
+            "Read a query/dep/color table. Name a green query whose own "
+            "changed dependency was never recorded. A recorded dep that "
+            "also changed is invalidation, rc=1, not false_green. A green "
+            "with no changed pair is incomplete (rc=2), not agreement."
+        ),
+    )
+    parser.add_argument("record", nargs="?", default="-")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.record == "-":
+            text = sys.stdin.read()
+            source = "<stdin>"
+        else:
+            text = Path(args.record).read_text(encoding="utf-8")
+            source = args.record
+        rec = parse_record(text, source=source)
+    except (OSError, ValueError) as err:
+        print(f"greendep: {err}", file=sys.stderr)
+        return 1
+    result = inspect(rec)
+    sys.stdout.write(format_report(result))
+    if result["incomplete"]:
+        return 2
+    if result["false_green"] or result["invalidation"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

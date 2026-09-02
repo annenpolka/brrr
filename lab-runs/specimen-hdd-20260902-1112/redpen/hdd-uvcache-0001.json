@@ -1,0 +1,18 @@
+{
+  "summary": "Invented uv cache list/clean --type=workspace-member. Preserve leftover fingerprints vs current lockfile. Harvest on owned entry list; no uv.",
+  "preserve_add": ["Workspace-member fingerprints from an older lockfile can sit beside live artifacts after a lockfile bump"],
+  "established_add": ["Packet: CI Rust cache grows across lockfile updates; external deps should remain"],
+  "rejected_add": ["Invented uv cache list/clean --exclude-lockfile-hash and uv lockfile-hash are not host evidence"],
+  "constraints_add": ["No uv. Owned records: current lockfile hash plus (id, member, lockfile_hash, size)"],
+  "open_questions_add": [],
+  "harvest_candidates_add": ["Name live vs leftover fingerprints against the current lockfile hash without deleting the whole cache"],
+  "affordance_assessment": {
+    "classification": "USEFUL_COMPOSITION",
+    "core_operation": "name which cache fingerprints still match the current lockfile versus leftover hashes",
+    "nearest_existing_operation": "ls plus grep of fingerprint dirs",
+    "observable_delta": "one query names leftover vs live without a whole-cache wipe",
+    "reason": "adjacent to freshmiss; lockfile hash is the identity, leftover entries are the miss"
+  },
+  "pressure": [],
+  "redpen_markdown": "NEXT_ACTION=HARVEST_NOW. Do not send invented uv CLI back to R1."
+}

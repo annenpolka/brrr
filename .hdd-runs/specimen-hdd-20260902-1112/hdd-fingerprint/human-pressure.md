@@ -1,0 +1,1 @@
+- There is no cache-introspection CLI that lists fingerprint components. Only build status text and whether named output files exist are observable. A tiny owned cache that keys only on input hash and ignores extra outputs is present. Use the same tool on that fixture.

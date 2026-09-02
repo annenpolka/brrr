@@ -93,3 +93,7 @@ Lab closed. No further R1. Scheduler cancelled.
 | Preservation 08:20 | `688acc8` 08:20 |
 
 Governing answer: delayed feasibility produced different questions in merge-parentage (`whence`) and env-empty-override (`envfrom`). Not a statistical benchmark. Much of the Cambrian still collapsed to renamed Unix.
+
+## 2026-09-02 09:16 JST — leftover scheduler fire (no-op)
+
+Hard end already passed. Phase remains CLOSED. No pending Red Pen, no live `hdd.py`/`dream.sh`, no new R1. Isolation hashes unchanged. Scheduler list empty (cancelled at 09:00). This fire does not reopen the lab.

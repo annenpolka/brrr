@@ -1,22 +1,26 @@
 # Status board
 
-**Phase:** HDD Cambrian Explosion (22:00–00:00)  
-**JST:** 2026-09-01 23:18  
-**R1 calls:** see `R1_BUDGET.md` (observed spend ~$0.29 of $10 effective / $50 hard)  
-**Embodiments:** 7 archived under `lab-hdd/lineages/candidate-*`  
-**First Selection:** not started (seal in force)
+**Phase:** CLOSED  
+**JST:** 2026-09-02 09:00  
+**R1 calls:** 38 (ledger $0.398488; OpenRouter snapshot delta $0.4101 of $10 effective / $50 hard)  
+**Embodiments:** archived under `lab-hdd/lineages/` (candidates, mutations, reimpls, gen3)  
+**First Selection:** complete (`lab-hdd/FIRST_SELECTION.md`)  
+**Final jury:** complete (`lab-hdd/judges/FINAL_*.md`)  
+**Tomorrow Test:** envfrom, whence (rename); slots 3–5 empty (`lab-hdd/TOMORROW.md`)  
+**Report:** `HDD_EVOLUTION_REPORT.md` (14 sections)
 
-## Harvested (USEFUL_COMPOSITION)
+## Harvested then evolved
 
-| ID | Tool | Trial | Primitive |
-| --- | --- | --- | --- |
-| candidate-01 | whence | hdd-merge | parent-tagged conflict resolve + provenance |
-| candidate-02 | stated | hdd-debug | config key declaration vs contradicting assignment |
-| candidate-03 | owes | hdd-agent | in-tree obligations a change fails to keep |
-| candidate-04 | capdiff | hdd-ci | named env+file captures, diff, env replay |
-| candidate-05 | envfrom | hdd-env | per-variable env provenance (file empty override) |
-| candidate-06 | same | hdd-ident | exclusive identity kind: inode / bytes / json |
-| candidate-07 | hits | hdd-empty | search where empty is success (exit 0), distinct from query/I/O errors |
+| ID | Tool | Fate |
+| --- | --- | --- |
+| candidate-01 / gen3-01 | whence | KEEP (PATH with rename) |
+| candidate-05 / gen3-02 | envfrom | KEEP (PATH) |
+| candidate-02 / gen3-03 | stated | remember, not PATH |
+| hybrid-01 / gen3-04 | effect | remember, not PATH |
+| candidate-03 / mutation-02 | owes | remember, not PATH |
+| candidate-04 / mutation-04 | capdiff | do not install |
+| candidate-06 | same | KILL primitive |
+| candidate-07 | hits | KILL primitive |
 
 ## Fossils (no further R1)
 

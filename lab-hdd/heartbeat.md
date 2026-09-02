@@ -72,3 +72,24 @@
 - 00:00 budget prune: observed ~$0.40 of $10 effective / $50 hard. No weak R1 consumers left. Casual R1 stopped.
 - Seven embodiments already satisfy the candidate contract (CLI, README, CANDIDATE, demo, tests, commits, transcripts, dogfood, origin).
 - Seal still in force until First Selection.
+
+## 2026-09-02 09:00 JST — Hard end / close
+
+Lab closed. No further R1. Scheduler cancelled.
+
+- Isolation hashes unchanged: EVOLUTION_REPORT `d3463e66…`, master prompt `1a9438c8…`, PROTOCOL `666d14c5…`. `lab/lineages` still 302 dirs. Parent `main` has coordinator + `.hdd/` + report only — no candidate product merge.
+- R1: 38 calls; ledger observed **$0.398488**; OpenRouter snapshot at close usage 14.25102774 (delta **$0.4101**) of $10 effective / $50 hard. Remaining $10.75 of $25 credits.
+- Survivor demos (gen3-01 whence, gen3-02 envfrom, gen3-03 stated) run twice at 08:54; pairs identical after tmpdir strip (whence also differs by unittest duration). Tests: whence 31 OK, envfrom 31 OK, stated 22 OK, effect 18 OK.
+- Tomorrow Test: PATH envfrom + whence (rename); slots 3–5 empty. `HDD_EVOLUTION_REPORT.md` 14 sections present.
+- Heartbeat.md is thin after 00:00; later phases are in git, not missing because the lab stopped:
+
+| Phase | Evidence commit |
+| --- | --- |
+| First Selection 01:15 | `d22301b` 01:27 JST |
+| Generation 2 02:00 | `a57f7a1` 02:18 … `380b0aa` 03:46 |
+| Destroyers 05:00 | `15684a8` 05:17 |
+| Generation 3 06:15 | `33b5a3e` 05:27, `e84e221` 05:31 (FIX landed early; 06:15–07:40 concentrated) |
+| Final jury 07:40 | `9118fb1` 07:50 |
+| Preservation 08:20 | `688acc8` 08:20 |
+
+Governing answer: delayed feasibility produced different questions in merge-parentage (`whence`) and env-empty-override (`envfrom`). Not a statistical benchmark. Much of the Cambrian still collapsed to renamed Unix.

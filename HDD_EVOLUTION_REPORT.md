@@ -1,6 +1,6 @@
 # HDD Evolution Report
 
-Experiment window: **2026-09-01 22:00 JST → 2026-09-02 09:00 JST**. Final jury stamped 07:40–08:20; preservation 08:20–09:00.
+Experiment window: **2026-09-01 22:00 JST → 2026-09-02 09:00 JST**. Closed **2026-09-02 09:00 JST**. Final jury stamped 07:40–08:20; preservation 08:20–09:00.
 
 Coordinator tree: `lab-hdd/`. Raw HDD: `.hdd/`. Previous brrr (`EVOLUTION_REPORT.md`, `lab/`) was not overwritten.
 

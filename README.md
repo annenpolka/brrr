@@ -2,6 +2,13 @@
 
 Autonomous overnight search for developer tools that do not meaningfully exist yet.
 
+Issue collection redesign preparation (2026-09-09): see
+[the implementation and migration report](docs/preparation/README.md) and
+[the next execution prompt](docs/preparation/next-run-prompt.md).
+The new corpus CLI is `python3 scripts/corpus.py`; its tests are
+`python3 scripts/check_corpus.py`. Legacy import is complete; the new 24-case
+HDD input still requires source acquisition and content review.
+
 Experiment window: **2026-08-19 23:45 JST → 2026-08-20 09:00 JST**.
 
 Coordinator stays in the parent workspace. Candidates live in isolated git worktrees. Do not merge a candidate into `main` unless a later generation explicitly promotes it.

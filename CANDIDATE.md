@@ -26,4 +26,4 @@ USEFUL_COMPOSITION of run + directory snapshot. Not claimed as a new foundationa
 
 ## Isolation
 
-This worktree/branch is not merged onto coordinator `main`.
+Merged onto coordinator `main` from branch `hdd-20260909-runpair`.

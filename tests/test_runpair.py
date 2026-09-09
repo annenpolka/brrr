@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 from runpair import file_delta, runpair, snapshot_files  # noqa: E402
 
-RUN_BUNDLE = Path(__file__).resolve().parents[3] / "inputs" / "case-001" / "discovery" / "input-001" / "files"
+# Public reported 32113 files (not the collector root). Same bytes as the HDD public bundle.
+RUN_BUNDLE = ROOT / "tests" / "fixtures" / "runpair-reported-input"
 
 
 class SnapshotTests(unittest.TestCase):

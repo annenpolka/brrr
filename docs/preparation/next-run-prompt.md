@@ -14,7 +14,9 @@ collection IDを記録してください。同じrecipeのcollectは既存の初
 
 終了時に、完了・不足・失敗・SourceObservation件数・原文の由来をreportに記録してください。`python3 scripts/corpus.py audit` を通し、新しい名前でDBとobjectをバックアップしてください。出典URLや修正SHAがあるだけでローカル再現済みとしないでください。
 
-以降は保存原文からCase/Claim/Viewを整理するP3へ進みます。品質と意味的漏洩の審査は対象hashに結び付け、実際の人間の内容審査を受ける前にhuman PASSを作らないでください。pilotの目標24事例、同一機構最大8、同一repository最大6、holdout目標6を守り、不足は不足として残してください。同じ障害・派生系列や公開履歴不明の資料を未知事例用holdoutへ流さないでください。
+少数で試す場合は `docs/preparation/mini-loop.md` を使ってください。`mini-demo` は収集から復元まで合成資料で動きます。実資料には `.brrr-corpus/mini-real/pilot` の審査パッケージがあり、Case/Claim/reprocess/selectは実装済みです。
+
+以降は保存原文から既存のCLIでCase/Claim/Viewを整理します。品質と意味的漏洩の審査は対象hashに結び付け、実際の人間の内容審査を受ける前にhuman PASSを作らないでください。pilotの目標24事例、同一機構最大8、同一repository最大6、holdout目標6を守り、不足は不足として残してください。同じ障害・派生系列や公開履歴不明の資料を未知事例用holdoutへ流さないでください。
 
 HDDへ渡すのは審査済みsnapshotからexportしたバンドルだけです。旧packet・正解・raw corpus・.gitをconsumerへ渡さず、OS隔離を確認できない場合はstatic_bundle_onlyと記録してください。発明指示・R1モデル・Reality Gateを収集変更と同時に再設計しないでください。
 

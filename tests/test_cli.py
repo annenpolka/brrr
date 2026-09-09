@@ -73,6 +73,32 @@ class CliTests(unittest.TestCase):
             call('revoke', snapshot, '--reason', 'Synthetic revocation test')
             call('export', snapshot, '--output', root / 'public', expected=1)
 
+    def test_mini_reuse_commands_and_pending_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            corpus = root / 'demo/corpus'
+            def call(*args, expected=0):
+                result = subprocess.run([sys.executable,str(CLI),'--root',str(corpus),*map(str,args)],capture_output=True,text=True)
+                self.assertEqual(result.returncode,expected,result.stderr)
+                return json.loads(result.stdout or result.stderr)
+            report = call('mini-demo','--output',root/'demo')
+            self.assertTrue(call('mini-demo','--output',root/'demo')['reused'])
+            found = call('sources','--query','SYNTHETIC REPORT')
+            self.assertEqual(found['total'],3)
+            self.assertIn('SYNTHETIC REPORT',call('show-source',found['matches'][0]['revision'])['body'])
+            self.assertEqual(len(call('list-cases')['cases']),3)
+            self.assertTrue(call('show-case',report['cases'][0]['case_revision'])['case_id'])
+            selection = call('inspect-selection',report['selections']['two'])
+            self.assertEqual(len(selection['selected']),2)
+            self.assertEqual(call('seal-selection',report['selections']['two'])['snapshot_id'],report['snapshots']['two'])
+            recipe = json.loads((CLI.parent.parent/'recipes/selection/mini-one-v1.json').read_text())
+            recipe['pipeline_id'] = 'mini-v2'
+            pending = root/'pending.json'
+            pending.write_text(json.dumps(recipe))
+            held = call('select','--recipe',pending,expected=3)
+            self.assertEqual(held['status'],'HOLD')
+            call('seal-selection',held['selection_id'],expected=1)
+
     def test_dry_run_creates_no_corpus(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

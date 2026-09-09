@@ -47,6 +47,28 @@ def parser():
             cmd.add_argument('--dry-run', action='store_true')
             cmd.add_argument('--limit', type=int)
     commands.add_parser('audit')
+    cmd = commands.add_parser('sources', help='Search all stored source revisions offline')
+    for name in ('query', 'repository', 'kind', 'origin'):
+        cmd.add_argument('--' + name, default='')
+    cmd.add_argument('--limit', type=int, default=50)
+    cmd = commands.add_parser('show-source')
+    cmd.add_argument('revision')
+    for name in ('save-case', 'relate-case', 'add-claim'):
+        cmd = commands.add_parser(name)
+        cmd.add_argument('--file', required=True)
+    commands.add_parser('list-cases')
+    cmd = commands.add_parser('show-case')
+    cmd.add_argument('revision')
+    cmd = commands.add_parser('reprocess')
+    cmd.add_argument('--config', required=True)
+    cmd.add_argument('--recipe', required=True)
+    cmd = commands.add_parser('select')
+    cmd.add_argument('--recipe', required=True)
+    for name in ('inspect-selection', 'seal-selection'):
+        cmd = commands.add_parser(name)
+        cmd.add_argument('selection_id')
+    cmd = commands.add_parser('mini-demo', help='Offline synthetic end-to-end exercise in a dedicated directory')
+    cmd.add_argument('--output', required=True)
     cmd = commands.add_parser('backup')
     cmd.add_argument('--output', required=True)
     cmd = commands.add_parser('restore')
@@ -75,6 +97,7 @@ def parser():
     cmd.add_argument('snapshot_id')
     cmd.add_argument('--consumer', required=True)
     cmd.add_argument('--scope', required=True)
+    cmd.add_argument('--split', choices=['all', 'discovery', 'holdout'], default='all')
     cmd = commands.add_parser('readiness')
     cmd.add_argument('--recipe', required=True)
     cmd = commands.add_parser('plan', help='Freeze a collection recipe and legacy seed set; offline')
@@ -156,6 +179,9 @@ def readiness(c, recipe):
 
 
 def dispatch(args):
+    if args.command == 'mini-demo':
+        from .mini import run_demo
+        return run_demo(args.output)
     if args.command == 'inventory':
         result = inventory(args.run, args.companion, args.design)
         path = no_symlink_components(args.output)
@@ -179,6 +205,32 @@ def dispatch(args):
         require((Path(args.root) / 'corpus.sqlite').is_file(), 'Corpus does not exist; import data first')
     c = Corpus(args.root)
     try:
+        from . import cases, catalog, selection
+        if args.command == 'sources':
+            return catalog.sources(c, query=args.query, repository=args.repository,
+                                   kind=args.kind, origin=args.origin, limit=args.limit)
+        if args.command == 'show-source':
+            return catalog.show_source(c, args.revision)
+        if args.command == 'save-case':
+            return cases.save_case(c, read_json(args.file))
+        if args.command == 'list-cases':
+            return {'cases': [{'revision': rid, **c.get(rid, 'case_revision')}
+                              for rid in cases.current_cases(c).values()]}
+        if args.command == 'show-case':
+            return c.get(args.revision, 'case_revision')
+        if args.command == 'relate-case':
+            return {'relation_id': cases.relate(c, read_json(args.file))}
+        if args.command == 'add-claim':
+            return {'claim_id': cases.save_claim(c, read_json(args.file))}
+        if args.command == 'reprocess':
+            return cases.reprocess(c, read_json(args.config), read_json(args.recipe))
+        if args.command == 'select':
+            return selection.build_selection(c, read_json(args.recipe))
+        if args.command == 'inspect-selection':
+            return c.get(args.selection_id, 'selection_run')
+        if args.command == 'seal-selection':
+            selected = selection.validate_selection(c, args.selection_id)
+            return {'snapshot_id': seal(c, selected['selected'], args.selection_id)}
         if args.command == 'plan':
             pid = make_plan(c, read_json(args.recipe))
             return {'plan_id': pid, **c.get(pid, 'collection_plan')}
@@ -216,15 +268,7 @@ def dispatch(args):
                 states[kind] = c.get(row[0], 'review')['verdict'] if row else 'PENDING'
             return {'view_id': vid, **states}
         if args.command == 'inspect-view':
-            view = validate_view(c, args.view_id)
-            files = {f'public/{name}': c.read(blob) for name, blob in view['files'].items()}
-            files['PRIVATE-review-target.json'] = canonical({'view_id': args.view_id, **view})
-            for blob in view['spec']['restricted_blobs']:
-                files[f'PRIVATE-solution-context/{blob}.txt'] = c.read(blob)
-            for rid in view['source_revisions']:
-                files[f'PRIVATE-sources/{rid}.txt'] = c.read(c.get(rid, 'source_revision')['body_blob'])
-            return {'view_id': args.view_id, 'private_review_package': args.output,
-                    'reused': publish_tree(args.output, files)}
+            return catalog.review_package(c, args.view_id, args.output)
         if args.command == 'record-review':
             data = read_json(args.file)
             keys(data, ['view_id', 'kind', 'verdict', 'reviewer', 'reviewer_type', 'rationale', 'attestations'])
@@ -246,7 +290,7 @@ def dispatch(args):
             nonempty(args.scope, 'scope')
             with c.transaction():
                 rid = c.record('exposure', {'snapshot_id': args.snapshot_id, 'consumer': args.consumer,
-                               'scope': args.scope, 'observed_at': datetime.now(timezone.utc).isoformat()},
+                               'scope': args.scope, 'split': args.split, 'observed_at': datetime.now(timezone.utc).isoformat()},
                                records=[args.snapshot_id])
             return {'exposure_id': rid}
         if args.command == 'readiness':
@@ -263,6 +307,8 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if result.get('ok') is False:
             return 1
+        if args.command == 'select' and result['status'] != 'READY':
+            return 3
         if args.command == 'readiness' and not result['ready_for_selection']:
             return 3
         if args.command in ('collect', 'resume', 'refresh', 'collection-status') and result['state'] != 'COMPLETE_FOR_POLICY':

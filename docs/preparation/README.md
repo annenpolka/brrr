@@ -1,6 +1,6 @@
 # 次回実行の準備状況
 
-2026-09-09 JST。公開境界（P0）と保全移行（P1）の初回実装を行い、旧151標本と旧HDD状態を取り込んだ。その後P2のGitHub収集・再開も実装・検証済み。**次回は [収集開始の手順](collection-readiness.md) から始められる。** 下表と移行receiptは初回保全時点の記録。HDD本番用の24事例はまだ審査・確定していない。
+2026-09-09 JST。公開境界（P0）と保全移行（P1）の初回実装を行い、旧151標本と旧HDD状態を取り込んだ。その後P2のGitHub収集・再開も実装・検証済み。**次回は [収集開始の手順](collection-readiness.md) から始められる。** 再利用の小規模な一巡は [mini-loop.md](mini-loop.md) にまとめた。合成3事例の一括demoと、実資料1事例・2 Viewの審査パッケージを用意済み。下表と移行receiptは初回保全時点の記録。HDD本番用の24事例はまだ審査・確定していない。
 
 ## 確認した結果
 
@@ -93,7 +93,9 @@ pilot recipeは24件を要求するため、sealの例の2件だけでは停止�
 
 `inspect-view` は人間の審査用に公開予定の全文と非公開の出典・正解照合資料を出す。Dreamerへ渡すファイルは `export` が作るbundleのみ。人間の実審査を受ける前に `reviewer_type: human` のPASSを作らない。collectorは原文のコマンドを実行せず、ローカル再現済み表示も作らない。
 
-## 設計の受け入れ条件との対応
+## 初回保全時点の設計受け入れ条件との対応
+
+下表はP0/P1時点の記録。Case関係・母集団固定・scopeなどの追加実装と残る制限は [mini-loop.md](mini-loop.md) に記載した。
 
 | 設計のテスト | 今回の検証範囲 | 残る条件 |
 | --- | --- | --- |
@@ -113,6 +115,6 @@ pilot recipeは24件を要求するため、sealの例の2件だけでは停止�
 
 ## 次に実行する作業
 
-次回用の指示は `next-run-prompt.md`。収集器の実装を挟まず、`collection-readiness.md` のcollectから開始する。収集後にP3の事例・根拠・関連・表示審査と、P4の24事例pilotを進める。
+次回用の指示は `next-run-prompt.md`。収集器の実装を挟まず、`collection-readiness.md` のcollectから開始する。収集後は実装済みのCase/Claim/reprocess/selectを使い、[小規模な一巡](mini-loop.md) から内容審査を試す。24事例pilotは別途進める。
 
 夜間HDD実験、R1/OpenRouterの呼び出し、定期automationは今回開始していない。実験の終了時刻・費用上限・新run IDは本番を開始する時点で固定する。旧master promptのthroughput規則より、新しい品質・漏洩・公開境界を優先する。

@@ -116,7 +116,7 @@ def stage_view(corpus, spec, recipe):
     validate_recipe(recipe)
     keys(spec, ['schema_version', 'origin', 'case_id', 'lineage_group', 'repository',
                 'primary_mechanism', 'split', 'exposure', 'mode', 'artifacts',
-                'restricted_blobs', 'forbidden_identifiers'])
+                'restricted_blobs', 'forbidden_identifiers'], ['derivation'])
     require(type(spec['schema_version']) is int and spec['schema_version'] == 1, 'Unsupported view schema')
     require(spec['mode'] == recipe['view_mode'], 'Mixed publication modes')
     require(spec['origin'] in ('real', 'synthetic'), 'Unsupported origin; legacy/derived material needs P3 review')
@@ -127,6 +127,9 @@ def stage_view(corpus, spec, recipe):
         nonempty(spec[name], name)
     for name in ('artifacts', 'restricted_blobs', 'forbidden_identifiers'):
         require(isinstance(spec[name], list), f'Invalid {name}')
+    if spec.get('derivation'):
+        from .cases import validate_derivation
+        validate_derivation(corpus, spec)
     files, provenance = {}, set()
     for artifact in spec['artifacts']:
         data, refs = build_artifact(corpus, artifact, spec['origin'])
@@ -151,13 +154,16 @@ def stage_view(corpus, spec, recipe):
         return corpus.record('view', {'schema_version': 1, 'spec': spec, 'recipe': recipe,
                                      'exporter_hash': exporter_hash(), 'files': blobs,
                                      'source_revisions': sorted(provenance)},
-                             [*blobs.values(), *spec['restricted_blobs']], sorted(provenance))
+                             [*blobs.values(), *spec['restricted_blobs']], [*sorted(provenance), *([spec['derivation']] if spec.get('derivation') else [])])
 
 
 def validate_view(corpus, view_id):
     view = corpus.get(view_id, 'view')
     require(view['exporter_hash'] == exporter_hash(), 'Exporter changed: restage and review required')
     validate_recipe(view['recipe'])
+    if view['spec'].get('derivation'):
+        from .cases import validate_derivation
+        validate_derivation(corpus, view['spec'])
     for source in view['source_revisions']:
         corpus.get(source, 'source_revision')
     files = {name: corpus.read(blob) for name, blob in view['files'].items()}
@@ -169,15 +175,16 @@ def validate_view(corpus, view_id):
 
 
 def review(corpus, view_id, *, kind, verdict, reviewer, reviewer_type, rationale, attestations):
-    validate_view(corpus, view_id)
+    view = validate_view(corpus, view_id)
     require(kind in ('quality', 'leakage'), 'Invalid review kind')
     choices = ('PENDING', 'PASS', 'HOLD', 'REJECT') if kind == 'quality' else ('PENDING', 'PASS', 'FAIL', 'INDETERMINATE')
     require(verdict in choices, 'Invalid review verdict')
-    require(reviewer_type in ('human', 'agent'), 'Invalid reviewer type')
+    require(reviewer_type in ('human', 'agent', 'fixture'), 'Invalid reviewer type')
     nonempty(reviewer, 'reviewer')
     nonempty(rationale, 'rationale')
     if verdict == 'PASS':
-        require(reviewer_type == 'human', 'Pilot PASS requires human content review')
+        require(reviewer_type == 'human' or (reviewer_type == 'fixture' and fixture_allowed(corpus, view)),
+                'Pilot PASS requires human content review; fixture PASS is synthetic-only')
         keys(attestations, ['full_bundle_read', 'provenance_checked', 'solution_context_checked'])
         require(all(v is True for v in attestations.values()), 'PASS requires all explicit attestations')
     with corpus.transaction():
@@ -195,15 +202,29 @@ def approvals(corpus, view_id):
                                 (view_id, kind)).fetchone()
         require(row is not None, f'{kind} review is PENDING')
         r = corpus.get(row[0], 'review')
-        require(r['verdict'] == 'PASS' and r['reviewer_type'] == 'human', f'{kind} review is not human PASS')
+        require(r['verdict'] == 'PASS' and (r['reviewer_type'] == 'human' or
+                (r['reviewer_type'] == 'fixture' and fixture_allowed(corpus, corpus.get(view_id, 'view')))),
+                f'{kind} review is not human PASS or synthetic fixture PASS')
         result[kind] = row[0]
     return result
 
 
-def seal(corpus, view_ids):
+def fixture_allowed(corpus, view):
+    return (view['spec']['origin'] == 'synthetic' and view['recipe']['allow_synthetic']
+            and all(corpus.get(rid, 'source_revision')['origin'] == 'synthetic'
+                    for rid in view['source_revisions']))
+
+
+def seal(corpus, view_ids, selection_id=None):
+    selection = None
+    if selection_id:
+        from .selection import validate_selection
+        selection = validate_selection(corpus, selection_id, view_ids)
     require(isinstance(view_ids, list) and view_ids, 'No eligible views; cannot seal an empty snapshot')
     require(len(view_ids) == len(set(view_ids)), 'Duplicate view')
     views = [(vid, validate_view(corpus, vid)) for vid in sorted(view_ids)]
+    require(selection is not None or not any(v['spec'].get('derivation') for _, v in views),
+            'Derived views require seal-selection to enforce Case relations and selection policy')
     recipe = views[0][1]['recipe']
     require(all(v['recipe'] == recipe for _, v in views), 'Mixed recipes')
     require(len(views) <= recipe['target_cases'], 'Target case count exceeded')
@@ -214,10 +235,11 @@ def seal(corpus, view_ids):
         spec = view['spec']
         require(spec['case_id'] not in cases, 'Duplicate case')
         cases.add(spec['case_id'])
-        group = spec['lineage_group']
+        group = selection['graph']['groups'][spec['case_id']] if selection else spec['lineage_group']
         require(group not in groups, 'DUPLICATE_INCIDENT or GROUP_SPLIT_CONFLICT')
         groups[group] = spec['split']
-        check_holdout_exposure(corpus, spec)
+        if selection is None:
+            check_holdout_exposure(corpus, spec)
         repositories[spec['repository']] += 1
         mechanisms[spec['primary_mechanism']] += 1
         approved[vid] = approvals(corpus, vid)
@@ -230,9 +252,13 @@ def seal(corpus, view_ids):
                 'target_cases': recipe['target_cases'], 'selected_cases': len(views),
                 'shortfall': recipe['target_cases'] - len(views),
                 'isolation_level': 'static_bundle_only'}
+    if selection:
+        manifest['selection_id'] = selection_id
+        manifest['selection_target_cases'] = selection['recipe']['target_cases']
     with corpus.transaction():
         sid = corpus.record('snapshot', manifest, list(filemap.values()),
-                            [*manifest['views'], *(r for pair in approved.values() for r in pair.values())])
+                            [*manifest['views'], *(r for pair in approved.values() for r in pair.values()),
+                             *([selection_id] if selection else [])])
         previous = corpus.db.execute('SELECT state FROM snapshot_events WHERE snapshot_id=? ORDER BY seq DESC LIMIT 1',
                                      (sid,)).fetchone()
         require(previous is None or previous[0] == 'SEALED', 'Snapshot was revoked; create a new revision')
@@ -247,10 +273,14 @@ def export_snapshot(corpus, snapshot_id, dest):
                               (snapshot_id,)).fetchone()
     require(state is not None and state[0] == 'SEALED', 'Snapshot is not SEALED')
     require(snapshot['exporter_hash'] == exporter_hash(), 'Exporter version mismatch')
+    if snapshot.get('selection_id'):
+        from .selection import validate_selection
+        validate_selection(corpus, snapshot['selection_id'], snapshot['views'])
     # Recheck current reviews and all referenced objects before any public write.
     for vid in snapshot['views']:
         view = validate_view(corpus, vid)
-        check_holdout_exposure(corpus, view['spec'])
+        if not snapshot.get('selection_id'):
+            check_holdout_exposure(corpus, view['spec'])
         require(approvals(corpus, vid) == snapshot['approvals'][vid], 'Snapshot review changed; reseal required')
     files = {name: corpus.read(blob) for name, blob in snapshot['files'].items()}
     reused = publish_tree(dest, files)

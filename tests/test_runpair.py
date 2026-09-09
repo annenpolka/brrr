@@ -68,6 +68,57 @@ class RunpairFunctionTests(unittest.TestCase):
             self.assertEqual(result["second"]["rc"], 0)
             self.assertEqual(result["second"]["delta"]["added"], [])
 
+    def test_second_run_grows_existing_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "grow.py").write_text(
+                "from pathlib import Path\n"
+                "p = Path('log.bin')\n"
+                "p.write_bytes(p.read_bytes() + b'xx' if p.exists() else b'x')\n"
+            )
+            result = runpair([sys.executable, "grow.py"], cwd)
+            self.assertEqual(result["first"]["delta"]["added"], [{"name": "log.bin", "size": 1}])
+            self.assertEqual(result["second"]["delta"]["changed"], [{"name": "log.bin", "before": 1, "after": 3}])
+
+    def test_first_run_removes_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "gone.txt").write_text("bye")
+            (cwd / "rm.py").write_text("from pathlib import Path\nPath('gone.txt').unlink(missing_ok=True)\n")
+            result = runpair([sys.executable, "rm.py"], cwd)
+            self.assertEqual(result["first"]["delta"]["removed"], [{"name": "gone.txt", "size": 3}])
+            self.assertEqual(result["second"]["delta"]["removed"], [])
+
+    def test_unicode_and_binary_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "w.py").write_text(
+                "from pathlib import Path\n"
+                "Path('日本語.txt').write_text('あ')\n"
+                "Path('nul.bin').write_bytes(b'a\\x00b')\n"
+            )
+            result = runpair([sys.executable, "w.py"], cwd)
+            names = {row["name"]: row["size"] for row in result["first"]["delta"]["added"]}
+            self.assertIn("日本語.txt", names)
+            self.assertEqual(names["nul.bin"], 3)
+
+    def test_transfer_stamp_not_deno_bundle(self):
+        """Tool contract on a different command: first write, second fail. Not issue 32113."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "stamp.py").write_text(
+                "from pathlib import Path\n"
+                "p = Path('stamp.dat')\n"
+                "if p.exists():\n"
+                "    raise SystemExit(2)\n"
+                "p.write_bytes(b'STAMP')\n"
+            )
+            result = runpair([sys.executable, "stamp.py"], cwd)
+            self.assertEqual(result["first"]["rc"], 0)
+            self.assertEqual(result["first"]["delta"]["added"], [{"name": "stamp.dat", "size": 5}])
+            self.assertEqual(result["second"]["rc"], 2)
+            self.assertEqual(result["second"]["delta"]["added"], [])
+
 
 class RunpairCliTests(unittest.TestCase):
     def test_cli_json_on_true(self):

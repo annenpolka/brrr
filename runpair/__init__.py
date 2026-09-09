@@ -28,7 +28,15 @@ def file_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, list[
 
 
 def run_once(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> dict:
-    proc = subprocess.run(command, cwd=cwd, capture_output=True, env=env)
+    try:
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, env=env)
+    except FileNotFoundError as exc:
+        return {
+            "argv": command,
+            "rc": 127,
+            "stdout": "",
+            "stderr": str(exc),
+        }
     return {
         "argv": command,
         "rc": proc.returncode,

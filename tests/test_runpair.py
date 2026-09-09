@@ -48,6 +48,14 @@ class RunpairFunctionTests(unittest.TestCase):
             self.assertEqual(result["first"]["delta"]["added"], [])
             self.assertEqual(result["second"]["delta"]["added"], [])
 
+    def test_missing_binary_is_rc_127_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = runpair(["runpair-definitely-not-installed-xyz"], cwd)
+            self.assertEqual(result["first"]["rc"], 127)
+            self.assertEqual(result["second"]["rc"], 127)
+            self.assertEqual(result["first"]["delta"]["added"], [])
+
     def test_first_failure_still_runs_second(self):
         with tempfile.TemporaryDirectory() as tmp:
             cwd = Path(tmp)

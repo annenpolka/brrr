@@ -11,7 +11,8 @@
 - Dream 0001: 17:33:23–17:40:54 JST http-ok, tool_success=false (Deno collapse). CHAIN-001.json
 - Dream 0002: 17:42:37–17:46:56 JST http-ok, tool_success=false (invented `tool` CLI reprinting the transcript). CHAIN-002.json
 - Dream 0003 started: 2026-09-09 17:48:37 JST
-- Additional inputs: still 1 discovery (小規模試行). Expand screens HOLD. 32113 is not 未知holdout.
+- Additional inputs: still 1 discovery (小規模試行). Expand/uv/cargo screens HOLD. 32113 is not 未知holdout.
+- collect-other-1730-resume completed (NO_RUNNABLE_JOB). Worker-3 filled with remaining cargo PR HOLD + 14591 9.1.1 実機. Expand 200d still running.
 - Parent role: coordinator only (no candidate product merge onto main)
 - Dreamer: `deepseek/deepseek-r1` via OpenRouter through `/Users/annenpolka/.codex/skills/hdd-loop/scripts/hdd.py` `--root /Users/annenpolka/ghq/github.com/annenpolka/brrr/.hdd-runs/specimen-hdd-20260909-1730`
 - Critic: host Red Pen

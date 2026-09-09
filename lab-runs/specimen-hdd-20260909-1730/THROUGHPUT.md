@@ -3,9 +3,9 @@
 Vacant inference slots take the next ready job. Clock milestones are deadlines.
 R1/test waits register a handle and free the slot. No isomorphic-Dream filler.
 
-Updated: 2026-09-09 17:55:25 JST
+Updated: 2026-09-09 18:10:07 JST
 
-Jobs recorded: 30
+Jobs recorded: 63
 Intentional idle gaps >120s: 0
 
 | When JST | Job | Status | Slot | Note |
@@ -40,3 +40,36 @@ Intentional idle gaps >120s: 0
 | 2026-09-09 17:54:49 JST | uv-review | completed | worker-1 | 9 uv issues HOLD; no PASS; not Dreamer |
 | 2026-09-09 17:54:49 JST | first-selection | completed | coordinator | KEEP 0; KILL fictional CLIs; HOLD extras; FIRST_SELECTION does not disable contamination |
 | 2026-09-09 17:54:49 JST | collect-expand-resume-200d | started | worker-2 | resume a9328ef4 after RATE_WAIT passed; 200/600; not isomorphic Dream filler |
+| 2026-09-09 17:56:44 JST | other-eco-review | completed | worker-3 | 6 cargo issues HOLD; NO_RUNNABLE_JOB; not Dreamer; no PASS |
+| 2026-09-09 17:58:46 JST | collect-other-1730-resume | completed | worker-3 | EXIT:3 NO_RUNNABLE_JOB unfinished 0; 25 requests; 16 cargo complete; not isomorphic R1 |
+| 2026-09-09 17:58:46 JST | other-eco-review-remaining | started | worker-3 | screen remaining cargo issues from 1730-other; HOLD not PASS |
+| 2026-09-09 17:59:44 JST | other-eco-review-remaining | completed | worker-3 | 10 cargo PRs HOLD (repair/feature); all 16 roots screened; no PASS; not Dreamer |
+| 2026-09-09 18:00:14 JST | host-refute-14591-911 | started | worker-3 | pytest 9.1.1 on 14591 public snippet; HOLD; not Dreamer; not isomorphic R1 |
+| 2026-09-09 18:00:18 JST | host-refute-14591-911 | completed | worker-3 | pytest 9.1.1 rc=0; HOLD no View; not Dreamer |
+| 2026-09-09 18:01:55 JST | collect-expand-resume-200d | completed | worker-2 | EXIT:3 158 requests; refill worker-2 immediately; not isomorphic R1 |
+| 2026-09-09 18:01:55 JST | collect-expand-resume-200e | started | worker-2 | resume a9328ef4 200/600 after 200d exit |
+| 2026-09-09 18:02:32 JST | collect-expand-resume-200e | blocked | worker-2 | Corpus busy from overlapping status; retry immediately; not isomorphic R1 |
+| 2026-09-09 18:02:32 JST | host-refute-14011-911 | started | worker-3 | pytest 9.1.1 on 14011 snippet; HOLD; not Dreamer |
+| 2026-09-09 18:02:32 JST | collect-expand-resume-200e2 | started | worker-2 | retry resume a9328ef4 200/600 after lock free and RATE_WAIT passed |
+| 2026-09-09 18:02:32 JST | host-refute-13885-911 | started | worker-1 | pytest 9.1.1 on 13885 snippet; HOLD; not Dreamer |
+| 2026-09-09 18:02:32 JST | host-refute-14011-911 | completed | worker-3 | pytest 9.1.1 rc=1; HOLD no View; not Dreamer |
+| 2026-09-09 18:02:32 JST | host-refute-13885-911 | completed | worker-1 | pytest 9.1.1 rc=0; HOLD no View; not Dreamer |
+| 2026-09-09 18:03:03 JST | host-refute-13479-911 | started | worker-3 | pytest 9.1.1+freezegun on 13479 snippet; HOLD; not Dreamer |
+| 2026-09-09 18:03:03 JST | host-refute-13479-911 | completed | worker-3 | pytest 9.1.1+freezegun rc=1; HOLD no View; not Dreamer |
+| 2026-09-09 18:03:42 JST | expand-cargo-queue | completed | worker-1 | queued 7 expand cargo complete roots for next lock-free screen; HOLD pending; not Dreamer |
+| 2026-09-09 18:06:14 JST | collect-expand-resume-200e2 | completed | worker-2 | EXIT:3 35 requests; refill immediately; not isomorphic R1 |
+| 2026-09-09 18:06:14 JST | expand-cargo-screen | started | worker-1 | screen 7 expand cargo complete roots; HOLD not PASS |
+| 2026-09-09 18:06:49 JST | collect-expand-resume-200f | started | worker-2 | resume a9328ef4 200/600 after 200e2 EXIT; not isomorphic R1 |
+| 2026-09-09 18:06:49 JST | host-refute-14011-841 | started | worker-3 | pytest 8.4.1 on 14011 snippet; HOLD; not Dreamer |
+| 2026-09-09 18:06:49 JST | expand-cargo-screen | blocked | worker-1 | body screen deferred: expand lock taken by 200f; HOLD pending; not PASS |
+| 2026-09-09 18:06:49 JST | host-refute-14011-841 | completed | worker-3 | pytest 8.4.1 rc=1; HOLD no View; not Dreamer |
+| 2026-09-09 18:07:22 JST | collect-expand-resume-200f | completed | worker-2 | NO_RUNNABLE_JOB unfinished 0; 0 requests this invocation; stop resuming expand; not isomorphic R1 |
+| 2026-09-09 18:07:22 JST | expand-cargo-screen | started | worker-1 | lock free; screen 7 expand cargo complete roots; HOLD not PASS |
+| 2026-09-09 18:07:24 JST | expand-cargo-screen | completed | worker-1 | 4 expand cargo HOLD; missing ['15834', '17148', '17326']; no PASS; not Dreamer |
+| 2026-09-09 18:07:44 JST | expand-cargo-screen-rest | completed | worker-3 | remaining expand cargo HOLD n=3; no PASS; not Dreamer |
+| 2026-09-09 18:08:08 JST | pytest-expand-more-screen | started | worker-2 | screen additional expand pytest complete issues; HOLD not PASS |
+| 2026-09-09 18:08:13 JST | pytest-expand-more-screen | completed | worker-2 | 8 more pytest HOLD; no PASS; not Dreamer |
+| 2026-09-09 18:08:37 JST | pytest-expand-screen-batch2 | started | worker-1 | screen remaining complete pytest issues with snippets; HOLD not PASS; not isomorphic R1 |
+| 2026-09-09 18:08:39 JST | host-reconstitute-13754 | started | worker-3 | pytest --setup-plan on 13754 public snippet; HOLD no View; not Dreamer |
+| 2026-09-09 18:08:40 JST | host-reconstitute-13754 | completed | worker-3 | 13754 setup-plan rc=0 run rc=0; HOLD no View |
+| 2026-09-09 18:10:07 JST | pytest-expand-screen-batch2 | completed | worker-1 | 8 pytest HOLD already recorded in prior batch; no PASS; not isomorphic R1 |

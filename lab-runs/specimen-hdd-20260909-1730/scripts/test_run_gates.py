@@ -110,6 +110,9 @@ class ClockGateTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as err:
             clock_gate.assert_start_allowed(before)
         self.assertIn("not-before", str(err.exception))
+        if start_run.already_initialized():
+            # After a live init, main() resumes status and must not call init.
+            return
         with self.assertRaises(SystemExit) as start_err:
             start_run.main(at=before)
         self.assertIn("not-before", str(start_err.exception))

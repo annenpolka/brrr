@@ -86,7 +86,7 @@ def build_artifact(corpus, artifact, origin):
                     'P0 supports reported text only; local/source-fact claims require P3 evidence contracts')
             source = corpus.get(segment['source_revision'], 'source_revision')
             require(source.get('origin') == origin, 'Source origin differs from view origin')
-            require(source.get('acquisition') in ('operator_supplied', 'synthetic_test_fixture'),
+            require(source.get('acquisition') in ('operator_supplied', 'synthetic_test_fixture', 'github_http'),
                     'Unsupported source acquisition')
             raw = corpus.read(source['body_blob'])
             start, end = segment['start'], segment['end']

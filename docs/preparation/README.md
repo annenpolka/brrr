@@ -1,6 +1,6 @@
 # 次回実行の準備状況
 
-2026-09-09 JST。公開境界（P0）と保全移行（P1）の初回実装を行い、旧151標本と旧HDD状態を取り込んだ。次回はこのコーパスからP2の収集・再開処理へ進める。HDD本番用の24事例はまだ審査・確定していない。
+2026-09-09 JST。公開境界（P0）と保全移行（P1）の初回実装を行い、旧151標本と旧HDD状態を取り込んだ。その後P2のGitHub収集・再開も実装・検証済み。**次回は [収集開始の手順](collection-readiness.md) から始められる。** 下表と移行receiptは初回保全時点の記録。HDD本番用の24事例はまだ審査・確定していない。
 
 ## 確認した結果
 
@@ -97,10 +97,10 @@ pilot recipeは24件を要求するため、sealの例の2件だけでは停止�
 
 | 設計のテスト | 今回の検証範囲 | 残る条件 |
 | --- | --- | --- |
-| T01〜T03 | 旧run重複import、object後/transaction中/DB後の停止と再試行 | HTTPページとcheckpointの故障注入はP2 |
-| T04 | 単一coordinator lockのみ | lease/fencingはP2 |
-| T05 | 手動原文の編集・取得観測・旧版不変 | 実HTTPコメント更新はP2 |
-| T06〜T10 | 未実装 | 304、HTTPエラー、検索上限、再走査、コメント不足 |
+| T01〜T03 | 旧run重複import、object後/transaction中/DB後の停止と再試行。追加実装でHTTPページにも故障注入済み | collection-readiness.md参照 |
+| T04 | 追加実装でlease/fencingも検証済み | collection-readiness.md参照 |
+| T05 | 手動原文に加え、HTTP fixtureでもコメント編集・取得観測・旧版不変を検証 | collection-readiness.md参照 |
+| T06〜T10 | 追加実装で304、HTTPエラー、検索上限、再走査、コメント不足を検証済み | collection-readiness.md参照 |
 | T11〜T13 | 旧資料候補を自動統合・実行証拠に格上げしない | Case関係と実行証拠schemaはP3 |
 | T14〜T19 | 未審査拒否、既知文字列・識別子、意味的FAIL/未判定の拒否、hash失効、path/symlink/残存物拒否 | 未知の意味的漏洩と実view全件の内容監査は別途必要 |
 | T20 | 明示した同一case/lineageの重複・分割越境を停止 | 関係の連結成分を計算するP3 |
@@ -113,6 +113,6 @@ pilot recipeは24件を要求するため、sealの例の2件だけでは停止�
 
 ## 次に実行する作業
 
-次回用の指示は `next-run-prompt.md`。まずP2の小さな固定HTTP fixtureから収集器を実装し、原文取得・再開を検証する。その後P3の事例・根拠・関連・表示審査と、P4の24事例pilotを進める。
+次回用の指示は `next-run-prompt.md`。収集器の実装を挟まず、`collection-readiness.md` のcollectから開始する。収集後にP3の事例・根拠・関連・表示審査と、P4の24事例pilotを進める。
 
 夜間HDD実験、R1/OpenRouterの呼び出し、定期automationは今回開始していない。実験の終了時刻・費用上限・新run IDは本番を開始する時点で固定する。旧master promptのthroughput規則より、新しい品質・漏洩・公開境界を優先する。

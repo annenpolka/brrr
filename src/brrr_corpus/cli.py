@@ -1,4 +1,4 @@
-"""Offline CLI; no implicit HTTP, model calls or execution of source commands."""
+"""Corpus CLI. Only collect/resume/refresh perform explicit GitHub GET requests."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,9 @@ from pathlib import Path
 from .boundary import (approvals, export_snapshot, review, seal, stage_view,
                        validate_recipe, validate_view)
 from .legacy import import_legacy, inventory, verify_baseline
+from .collection import (collection_status, resolve_collection, run_collection, setup,
+                         start_collection)
+from .collection_plan import make_plan
 from .store import (Corpus, CorpusError, canonical, keys, nonempty,
                     no_symlink_components, publish_tree, require, restore_backup)
 
@@ -74,6 +77,22 @@ def parser():
     cmd.add_argument('--scope', required=True)
     cmd = commands.add_parser('readiness')
     cmd.add_argument('--recipe', required=True)
+    cmd = commands.add_parser('plan', help='Freeze a collection recipe and legacy seed set; offline')
+    cmd.add_argument('--recipe', required=True)
+    for name in ('collect', 'resume', 'refresh'):
+        cmd = commands.add_parser(name)
+        if name == 'collect':
+            group = cmd.add_mutually_exclusive_group(required=True)
+            group.add_argument('--recipe')
+            group.add_argument('--plan')
+        else:
+            cmd.add_argument('--collection', required=True)
+        cmd.add_argument('--max-requests', type=int, default=100)
+        cmd.add_argument('--max-seconds', type=float, default=300)
+        if name == 'resume':
+            cmd.add_argument('--retry-failed', action='store_true')
+    cmd = commands.add_parser('collection-status')
+    cmd.add_argument('collection', nargs='?', default='latest')
     return p
 
 
@@ -131,8 +150,7 @@ def readiness(c, recipe):
             'shortfall': max(0, recipe['target_cases'] - len(cases)),
             'eligible_view_ids': eligible, 'blocked_views': blocked,
             'legacy_aliases': c.db.execute('SELECT count(*) FROM aliases').fetchone()[0],
-            'pending_work': ['GitHub collection/resume/refresh (P2)',
-                             'case relations, evidence and exposure-policy adjudication (P3)',
+            'pending_work': ['case relations, evidence and exposure-policy adjudication (P3)',
                              '24-case human content audit and pilot selection (P4)',
                              'consumer isolation and fresh HDD context']}
 
@@ -157,10 +175,29 @@ def dispatch(args):
                 'publication_eligible': 0, 'quality': 'PENDING', 'leakage': 'PENDING'}
     if args.command == 'restore':
         return restore_backup(args.backup, args.output)
-    if args.command not in ('import-legacy', 'import-source'):
+    if args.command not in ('import-legacy', 'import-source', 'plan', 'collect'):
         require((Path(args.root) / 'corpus.sqlite').is_file(), 'Corpus does not exist; import data first')
     c = Corpus(args.root)
     try:
+        if args.command == 'plan':
+            pid = make_plan(c, read_json(args.recipe))
+            return {'plan_id': pid, **c.get(pid, 'collection_plan')}
+        if args.command == 'collection-status':
+            return collection_status(c, args.collection)
+        if args.command in ('collect', 'resume', 'refresh'):
+            if args.command == 'collect':
+                pid = make_plan(c, read_json(args.recipe)) if args.recipe else args.plan
+                cid = start_collection(c, pid)
+            else:
+                cid = resolve_collection(c, args.collection)
+                if args.command == 'refresh':
+                    old = c.db.execute('SELECT plan_id FROM collections WHERE id=?', (cid,)).fetchone()[0]
+                    pid = make_plan(c, c.get(old, 'collection_plan')['recipe'])
+                    cid = start_collection(c, pid, refresh_of=cid)
+            print(json.dumps({'collection_id': cid, 'resume': f'python3 scripts/corpus.py --root {args.root} resume --collection {cid}'}), file=sys.stderr)
+            return run_collection(c, cid, max_requests=args.max_requests, max_seconds=args.max_seconds,
+                                  retry_failed=getattr(args, 'retry_failed', False),
+                                  progress=lambda message: print(json.dumps(message), file=sys.stderr))
         if args.command == 'import-legacy':
             require(args.limit is None or args.limit > 0, 'limit must be positive')
             return import_legacy(c, args.run, args.companion, args.limit)
@@ -228,7 +265,13 @@ def main(argv=None):
             return 1
         if args.command == 'readiness' and not result['ready_for_selection']:
             return 3
+        if args.command in ('collect', 'resume', 'refresh', 'collection-status') and result['state'] != 'COMPLETE_FOR_POLICY':
+            return 3
         return 0
     except (CorpusError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as e:
         print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False), file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print(json.dumps({'ok': False, 'error': 'INTERRUPTED',
+                          'recovery': 'Resume the printed collection ID after its active lease expires.'}), file=sys.stderr)
+        return 130

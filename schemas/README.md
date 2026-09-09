@@ -23,6 +23,10 @@ artifactは `path, segments` を持つ。pathは `TASK.md, OBSERVED.md, COMMANDS
 
 Sourceはprovider/資料種別/provider IDの組を一意キーとしてUUIDで登録する。原文やproviderメタデータが変われば別SourceRevision、取得時刻だけが変われば同じrevisionに別観測を追加する。全て `acquisition: operator_supplied`。旧packetと旧SOURCE.mdはこの経路へ自動投入しない。
 
+追加したGitHub collectorは `acquisition: github_http` を記録する。生HTTP応答はFetchAttemptのraw_blob、資料単体のcanonical JSONはresource_blob、APIのbody文字列をUTF-8抽出したものはbody_blobとして別々に保全する。SourceObservationは原文応答内のJSON Pointer、抽出フィールド、取得時刻を結ぶ。コメント編集は新revision、同内容の再取得は別観測。PR変更ファイルには独立の数値IDがないため、provider IDはGitHubのPR IDとファイル名からなる複合キーを使う。
+
+収集recipeは `collection_plan.py` が必須キー・値域・不明キーを検証する。planにはrecipe、API version、実装hash、旧候補の固定リスト、検索区画を保存する。job、lease/fencing、キャッシュ、checkpointはSQLiteで管理し、確定ページからのみ子jobを登録する。取得の成否と品質・漏洩は別状態。操作契約は `docs/preparation/collection-readiness.md` を参照。
+
 ## 審査
 
 `record-review --file` の必須キーは `view_id, kind, verdict, reviewer, reviewer_type, rationale, attestations`。kindはquality/leakage。qualityは `PENDING|PASS|HOLD|REJECT`、leakageは `PENDING|PASS|FAIL|INDETERMINATE`。pilotのPASSには `reviewer_type: human` と、以下すべての明示的なtrueが必要。

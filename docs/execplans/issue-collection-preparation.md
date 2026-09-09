@@ -15,7 +15,7 @@
 - [x] (2026-09-08 23:36:46Z) 審査hashと許可リストに基づくadapter、手動選別snapshot、バックアップを実装。
 - [x] (2026-09-08 23:36:46Z) 151標本と旧HDD rootを保全。再importの追加0件、整合性・復元成功。
 - [x] (2026-09-08 23:36:46Z) 次回手順、実行プロンプト、準備状況を記録。
-- [ ] 後続P2: GitHub収集・HTTPページ再開・lease/fencing・エラーと上限処理。
+- [x] (2026-09-09 00:14:10Z) 後続P2を実装。GitHub収集・HTTPページ再開・lease/fencing・エラーと上限処理。詳細はgithub-collection.md。
 - [ ] 後続P3/P4: Case関係・証拠契約・母集団固定・24事例の実内容審査とpilot。
 
 ## Surprises & Discoveries

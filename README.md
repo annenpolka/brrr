@@ -6,8 +6,10 @@ Issue collection redesign preparation (2026-09-09): see
 [the implementation and migration report](docs/preparation/README.md) and
 [the next execution prompt](docs/preparation/next-run-prompt.md).
 The new corpus CLI is `python3 scripts/corpus.py`; its tests are
-`python3 scripts/check_corpus.py`. Legacy import is complete; the new 24-case
-HDD input still requires source acquisition and content review.
+`python3 scripts/check_corpus.py`. GitHub collection and resume are ready:
+`python3 scripts/corpus.py collect --recipe recipes/collection/github-pilot-v1.json`.
+See [collection startup and verification](docs/preparation/collection-readiness.md).
+The new 24-case HDD input still requires content review and selection.
 
 Experiment window: **2026-08-19 23:45 JST → 2026-08-20 09:00 JST**.
 

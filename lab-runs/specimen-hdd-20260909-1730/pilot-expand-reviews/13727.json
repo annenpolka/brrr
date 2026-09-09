@@ -1,0 +1,117 @@
+{
+  "revision": "231fa63eba0f98f4fad26db7edcf60ffd9dcbf5dd3577f43134194838da3e693",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "088721e809f1828b9777cc3be8c18fd0e3eb3607615eaeb8fb95d0eae9b660ec",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2025-09-18T12:24:53Z",
+    "provider_id": "2358970828",
+    "provider_updated_at": "2025-09-18T12:25:18Z",
+    "quality": "PENDING",
+    "resource_blob": "29c01f8f7291e8a7beda29e552ffabafdb148c7e6be76314c4958b0933c26b9f",
+    "resource_kind": "pr_review_comment",
+    "schema_version": 1,
+    "source_id": "58d37637-5db2-4b3c-8d9d-c6f7632cc8e5",
+    "url": "https://github.com/pytest-dev/pytest/pull/13727#discussion_r2358970828"
+  },
+  "body": "Thanks for noticing, I thought it was a neat optimization ! ``boolop`` is an ``ast.BoolOp`` and we're iterating on it's values so I think the only node that can have an \"id\" attribute that is equal to another ast.Name (from ``target=ast.Name(id=target_id)`` in this context are ``ast.Name`` nodes. To be honest, I have relied on the tests suite to confirm that, but I'm now wondering if it's not more prudent to use all the possible node that have an id insteadI suppose if a function/class node has the same name as a name node it's going to be invalid python, but maybe it could be shadowed locally ?\r\n\r\n```suggestion\r\n                            e.id for e in boolop.values[:i] if isinstance(e, ast.Name, ast.FunctionDef, ast.ClassDef)\r\n```",
+  "resource": {
+    "_links": {
+      "html": {
+        "href": "https://github.com/pytest-dev/pytest/pull/13727#discussion_r2358970828"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/pytest-dev/pytest/pulls/13727"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytest-dev/pytest/pulls/comments/2358970828"
+      }
+    },
+    "author_association": "MEMBER",
+    "body": "Thanks for noticing, I thought it was a neat optimization ! ``boolop`` is an ``ast.BoolOp`` and we're iterating on it's values so I think the only node that can have an \"id\" attribute that is equal to another ast.Name (from ``target=ast.Name(id=target_id)`` in this context are ``ast.Name`` nodes. To be honest, I have relied on the tests suite to confirm that, but I'm now wondering if it's not more prudent to use all the possible node that have an id insteadI suppose if a function/class node has the same name as a name node it's going to be invalid python, but maybe it could be shadowed locally ?\r\n\r\n```suggestion\r\n                            e.id for e in boolop.values[:i] if isinstance(e, ast.Name, ast.FunctionDef, ast.ClassDef)\r\n```",
+    "commit_id": "b99273fdda831c37cdc3649b08d47afdd7856321",
+    "created_at": "2025-09-18T12:24:53Z",
+    "diff_hunk": "@@ -1017,20 +1008,16 @@ def visit_BoolOp(self, boolop: ast.BoolOp) -> tuple[ast.Name, str]:\n                 # cond is set in a prior loop iteration below\n                 self.expl_stmts.append(ast.If(cond, fail_inner, []))  # noqa: F821\n                 self.expl_stmts = fail_inner\n-                # Check if the left operand is a ast.NamedExpr and the value has already been visited\n-                if (\n-                    isinstance(v, ast.Compare)\n-                    and isinstance(v.left, ast.NamedExpr)\n-                    and v.left.target.id\n-                    in [\n-                        ast_expr.id\n-                        for ast_expr in boolop.values[:i]\n-                        if hasattr(ast_expr, \"id\")\n-                    ]\n-                ):\n-                    pytest_temp = self.variable()\n-                    self.variables_overwrite[self.scope][v.left.target.id] = v.left  # type:ignore[assignment]\n-                    v.left.target.id = pytest_temp\n+                match v:\n+                    # Check if the left operand is an ast.NamedExpr and the value has already been visited\n+                    case ast.Compare(left=ast.NamedExpr(target=ast.Name(id=target_id))):\n+                        if target_id in [\n+                            e.id for e in boolop.values[:i] if isinstance(e, ast.Name)",
+    "html_url": "https://github.com/pytest-dev/pytest/pull/13727#discussion_r2358970828",
+    "id": 2358970828,
+    "in_reply_to_id": 2358794042,
+    "line": null,
+    "node_id": "PRRC_kwDOAjwLdc6MmwnM",
+    "original_commit_id": "72afed6a860c461609f7629e9e940ccbd152ee96",
+    "original_line": 1015,
+    "original_position": 56,
+    "original_start_line": null,
+    "path": "src/_pytest/assertion/rewrite.py",
+    "position": 1,
+    "pull_request_review_id": 3239339445,
+    "pull_request_url": "https://api.github.com/repos/pytest-dev/pytest/pulls/13727",
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/pytest-dev/pytest/pulls/comments/2358970828/reactions"
+    },
+    "side": "RIGHT",
+    "start_line": null,
+    "start_side": null,
+    "subject_type": "line",
+    "updated_at": "2025-09-18T12:25:18Z",
+    "url": "https://api.github.com/repos/pytest-dev/pytest/pulls/comments/2358970828",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/5493666?v=4",
+      "events_url": "https://api.github.com/users/Pierre-Sassoulas/events{/privacy}",
+      "followers_url": "https://api.github.com/users/Pierre-Sassoulas/followers",
+      "following_url": "https://api.github.com/users/Pierre-Sassoulas/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Pierre-Sassoulas/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/Pierre-Sassoulas",
+      "id": 5493666,
+      "login": "Pierre-Sassoulas",
+      "node_id": "MDQ6VXNlcjU0OTM2NjY=",
+      "organizations_url": "https://api.github.com/users/Pierre-Sassoulas/orgs",
+      "received_events_url": "https://api.github.com/users/Pierre-Sassoulas/received_events",
+      "repos_url": "https://api.github.com/users/Pierre-Sassoulas/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/Pierre-Sassoulas/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Pierre-Sassoulas/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/Pierre-Sassoulas",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "27c7d6c1757d0911b2b817c05cfbf8437eaa2b51d67088777054d9e41259355c",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "5ab32006b105b5f81e7c1266cfa8bee2a7229322f2f3c9a885148fcf0f4d8386",
+      "locator": "/13",
+      "observed_at": "2026-09-09T03:59:55.618619+00:00",
+      "raw_blob": "3a6cac4b0d3ad1d740f74117485511a6737345bb90701ae8362248c61d05c481",
+      "source_revision": "231fa63eba0f98f4fad26db7edcf60ffd9dcbf5dd3577f43134194838da3e693"
+    },
+    {
+      "id": "d928bed58eeab0cb8fb1eed835ea1b627d2ca5b816e149055dfb6a2cc71a416d",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "b1faaae0cf71a9cd18c3cfb46e07f965857e95edee791162a526cbeed72e1bbe",
+      "locator": "/13",
+      "observed_at": "2026-09-09T03:59:50.405123+00:00",
+      "raw_blob": "3a6cac4b0d3ad1d740f74117485511a6737345bb90701ae8362248c61d05c481",
+      "source_revision": "231fa63eba0f98f4fad26db7edcf60ffd9dcbf5dd3577f43134194838da3e693"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

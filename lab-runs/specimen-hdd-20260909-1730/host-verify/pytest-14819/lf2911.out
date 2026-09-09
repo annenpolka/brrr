@@ -1,0 +1,40 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.1.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-lf-911
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14819
+collected 2 items
+run-last-failure: rerun previous 2 failures
+
+test_chain.py FF                                                         [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_raises_the_wrong_error __________________________
+
+    def test_raises_the_wrong_error():
+>       assert 1 < 0 < 1 / 0
+                       ^^^^^
+E       ZeroDivisionError: division by zero
+
+test_chain.py:2: ZeroDivisionError
+________________________ test_calls_what_it_should_not _________________________
+
+    def test_calls_what_it_should_not():
+        calls = []
+        def boom():
+            calls.append("boom")
+            return 5
+        try:
+            assert 1 < 0 < boom()
+        except AssertionError:
+            pass
+>       assert calls == []
+E       AssertionError: assert ['boom'] == []
+E         
+E         Left contains one more item: 'boom'
+E         Use -v to get more diff
+
+test_chain.py:13: AssertionError
+=========================== short test summary info ============================
+FAILED test_chain.py::test_raises_the_wrong_error - ZeroDivisionError: divisi...
+FAILED test_chain.py::test_calls_what_it_should_not - AssertionError: assert ...
+============================== 2 failed in 0.01s ===============================

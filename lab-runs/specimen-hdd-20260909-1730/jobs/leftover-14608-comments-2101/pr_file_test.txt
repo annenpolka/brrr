@@ -1,0 +1,59 @@
+{
+  "revision": "6c2798ec9c469f1bcc7ab389d84820966b1a4740d31a7a20bdafc77002007723",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "f39a9d8a8f7471844b50c9307cf535612241ff8e06b36c0673f6746b4f8f0120",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": null,
+    "provider_id": "pull:3891285946:file:testing/test_conftest.py",
+    "provider_updated_at": null,
+    "quality": "PENDING",
+    "resource_blob": "f73946ae331005a94000f9bffae81796fb90f4fb9bf3c6df08033b926c4f0b8e",
+    "resource_kind": "pr_file",
+    "schema_version": 1,
+    "source_id": "a468c27d-7947-48ac-b8e2-6ef03f2f5d8b",
+    "url": null
+  },
+  "body": "@@ -440,6 +440,28 @@ def pytest_addoption(parser):\n     result.stdout.fnmatch_lines([\"*--xyz*\"])\n \n \n+def test_conftests_in_invocation_dir_tests_is_initial(pytester: Pytester) -> None:\n+    \"\"\"An option registered in a conftest under ``test*`` subdir of the\n+    invocation dir is loaded as initial when no command-line arguments\n+    or `testpaths` are given (#14608).\n+    \"\"\"\n+    pytester.makepyfile(\n+        **{\n+            \"tests/conftest.py\": \"\"\"\n+                def pytest_addoption(parser):\n+                    parser.addoption(\"--db-url\")\n+            \"\"\",\n+            \"test_it.py\": \"\"\"\n+                def test_it(request):\n+                    assert request.config.getoption(\"--db-url\") == \"scheme://host/db\"\n+            \"\"\",\n+        }\n+    )\n+    result = pytester.runpytest(\"--db-url\", \"scheme://host/db\")\n+    assert result.ret == ExitCode.OK\n+    result.assert_outcomes(passed=1)\n+\n+\n def test_conftest_import_order(pytester: Pytester, monkeypatch: MonkeyPatch) -> None:\n     ct1 = pytester.makeconftest(\"\")\n     sub = pytester.mkdir(\"sub\")",
+  "resource": {
+    "additions": 22,
+    "blob_url": "https://github.com/pytest-dev/pytest/blob/f36b07a432100b55e4c0fd768b1d9339dd7c3415/testing%2Ftest_conftest.py",
+    "changes": 22,
+    "contents_url": "https://api.github.com/repos/pytest-dev/pytest/contents/testing%2Ftest_conftest.py?ref=f36b07a432100b55e4c0fd768b1d9339dd7c3415",
+    "deletions": 0,
+    "filename": "testing/test_conftest.py",
+    "patch": "@@ -440,6 +440,28 @@ def pytest_addoption(parser):\n     result.stdout.fnmatch_lines([\"*--xyz*\"])\n \n \n+def test_conftests_in_invocation_dir_tests_is_initial(pytester: Pytester) -> None:\n+    \"\"\"An option registered in a conftest under ``test*`` subdir of the\n+    invocation dir is loaded as initial when no command-line arguments\n+    or `testpaths` are given (#14608).\n+    \"\"\"\n+    pytester.makepyfile(\n+        **{\n+            \"tests/conftest.py\": \"\"\"\n+                def pytest_addoption(parser):\n+                    parser.addoption(\"--db-url\")\n+            \"\"\",\n+            \"test_it.py\": \"\"\"\n+                def test_it(request):\n+                    assert request.config.getoption(\"--db-url\") == \"scheme://host/db\"\n+            \"\"\",\n+        }\n+    )\n+    result = pytester.runpytest(\"--db-url\", \"scheme://host/db\")\n+    assert result.ret == ExitCode.OK\n+    result.assert_outcomes(passed=1)\n+\n+\n def test_conftest_import_order(pytester: Pytester, monkeypatch: MonkeyPatch) -> None:\n     ct1 = pytester.makeconftest(\"\")\n     sub = pytester.mkdir(\"sub\")",
+    "raw_url": "https://github.com/pytest-dev/pytest/raw/f36b07a432100b55e4c0fd768b1d9339dd7c3415/testing%2Ftest_conftest.py",
+    "sha": "23a0db81c394f484b1b06d714c660289ecff21ec",
+    "status": "modified"
+  },
+  "observations": [
+    {
+      "id": "835beb0249872561a03364cc55816c24b91d97342be283f705326dca781a1e5f",
+      "attempt": 1,
+      "body_pointer": "/patch",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "8da0659dbe46e3be55b173ddae40ced7c8dbc8b5a6c1cb7aaa2cd08844f38df7",
+      "locator": "/3",
+      "observed_at": "2026-09-09T08:46:28.795470+00:00",
+      "raw_blob": "36c670d8242803f606902b78a32faf290c04eb4b0607b18099c0f015c53a983a",
+      "source_revision": "6c2798ec9c469f1bcc7ab389d84820966b1a4740d31a7a20bdafc77002007723"
+    },
+    {
+      "id": "d631950e135edb322ac2131d7e7ef1823b5118f5728fa9ee0a36d9b19d09e09d",
+      "attempt": 1,
+      "body_pointer": "/patch",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "baf2f69c32f34b6d447b4686ebb67935d069ff3259a056d1c26d8ed65fd031bb",
+      "locator": "/3",
+      "observed_at": "2026-09-09T08:45:46.666741+00:00",
+      "raw_blob": "36c670d8242803f606902b78a32faf290c04eb4b0607b18099c0f015c53a983a",
+      "source_revision": "6c2798ec9c469f1bcc7ab389d84820966b1a4740d31a7a20bdafc77002007723"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

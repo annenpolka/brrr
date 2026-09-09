@@ -1,0 +1,93 @@
+{
+  "revision": "19b23dd52b4190154949a50bd067743192c76153f84c565acba357c0029ac2f5",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "5b86dccc890a76efa8b39a3e25279961b6af7f3a53f99c258df405fc22c2dbca",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2026-07-31T15:36:53Z",
+    "provider_id": "5144663702",
+    "provider_updated_at": "2026-07-31T15:36:53Z",
+    "quality": "PENDING",
+    "resource_blob": "b0d2442d1ac3a32e21f47e989494dcee09063e8a93b03b434e801e5c596f5f20",
+    "resource_kind": "issue_comment",
+    "schema_version": 1,
+    "source_id": "6a69d442-f8cf-4861-95fb-3df1cb560473",
+    "url": "https://github.com/pytest-dev/pytest/pull/14447#issuecomment-5144663702"
+  },
+  "body": "Thanks for working on this. A differential check found three remaining\nevaluation-order cases on PR HEAD\n`c4369d07873f5b7032f9e9baa4d405cc6ea4aad1`.\n\n```python\ndef identity(value):\n    return value\n\n\ndef test_compare_preserves_pre_walrus_left_value():\n    value = \"Hello\"\n    assert value != identity(value := value.lower())\n    assert value == \"hello\"\n```\n\nPython evaluates the left operand before the call, so this compares\n`\"Hello\" != \"hello\"` and passes. With assertion rewriting at the tested PR\nHEAD, it compares `\"hello\" != \"hello\"` and fails.\n\n```python\ndef collect(*values):\n    return values\n\n\ndef test_call_preserves_earlier_positional_argument():\n    value = \"Hello\"\n    assert collect(value, identity(value := value.lower())) == (\n        \"Hello\",\n        \"hello\",\n    )\n    assert value == \"hello\"\n```\n\nThe first positional argument should already be `\"Hello\"` when the second\nargument assigns `\"hello\"`. Rewriting instead passes `(\"hello\", \"hello\")` to\n`collect`.\n\nA related false-comparison case is:\n\n```python\ndef test_failed_compare_uses_pre_walrus_left_value():\n    value = 2\n    try:\n        assert value == identity(value := 3)\n    except AssertionError:\n        pass\n    else:\n        raise AssertionError(\"assertion was rewritten as 3 == 3\")\n    assert value == 3\n```\n\nThis must compare `2 == 3` and raise `AssertionError`; at the tested PR HEAD\nthe inner assertion unexpectedly passes.\n\nValues evaluated before a later walrus need to be captured before that\nassignment changes the target. I ran the three tests twice, using isolated\nsource paths to avoid rewritten-bytecode reuse:\n\n| Environment | Result (both runs) |\n| --- | --- |\n| Direct Python 3.13.13 | 3 passed |\n| pytest `--assert=plain` | 3 passed |\n| upstream base `56b196e921acec0259d84622a570fde6032e15b5` | 3 failed |\n| independent corrected implementation | 3 passed |\n| this PR `c4369d07873f5b7032f9e9baa4d405cc6ea4aad1` | 3 failed |\n\nI can provide tests adapted to `testing/test_assertrewrite.py` if useful.\n\nThese cases were identified with automated assistance, then reduced and\nverified by differential execution on normal Python, `--assert=plain`,\nupstream base, and this PR. Denis Scapin reviewed the reproductions and takes\nresponsibility for this report.\n",
+  "resource": {
+    "author_association": "NONE",
+    "body": "Thanks for working on this. A differential check found three remaining\nevaluation-order cases on PR HEAD\n`c4369d07873f5b7032f9e9baa4d405cc6ea4aad1`.\n\n```python\ndef identity(value):\n    return value\n\n\ndef test_compare_preserves_pre_walrus_left_value():\n    value = \"Hello\"\n    assert value != identity(value := value.lower())\n    assert value == \"hello\"\n```\n\nPython evaluates the left operand before the call, so this compares\n`\"Hello\" != \"hello\"` and passes. With assertion rewriting at the tested PR\nHEAD, it compares `\"hello\" != \"hello\"` and fails.\n\n```python\ndef collect(*values):\n    return values\n\n\ndef test_call_preserves_earlier_positional_argument():\n    value = \"Hello\"\n    assert collect(value, identity(value := value.lower())) == (\n        \"Hello\",\n        \"hello\",\n    )\n    assert value == \"hello\"\n```\n\nThe first positional argument should already be `\"Hello\"` when the second\nargument assigns `\"hello\"`. Rewriting instead passes `(\"hello\", \"hello\")` to\n`collect`.\n\nA related false-comparison case is:\n\n```python\ndef test_failed_compare_uses_pre_walrus_left_value():\n    value = 2\n    try:\n        assert value == identity(value := 3)\n    except AssertionError:\n        pass\n    else:\n        raise AssertionError(\"assertion was rewritten as 3 == 3\")\n    assert value == 3\n```\n\nThis must compare `2 == 3` and raise `AssertionError`; at the tested PR HEAD\nthe inner assertion unexpectedly passes.\n\nValues evaluated before a later walrus need to be captured before that\nassignment changes the target. I ran the three tests twice, using isolated\nsource paths to avoid rewritten-bytecode reuse:\n\n| Environment | Result (both runs) |\n| --- | --- |\n| Direct Python 3.13.13 | 3 passed |\n| pytest `--assert=plain` | 3 passed |\n| upstream base `56b196e921acec0259d84622a570fde6032e15b5` | 3 failed |\n| independent corrected implementation | 3 passed |\n| this PR `c4369d07873f5b7032f9e9baa4d405cc6ea4aad1` | 3 failed |\n\nI can provide tests adapted to `testing/test_assertrewrite.py` if useful.\n\nThese cases were identified with automated assistance, then reduced and\nverified by differential execution on normal Python, `--assert=plain`,\nupstream base, and this PR. Denis Scapin reviewed the reproductions and takes\nresponsibility for this report.\n",
+    "created_at": "2026-07-31T15:36:53Z",
+    "html_url": "https://github.com/pytest-dev/pytest/pull/14447#issuecomment-5144663702",
+    "id": 5144663702,
+    "issue_url": "https://api.github.com/repos/pytest-dev/pytest/issues/14447",
+    "minimized": null,
+    "node_id": "IC_kwDOAjwLdc8AAAABMqVWlg",
+    "performed_via_github_app": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/5144663702/reactions"
+    },
+    "updated_at": "2026-07-31T15:36:53Z",
+    "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/5144663702",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/204218758?v=4",
+      "events_url": "https://api.github.com/users/scapalive/events{/privacy}",
+      "followers_url": "https://api.github.com/users/scapalive/followers",
+      "following_url": "https://api.github.com/users/scapalive/following{/other_user}",
+      "gists_url": "https://api.github.com/users/scapalive/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/scapalive",
+      "id": 204218758,
+      "login": "scapalive",
+      "node_id": "U_kgDODCwhhg",
+      "organizations_url": "https://api.github.com/users/scapalive/orgs",
+      "received_events_url": "https://api.github.com/users/scapalive/received_events",
+      "repos_url": "https://api.github.com/users/scapalive/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/scapalive/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/scapalive/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/scapalive",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "580a4040c227dd4595b2c1d002912c80e6b36f944cf7702cfdfcc8484472cd00",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "059cb55302f845dcc8b1ac5db7189330ab19eb8f9dfa0143e7ab005ef4d68f33",
+      "locator": "/3",
+      "observed_at": "2026-09-09T08:39:26.196568+00:00",
+      "raw_blob": "66dfdd9591413852b68807728bcc84e088940e871af1086e4f59e1f784369ae0",
+      "source_revision": "19b23dd52b4190154949a50bd067743192c76153f84c565acba357c0029ac2f5"
+    },
+    {
+      "id": "d6cd75f7e00f7818c529f873091b4cac599242c5690853d48b618c5aba5a1314",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "73344e26807affc0c009c2376331f298e6cce8e92bfef3c07e968963424ad554",
+      "locator": "/3",
+      "observed_at": "2026-09-09T08:38:30.155067+00:00",
+      "raw_blob": "66dfdd9591413852b68807728bcc84e088940e871af1086e4f59e1f784369ae0",
+      "source_revision": "19b23dd52b4190154949a50bd067743192c76153f84c565acba357c0029ac2f5"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

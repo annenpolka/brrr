@@ -1,0 +1,93 @@
+{
+  "revision": "1496ecf8cd37508ab271574e546e8708542ad730defe67c8019e03d67c3a2bb2",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "633a16a9c6e98b697d628863ffd8ae0a3b584de4aeab6359a9d94215880f76ec",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2026-01-13T21:15:24Z",
+    "provider_id": "3746610119",
+    "provider_updated_at": "2026-01-14T08:59:38Z",
+    "quality": "PENDING",
+    "resource_blob": "bb88664b2294256ebcb9dc44fed3e86e1c53665f4b431d983f9ca7f1a070871c",
+    "resource_kind": "issue_comment",
+    "schema_version": 1,
+    "source_id": "69a6ef24-5a7b-44fa-98cc-17747b6e614a",
+    "url": "https://github.com/pytest-dev/pytest/pull/14104#issuecomment-3746610119"
+  },
+  "body": "@RonnyPfannschmidt what do you think is the lesser evil in this case?\r\n\r\n```py\r\nimport pytest\r\n\r\n@pytest.fixture(scope=\"session\")\r\ndef foo(request):\r\n    return getattr(request, \"param\", None)\r\n\r\n@pytest.mark.parametrize(\"foo\", [1], indirect=True)\r\ndef test_a(foo):\r\n    assert foo == 1\r\n\r\ndef test_b(request):\r\n    hmmm(request)\r\n\r\n@pytest.mark.parametrize(\"foo\", [1], indirect=True)\r\ndef test_c(foo):\r\n    assert foo == 1\r\n```\r\n\r\n1. Teardown the fixture at the end of `test_a`, because `nextitem` does not request the fixture\r\n2. Carry the fixture over, but if `test_b` requests `foo` via `getfixturevalue`, then we fail, because we refuse to perform teardown at call phase\r\n\r\n\\* Assume that parametrized tests autoreordering is turned off, or that the user forced a custom order, or that there are multiple parameters, and autoreordering had to pick an argname to not be consecutive, and our fixture was picked.\r\n\r\nUPD: I will go with option 1 for now, because in most cases extra setup-teardown won't happen due to autoreordering, and worst-case scenario is tests slowdown, while option 2 risks breaking some tests in-the-wild (I'm almost certain that I'll find out at my worksite that the new version of pytest broke some of the millions of pytest tests.)",
+  "resource": {
+    "author_association": "CONTRIBUTOR",
+    "body": "@RonnyPfannschmidt what do you think is the lesser evil in this case?\r\n\r\n```py\r\nimport pytest\r\n\r\n@pytest.fixture(scope=\"session\")\r\ndef foo(request):\r\n    return getattr(request, \"param\", None)\r\n\r\n@pytest.mark.parametrize(\"foo\", [1], indirect=True)\r\ndef test_a(foo):\r\n    assert foo == 1\r\n\r\ndef test_b(request):\r\n    hmmm(request)\r\n\r\n@pytest.mark.parametrize(\"foo\", [1], indirect=True)\r\ndef test_c(foo):\r\n    assert foo == 1\r\n```\r\n\r\n1. Teardown the fixture at the end of `test_a`, because `nextitem` does not request the fixture\r\n2. Carry the fixture over, but if `test_b` requests `foo` via `getfixturevalue`, then we fail, because we refuse to perform teardown at call phase\r\n\r\n\\* Assume that parametrized tests autoreordering is turned off, or that the user forced a custom order, or that there are multiple parameters, and autoreordering had to pick an argname to not be consecutive, and our fixture was picked.\r\n\r\nUPD: I will go with option 1 for now, because in most cases extra setup-teardown won't happen due to autoreordering, and worst-case scenario is tests slowdown, while option 2 risks breaking some tests in-the-wild (I'm almost certain that I'll find out at my worksite that the new version of pytest broke some of the millions of pytest tests.)",
+    "created_at": "2026-01-13T21:15:24Z",
+    "html_url": "https://github.com/pytest-dev/pytest/pull/14104#issuecomment-3746610119",
+    "id": 3746610119,
+    "issue_url": "https://api.github.com/repos/pytest-dev/pytest/issues/14104",
+    "minimized": null,
+    "node_id": "IC_kwDOAjwLdc7fULvH",
+    "performed_via_github_app": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/3746610119/reactions"
+    },
+    "updated_at": "2026-01-14T08:59:38Z",
+    "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/3746610119",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/2719663?v=4",
+      "events_url": "https://api.github.com/users/Anton3/events{/privacy}",
+      "followers_url": "https://api.github.com/users/Anton3/followers",
+      "following_url": "https://api.github.com/users/Anton3/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Anton3/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/Anton3",
+      "id": 2719663,
+      "login": "Anton3",
+      "node_id": "MDQ6VXNlcjI3MTk2NjM=",
+      "organizations_url": "https://api.github.com/users/Anton3/orgs",
+      "received_events_url": "https://api.github.com/users/Anton3/received_events",
+      "repos_url": "https://api.github.com/users/Anton3/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/Anton3/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Anton3/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/Anton3",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "5b760ded3d036ac081c0427c045fde34db30551e598453b9c0167d0d0075d292",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "ee57d794be2c952262c6c1baca1d9fa4ebd53993b91f991bc31454103190538b",
+      "locator": "/9",
+      "observed_at": "2026-09-09T03:29:22.077835+00:00",
+      "raw_blob": "24e05f599fb62350a7cf58d36d8035908e3be1c623f358650756ebc77de6ffef",
+      "source_revision": "1496ecf8cd37508ab271574e546e8708542ad730defe67c8019e03d67c3a2bb2"
+    },
+    {
+      "id": "d6385e5db4337664962dd24b2e25e8ef112abb214c6c59699a620d75cb35bb03",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "cf0d208b576eda04b682c08dcca4d02d222b0dbddfe9c161e3b0e41b822b7f71",
+      "locator": "/9",
+      "observed_at": "2026-09-09T03:32:30.648514+00:00",
+      "raw_blob": "24e05f599fb62350a7cf58d36d8035908e3be1c623f358650756ebc77de6ffef",
+      "source_revision": "1496ecf8cd37508ab271574e546e8708542ad730defe67c8019e03d67c3a2bb2"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

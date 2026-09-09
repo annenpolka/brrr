@@ -1,0 +1,42 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-8.4.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-mf-841
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14488
+collected 2 items
+
+test_handler.py .F                                                       [100%]
+
+=================================== FAILURES ===================================
+____________________________ test_handler_after_del ____________________________
+
+caplog = <_pytest.logging.LogCaptureFixture object at 0x10ae7df90>
+
+    def test_handler_after_del(caplog):
+        from _pytest.logging import caplog_handler_key
+        del caplog._item.stash[caplog_handler_key]
+>       _ = caplog.handler
+            ^^^^^^^^^^^^^^
+
+test_handler.py:9: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/private/tmp/hdd-20260909-1730-venvs/py841/lib/python3.14/site-packages/_pytest/logging.py:434: in handler
+    return self._item.stash[caplog_handler_key]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <_pytest.stash.Stash object at 0x10a512890>
+key = <_pytest.stash.StashKey object at 0x10a7f2ea0>
+
+    def __getitem__(self, key: StashKey[T]) -> T:
+        """Get the value for key.
+    
+        Raises ``KeyError`` if the key wasn't set before.
+        """
+>       return cast(T, self._storage[key])
+                       ^^^^^^^^^^^^^^^^^^
+E       KeyError: <_pytest.stash.StashKey object at 0x10a7f2ea0>
+
+/private/tmp/hdd-20260909-1730-venvs/py841/lib/python3.14/site-packages/_pytest/stash.py:84: KeyError
+=========================== short test summary info ============================
+FAILED test_handler.py::test_handler_after_del - KeyError: <_pytest.stash.Sta...
+========================= 1 failed, 1 passed in 0.02s ==========================

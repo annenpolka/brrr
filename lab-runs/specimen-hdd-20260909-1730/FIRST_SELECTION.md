@@ -13,7 +13,7 @@ Fictional CLI wrappers from trial `case-001-a` turns 1–3 (`deno` as the unfami
 
 ## HOLD
 
-Additional collected issues (pytest expand, uv, cargo other-ecosystems). Quality not PASS. No View/export. Not converted to PASS for the clock. 32113 public packet remains **discovery**, not 未知holdout. Scale: **小規模試行**.
+Additional collected issues (pytest expand including leftover complete 36, uv 17/17 complete, cargo other-ecosystems 16). Quality not PASS. No View/export. Not converted to PASS for the clock. 32113 public packet remains **discovery**, not 未知holdout. Scale: **小規模試行**.
 
 ## Main
 

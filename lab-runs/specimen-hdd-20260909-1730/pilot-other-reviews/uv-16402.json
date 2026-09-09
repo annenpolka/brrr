@@ -1,0 +1,121 @@
+{
+  "revision": "b7433a0af6541ceb231561ac65ca8f5c5f6b5b7a53c203b4bf581b4a01aeade7",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "7d58fe98329f73c5c579cd73a8c355f6fbe0c3a2771f61b19b9d8a72f7037036",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2025-10-22T00:43:53Z",
+    "provider_id": "3538633215",
+    "provider_updated_at": "2026-02-26T20:30:40Z",
+    "quality": "PENDING",
+    "resource_blob": "cc4d5195606fa4e163621cf07d3734aecf7202c6e36471b3ced15634722667d5",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "6c700d9f-2910-4451-a4f6-f442d9737e2b",
+    "url": "https://github.com/astral-sh/uv/issues/16402"
+  },
+  "body": "### Summary\n\n`uv sync` fails to authenticate to my private index (Gitlab). \n\nAfter updating `uv` a few days ago and running `uv auth login [gitlab-domain] --token [token]` I was able to `uv sync` without issue. Today, I could not get sync to work at all. Interestingly, the very first alternative strategy I tried, `uv pip install --index https://[gitlab-domain]/api/v4/groups/XX/-/packages/pypi/simple sandbox`, worked without issue. However, this is not ideal for my workflow and I wanted to be able to `sync` from my pyproject.toml so I tried the following:\n\n- `uv auth logout [gitlab-domain]` && logging back in\n- Cycling my gitlab PAT and running the above to update uv auth\n- Creating an entirely new PAT with all scopes enabled and the above to update uv auth\n- deleting the uv credentials file and logging in again to recreate it\n- restarting my shell\n- using VSCode integrated vs Ubuntu native terminal\n- Providing the name of my token as --username and my token as password with `uv auth login [domain] --username ... --password ...`\n- Providing my gitlab username as --username in the above approach\n- Uninstalling and reinstalling uv\n\nThe only approach other than `uv pip install --index` which worked was setting `UV_INDEX_GITLAB_USERNAME=__token__` and `UV_INDEX_GITLAB_PASSWORD=[token]` and re-running uv sync.\n\nMy `.toml` looks like this:\n\n```\ndependencies = [\n    ...\n    \"sandbox>=0.1.0\",\n    ...\n]\n\n[[tool.uv.index]]\nname = \"gitlab\"\nurl = \"https://[gitlab-domain]/api/v4/groups/XXX/-/packages/pypi/simple\"\nexplicit = true\nauthenticate = \"always\"\n\n[tool.uv.sources]\nsandbox = { index = \"gitlab\" }\n```\n\nAnd uv throws this error:\n```\n× No solution found when resolving dependencies:\n  ╰─▶ Because sandbox was not found in the package registry and your project depends on sandbox>=0.1.0, we can conclude that your project's requirements are unsatisfiable.\n\n      hint: An index URL (https://[gitlab-domain]/api/v4/groups/XXX/-/packages/pypi/simple) could not be queried due to a lack of valid authentication credentials (401 Unauthorized).\n```\n\nThe above error indicating that no package could be found at the index is false; running `uv sync -vv` makes it clear that uv never actually authenticates to the index to list the packages available there.\n\n### Platform\n\nUbuntu 24.04.3 amd64\n\n### Version\n\n0.9.5\n\n### Python version\n\nPython 3.12.3",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "body": "### Summary\n\n`uv sync` fails to authenticate to my private index (Gitlab). \n\nAfter updating `uv` a few days ago and running `uv auth login [gitlab-domain] --token [token]` I was able to `uv sync` without issue. Today, I could not get sync to work at all. Interestingly, the very first alternative strategy I tried, `uv pip install --index https://[gitlab-domain]/api/v4/groups/XX/-/packages/pypi/simple sandbox`, worked without issue. However, this is not ideal for my workflow and I wanted to be able to `sync` from my pyproject.toml so I tried the following:\n\n- `uv auth logout [gitlab-domain]` && logging back in\n- Cycling my gitlab PAT and running the above to update uv auth\n- Creating an entirely new PAT with all scopes enabled and the above to update uv auth\n- deleting the uv credentials file and logging in again to recreate it\n- restarting my shell\n- using VSCode integrated vs Ubuntu native terminal\n- Providing the name of my token as --username and my token as password with `uv auth login [domain] --username ... --password ...`\n- Providing my gitlab username as --username in the above approach\n- Uninstalling and reinstalling uv\n\nThe only approach other than `uv pip install --index` which worked was setting `UV_INDEX_GITLAB_USERNAME=__token__` and `UV_INDEX_GITLAB_PASSWORD=[token]` and re-running uv sync.\n\nMy `.toml` looks like this:\n\n```\ndependencies = [\n    ...\n    \"sandbox>=0.1.0\",\n    ...\n]\n\n[[tool.uv.index]]\nname = \"gitlab\"\nurl = \"https://[gitlab-domain]/api/v4/groups/XXX/-/packages/pypi/simple\"\nexplicit = true\nauthenticate = \"always\"\n\n[tool.uv.sources]\nsandbox = { index = \"gitlab\" }\n```\n\nAnd uv throws this error:\n```\n× No solution found when resolving dependencies:\n  ╰─▶ Because sandbox was not found in the package registry and your project depends on sandbox>=0.1.0, we can conclude that your project's requirements are unsatisfiable.\n\n      hint: An index URL (https://[gitlab-domain]/api/v4/groups/XXX/-/packages/pypi/simple) could not be queried due to a lack of valid authentication credentials (401 Unauthorized).\n```\n\nThe above error indicating that no package could be found at the index is false; running `uv sync -vv` makes it clear that uv never actually authenticates to the index to list the packages available there.\n\n### Platform\n\nUbuntu 24.04.3 amd64\n\n### Version\n\n0.9.5\n\n### Python version\n\nPython 3.12.3",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 9,
+    "comments_url": "https://api.github.com/repos/astral-sh/uv/issues/16402/comments",
+    "created_at": "2025-10-22T00:43:53Z",
+    "events_url": "https://api.github.com/repos/astral-sh/uv/issues/16402/events",
+    "html_url": "https://github.com/astral-sh/uv/issues/16402",
+    "id": 3538633215,
+    "issue_dependencies_summary": {
+      "blocked_by": 0,
+      "blocking": 0,
+      "total_blocked_by": 0,
+      "total_blocking": 0
+    },
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "FBCA04",
+        "default": false,
+        "description": "Needs more information for reproduction, see #9452",
+        "id": 6569957189,
+        "name": "needs-mre",
+        "node_id": "LA_kwDOKbIFZc8AAAABh5mXRQ",
+        "url": "https://api.github.com/repos/astral-sh/uv/labels/needs-mre"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/astral-sh/uv/issues/16402/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "I_kwDOKbIFZc7S60H_",
+    "number": 16402,
+    "performed_via_github_app": null,
+    "pinned_comment": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/astral-sh/uv/issues/16402/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/astral-sh/uv",
+    "state": "open",
+    "state_reason": null,
+    "sub_issues_summary": {
+      "completed": 0,
+      "percent_completed": 0,
+      "total": 0
+    },
+    "timeline_url": "https://api.github.com/repos/astral-sh/uv/issues/16402/timeline",
+    "title": "Private index authentication fails for `uv sync`",
+    "type": null,
+    "updated_at": "2026-02-26T20:30:40Z",
+    "url": "https://api.github.com/repos/astral-sh/uv/issues/16402",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/22524538?v=4",
+      "events_url": "https://api.github.com/users/lachiewalker/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lachiewalker/followers",
+      "following_url": "https://api.github.com/users/lachiewalker/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lachiewalker/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lachiewalker",
+      "id": 22524538,
+      "login": "lachiewalker",
+      "node_id": "MDQ6VXNlcjIyNTI0NTM4",
+      "organizations_url": "https://api.github.com/users/lachiewalker/orgs",
+      "received_events_url": "https://api.github.com/users/lachiewalker/received_events",
+      "repos_url": "https://api.github.com/users/lachiewalker/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lachiewalker/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lachiewalker/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lachiewalker",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "30c756c60afda286fb67868c83344f02da6bd76be7c65d8c7844a64438dae923",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "ddca3a44d5447796d404eb8e6cee99309c6ce98862d062609093c7db0b71464b",
+      "locator": "",
+      "observed_at": "2026-09-09T08:51:38.811081+00:00",
+      "raw_blob": "c6485c2b96e7ba89cf0dad0713e886b73197f8ca5424c8cc8d6c4e0a2aec67e9",
+      "source_revision": "b7433a0af6541ceb231561ac65ca8f5c5f6b5b7a53c203b4bf581b4a01aeade7"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

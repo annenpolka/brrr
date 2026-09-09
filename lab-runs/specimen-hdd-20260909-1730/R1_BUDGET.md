@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-09 17:53:09 JST
+Updated: 2026-09-10 08:30:03 JST
 
 ## Caps
 

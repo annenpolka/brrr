@@ -1,0 +1,240 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.1.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-plainlf-911
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14775
+collected 2 items
+
+test_class_fixt.py EE                                                    [100%]
+
+==================================== ERRORS ====================================
+______________________ ERROR at setup of TestFixt.test_1 _______________________
+
+cls = <class '_pytest.runner.CallInfo'>
+func = <function call_and_report.<locals>.<lambda> at 0x106dee6c0>
+when = 'setup'
+reraise = (<class '_pytest.outcomes.Exit'>, <class 'KeyboardInterrupt'>)
+
+    @classmethod
+    def from_call(
+        cls,
+        func: Callable[[], TResult],
+        when: Literal["collect", "setup", "call", "teardown"],
+        reraise: type[BaseException] | tuple[type[BaseException], ...] | None = None,
+    ) -> CallInfo[TResult]:
+        """Call func, wrapping the result in a CallInfo.
+    
+        :param func:
+            The function to call. Called without arguments.
+        :type func: Callable[[], _pytest.runner.TResult]
+        :param when:
+            The phase in which the function is called.
+        :param reraise:
+            Exception or exceptions that shall propagate if raised by the
+            function, instead of being wrapped in the CallInfo.
+        """
+        excinfo = None
+        instant = timing.Instant()
+        try:
+>           result: TResult | None = func()
+                                     ^^^^^^
+
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:361: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:250: in <lambda>
+    lambda: runtest_hook(item=item, **kwds),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/logging.py:858: in pytest_runtest_setup
+    yield
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/capture.py:895: in pytest_runtest_setup
+    return (yield)
+            ^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:170: in pytest_runtest_setup
+    item.session._setupstate.setup(item)
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:536: in setup
+    col.setup()
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/python.py:1710: in setup
+    self._request._fillfixtures()
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:806: in _fillfixtures
+    item.funcargs[argname] = self.getfixturevalue(argname)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:630: in getfixturevalue
+    fixturedef = self._get_active_fixturedef(argname)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:726: in _get_active_fixturedef
+    fixturedef.execute(request=subrequest)
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:1232: in execute
+    result: FixtureValue = ihook.pytest_fixture_setup(
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/setuponly.py:36: in pytest_fixture_setup
+    return (yield)
+            ^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:1313: in pytest_fixture_setup
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fixturedef = <FixtureDef argname='fixt' scope='class' baseid='test_class_fixt.py::TestFixt'>
+request = <SubRequest 'fixt' for <Function test_1>>
+
+    def resolve_fixture_function(
+        fixturedef: FixtureDef[FixtureValue], request: FixtureRequest
+    ) -> _FixtureFunc[FixtureValue]:
+        """Get the actual callable that can be called to obtain the fixture
+        value."""
+        fixturefunc = fixturedef.func
+        # The fixture function needs to be bound to the actual
+        # request.instance so that code working with "fixturedef" behaves
+        # as expected.
+        instance = request.instance
+    
+        if fixturedef._scope is Scope.Class:
+            # Check if fixture is an instance method (bound to instance, not class)
+            if hasattr(fixturefunc, "__self__"):
+                bound_to = fixturefunc.__self__
+                # classmethod: bound_to is the class itself (a type)
+                # instance method: bound_to is an instance (not a type)
+                if not isinstance(bound_to, type):
+>                   warnings.warn(CLASS_FIXTURE_INSTANCE_METHOD, stacklevel=2)
+E                   pytest.PytestRemovedIn10Warning: Class-scoped fixture defined as instance method is deprecated.
+E                   Instance attributes set in this fixture will NOT be visible to test methods,
+E                   as each test gets a new instance while the fixture runs only once per class.
+E                   Use @classmethod decorator and set attributes on cls instead.
+E                   See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:1289: PytestRemovedIn10Warning
+______________________ ERROR at setup of TestFixt.test_2 _______________________
+
+cls = <class '_pytest.runner.CallInfo'>
+func = <function call_and_report.<locals>.<lambda> at 0x106decd50>
+when = 'setup'
+reraise = (<class '_pytest.outcomes.Exit'>, <class 'KeyboardInterrupt'>)
+
+    @classmethod
+    def from_call(
+        cls,
+        func: Callable[[], TResult],
+        when: Literal["collect", "setup", "call", "teardown"],
+        reraise: type[BaseException] | tuple[type[BaseException], ...] | None = None,
+    ) -> CallInfo[TResult]:
+        """Call func, wrapping the result in a CallInfo.
+    
+        :param func:
+            The function to call. Called without arguments.
+        :type func: Callable[[], _pytest.runner.TResult]
+        :param when:
+            The phase in which the function is called.
+        :param reraise:
+            Exception or exceptions that shall propagate if raised by the
+            function, instead of being wrapped in the CallInfo.
+        """
+        excinfo = None
+        instant = timing.Instant()
+        try:
+>           result: TResult | None = func()
+                                     ^^^^^^
+
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:361: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:250: in <lambda>
+    lambda: runtest_hook(item=item, **kwds),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/pluggy/_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/logging.py:858: in pytest_runtest_setup
+    yield
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/capture.py:895: in pytest_runtest_setup
+    return (yield)
+            ^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:170: in pytest_runtest_setup
+    item.session._setupstate.setup(item)
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/runner.py:536: in setup
+    col.setup()
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/python.py:1710: in setup
+    self._request._fillfixtures()
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:806: in _fillfixtures
+    item.funcargs[argname] = self.getfixturevalue(argname)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:630: in getfixturevalue
+    fixturedef = self._get_active_fixturedef(argname)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:726: in _get_active_fixturedef
+    fixturedef.execute(request=subrequest)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <FixtureDef argname='fixt' scope='class' baseid='test_class_fixt.py::TestFixt'>
+request = <SubRequest 'fixt' for <Function test_2>>
+
+    def execute(self, request: SubRequest) -> FixtureValue:
+        """Return the value of this fixture, executing it if not cached."""
+        # Ensure that the dependent fixtures requested by this fixture are loaded.
+        # This needs to be done before checking if we have a cached value, since
+        # if a dependent fixture has their cache invalidated, e.g. due to
+        # parametrization, they finalize themselves and fixtures depending on it
+        # (which will likely include this fixture) setting `self.cached_result = None`.
+        # See #4871
+        requested_fixtures_that_should_finalize_us = []
+        for argname in self.argnames:
+            fixturedef = request._get_active_fixturedef(argname)
+            # Saves requested fixtures in a list so we later can add our finalizer
+            # to them, ensuring that if a requested fixture gets torn down we get torn
+            # down first. This is generally handled by SetupState, but still currently
+            # needed when this fixture is not parametrized but depends on a parametrized
+            # fixture.
+            requested_fixtures_that_should_finalize_us.append(fixturedef)
+    
+        # Check for (and return) cached value/exception.
+        if self.cached_result is not None:
+            request_cache_key = self.cache_key(request)
+            cache_key = self.cached_result[1]
+            try:
+                # Attempt to make a normal == check: this might fail for objects
+                # which do not implement the standard comparison (like numpy arrays -- #6497).
+                cache_hit = bool(request_cache_key == cache_key)
+            except (ValueError, RuntimeError):
+                # If the comparison raises, use 'is' as fallback.
+                cache_hit = request_cache_key is cache_key
+    
+            if cache_hit:
+                if self.cached_result[2] is not None:
+                    exc, exc_tb = self.cached_result[2]
+                    raise exc.with_traceback(exc_tb)
+                else:
+                    return self.cached_result[0]
+            # We have a previous but differently parametrized fixture instance
+            # so we need to tear it down before creating a new one.
+            self.finish(request)
+            assert self.cached_result is None
+    
+        # Add finalizer to requested fixtures we saved previously.
+        # We make sure to do this after checking for cached value to avoid
+        # adding our finalizer multiple times. (#12135)
+        finalizer = functools.partial(self.finish, request=request)
+        for parent_fixture in requested_fixtures_that_should_finalize_us:
+            parent_fixture.addfinalizer(finalizer)
+    
+        # Register the pytest_fixture_post_finalizer as the first finalizer,
+        # which is executed last.
+>       assert not self._finalizers
+               ^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+/private/tmp/hdd-20260909-1730-venvs/py911/lib/python3.14/site-packages/_pytest/fixtures.py:1221: AssertionError
+=========================== short test summary info ============================
+ERROR test_class_fixt.py::TestFixt::test_1 - pytest.PytestRemovedIn10Warning:...
+ERROR test_class_fixt.py::TestFixt::test_2 - AssertionError
+============================== 2 errors in 0.16s ===============================

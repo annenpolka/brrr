@@ -1,0 +1,50 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-8.4.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-nf-841
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14447
+collected 3 items
+
+test_walrus.py FFF                                                       [100%]
+
+=================================== FAILURES ===================================
+_________________ test_compare_preserves_pre_walrus_left_value _________________
+
+    def test_compare_preserves_pre_walrus_left_value():
+        value = "Hello"
+>       assert value != identity(value := value.lower())
+E       AssertionError: assert 'hello' != 'hello'
+E        +  where 'hello' = identity('hello')
+
+test_walrus.py:9: AssertionError
+_______________ test_call_preserves_earlier_positional_argument ________________
+
+    def test_call_preserves_earlier_positional_argument():
+        value = "Hello"
+>       assert collect(value, identity(value := value.lower())) == (
+            "Hello",
+            "hello",
+        )
+E       AssertionError: assert ('hello', 'hello') == ('Hello', 'hello')
+E         
+E         At index 0 diff: 'hello' != 'Hello'
+E         Use -v to get more diff
+
+test_walrus.py:14: AssertionError
+________________ test_failed_compare_uses_pre_walrus_left_value ________________
+
+    def test_failed_compare_uses_pre_walrus_left_value():
+        value = 2
+        try:
+            assert value == identity(value := 3)
+        except AssertionError:
+            pass
+        else:
+>           raise AssertionError("assertion was rewritten as 3 == 3")
+E           AssertionError: assertion was rewritten as 3 == 3
+
+test_walrus.py:27: AssertionError
+=========================== short test summary info ============================
+FAILED test_walrus.py::test_compare_preserves_pre_walrus_left_value - Asserti...
+FAILED test_walrus.py::test_call_preserves_earlier_positional_argument - Asse...
+FAILED test_walrus.py::test_failed_compare_uses_pre_walrus_left_value - Asser...
+============================== 3 failed in 0.01s ===============================

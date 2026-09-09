@@ -1,0 +1,104 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.0.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-mf-901
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14841
+collected 10 items
+
+test_demo.py ...F                                                        [100%]
+
+=================================== FAILURES ===================================
+____________________ test_run_mp_test[deferred-import-fail] ____________________
+
+workload = 'fail', import_mp = 'deferred-import'
+
+    @fuzz_workload
+    @fuzz_import_mp
+    def test_run_mp_test(
+        workload: Literal['pass', 'fail'],
+        import_mp: Literal['pre-import', 'deferred-import'],
+    ) -> None:
+        """
+        Test what happens when a test using `multiprocessing` is run
+        in-process with `pytester`.
+        """
+        cmd = [
+            sys.executable, '-m', 'pytest',
+            '-k', f'test_run_mp_test_in_process and {workload} and {import_mp}',
+            '-o', 'skip_by_default=false',
+            THIS_TEST_SUITE,
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                'COLUMNS': (
+                    str(int(os.environ['COLUMNS']) - 2)
+                    if 'COLUMNS' in os.environ else
+                    '80'
+                ),
+            },
+        )
+        try:
+            proc.check_returncode()
+            assert '1 passed' in proc.stdout
+>           assert 'resource_tracker' not in proc.stderr
+E           assert 'resource_tracker' not in "Traceback (...-kda5b2us'\n"
+E             
+E             'resource_tracker' is contained here:
+E               rocessing/resource_tracker.py", line 453, in main
+E             ?           ++++++++++++++++
+E                   cache[rtype].remove(name)
+E                   ~~~~~~~~~~~~~~~~~~~^^^^^^
+E               KeyError: '/mp-15xyp77q'...
+E             
+E             ...Full output truncated (25 lines hidden), use '-vv' to show
+
+test_demo.py:112: AssertionError
+----------------------------- Captured stdout call -----------------------------
+Command stdout:
+  ============================= test session starts ==============================
+  platform darwin -- Python 3.14.5, pytest-9.0.1, pluggy-1.6.0
+  rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14841
+  collected 10 items / 9 deselected / 1 selected
+
+  test_demo.py .                                                           [100%]
+
+  ======================= 1 passed, 9 deselected in 0.11s ========================
+
+Command stderr:
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-15xyp77q'
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-rlbnbzld'
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-wxe4zhj2'
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-wku01hl7'
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-f664tl22'
+  Traceback (most recent call last):
+    File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py", line 453, in main
+      cache[rtype].remove(name)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^
+  KeyError: '/mp-kda5b2us'
+
+=========================== short test summary info ============================
+FAILED test_demo.py::test_run_mp_test[deferred-import-fail] - assert 'resourc...
+========================= 1 failed, 3 passed in 0.99s ==========================

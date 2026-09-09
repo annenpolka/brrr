@@ -1,0 +1,77 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.1.0, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-13699mf-910
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-13699
+collected 1 item
+
+test_skip.py F
+
+=================================== FAILURES ===================================
+____________________________ test_asynctest_support ____________________________
+
+    def test_asynctest_support():
+>       pytest.importorskip("asynctest")
+
+test_skip.py:4: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+<frozen importlib._bootstrap_external>:759: in exec_module
+    ???
+<frozen importlib._bootstrap>:491: in _call_with_frames_removed
+    ???
+/tmp/hdd-13699-asynctest-only/asynctest/__init__.py:22: in <module>
+    from .case import *
+/tmp/hdd-13699-asynctest-only/asynctest/case.py:54: in <module>
+    import asynctest.selector
+/tmp/hdd-13699-asynctest-only/asynctest/selector.py:29: in <module>
+    from . import mock
+/tmp/hdd-13699-asynctest-only/asynctest/mock.py:428: in <module>
+    class _AwaitEvent:
+/tmp/hdd-13699-asynctest-only/asynctest/mock.py:433: in _AwaitEvent
+    @asyncio.coroutine
+     ^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'coroutine'
+
+    def __getattr__(name: str):
+        import warnings
+    
+        match name:
+            case "AbstractEventLoopPolicy":
+                warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                return events._AbstractEventLoopPolicy
+            case "DefaultEventLoopPolicy":
+                warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                if sys.platform == 'win32':
+                    return windows_events._DefaultEventLoopPolicy
+                return unix_events._DefaultEventLoopPolicy
+            case "WindowsSelectorEventLoopPolicy":
+                if sys.platform == 'win32':
+                    warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                    return windows_events._WindowsSelectorEventLoopPolicy
+                # Else fall through to the AttributeError below.
+            case "WindowsProactorEventLoopPolicy":
+                if sys.platform == 'win32':
+                    warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                    return windows_events._WindowsProactorEventLoopPolicy
+                # Else fall through to the AttributeError below.
+    
+>       raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+E       AttributeError: module 'asyncio' has no attribute 'coroutine'. Did you mean: 'coroutines'?
+
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/__init__.py:74: AttributeError
+=========================== short test summary info ============================
+FAILED test_skip.py::test_asynctest_support - AttributeError: module 'asyncio...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+============================== 1 failed in 0.03s ===============================

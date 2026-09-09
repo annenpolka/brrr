@@ -1,0 +1,130 @@
+{
+  "revision": "d576a9814eab951805330e411de35aa478410f7ff6a2b4f1de173b3ae9e4238b",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "c5e7a0539f20c3678c5aba5f1dee94966e043a46b06662de801364dab632f834",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2026-02-28T01:13:29Z",
+    "provider_id": "4003521765",
+    "provider_updated_at": "2026-03-16T13:22:31Z",
+    "quality": "PENDING",
+    "resource_blob": "7b2b33a5c22db813848844c7f6e6542f8ed17b7a76bf5b7460aa2567be4ecba3",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "5f07bc24-537a-4c8c-8355-275a516a7c68",
+    "url": "https://github.com/astral-sh/uv/issues/18221"
+  },
+  "body": "### Summary\n\n## Background\n\n`unstructured-inference` is a transitive dependency of the `unstructured[pdf]` package, which is provided by unstructured.io\n\nit has a transitive dependency on `onnxruntime` of the ONNX Runtime engine, which is used to run inference on some of the ML models involved in unstructured's operation\n\ni would like to use the CUDA/TensorRT hardware accelerated package of the ONNX Runtime, `onnxruntime-gpu`, instead of the CPU flavor for scaling purposes when CUDA is available\n\ni also have to support a non-CUDA environment for development purposes, which means i have two dependency groups:\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n```\n\nunfortunately, because of the hard transitive dependency on `onnxruntime` in the unstructured-inference metadata, i will have dual installations of onnxruntime and onnxruntime-gpu. this causes problems\n\n## Current Workaround\n\nmy current workaround is to fix the package version and manually edit the metadata\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\", \"unstructured-inference==1.2.0\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n\n[[tool.uv.dependency-metadata]]\nname = \"unstructured-inference\"\nversion = \"1.2.0\"\nrequires-python = \">=3.7.0\"\nrequires-dist = [\n    \"python-multipart\",\n    \"huggingface-hub\",\n    \"numpy\",\n    \"opencv-python>=4.13.0.90\",\n    \"onnx\",\n    # \"onnxruntime>=1.18.0\",\n    \"matplotlib\",\n    \"torch\",\n    \"timm\",\n    \"transformers>=4.25.1\",\n    \"accelerate\",\n    \"rapidfuzz\",\n    \"pandas\",\n    \"scipy\",\n    \"pypdfium2>=5.0.0\",\n    \"pdfminer-six\",\n]\n```\n\nthis works, but every package upgrade is a manual endeavor\n\nmy company uses rennovate/dependabot to automatically make PRs to update my packages. it is not smart enough to figure out how to do this\n\n## Alternatives\n\ni'm not aware of another solution in UV, but would love to hear about it\n\nfor better or worse, onnxruntime has not adopted torch's strategy of separate pypi indexes but using the same package name, so that strategy is out\n\ni'm not sure how better unstructured could handle this on their side, but if there are ideas with that, i could forward that along to them and hope that they do it\n\n## Related Issues\n\nhttps://github.com/astral-sh/uv/issues/17642\n\n## Desired Behavior\n\ni want to be able to do something like exclude a dependency from resolution, but conditioned on a group\n\ne.g.\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n\n# something like this\n# but i strongly don't care what the config format looks like\n# your best judgement\n[tool.uv.exclude-dependencies]\nonnxruntime = [\n    { group = \"cuda126\"}\n]\n\n```\n\ncurrently, `exclude-dependencies` affects resolution globally and has no such facility for restricting exclusion conditioned on anything\n\nif there's some other idea anyone has, fine with that\n\n\n## Impact\n\ni would not have to manually manage package upgrades on the `unstructured` and `unstructured-inference` packages\n\nthis lets my company's rennovate and dependabot PRs \"just work\" and require no manual intervention\n\ncould help with similarly maintained packages like:\n- `paddlepaddle` and `paddlepaddle-gpu` and \n- `tensorflow` and `tensorflow-cpu`\n- `cupy-cuda12x` and `cupy-cuda13x` and `cupy-rocm-7-0`\n- the various `opencv-python` if, for w/e reason, you wanted headless in one group but not the other\n\nalso, could help with transitive dependencies that are inappropriatley marked as required that can be very large, and perhaps in some groups, you don't want them but in others you do:\n\n- torch\n- opencv\n- paddlepaddle\n- triton\n- tensorflow\n- jax\n- etc...\n\n## Related\n\ncould support the same thing with extra:\n\n```toml\n[tool.uv.exclude-dependencies]\nonnxruntime = [\n    { extra = \"cuda126\"}\n]\n\n```\n\nit would probably be cool to override transitive dependencies on a per-group basis to, say, remove/changed the extras:\n- `jax` vs. `jax[cuda12]` vs `jax[cuda13]`\n- various `matplotlib` backends\n- and so on\n\n## Thanks\n\ni would finally like to thank you for:\n- `exclude-dependencies`\n- `override-dependencies`\n- `constrain-dependencies`\n- `conflicts`\n- `dependency-metadata`\n- `sources`\n\nthey have been amazing to work with in the face of suboptimally packaged wheels\n\n\n### Example\n\n_No response_",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "body": "### Summary\n\n## Background\n\n`unstructured-inference` is a transitive dependency of the `unstructured[pdf]` package, which is provided by unstructured.io\n\nit has a transitive dependency on `onnxruntime` of the ONNX Runtime engine, which is used to run inference on some of the ML models involved in unstructured's operation\n\ni would like to use the CUDA/TensorRT hardware accelerated package of the ONNX Runtime, `onnxruntime-gpu`, instead of the CPU flavor for scaling purposes when CUDA is available\n\ni also have to support a non-CUDA environment for development purposes, which means i have two dependency groups:\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n```\n\nunfortunately, because of the hard transitive dependency on `onnxruntime` in the unstructured-inference metadata, i will have dual installations of onnxruntime and onnxruntime-gpu. this causes problems\n\n## Current Workaround\n\nmy current workaround is to fix the package version and manually edit the metadata\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\", \"unstructured-inference==1.2.0\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n\n[[tool.uv.dependency-metadata]]\nname = \"unstructured-inference\"\nversion = \"1.2.0\"\nrequires-python = \">=3.7.0\"\nrequires-dist = [\n    \"python-multipart\",\n    \"huggingface-hub\",\n    \"numpy\",\n    \"opencv-python>=4.13.0.90\",\n    \"onnx\",\n    # \"onnxruntime>=1.18.0\",\n    \"matplotlib\",\n    \"torch\",\n    \"timm\",\n    \"transformers>=4.25.1\",\n    \"accelerate\",\n    \"rapidfuzz\",\n    \"pandas\",\n    \"scipy\",\n    \"pypdfium2>=5.0.0\",\n    \"pdfminer-six\",\n]\n```\n\nthis works, but every package upgrade is a manual endeavor\n\nmy company uses rennovate/dependabot to automatically make PRs to update my packages. it is not smart enough to figure out how to do this\n\n## Alternatives\n\ni'm not aware of another solution in UV, but would love to hear about it\n\nfor better or worse, onnxruntime has not adopted torch's strategy of separate pypi indexes but using the same package name, so that strategy is out\n\ni'm not sure how better unstructured could handle this on their side, but if there are ideas with that, i could forward that along to them and hope that they do it\n\n## Related Issues\n\nhttps://github.com/astral-sh/uv/issues/17642\n\n## Desired Behavior\n\ni want to be able to do something like exclude a dependency from resolution, but conditioned on a group\n\ne.g.\n\n```toml\n[project]\ndependencies = [\"unstructured[pdf]\"]\n\n[dependency-groups]\ncpu = [\"onnxruntime\"]\ncuda = [\"onnxruntime-gpu\"]\n\n[tool.uv]\nconflicts = [\n    [\n        { group = \"cpu\" },\n        { group = \"cuda126\" },\n    ],\n]\n\n# something like this\n# but i strongly don't care what the config format looks like\n# your best judgement\n[tool.uv.exclude-dependencies]\nonnxruntime = [\n    { group = \"cuda126\"}\n]\n\n```\n\ncurrently, `exclude-dependencies` affects resolution globally and has no such facility for restricting exclusion conditioned on anything\n\nif there's some other idea anyone has, fine with that\n\n\n## Impact\n\ni would not have to manually manage package upgrades on the `unstructured` and `unstructured-inference` packages\n\nthis lets my company's rennovate and dependabot PRs \"just work\" and require no manual intervention\n\ncould help with similarly maintained packages like:\n- `paddlepaddle` and `paddlepaddle-gpu` and \n- `tensorflow` and `tensorflow-cpu`\n- `cupy-cuda12x` and `cupy-cuda13x` and `cupy-rocm-7-0`\n- the various `opencv-python` if, for w/e reason, you wanted headless in one group but not the other\n\nalso, could help with transitive dependencies that are inappropriatley marked as required that can be very large, and perhaps in some groups, you don't want them but in others you do:\n\n- torch\n- opencv\n- paddlepaddle\n- triton\n- tensorflow\n- jax\n- etc...\n\n## Related\n\ncould support the same thing with extra:\n\n```toml\n[tool.uv.exclude-dependencies]\nonnxruntime = [\n    { extra = \"cuda126\"}\n]\n\n```\n\nit would probably be cool to override transitive dependencies on a per-group basis to, say, remove/changed the extras:\n- `jax` vs. `jax[cuda12]` vs `jax[cuda13]`\n- various `matplotlib` backends\n- and so on\n\n## Thanks\n\ni would finally like to thank you for:\n- `exclude-dependencies`\n- `override-dependencies`\n- `constrain-dependencies`\n- `conflicts`\n- `dependency-metadata`\n- `sources`\n\nthey have been amazing to work with in the face of suboptimally packaged wheels\n\n\n### Example\n\n_No response_",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/astral-sh/uv/issues/18221/comments",
+    "created_at": "2026-02-28T01:13:29Z",
+    "events_url": "https://api.github.com/repos/astral-sh/uv/issues/18221/events",
+    "html_url": "https://github.com/astral-sh/uv/issues/18221",
+    "id": 4003521765,
+    "issue_dependencies_summary": {
+      "blocked_by": 0,
+      "blocking": 0,
+      "total_blocked_by": 0,
+      "total_blocking": 0
+    },
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "D4C5F9",
+        "default": true,
+        "description": "New feature or improvement to existing functionality",
+        "id": 6034754233,
+        "name": "enhancement",
+        "node_id": "LA_kwDOKbIFZc8AAAABZ7MKuQ",
+        "url": "https://api.github.com/repos/astral-sh/uv/labels/enhancement"
+      },
+      {
+        "color": "C2E0C6",
+        "default": false,
+        "description": "A wonderful example of a quality contribution 💜",
+        "id": 6571376159,
+        "name": "great writeup",
+        "node_id": "LA_kwDOKbIFZc8AAAABh68-Hw",
+        "url": "https://api.github.com/repos/astral-sh/uv/labels/great%20writeup"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/astral-sh/uv/issues/18221/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "I_kwDOKbIFZc7uoOTl",
+    "number": 18221,
+    "performed_via_github_app": null,
+    "pinned_comment": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/astral-sh/uv/issues/18221/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/astral-sh/uv",
+    "state": "open",
+    "state_reason": null,
+    "sub_issues_summary": {
+      "completed": 0,
+      "percent_completed": 0,
+      "total": 0
+    },
+    "timeline_url": "https://api.github.com/repos/astral-sh/uv/issues/18221/timeline",
+    "title": "allow exclude-dependencies to be conditioned on dev groups",
+    "type": null,
+    "updated_at": "2026-03-16T13:22:31Z",
+    "url": "https://api.github.com/repos/astral-sh/uv/issues/18221",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/1066590?v=4",
+      "events_url": "https://api.github.com/users/andreaimprovised/events{/privacy}",
+      "followers_url": "https://api.github.com/users/andreaimprovised/followers",
+      "following_url": "https://api.github.com/users/andreaimprovised/following{/other_user}",
+      "gists_url": "https://api.github.com/users/andreaimprovised/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/andreaimprovised",
+      "id": 1066590,
+      "login": "andreaimprovised",
+      "node_id": "MDQ6VXNlcjEwNjY1OTA=",
+      "organizations_url": "https://api.github.com/users/andreaimprovised/orgs",
+      "received_events_url": "https://api.github.com/users/andreaimprovised/received_events",
+      "repos_url": "https://api.github.com/users/andreaimprovised/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/andreaimprovised/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/andreaimprovised/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/andreaimprovised",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "a9d7303de06663ea6acea065e1575646ebeb60345f07e3d50b4c6faf71d1d69d",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "245d868ad36384c638b34d847721a4ab0b2d617b9c97b3bf60ebdd1ee51b9505",
+      "locator": "",
+      "observed_at": "2026-09-09T08:50:12.527922+00:00",
+      "raw_blob": "306c1d016a6984b02f8ec840bba1295c29c2b997da2b3b883927d85523f53ba5",
+      "source_revision": "d576a9814eab951805330e411de35aa478410f7ff6a2b4f1de173b3ae9e4238b"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

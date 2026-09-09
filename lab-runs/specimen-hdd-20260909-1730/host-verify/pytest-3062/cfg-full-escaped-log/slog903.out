@@ -1,0 +1,81 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-3062/cfg-full-escaped-log
+configfile: setup.cfg
+collected 1 item
+
+tests/test_log.py::test_log 
+-------------------------------- live log call ---------------------------------
+FAILED
+
+=================================== FAILURES ===================================
+___________________________________ test_log ___________________________________
+
+    def test_log():
+>       logging.getLogger("hdd3062").warning("hello-log")
+
+tests/test_log.py:3: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1532: in warning
+    self._log(WARNING, msg, args, **kwargs)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1665: in _log
+    self.handle(record)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1681: in handle
+    self.callHandlers(record)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1737: in callHandlers
+    hdlr.handle(record)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1027: in handle
+    self.emit(record)
+/private/tmp/hdd-20260909-1730-venvs/py903/lib/python3.14/site-packages/_pytest/logging.py:384: in emit
+    super().emit(record)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1159: in emit
+    self.handleError(record)
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:1151: in emit
+    msg = self.format(record)
+          ^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:999: in format
+    return fmt.format(record)
+           ^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py903/lib/python3.14/site-packages/_pytest/logging.py:137: in format
+    return super().format(record)
+           ^^^^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:715: in format
+    s = self.formatMessage(record)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/logging/__init__.py:684: in formatMessage
+    return self._style.format(record)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <_pytest.logging.PercentStyleMultiline object at 0x1093a82f0>
+record = <LogRecord: hdd3062, 30, /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-3062/cfg-full-escaped-log/tests/test_log.py, 3, "hello-log">
+
+    def format(self, record: logging.LogRecord) -> str:
+        if "\n" in record.message:
+            if hasattr(record, "auto_indent"):
+                # Passed in from the "extra={}" kwarg on the call to logging.log().
+                auto_indent = self._get_auto_indent(record.auto_indent)
+            else:
+                auto_indent = self._auto_indent
+    
+            if auto_indent:
+                lines = record.message.splitlines()
+                formatted = self._fmt % {**record.__dict__, "message": lines[0]}
+    
+                if auto_indent < 0:
+                    indentation = _remove_ansi_escape_sequences(formatted).find(
+                        lines[0]
+                    )
+                else:
+                    # Optimizes logging by allowing a fixed indentation.
+                    indentation = auto_indent
+                lines[0] = formatted
+                return ("\n" + " " * indentation).join(lines)
+>       return self._fmt % record.__dict__
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: unsupported format character 'W' (0x57) at index 36
+
+/private/tmp/hdd-20260909-1730-venvs/py903/lib/python3.14/site-packages/_pytest/logging.py:226: ValueError
+=========================== short test summary info ============================
+FAILED tests/test_log.py::test_log - ValueError: unsupported format character...
+============================== 1 failed in 0.06s ===============================

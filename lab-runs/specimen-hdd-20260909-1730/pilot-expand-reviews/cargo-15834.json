@@ -1,0 +1,148 @@
+{
+  "revision": "7c528a05e62d97a100ecbfa294d0078659622dd806dd87a8a3e1851c0d42e447",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "d2f40ee3089c4c1b7dfc4b8706e331739545c16aa0e256657d1d9cb80cba0de6",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2025-08-13T15:20:21Z",
+    "provider_id": "3318881396",
+    "provider_updated_at": "2025-11-12T16:18:06Z",
+    "quality": "PENDING",
+    "resource_blob": "2fda4c2edaab7ab55a37a8f3a083ab87762671582f8a27058825311e4b716570",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "e5192cf9-1632-4a73-a52c-dd5178ebeed3",
+    "url": "https://github.com/rust-lang/cargo/issues/15834"
+  },
+  "body": "### Problem\n\nCargo's resolver has 3 phases, narrowing down the packages used at each step\n- Resolve for lockfile\n- Resolve for target and some other settings\n- Resolve features\n\nResolving of features requires downloading and parsing all packages from step (2)\nhttps://github.com/rust-lang/cargo/blob/02bcdd29836032dca3a3bb7c430cb3ba2e6aac36/src/cargo/ops/resolve.rs#L259-L309\nso we can then know what proc macros there are\nhttps://github.com/rust-lang/cargo/blob/02bcdd29836032dca3a3bb7c430cb3ba2e6aac36/src/cargo/core/resolver/features.rs#L951-L970\nso we can know whether a package and its features are being resolved for the host-platform or target-platform\n\nWithout this, resolving of features could operate on the Index and we could download packages after step 3, reducing how many we download.\n\nProblems with this:\n- Network, file IO, and CPU performance in downloading and parsing more manifests than needed\n- This makes a [plumbing command](https://github.com/crate-ci/cargo-plumbing) for a feature resolver take in a lot more input than it would otherwise need, slowing down the plumbing command operations\n- The plumbing commands are also providing light on how ways we might be able to better isolate cargo's architecture for easier maintainability and contributor approachability\n\n\nSee also\n- #11352\n- #9222\n\n### Proposed Solution\n\n- Add proc macro information to the Index Summary\n- Have crates.io backfill this Summary entry\n\nOpen question\n- How do we deal with non-backfilled data, like third-party registries\n\n### Notes\n\n_No response_",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "body": "### Problem\n\nCargo's resolver has 3 phases, narrowing down the packages used at each step\n- Resolve for lockfile\n- Resolve for target and some other settings\n- Resolve features\n\nResolving of features requires downloading and parsing all packages from step (2)\nhttps://github.com/rust-lang/cargo/blob/02bcdd29836032dca3a3bb7c430cb3ba2e6aac36/src/cargo/ops/resolve.rs#L259-L309\nso we can then know what proc macros there are\nhttps://github.com/rust-lang/cargo/blob/02bcdd29836032dca3a3bb7c430cb3ba2e6aac36/src/cargo/core/resolver/features.rs#L951-L970\nso we can know whether a package and its features are being resolved for the host-platform or target-platform\n\nWithout this, resolving of features could operate on the Index and we could download packages after step 3, reducing how many we download.\n\nProblems with this:\n- Network, file IO, and CPU performance in downloading and parsing more manifests than needed\n- This makes a [plumbing command](https://github.com/crate-ci/cargo-plumbing) for a feature resolver take in a lot more input than it would otherwise need, slowing down the plumbing command operations\n- The plumbing commands are also providing light on how ways we might be able to better isolate cargo's architecture for easier maintainability and contributor approachability\n\n\nSee also\n- #11352\n- #9222\n\n### Proposed Solution\n\n- Add proc macro information to the Index Summary\n- Have crates.io backfill this Summary entry\n\nOpen question\n- How do we deal with non-backfilled data, like third-party registries\n\n### Notes\n\n_No response_",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 11,
+    "comments_url": "https://api.github.com/repos/rust-lang/cargo/issues/15834/comments",
+    "created_at": "2025-08-13T15:20:21Z",
+    "events_url": "https://api.github.com/repos/rust-lang/cargo/issues/15834/events",
+    "html_url": "https://github.com/rust-lang/cargo/issues/15834",
+    "id": 3318881396,
+    "issue_dependencies_summary": {
+      "blocked_by": 0,
+      "blocking": 0,
+      "total_blocked_by": 0,
+      "total_blocking": 0
+    },
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "fbca04",
+        "default": false,
+        "description": "Area: features — conditional compilation",
+        "id": 137465458,
+        "name": "A-features",
+        "node_id": "MDU6TGFiZWwxMzc0NjU0NTg=",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/A-features"
+      },
+      {
+        "color": "f5f1fd",
+        "default": false,
+        "description": "Category: proposal for a feature. Before PR, ping rust-lang/cargo if this is not `Feature accepted`",
+        "id": 677709505,
+        "name": "C-feature-request",
+        "node_id": "MDU6TGFiZWw2Nzc3MDk1MDU=",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/C-feature-request"
+      },
+      {
+        "color": "b60205",
+        "default": false,
+        "description": "Status: Needs someone to work further on the design for the feature or fix. NOT YET accepted.",
+        "id": 813047080,
+        "name": "S-needs-design",
+        "node_id": "MDU6TGFiZWw4MTMwNDcwODA=",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/S-needs-design"
+      },
+      {
+        "color": "b8f9a9",
+        "default": false,
+        "description": "Gotta go fast!",
+        "id": 1353173145,
+        "name": "Performance",
+        "node_id": "MDU6TGFiZWwxMzUzMTczMTQ1",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/Performance"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/rust-lang/cargo/issues/15834/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "I_kwDOAQnScc7F0hx0",
+    "number": 15834,
+    "performed_via_github_app": null,
+    "pinned_comment": null,
+    "reactions": {
+      "+1": 3,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 3,
+      "url": "https://api.github.com/repos/rust-lang/cargo/issues/15834/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/rust-lang/cargo",
+    "state": "open",
+    "state_reason": null,
+    "sub_issues_summary": {
+      "completed": 0,
+      "percent_completed": 0,
+      "total": 0
+    },
+    "timeline_url": "https://api.github.com/repos/rust-lang/cargo/issues/15834/timeline",
+    "title": "Don't require downloading and parsing all packages to resolve features",
+    "type": null,
+    "updated_at": "2025-11-12T16:18:06Z",
+    "url": "https://api.github.com/repos/rust-lang/cargo/issues/15834",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/60961?v=4",
+      "events_url": "https://api.github.com/users/epage/events{/privacy}",
+      "followers_url": "https://api.github.com/users/epage/followers",
+      "following_url": "https://api.github.com/users/epage/following{/other_user}",
+      "gists_url": "https://api.github.com/users/epage/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/epage",
+      "id": 60961,
+      "login": "epage",
+      "node_id": "MDQ6VXNlcjYwOTYx",
+      "organizations_url": "https://api.github.com/users/epage/orgs",
+      "received_events_url": "https://api.github.com/users/epage/received_events",
+      "repos_url": "https://api.github.com/users/epage/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/epage/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/epage/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/epage",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "01962982f2fd511aa921deccc649a08efffc200731b0ec8f998a1220bbec1e9b",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "606838085c0c1f60914d7df4fd27262a89464261eb09fb607fa783359134bf73",
+      "locator": "",
+      "observed_at": "2026-09-09T08:47:33.225283+00:00",
+      "raw_blob": "80d358f6096b04411ce9a53db735df0fffd309fa275ed04e70e87983d0e33e60",
+      "source_revision": "7c528a05e62d97a100ecbfa294d0078659622dd806dd87a8a3e1851c0d42e447"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

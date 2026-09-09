@@ -1,0 +1,139 @@
+{
+  "revision": "fa8c99e5b8c4c8768abed395c181aadffc6343317da02caaababb36855d86fa0",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "3521e1622e4289b44887eff930725f8e2c48aeca25ab961f2895cf96e4a5ebaa",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2025-09-26T09:39:43Z",
+    "provider_id": "3456669521",
+    "provider_updated_at": "2026-02-02T12:59:27Z",
+    "quality": "PENDING",
+    "resource_blob": "5c8b01ecaeb42146409ae713e2073200966e7bbb635ddbe0780744978146ef81",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "ba52461c-6a3e-442c-ad0f-dd8110b3ab86",
+    "url": "https://github.com/pytest-dev/pytest/issues/13755"
+  },
+  "body": "## Description\n\nThere appears to be an issue with pytest's test execution order that causes a session-scoped, parametrized fixture to be set up and torn down multiple times with the same parameters within a single test session. This behavior is contrary to the expectation that a session-scoped fixture instance should be created only once per unique parameter set and reused for all tests that require it.\n\n## Steps to Reproduce\n\nThe issue can be observed with the provided test file. The `heavy_fixture` is session-scoped and parametrized.\n\n```python\nimport logging\nimport pytest\nimport collections\n\nlogger = logging.getLogger(__name__)\n\n\nHW_IDS: list[str] = [\n    \"FIRST\",\n    \"SECOND\",\n]\n\nSECOND_HW_PARAM: list[str] = [\"!ZZZ!\", \"!XXX!\"]\n\n\nOTHER_PARAMETERS: list[str] = [\"p_1_1\", \"p_1_2\"]\nOTHER_PARAMETERS_2: list[str] = [\"p_2_1\", \"p_2_2\"]\n\n\ncalls_cache = collections.Counter()\n\n\n@pytest.fixture(scope=\"session\")\ndef heavy_fixture(request: pytest.FixtureRequest) -> str:\n    param1, param2 = request.param\n    calls_cache[(param1, param2)] += 1\n    logger.info(f\" ************ {param1} {param2} - {calls_cache[(param1, param2)]}\")\n    return f\"{param1}/{param2}\"\n\n    \n@pytest.fixture(scope=\"function\", autouse=True)\ndef print_current_test_name(request: pytest.FixtureRequest):\n    yield\n    logger.info(f\"-> {request.node.name}\")\n\n    \n@pytest.fixture(scope=\"session\", autouse=True)\ndef print_calls_cache():\n    yield\n    logger.info(\" Fixture calls cache:\")\n    for (param1, param2), calls in calls_cache.items():\n        logger.info(f\" - {param1} {param2} -> {calls}\")\n    logger.info(f\" Total times fixtures called: {sum(calls_cache.values())}\")\n    logger.info(f\" Total heavy fixtures: {len(calls_cache)}\")\n\n\n@pytest.fixture(scope=\"module\")\ndef fixture_1() -> str:\n    return \"fixture_1\"\n\n\n@pytest.fixture(scope=\"module\")\ndef fixture_param_1(request: pytest.FixtureRequest) -> str:\n    return request.param\n\n\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(m, b) for m in HW_IDS for b in SECOND_HW_PARAM],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_one_fxt(heavy_fixture: str, fixture_1):\n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], SECOND_HW_PARAM[0])],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_one(heavy_fixture: str, config: str):    \n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\"config_2\", OTHER_PARAMETERS_2)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], SECOND_HW_PARAM[1])],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_one_second_param(heavy_fixture: str, config: str, config_2: str):    \n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], b) for b in SECOND_HW_PARAM],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_all_models(heavy_fixture: str, config: str):    \n    pass\n\n\nITEMS_DATA = [\n    ((hw, b), \"fp_1\") for hw in HW_IDS for b in SECOND_HW_PARAM\n]\n\n\nITEMS_DATA_2 = [\n    ((hw, b), \"fp_2\") for hw in HW_IDS for b in SECOND_HW_PARAM\n]\n\n\ndef multiple_fixture_parametrize(\n    items: tuple[tuple[str, str], str]\n):\n    return pytest.mark.parametrize(\n        \"heavy_fixture, fixture_param_1\",\n        items,\n        indirect=[\"heavy_fixture\", \"fixture_param_1\"],\n        ids=[f\"{item[0][0]}/{item[0][1]}/{item[1]}\" for item in items]\n    )\n    \n    \n\n@multiple_fixture_parametrize(ITEMS_DATA)\ndef test_multiple_fixture_parametrize(heavy_fixture: str, fixture_param_1: str):\n    pass\n\n    \n\n@multiple_fixture_parametrize(ITEMS_DATA_2)\ndef test_multiple_fixture_parametrize_second(heavy_fixture: str, fixture_param_1: str):\n    pass\n```\n\n## Actual Behavior\n\nWhen running the tests, the output shows that `heavy_fixture` is called multiple times for the same parameters. For example, `heavy_fixture` with parameters `('FIRST', '!ZZZ!')` is instantiated three separate times during the session.\n\n**Execution Log Snippet:**\n\n```text\n************ FIRST !ZZZ! - 1\n> test_one_fxt[FIRST/!ZZZ!]\n> test_with_params_one[FIRST/!ZZZ!-p_1_1]\n> test_with_params_one[FIRST/!ZZZ!-p_1_2]\n************ FIRST !XXX! - 1\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_1-p_1_1]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_1-p_1_2]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_2-p_1_1]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_2-p_1_2]\n************ FIRST !ZZZ! - 2\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_1]\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_2]\n************ FIRST !XXX! - 2\n> test_one_fxt[FIRST/!XXX!]\n> test_with_params_all_models[FIRST/!XXX!-p_1_1]\n> test_with_params_all_models[FIRST/!XXX!-p_1_2]\n************ SECOND !ZZZ! - 1\n> test_one_fxt[SECOND/!ZZZ!]\n************ SECOND !XXX! - 1\n> test_one_fxt[SECOND/!XXX!]\n************ FIRST !ZZZ! - 3\n> test_multiple_fixture_parametrize[FIRST/!ZZZ!/fp_1]\n> test_multiple_fixture_parametrize_second[FIRST/!ZZZ!/fp_2]\n************ FIRST !XXX! - 3\n> test_multiple_fixture_parametrize[FIRST/!XXX!/fp_1]\n> test_multiple_fixture_parametrize_second[FIRST/!XXX!/fp_2]\n************ SECOND !ZZZ! - 2\n> test_multiple_fixture_parametrize[SECOND/!ZZZ!/fp_1]\n> test_multiple_fixture_parametrize_second[SECOND/!ZZZ!/fp_2]\n************ SECOND !XXX! - 2\n> test_multiple_fixture_parametrize[SECOND/!XXX!/fp_1]\n> test_multiple_fixture_parametrize_second[SECOND/!XXX!/fp_2]\n```\n\n**Final Fixture Call Count:**\n\n```text\nFixture calls cache:\n- FIRST !ZZZ! -> 3\n- FIRST !XXX! -> 3\n- SECOND !ZZZ! -> 2\n- SECOND !XXX! -> 2\nTotal times fixtures called: 10\nTotal heavy fixtures: 4\n```\n\n## Expected Behavior\n\nPytest should group all tests using the same session-scoped fixture instance together to avoid re-initialization. The `heavy_fixture` for a given parameter set (e.g., `('FIRST', '!ZZZ!')` or `('FIRST', '!XXX!')` ) should be set up only once for the entire test session.\n\n**Expected Execution Log:**\n\n```text\n ************ FIRST !ZZZ! - 1\n> test_one_fxt[FIRST/!ZZZ!]\n...\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_1]\n...\n> test_multiple_fixture_parametrize[FIRST/!ZZZ!/fp_1]\n...\n ************ FIRST !XXX! - 1\n...\n```\n\n**Expected Final Fixture Call Count:**\n\n```text\n Fixture calls cache:\n- FIRST !ZZZ! -> 1\n- FIRST !XXX! -> 1\n- SECOND !ZZZ! -> 1\n- SECOND !XXX! -> 1\n ...\n```\n\n## Additional Context\n\nInterestingly, the execution order changes if the test function `test_with_params_all_models` is moved before other tests in the file (e.g., to line 97). When moved, the grouping for the `('FIRST', '!XXX!')` parameter set behaves as expected (at least for this test), and its fixture is called one time less. This suggests that the test ordering algorithm is sensitive to the declaration order of tests, which can lead to inefficient fixture management.\n\n\n## How to run\n\n```ini\n[pytest]\nlog_cli = true\nlog_cli_level = DEBUG\n```\n\n```bash\npytest -v | grep 'INFO'\n```\n\n\n## Environment\n\n- pytest 8.4.1\n- Ubuntu 24.04\n",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "body": "## Description\n\nThere appears to be an issue with pytest's test execution order that causes a session-scoped, parametrized fixture to be set up and torn down multiple times with the same parameters within a single test session. This behavior is contrary to the expectation that a session-scoped fixture instance should be created only once per unique parameter set and reused for all tests that require it.\n\n## Steps to Reproduce\n\nThe issue can be observed with the provided test file. The `heavy_fixture` is session-scoped and parametrized.\n\n```python\nimport logging\nimport pytest\nimport collections\n\nlogger = logging.getLogger(__name__)\n\n\nHW_IDS: list[str] = [\n    \"FIRST\",\n    \"SECOND\",\n]\n\nSECOND_HW_PARAM: list[str] = [\"!ZZZ!\", \"!XXX!\"]\n\n\nOTHER_PARAMETERS: list[str] = [\"p_1_1\", \"p_1_2\"]\nOTHER_PARAMETERS_2: list[str] = [\"p_2_1\", \"p_2_2\"]\n\n\ncalls_cache = collections.Counter()\n\n\n@pytest.fixture(scope=\"session\")\ndef heavy_fixture(request: pytest.FixtureRequest) -> str:\n    param1, param2 = request.param\n    calls_cache[(param1, param2)] += 1\n    logger.info(f\" ************ {param1} {param2} - {calls_cache[(param1, param2)]}\")\n    return f\"{param1}/{param2}\"\n\n    \n@pytest.fixture(scope=\"function\", autouse=True)\ndef print_current_test_name(request: pytest.FixtureRequest):\n    yield\n    logger.info(f\"-> {request.node.name}\")\n\n    \n@pytest.fixture(scope=\"session\", autouse=True)\ndef print_calls_cache():\n    yield\n    logger.info(\" Fixture calls cache:\")\n    for (param1, param2), calls in calls_cache.items():\n        logger.info(f\" - {param1} {param2} -> {calls}\")\n    logger.info(f\" Total times fixtures called: {sum(calls_cache.values())}\")\n    logger.info(f\" Total heavy fixtures: {len(calls_cache)}\")\n\n\n@pytest.fixture(scope=\"module\")\ndef fixture_1() -> str:\n    return \"fixture_1\"\n\n\n@pytest.fixture(scope=\"module\")\ndef fixture_param_1(request: pytest.FixtureRequest) -> str:\n    return request.param\n\n\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(m, b) for m in HW_IDS for b in SECOND_HW_PARAM],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_one_fxt(heavy_fixture: str, fixture_1):\n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], SECOND_HW_PARAM[0])],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_one(heavy_fixture: str, config: str):    \n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\"config_2\", OTHER_PARAMETERS_2)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], SECOND_HW_PARAM[1])],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_one_second_param(heavy_fixture: str, config: str, config_2: str):    \n    pass\n\n\n@pytest.mark.parametrize(\"config\", OTHER_PARAMETERS)\n@pytest.mark.parametrize(\n    \"heavy_fixture\",\n    [(HW_IDS[0], b) for b in SECOND_HW_PARAM],\n    ids=lambda p: f\"{p[0]}/{p[1]}\",\n    indirect=[\"heavy_fixture\"],\n)\ndef test_with_params_all_models(heavy_fixture: str, config: str):    \n    pass\n\n\nITEMS_DATA = [\n    ((hw, b), \"fp_1\") for hw in HW_IDS for b in SECOND_HW_PARAM\n]\n\n\nITEMS_DATA_2 = [\n    ((hw, b), \"fp_2\") for hw in HW_IDS for b in SECOND_HW_PARAM\n]\n\n\ndef multiple_fixture_parametrize(\n    items: tuple[tuple[str, str], str]\n):\n    return pytest.mark.parametrize(\n        \"heavy_fixture, fixture_param_1\",\n        items,\n        indirect=[\"heavy_fixture\", \"fixture_param_1\"],\n        ids=[f\"{item[0][0]}/{item[0][1]}/{item[1]}\" for item in items]\n    )\n    \n    \n\n@multiple_fixture_parametrize(ITEMS_DATA)\ndef test_multiple_fixture_parametrize(heavy_fixture: str, fixture_param_1: str):\n    pass\n\n    \n\n@multiple_fixture_parametrize(ITEMS_DATA_2)\ndef test_multiple_fixture_parametrize_second(heavy_fixture: str, fixture_param_1: str):\n    pass\n```\n\n## Actual Behavior\n\nWhen running the tests, the output shows that `heavy_fixture` is called multiple times for the same parameters. For example, `heavy_fixture` with parameters `('FIRST', '!ZZZ!')` is instantiated three separate times during the session.\n\n**Execution Log Snippet:**\n\n```text\n************ FIRST !ZZZ! - 1\n> test_one_fxt[FIRST/!ZZZ!]\n> test_with_params_one[FIRST/!ZZZ!-p_1_1]\n> test_with_params_one[FIRST/!ZZZ!-p_1_2]\n************ FIRST !XXX! - 1\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_1-p_1_1]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_1-p_1_2]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_2-p_1_1]\n> test_with_params_one_second_param[FIRST/!XXX!-p_2_2-p_1_2]\n************ FIRST !ZZZ! - 2\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_1]\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_2]\n************ FIRST !XXX! - 2\n> test_one_fxt[FIRST/!XXX!]\n> test_with_params_all_models[FIRST/!XXX!-p_1_1]\n> test_with_params_all_models[FIRST/!XXX!-p_1_2]\n************ SECOND !ZZZ! - 1\n> test_one_fxt[SECOND/!ZZZ!]\n************ SECOND !XXX! - 1\n> test_one_fxt[SECOND/!XXX!]\n************ FIRST !ZZZ! - 3\n> test_multiple_fixture_parametrize[FIRST/!ZZZ!/fp_1]\n> test_multiple_fixture_parametrize_second[FIRST/!ZZZ!/fp_2]\n************ FIRST !XXX! - 3\n> test_multiple_fixture_parametrize[FIRST/!XXX!/fp_1]\n> test_multiple_fixture_parametrize_second[FIRST/!XXX!/fp_2]\n************ SECOND !ZZZ! - 2\n> test_multiple_fixture_parametrize[SECOND/!ZZZ!/fp_1]\n> test_multiple_fixture_parametrize_second[SECOND/!ZZZ!/fp_2]\n************ SECOND !XXX! - 2\n> test_multiple_fixture_parametrize[SECOND/!XXX!/fp_1]\n> test_multiple_fixture_parametrize_second[SECOND/!XXX!/fp_2]\n```\n\n**Final Fixture Call Count:**\n\n```text\nFixture calls cache:\n- FIRST !ZZZ! -> 3\n- FIRST !XXX! -> 3\n- SECOND !ZZZ! -> 2\n- SECOND !XXX! -> 2\nTotal times fixtures called: 10\nTotal heavy fixtures: 4\n```\n\n## Expected Behavior\n\nPytest should group all tests using the same session-scoped fixture instance together to avoid re-initialization. The `heavy_fixture` for a given parameter set (e.g., `('FIRST', '!ZZZ!')` or `('FIRST', '!XXX!')` ) should be set up only once for the entire test session.\n\n**Expected Execution Log:**\n\n```text\n ************ FIRST !ZZZ! - 1\n> test_one_fxt[FIRST/!ZZZ!]\n...\n> test_with_params_all_models[FIRST/!ZZZ!-p_1_1]\n...\n> test_multiple_fixture_parametrize[FIRST/!ZZZ!/fp_1]\n...\n ************ FIRST !XXX! - 1\n...\n```\n\n**Expected Final Fixture Call Count:**\n\n```text\n Fixture calls cache:\n- FIRST !ZZZ! -> 1\n- FIRST !XXX! -> 1\n- SECOND !ZZZ! -> 1\n- SECOND !XXX! -> 1\n ...\n```\n\n## Additional Context\n\nInterestingly, the execution order changes if the test function `test_with_params_all_models` is moved before other tests in the file (e.g., to line 97). When moved, the grouping for the `('FIRST', '!XXX!')` parameter set behaves as expected (at least for this test), and its fixture is called one time less. This suggests that the test ordering algorithm is sensitive to the declaration order of tests, which can lead to inefficient fixture management.\n\n\n## How to run\n\n```ini\n[pytest]\nlog_cli = true\nlog_cli_level = DEBUG\n```\n\n```bash\npytest -v | grep 'INFO'\n```\n\n\n## Environment\n\n- pytest 8.4.1\n- Ubuntu 24.04\n",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755/comments",
+    "created_at": "2025-09-26T09:39:43Z",
+    "events_url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755/events",
+    "html_url": "https://github.com/pytest-dev/pytest/issues/13755",
+    "id": 3456669521,
+    "issue_dependencies_summary": {
+      "blocked_by": 0,
+      "blocking": 0,
+      "total_blocked_by": 0,
+      "total_blocking": 0
+    },
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "84b6eb",
+        "default": false,
+        "description": "new feature or API change, should be merged into features branch",
+        "id": 224849195,
+        "name": "type: enhancement",
+        "node_id": "MDU6TGFiZWwyMjQ4NDkxOTU=",
+        "url": "https://api.github.com/repos/pytest-dev/pytest/labels/type:%20enhancement"
+      },
+      {
+        "color": "207de5",
+        "default": false,
+        "description": "performance or memory problem/improvement",
+        "id": 288470366,
+        "name": "type: performance",
+        "node_id": "MDU6TGFiZWwyODg0NzAzNjY=",
+        "url": "https://api.github.com/repos/pytest-dev/pytest/labels/type:%20performance"
+      },
+      {
+        "color": "5319e7",
+        "default": false,
+        "description": "anything involving fixtures directly or indirectly",
+        "id": 604021555,
+        "name": "topic: fixtures",
+        "node_id": "MDU6TGFiZWw2MDQwMjE1NTU=",
+        "url": "https://api.github.com/repos/pytest-dev/pytest/labels/topic:%20fixtures"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "I_kwDOAjwLdc7OCJdR",
+    "number": 13755,
+    "performed_via_github_app": null,
+    "pinned_comment": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/pytest-dev/pytest",
+    "state": "open",
+    "state_reason": null,
+    "sub_issues_summary": {
+      "completed": 0,
+      "percent_completed": 0,
+      "total": 0
+    },
+    "timeline_url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755/timeline",
+    "title": "Pytest session-scoped fixture is re-initialized unexpectedly",
+    "type": null,
+    "updated_at": "2026-02-02T12:59:27Z",
+    "url": "https://api.github.com/repos/pytest-dev/pytest/issues/13755",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/229123158?v=4",
+      "events_url": "https://api.github.com/users/sgonorov/events{/privacy}",
+      "followers_url": "https://api.github.com/users/sgonorov/followers",
+      "following_url": "https://api.github.com/users/sgonorov/following{/other_user}",
+      "gists_url": "https://api.github.com/users/sgonorov/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/sgonorov",
+      "id": 229123158,
+      "login": "sgonorov",
+      "node_id": "U_kgDODagkVg",
+      "organizations_url": "https://api.github.com/users/sgonorov/orgs",
+      "received_events_url": "https://api.github.com/users/sgonorov/received_events",
+      "repos_url": "https://api.github.com/users/sgonorov/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/sgonorov/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/sgonorov/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/sgonorov",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "3d441ff697b75e1c7ed97fe2fb10122ac7ba3367d643821159a750ae15ff687c",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "2e736dcf395f9f1ae51dfa28051a88f2711b8f41280ec2b4515579db4b698a33",
+      "locator": "",
+      "observed_at": "2026-09-09T03:27:33.851810+00:00",
+      "raw_blob": "830663fbef572d9a045369eea195374eb45c853e77b84e5c5cb33a53f8ae9a61",
+      "source_revision": "fa8c99e5b8c4c8768abed395c181aadffc6343317da02caaababb36855d86fa0"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

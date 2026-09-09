@@ -1,0 +1,93 @@
+{
+  "revision": "08b8c928ac8006732e7a1fecf88541e25c7fa74d32fdcd389b86eea1df114ac3",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "c49ff70355dbebc2fb77150b15bc7233ca9518a1c10921a867add85aca42d761",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2026-01-10T19:06:19Z",
+    "provider_id": "3733396855",
+    "provider_updated_at": "2026-01-10T19:06:19Z",
+    "quality": "PENDING",
+    "resource_blob": "e36495351bc81ba12dfbe97c8bb9b53662ad406e5461834216efea281942c4b9",
+    "resource_kind": "issue_comment",
+    "schema_version": 1,
+    "source_id": "4ee96909-8c1a-4bf8-b21d-017229e59bb5",
+    "url": "https://github.com/pytest-dev/pytest/pull/14098#issuecomment-3733396855"
+  },
+  "body": "Interesting!\r\n\r\nThe \"tests outside of the rootdir\" scenario is ill-advised but I guess we need to support it. \r\n\r\n---\r\n\r\nRegarding the first commit, I'm looking at the test `test_conftest_fixture_scoping_with_testpaths_outside_rootdir`, and first thing I wanted to understand is the collection tree and nodeid's generated in this case (when pytest is run from the rootdir `pytester.path/sdk`). The result is (I added the nodeid reprs after the names):\r\n\r\n```xml\r\n<Dir tests> '::tests'\r\n  <Dir sdk> ''\r\n    <Dir inner> 'inner'\r\n      <Module test_inner.py> 'inner/test_inner.py'\r\n        <Function test_inner> 'inner/test_inner.py::test_inner'\r\n    <Module test_outer.py> 'test_outer.py'\r\n      <Function test_outer> 'test_outer.py::test_outer'\r\n```\r\n\r\nThat seems odd and broken to me, there's obviously a confusion going on here. Generally the intention is for nodeid's to be relative to the rootdir, so what happens when the collection path is not under the rootdir? I've already written about this issue in #11245.\r\n\r\nThe commit \"fix #14004 - connect conftests to nodeids/nodes instead of matching string prefixes - ensure we connect in the collect phase in case of directory confusion\" works around the issue using some \"fixup\" code in fixtures.py. I think it's a bit confusing, particularly the function name \"_get_nodeid_for_path_outside_rootpath\", it basically invents a \"fake\" nodeid because the existing nodeid is broken, but it's not an actual ID of a node...\r\n\r\nI think that if we fix the underlying issue #11245, that would be a better way to go? In that issue we had a couple of suggestions.\r\n\r\nAlso regarding the implementation itself, I fear that the loop over the `config.args` might create an O(n^2) situation which could be problematic if lot's of args are given (I know some users pass lot's of args). I haven't investigated in detail, just something to look out for.\r\n\r\n---\r\n\r\nRegarding the \"fix: assign conftest fixtures to Directory nodes during collection\" idea and subsequent changes, I think I like the direction, I definitely think we should to try to integrate conftests with the collection tree better, and get away from the current path matching. Thanks for taking a look at this.\r\n\r\nI need to look into it more, but can you describe the interaction with initial conftests? Are they associated with a Directory or are they \"global\"?\r\n\r\nThe `_pending_conftests` adds a bit of tricky state, I wonder if we can't pass the node directly instead of relying on the collection report hook? I'm thinking here:\r\n\r\nhttps://github.com/pytest-dev/pytest/blob/0e9db5fa5a8de151ab43e5d71e0e8192e0456b9d/src/_pytest/runner.py#L383-L399",
+  "resource": {
+    "author_association": "MEMBER",
+    "body": "Interesting!\r\n\r\nThe \"tests outside of the rootdir\" scenario is ill-advised but I guess we need to support it. \r\n\r\n---\r\n\r\nRegarding the first commit, I'm looking at the test `test_conftest_fixture_scoping_with_testpaths_outside_rootdir`, and first thing I wanted to understand is the collection tree and nodeid's generated in this case (when pytest is run from the rootdir `pytester.path/sdk`). The result is (I added the nodeid reprs after the names):\r\n\r\n```xml\r\n<Dir tests> '::tests'\r\n  <Dir sdk> ''\r\n    <Dir inner> 'inner'\r\n      <Module test_inner.py> 'inner/test_inner.py'\r\n        <Function test_inner> 'inner/test_inner.py::test_inner'\r\n    <Module test_outer.py> 'test_outer.py'\r\n      <Function test_outer> 'test_outer.py::test_outer'\r\n```\r\n\r\nThat seems odd and broken to me, there's obviously a confusion going on here. Generally the intention is for nodeid's to be relative to the rootdir, so what happens when the collection path is not under the rootdir? I've already written about this issue in #11245.\r\n\r\nThe commit \"fix #14004 - connect conftests to nodeids/nodes instead of matching string prefixes - ensure we connect in the collect phase in case of directory confusion\" works around the issue using some \"fixup\" code in fixtures.py. I think it's a bit confusing, particularly the function name \"_get_nodeid_for_path_outside_rootpath\", it basically invents a \"fake\" nodeid because the existing nodeid is broken, but it's not an actual ID of a node...\r\n\r\nI think that if we fix the underlying issue #11245, that would be a better way to go? In that issue we had a couple of suggestions.\r\n\r\nAlso regarding the implementation itself, I fear that the loop over the `config.args` might create an O(n^2) situation which could be problematic if lot's of args are given (I know some users pass lot's of args). I haven't investigated in detail, just something to look out for.\r\n\r\n---\r\n\r\nRegarding the \"fix: assign conftest fixtures to Directory nodes during collection\" idea and subsequent changes, I think I like the direction, I definitely think we should to try to integrate conftests with the collection tree better, and get away from the current path matching. Thanks for taking a look at this.\r\n\r\nI need to look into it more, but can you describe the interaction with initial conftests? Are they associated with a Directory or are they \"global\"?\r\n\r\nThe `_pending_conftests` adds a bit of tricky state, I wonder if we can't pass the node directly instead of relying on the collection report hook? I'm thinking here:\r\n\r\nhttps://github.com/pytest-dev/pytest/blob/0e9db5fa5a8de151ab43e5d71e0e8192e0456b9d/src/_pytest/runner.py#L383-L399",
+    "created_at": "2026-01-10T19:06:19Z",
+    "html_url": "https://github.com/pytest-dev/pytest/pull/14098#issuecomment-3733396855",
+    "id": 3733396855,
+    "issue_url": "https://api.github.com/repos/pytest-dev/pytest/issues/14098",
+    "minimized": null,
+    "node_id": "IC_kwDOAjwLdc7ehx13",
+    "performed_via_github_app": null,
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 0,
+      "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/3733396855/reactions"
+    },
+    "updated_at": "2026-01-10T19:06:19Z",
+    "url": "https://api.github.com/repos/pytest-dev/pytest/issues/comments/3733396855",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/1223550?v=4",
+      "events_url": "https://api.github.com/users/bluetech/events{/privacy}",
+      "followers_url": "https://api.github.com/users/bluetech/followers",
+      "following_url": "https://api.github.com/users/bluetech/following{/other_user}",
+      "gists_url": "https://api.github.com/users/bluetech/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/bluetech",
+      "id": 1223550,
+      "login": "bluetech",
+      "node_id": "MDQ6VXNlcjEyMjM1NTA=",
+      "organizations_url": "https://api.github.com/users/bluetech/orgs",
+      "received_events_url": "https://api.github.com/users/bluetech/received_events",
+      "repos_url": "https://api.github.com/users/bluetech/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/bluetech/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/bluetech/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/bluetech",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "badc02a9da444e924fca020f703c1108b92313b79f8e8f16d2a556d6ab174497",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "6b94b37f1c6b00b476321f324709c7bb184d5496c431bb792e99b4810e1a81eb",
+      "locator": "/0",
+      "observed_at": "2026-09-09T08:38:46.927026+00:00",
+      "raw_blob": "a0e465c9ebb3d9622057e5b121c0bdeab45992a9d8a2050b92239342aa31ca70",
+      "source_revision": "08b8c928ac8006732e7a1fecf88541e25c7fa74d32fdcd389b86eea1df114ac3"
+    },
+    {
+      "id": "cf8bbe8054688903006680d3f00045f17e90a62de4160f3fdcb54917fb6c8004",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "0d093bebd5769bd66883db7bd12a1452c35e0d9c8e8a76cec8ec2937c326372c",
+      "locator": "/0",
+      "observed_at": "2026-09-09T08:39:46.534499+00:00",
+      "raw_blob": "a0e465c9ebb3d9622057e5b121c0bdeab45992a9d8a2050b92239342aa31ca70",
+      "source_revision": "08b8c928ac8006732e7a1fecf88541e25c7fa74d32fdcd389b86eea1df114ac3"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

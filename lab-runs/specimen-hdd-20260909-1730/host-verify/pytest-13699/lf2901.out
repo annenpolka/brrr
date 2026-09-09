@@ -1,0 +1,62 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.0.1, pluggy-1.6.0
+cachedir: /tmp/hdd-20260909-1730-cache-13699lf-901
+rootdir: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-13699
+collected 1 item
+run-last-failure: rerun previous 1 failure
+
+test_skip.py F                                                           [100%]
+
+=================================== FAILURES ===================================
+____________________________ test_asynctest_support ____________________________
+
+    def test_asynctest_support():
+>       pytest.importorskip("asynctest")
+
+test_skip.py:4: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/tmp/hdd-13699-asynctest-only/asynctest/__init__.py:22: in <module>
+    from .case import *
+/tmp/hdd-13699-asynctest-only/asynctest/case.py:54: in <module>
+    import asynctest.selector
+/tmp/hdd-13699-asynctest-only/asynctest/selector.py:29: in <module>
+    from . import mock
+/tmp/hdd-13699-asynctest-only/asynctest/mock.py:428: in <module>
+    class _AwaitEvent:
+/tmp/hdd-13699-asynctest-only/asynctest/mock.py:433: in _AwaitEvent
+    @asyncio.coroutine
+     ^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'coroutine'
+
+    def __getattr__(name: str):
+        import warnings
+    
+        match name:
+            case "AbstractEventLoopPolicy":
+                warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                return events._AbstractEventLoopPolicy
+            case "DefaultEventLoopPolicy":
+                warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                if sys.platform == 'win32':
+                    return windows_events._DefaultEventLoopPolicy
+                return unix_events._DefaultEventLoopPolicy
+            case "WindowsSelectorEventLoopPolicy":
+                if sys.platform == 'win32':
+                    warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                    return windows_events._WindowsSelectorEventLoopPolicy
+                # Else fall through to the AttributeError below.
+            case "WindowsProactorEventLoopPolicy":
+                if sys.platform == 'win32':
+                    warnings._deprecated(f"asyncio.{name}", remove=(3, 16))
+                    return windows_events._WindowsProactorEventLoopPolicy
+                # Else fall through to the AttributeError below.
+    
+>       raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+E       AttributeError: module 'asyncio' has no attribute 'coroutine'. Did you mean: 'coroutines'?
+
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/__init__.py:74: AttributeError
+=========================== short test summary info ============================
+FAILED test_skip.py::test_asynctest_support - AttributeError: module 'asyncio...
+============================== 1 failed in 0.03s ===============================

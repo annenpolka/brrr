@@ -1,0 +1,110 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________________________________ test_getini __________________________________
+
+pytestconfig = <_pytest.config.Config object at 0x109eb9010>
+
+    def test_getini(pytestconfig):
+>       val = pytestconfig.getini("mystr")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+test_dummy.py:2: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/private/tmp/hdd-20260909-1730-venvs/py910/lib/python3.14/site-packages/_pytest/config/__init__.py:1711: in getini
+    self._inicache[canonical_name] = val = self._getini(canonical_name)
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/private/tmp/hdd-20260909-1730-venvs/py910/lib/python3.14/site-packages/_pytest/config/__init__.py:1755: in _getini
+    return self._getini_toml(name, canonical_name, type, value, default)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <_pytest.config.Config object at 0x109eb9010>, name = 'mystr'
+canonical_name = 'mystr', type = 'string', value = ['not', 'a', 'string']
+default = 'x'
+
+    def _getini_toml(
+        self,
+        name: str,
+        canonical_name: str,
+        type: str,
+        value: object,
+        default: Any,
+    ):
+        """Handle TOML config values with strict type validation and no coercion.
+    
+        In TOML mode, values already have native types from TOML parsing.
+        We validate types match expectations exactly, including list items.
+        """
+        value_type = builtins.type(value).__name__
+        if type == "paths":
+            # Expect a list of strings.
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects a list for type 'paths', "
+                    f"got {value_type}: {value!r}"
+                )
+            for i, item in enumerate(value):
+                if not isinstance(item, str):
+                    item_type = builtins.type(item).__name__
+                    raise TypeError(
+                        f"{self.inipath}: config option '{name}' expects a list of strings, "
+                        f"but item at index {i} is {item_type}: {item!r}"
+                    )
+            dp = (
+                self.inipath.parent
+                if self.inipath is not None
+                else self.invocation_params.dir
+            )
+            return [dp / x for x in value]
+        elif type in {"args", "linelist"}:
+            # Expect a list of strings.
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects a list for type '{type}', "
+                    f"got {value_type}: {value!r}"
+                )
+            for i, item in enumerate(value):
+                if not isinstance(item, str):
+                    item_type = builtins.type(item).__name__
+                    raise TypeError(
+                        f"{self.inipath}: config option '{name}' expects a list of strings, "
+                        f"but item at index {i} is {item_type}: {item!r}"
+                    )
+            return list(value)
+        elif type == "bool":
+            # Expect a boolean.
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects a bool, "
+                    f"got {value_type}: {value!r}"
+                )
+            return value
+        elif type == "int":
+            # Expect an integer (but not bool, which is a subclass of int).
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects an int, "
+                    f"got {value_type}: {value!r}"
+                )
+            return value
+        elif type == "float":
+            # Expect a float or integer only.
+            if not isinstance(value, (float, int)) or isinstance(value, bool):
+                raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects a float, "
+                    f"got {value_type}: {value!r}"
+                )
+            return value
+        elif type == "string":
+            # Expect a string.
+            if not isinstance(value, str):
+>               raise TypeError(
+                    f"{self.inipath}: config option '{name}' expects a string, "
+                    f"got {value_type}: {value!r}"
+                )
+E               TypeError: /Users/annenpolka/ghq/github.com/annenpolka/brrr/lab-runs/specimen-hdd-20260909-1730/host-verify/pytest-14808/tool_pytest/pyproject.toml: config option 'mystr' expects a string, got list: ['not', 'a', 'string']
+
+/private/tmp/hdd-20260909-1730-venvs/py910/lib/python3.14/site-packages/_pytest/config/__init__.py:1896: TypeError
+=========================== short test summary info ============================
+FAILED test_dummy.py::test_getini - TypeError: /Users/annenpolka/ghq/github.c...
+1 failed in 0.06s

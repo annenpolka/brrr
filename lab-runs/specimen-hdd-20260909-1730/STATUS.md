@@ -5,7 +5,7 @@
 - hard_end: 2026-09-10 09:00:00 JST
 - hard_end_extended: no
 - effective_cap_usd: 16.15454896
-- trial: case-001-a — 3 Dreams, THIN_WRAPPER, Dreaming stopped (no isomorphic filler)
+- trial: case-001-a — 3 Dreams, THIN_WRAPPER, Dreaming stopped (no isomorphic filler); 保全 08:12 JST save complete; HARD_STOP 09:00 still ahead
 - CHAIN-001/002/003: http_success true, tool_success false
 - FIRST_SELECTION: KEEP 0, KILL fictional CLIs, HOLD extras
 - other runs re-inited: no
@@ -15,3 +15,218 @@
 - reviewer_type: agent
 - coordinator main candidate merge: no
 - worktrees in run dir: no
+- expand collect a9328ef4: NO_RUNNABLE_JOB unfinished 0
+- host 実機 14775/13925/14253/14092/14650/14094/5203/2043/14640/13784/14819/14820/14971/14691/14445/14737/14048/14964: HOLD no View
+- leftover complete pytest+uv screens: HOLD; no PASS; consumer still 1 discovery
+- 18:44 tick host 実機 14800/14101/14148/14608/14412: HOLD no View
+- 18:59 tick host 実機 14935/14412-times/14640: HOLD no View
+- 19:01 tick host 実機 14808/14560: HOLD no View; 14613 feature HOLD
+- 19:14 tick host 実機 14808 extra versions / 14560 extra versions / 14613 cache_dir workaround: HOLD no View
+- 19:16 tick host 実機 14683/13957: HOLD no View
+- 19:31 tick host 実機 14436/13699: HOLD no View
+- 19:29 tick host 実機 14444/14392: HOLD no View
+- 19:44 tick host 実機 14696/14841/14448/14323/14488: HOLD no View
+- 19:46 tick host 実機 14841: HOLD no View
+- 19:59 tick host 実機 14635/14694/14877: HOLD no View
+- 20:04 tick host 実機 14973/14812/14702: HOLD no View
+- 20:08 tick host 実機 13922: HOLD no View
+- 20:14 tick host 実機 14807/14514b/14255/14973-enter: HOLD no View
+- 20:16 tick host 実機 14389: HOLD no View; leftover 13913/14700/14762/9298 HOLD
+- 20:21 tick host 実機 14389 extra (During handling gone from 9.1.0); 14514 importlib 9.0.1–9.1.0; unittest suites OK; HOLD no View
+- 20:28 tick host 実機 13913/14700/14762/9298: HOLD no View
+- 20:32 tick host 実機 14811/13913-extra/14613-env: HOLD no View
+- 20:33 tick host 実機 13755: HOLD no View
+- 20:36 tick host 実機 13755-extra/14084/14811-extra/9298-extra: HOLD no View
+- 20:41 tick host 実機 14514c/14084-extra/14613-901/13913-addopts: HOLD no View
+- 20:49 tick host 実機 13699-extra/14094b/11502/14705/14447-911plain/14048-noinit: HOLD no View
+- 21:00 tick host 実機 14716/14916/14814/11502-run/14705-iniopt: HOLD no View
+- 20:57 tick host 実機 14445/14819/14820/14101 matrices, 14431 default collect skip, 14608 extra layouts, leftover PRs: HOLD no View
+- 21:01 tick host 実機 14608c invocation-dir tests/ --db-url 9.1.0-only unrecognized: HOLD no View
+- 21:07 tick host 実機 14817/14816/14815 rewrite display; 14608c testpaths does not rescue 9.1.0: HOLD no View
+- 21:11 tick host 実機 14608c CLI `tests` path rescues 9.1.0; `test_it.py` path unrecognized all versions: HOLD no View
+- 21:13 tick host 実機 14608c root conftest pass all versions; nested tests/unit unrecognized all; 14817 instance still bound-method: HOLD no View
+- 21:15 tick host 実機 14608c tests/test_it.py still 9.1.0-only miss; Tests/ capital unrecognized all: HOLD no View
+- 21:15 tick host 実機 9703/13246/14814-bare/14716-toml-cfg/11502-nocache: HOLD no View
+- 21:17 tick host 実機 14104 session-gap 3 pass; 14608c test-foo/testdir/testfoo 9.1.0-only miss; _tests unrecognized all: HOLD no View
+- 21:22 tick host 実機 14271 monkeypatch hasattr pass; 14476 -k foo both tests; 14104 setup-show carries session fixture; 14608c test_suite/test2/mytests: HOLD no View
+- 21:25 tick host 実機 13957b 8/9 nodeid swap; 13755b session teardown between tests; 14271 delitem pass: HOLD no View
+- 21:29 tick host 実機 13957b run 4 pass all versions; 13755 setup-show same 8/9 teardown between param groups: HOLD no View
+- 21:32 tick host 実機 13976 fixture-params override 9.1.0-only duplicate; 13957b -v nodeids match collect; 13755b 4 SETUP S: HOLD no View
+- 21:34 tick host 実機 13976 conftest layout same 9.1.0 miss; generate_tests workaround 5 pass including 9.1.0; 14608c confcutdir does not rescue 9.1.0: HOLD no View
+- 21:38 tick host 実機 14650b no-strict auto-suffix 2 pass; 13976 ids= does not rescue 9.1.0; 14800 setup-show _finalizers: HOLD no View
+- 21:42 tick host 実機 14650c pytest.ini/ini_options strict ERROR on 9.x unknown on 8.4.1; 14800 _finalizers from 9.1.0 not 9.0.3; 13976 pytest.param still 9.1.0 miss: HOLD no View
+- 21:30 tick host 実機 9703b same-named collapse/--lf; 9703 --rootdir=.; 13246 subdir: HOLD no View
+- 21:44 tick host 実機 14004b testpaths leak 8.4.1–9.0.3 gone 9.1.0; 9703b --rootdir=. --lf only failed: HOLD no View
+- 21:48 tick host 実機 14608c pythonpath does not rescue 9.1.0; addopts=tests does; noconftest unrecognized all; 14431 python_files=test.py 1 pass; 14800 setup-show 9.0.1 pass / setup-plan no run; 14694 pythonpath still NameError 9.1.0: HOLD no View
+- 21:54 tick host 実機 14608c collect_ignore/nspkg/pythonpath-inside still 9.1.0 miss; 14004b pythonpath still leak; 13913 pythonpath still pytest9 unrecognized; 14514 pythonpath still foo.test ImportError: HOLD no View
+- 21:58 tick host 実機 14696 pythonpath still existing-file unrecognized all / missing-file 9.1.0-only; leftover uv PRs HOLD no files; cargo 0: HOLD no View
+- 21:59 tick host 実機 12083 overlap collect 1 on 8.4.1 / 2 on pytest 9; 13925 empty/dot alone ZeroDivision all; 14004b --rootdir=. still leak / --rootdir=.. rc=5: HOLD no View
+- 22:01 tick host 実機 14807 extras native table / pytest.toml ini_options ignored / native+ini_options UsageError on 9; leftover pytest 正解 PRs + uv 8 fences=0 HOLD: HOLD no View
+- 22:05 tick host 実機 12083 reverse/subdir overlap 8.4.1 drops overlapping dir; run 1 vs 2 pass; 14807 pytest.cfg ignored: HOLD no View
+- 22:08 tick host 実機 13925 reverse empty-path same 8/9; `-- a/` 1 pass all; 14807 setup.cfg [pytest] Failed; ini_options string works; 12083 two files n=2 all: HOLD no View
+- 22:12 tick host 実機 14608c PYTEST_ADDOPTS=tests rescues 9.1.0; 13925 a/ . same 8/9 cwd-overlap; 14807 tox.ini [tool:pytest] ignored: HOLD no View
+- 22:15 tick host 実機 13704 dir/file overlap 1 vs 2 / same file twice 2 vs 1; 12083 keep-duplicates run 3; 13925 collect-only '' a/ same 8/9: HOLD no View
+- 22:17 tick host 実機 14412 ini_options times 8.4.1 whole-test ms no subtest us; 14640 reverse 9.1.0 miss later assignment; 14148 cache_on 8.4.1 1 pass: HOLD no View
+- 22:22 tick host 実機 14971 reverse/setup-show 9.1.0 no re-SETUP nested_fixture; 14964 reverse/setup-show 9.1.0 drops autouse after gap; 13704 keep-duplicates n=3/n=2 all: HOLD no View
+- 22:27 tick host 実機 14640/14971 dir collect pass all; 14964 no-gap both ERROR all; python_files=*.py dir both ERROR; 14104 setup-show 901/903 session carry: HOLD no View
+- 22:30 tick host 実機 7777 nested collect 5; 13704b a/b a/ 1 vs 3; 14964d test_* names still 9.1.0 gap miss: HOLD no View
+- 22:31 tick host 実機 14640 assignment-only 2 pass all; 14971 one-services+gap 2 pass all; 14964 one-file+gap still guard; 5203 setup-show b from first a; 13885 setup-show skip from 9.1.0: HOLD no View
+- 22:36 tick host 実機 14095 setup-show same 5203; 13755 setup-show 901/903/910 10 S; 13704b keep-duplicates n=4; 7777 a/b n=3; 14964d reverse gap 9.1.0 miss: HOLD no View
+- 22:40 tick host 実機 2043 collect-only same split as run; 7777 a/b a/ overlap collect 8.4.1 n=3 / pytest 9 n=5; 14964d setup-show gap 9.1.0 drops later guard; 13704b run a/b a/ 1 vs 3 pass: HOLD no View
+- 22:48 tick host 実機 7777 run overlap 3 vs 5; keep-duplicates run 8 all; 13925 keep-duplicates restores 8.4.1 cwd drop (ZeroDivision all); 12083 keep-duplicates tests . n=4; 14775 _finalizers after -Werror from 9.1.0; 13885 setup-plan still lists autouse on 9.1.0; 14608c -o addopts=tests rescues 9.1.0: HOLD no View
+- 22:50 tick host 実機 3062 setup.cfg log_format pytest raw getini + live-log / ConfigParser interpolation fail; 7777b package-scoped 3 pass all; 14807 setup.cfg [tool:pytest] addopts=-q collect 1: HOLD no View
+- 22:55 tick host 実機 13784 setup-show same doubling 8.4.1–9.0.3; 13976 setup-show same 9.1.0 duplicate; 14650 collect-only same 8.4.1 suffix / 9.x duplicate; 14104 dir collect 6 pass all: HOLD no View
+- 22:59 tick host 実機 14011 setup-show class fix per subclass still None; 14691 setup-show sample not found; nocm 901/903/910 1 pass; 14048 collect-only --pyargs with init 1 collected all: HOLD no View
+- 23:00 tick host 実機 13704b a/a a/ 1 vs 3 keep-duplicates 4; 7777 a/b2 a/ 1 vs 5 keep-duplicates run 6; 13925 '' . ZeroDivision all; 3062 escaped %% InterpolationSyntaxError; 14737 setup-show still fail: HOLD no View
+- 23:01 tick host 実機 13479 setup-show ff not found all; 14737 collect-only Function not skipped; conftest 901/910 still fail; module 841/901/910 skip; 14447 setup-show still 3 fail: HOLD no View
+- 23:04 tick host 実機 14084 subdir PYTHONPATH=. rc=4 903/910; collect-only matches run; 14392 even-count backslash-dot False from 9.1.0; 14444 CLI --capture=sys 1 pass all: HOLD no View
+- 23:07 tick host 実機 13754 setup-show shared module same 8/9 4 pass; 13965 python_files=test.py 1 pass all: HOLD no View
+- 23:09 tick host 実機 14389 --assert=plain drops During handling on 8.4.1 only; 9.0.1/9.0.3 still print it; 14819 --tb=short still 2 fail: HOLD no View
+- 23:11 tick host 実機 14820 --tb=short still 1 fail 1 pass; 14445 --tb=short still 2 fail 1!=1 and 6==3: HOLD no View
+- 23:12 tick host 実機 14816/14815 --tb=short still no changelog where line: HOLD no View
+- 23:16 tick host 実機 13755b setup-plan 4S/4T all; 13957b setup-show still 8/9 id swap; 14101 setup-show still XPASS; 14808 collect-only 1 per layout; 14812 tb=short still INTERNALERROR; 14973 setup-show 2 pass cleanup missing; 14448 no where / plain AssertionError; 14814 starred still (9,[9]): HOLD no View
+- 23:20 tick host 実機 9703 setup-show explicit files autouse twice through 9.0.3 once from 9.1.0; 13985 collect-only TypeError string addopts on 9; 14253/14092 collect-only TypeError int native table on 9; 14650b auto-suffix 2 pass; 14488 tb=short still StashKey: HOLD no View
+- 23:24 tick host 実機 14702 setup-show 2 pass 1 skip; 13246 setup-show still shadow; 14613 no:cacheprovider -o cache_dir warning on 9 still 2 pass; 14004 setup-show 4 pass no leak: HOLD no View
+- 23:26 tick host 実機 14004b setup-show inner 3 through 9.0.3 / 1 from 9.1.0: HOLD no View
+- 23:28 tick host 実機 14560 tb=short still KeyError; 14051 collect-only 1; 14323 setup-show 1 pass: HOLD no View
+- 23:33 tick host 実機 14811 collect-only 1; 14255 int collect-only TypeError on 9 quoted 1 all; 14916 tb=short still introspects; 14705 collect-only same [pytest] vs [tool.pytest] split; 7777b a/b a/ 1 vs 3 keep-duplicates 4; 9703b setup-show both test_same: HOLD no View
+- 23:35 tick host 実機 14716 setup-show 1 pass missing toml/cfg FileNotFoundError; 14094b tb=short still 2 fail 1 pass; 14608 collect-only --from-b A rc=4 / A B n=2; 13922 collect-only extra rc=4 no UserWarning: HOLD no View
+- 23:37 tick host 実機 14635 setup-show 4 pass; 14700 setup-show 1 skip; 13882 setup-show 2 pass; 14514b collect-only ImportError / importlib 1; 11502 setup-show /dev/null nocache 1 pass: HOLD no View
+- 23:39 tick host 実機 14514c collect-only dir rc=5 explicit ImportError / importlib 1; 14683 setup-show doctest 1 pass: HOLD no View
+- 23:41 tick host 実機 14094 tb=short Monkeypatch AttributeError; 13957 setup-show 1 pass no swap; 14148 setup-show cache off AttributeError / on 1 pass; 14650c collect-only 8 suffix / 9 ERROR; 13699 without tree skip / with PYTHONPATH AttributeError; 14877 plugin count 32: HOLD no View
+- 23:44 tick host 実機 14762 collect-only 1 no segfault; 9298 setup-show 1 pass: HOLD no View
+- 23:45 tick host 実機 13913 collect-only 8.4.1 1 / pytest 9 unrecognized; 14431 setup-show 1 pass all: HOLD no View
+- 00:00 tick host 実機 14935 unique basetemp keeps from-a / shared overwrites / count=10 keeps / policy=all still last 3; 12083 subdirectory vs cwd 1 vs 2; 13704 test_other vs parent 1 vs 2; 14608c collect-only still 9.1.0 miss / pytest.toml list addopts rescues / native inside 1 pass; 14807 -c INI [tool:pytest] ignored / setup.cfg both no Failed: HOLD no View
+- 00:04 tick host 実機 12083 three-way file+subdir+cwd n=2 all (file hides 8/9); three dirs 1 vs 2 keep-duplicates 5; 7777/13704b cwd-as-parent same as parent dir; 13925 . . ZeroDivision / keep-duplicates 2 errors; 14431 collect-only default rc=5 / explicit 1: HOLD no View
+- 00:07 tick host 実機 14800 tb=short/plain still _finalizers from 9.1.0; 14694 setup-show add_answer missing from 9.1.0; 13704 three-way n=2 all / file+tests+. 1 vs 2; 14101 tb=short still XPASS: HOLD no View
+- 00:09 tick host 実機 14775 tb=short no-Werror 2 pass 1 warning from 9.1.0 / -Werror 2 errors; 13885 tb=short still skip from 9.1.0; 14971/14640 collect-only gap n=3 all: HOLD no View
+- 00:13 tick host 実機 12083/13704/7777/13704b file vs cwd 8.4.1 drops cwd; 13965 collect-only default rc=5; 13754 collect-only 4; 14591/2043 tb=short same collect split; 14808 setup-show surfaces getini TypeError: HOLD no View
+- 00:15 tick host 実機 14011 collect-only 2 / tb=short still None; 5203/14095 collect-only 2 (miss is execute); 13976/14650 tb=short same collect split; 14051 setup-show 1 pass; 14476 -k foo collect 2: HOLD no View
+- 00:19 tick host 実機 13784 collect-only 1; 14148 collect-only 1 even no:cacheprovider; 14817 tb=short still bound-method; 14448/14815 setup-show no where; 14608 setup-show A B 2 pass; 14613 setup-show 2 pass: HOLD no View
+- 00:20 tick host 実機 14816/14819/14820/14389/14445 collect-only (miss is execute); 14812 setup-show still INTERNALERROR; 14973 tb=short still missing cleanup; 14702 tb=short 2 pass 1 skip: HOLD no View
+- 00:22 tick host 実機 11502/9298 collect-only 1; 13913 setup-show tests/ 1 pass; 14811 setup-show getini list fail; 14255 quoted 1 pass / int native TypeError on 9; 14716 collect-only -c 1; 14514 setup-show no-args rc=5: HOLD no View
+- 00:27 tick host 実機 14514c/b setup-show importlib 1 pass; 14094 collect-only 2; 14094b setup-show 2 fail 1 pass; 14488/14841/14691/13479/13885 collect-only (miss is execute); 14608c setup-show still 9.1.0 miss; 13699 setup-show still AttributeError: HOLD no View
+- 00:31 tick host 実機 13985 setup-show string TypeError on 9 / list+ini_options 1 pass; 14560 collect-only KeyError; 14004 collect-only 4; 13755 collect-only 22; 14705 setup-show -c tool 8 unread / 9 bench; 9703 collect-only collapsed nodeids; 14253/14092 ini_options 1 pass: HOLD no View
+- 00:41 tick host 実機 14971/14640 --lf later ERROR last-failed from 9.1.0 / --ff still later miss; 14964 --ff still later PASS / --maxfail=1 hides later miss; 7777/13704b file vs containing dir n=1 all keep 2; 14807 ini+toml 8.4.1 ini / pytest 9 toml: HOLD no View
+- 00:47 tick host 実機 14640/14971 --lf later ERROR rerun 1 pass (gap skipped); 14004b/9703 setup-plan leak through 9.0.3 gone 9.1.0; 13755 plan 10S/10T all; 14104 session carry at plan; 7777b file-vs-cwd 1 vs 3 keep 4; collect-only 14694/14812/14973/14702/13246/14814 miss is execute; 13699 tb=short still AttributeError; 14696 iso_miss existing unrecognized all / missing 9.1.0-only: HOLD no View
+- 00:52 tick host 実機 13976/14591/2043 setup-plan same collect split; 14650 plan pytest9 duplicate IDs; 14148 --cache-show nodeids / no:cacheprovider unrecognized --cache-show; 14608c --override-ini addopts=tests rescues 9.1.0 on alt_inside; 14412 --durations=0 not per-subtest us; 13784 tb=short still doubling; 14817 setup-show still bound-method; 14800 --lf hides _finalizers; 14775 --lf -Werror still 2 errors: HOLD no View
+- 00:54 tick host 実機 12083/13704/7777 setup-plan same overlap drop as collect; 13925 setup-plan empty 8.4.1 drops cwd / pytest9 ZeroDivision; 14444 plan hides capture; 14762 setup-show 1 pass; 13922 extra rc=4; 13885 --lf 8.4.1-9.0.3 still ERROR / 9.1.0 skip: HOLD no View
+- 00:56 tick host 実機 5203/14095 setup-plan b from first a; 14011 setup-plan class fix per subclass; 14691 setup-plan sample not found; 14444 collect-only 2; 13479 setup-plan ff not found: HOLD no View
+- 00:59 tick host 実機 12083 reverse plan 1 vs 2 keep 3; 13704b plan 1 vs 3 keep 4; 7777b plan 1 vs 3; 14800 --ff hides _finalizers; 14775 --ff still 2 errors; 13885 --ff still 8/9 split; 14101 --lf XPASS not last-failed; 14613 cache-show after run has nodeids; 14148 nocache --cache-clear unrecognized; 14650b plan 2 all; 14650c plan pytest9 duplicate; 14608c override-ini 1 pass including 9.1.0: HOLD no View
+- 01:02 tick host 実機 14807 pytest.ini beats pyproject all; named pytest.toml beats setup.cfg from 9.0.1; 14964 --nf later miss visible; 14971/14640 --maxfail=1 later miss visible; 14737 --lf still 1 fail: HOLD no View
+- 01:03 tick host 実機 13704 reverse plan 1 vs 2 keep 3; 7777 reverse 3 vs 5 keep 8; 13925 . a/ 8.4.1 drop cwd / pytest9 ZeroDivision; 14101 --ff still XPASS; 13784 plain -s still doubling; 14389 --tb=line During handling gone 8.4.1 and 9.1.0+; 13699 plain still AttributeError; 14808 tb=short still list isinstance; 14448 tb=native no where; 14255 int_native tb=short TypeError on 9: HOLD no View
+- 01:04 tick host 実機 13704 same-file plan 2 vs 1; 12083 subdir vs cwd plan 1 vs 2; 7777 file-vs-cwd plan 1 vs 5; 14811/14716/14514c/14431 tb=short 1 pass; 14694 tb=short NameError from 9.1.0; 14841 setup-show still resource_tracker; 13913 tb=short tests/ 1 pass; 11502 tb=short 1 pass: HOLD no View
+- 01:06 tick host 実機 13704b file-vs-cwd plan 1 vs 3; 12083 keep subdir cwd plan n=3 all; 9298 tb=short 1 pass; 14004 setup-plan 4 no leak; 13913 tb=short no path 8.4.1 pass / pytest9 unrecognized: HOLD no View
+- 01:08 tick host 実機 13925 keep-duplicates . a/ plan ZeroDivision on 8.4.1 too; 7777b keep-duplicates plan n=4 all; 3062 isolated cfg-log tb=short 1 pass: HOLD no View
+- 01:12 tick host 実機 same-dir twice setup-plan unique 2/2/5/1 keep 4/4; 14800/14775 --maxfail=1 hides second error from 9.1.0; 14964d --ff later also ERROR; 14476 setup-show -k foo 2 pass; 14271 setup-show 1 pass; 13246 tb=short still shadow; 14814 setup-show still starred; 3062 cfg-getini tb=short 1 pass: HOLD no View
+- 01:14 tick host 実機 14591/13976/2043 --lf collect-error is not last-failed; 13885 --maxfail=1 still 8/9 split; 14101 --maxfail=1 still XPASS; 14817 --assert=plain no where; 14608c --noconftest unrecognized all; 14444 --capture=sys 2 pass; 14650 --lf collect-error not last-failed: HOLD no View
+- 01:16 tick host 実機 7777 keep-duplicates same-dir plan n=10; 13925 keep a/ a/ plan n=2; 14800 --nf still 2 _finalizers errors; 9703 --lf 2 pass no last-failed: HOLD no View
+- 01:20 tick host 実機 14775 --nf -Werror still 2 errors; 13885 --nf still 8/9; 14101 --nf still XPASS; 14964d --maxfail=1 1 error all; 14591/2043 --ff collect-error not last-failed; 14815/14816 --assert=plain no where; 7777b reverse plan 1 vs 3; 12083 subdir vs parent plan 1 vs 2: HOLD no View
+- 01:22 tick host 実機 14814 --assert=plain 3 pass; 14444 with_hook --capture=sys 2 pass; 14650 --ff collect-error not last-failed; 14148 cache-show after run has nodeids; 13246 setup-plan lists both value; 9703 --ff 2 pass no last-failed: HOLD no View
+- 01:17 tick host 実機 14807 ini+pyboth 8.4.1 ini / pytest 9 UsageError; toml beats pyproject from 9.0.1; setup.cfg loses to native on 9; 14964 --sw hides later miss; 14971/14640 --nf later miss visible: HOLD no View
+- 01:31 tick host 実機 14807 tox+pyproject 8.4.1 tox / pytest 9 native; -c toml displaces pytest.ini; 14971/14640 --sw later miss visible: HOLD no View
+- 01:28 tick host 実機 13704b same-dir plan n=3; 7777b a/b2 a/ plan 1 vs 3; 13925 -- a/ plan n=1; 13885 --sw still 8/9; 14101 --sw XPASS not stepwise-failed; 13913 no-path plan 8.4.1 1 / pytest9 unrecognized; 14808 pytest_ini tb 1 pass; 11502 setup-plan 1; 14650b --lf 2 pass: HOLD no View
+- 01:38 tick host 実機 7777b keep a/b2 plan n=4; 13925 keep -- a/ n=1; 12083 three-way plan n=2 all; 13704 three-way plan 1 vs 2; 14964d --sw hides later miss; 14737 --ff/--sw still 1 fail; 13755b --lf hides session miss (2 pass); 13784 --tb=line still doubling through 9.0.3; 14650c --lf collect-error not last-failed; 14812 plain INTERNALERROR: HOLD no View
+- 01:42 tick host 実機 7777 keep a/b2 plan n=6; 12083 keep three-way plan n=4; 13704 keep three-way plan n=5; 13755b --ff swaps miss onto test_a; --sw hides remaining; --nf still 2 errors; 14650c --ff collect-error not last-failed; 14514c importlib plan 1; 14819 --tb=line still 2 fail; 13913 nopath --lf 8.4.1 pass / pytest9 unrecognized: HOLD no View
+- 01:44 tick host 実機 13755b --maxfail=1 hides second test_b; 14011 --lf still 2 fail; 14691 --lf still sample missing; 5203/14095 --lf hides rebuild miss (1 pass); 14811 --lf still getini fail; 14820/14445 --tb=line still rewrite miss; 14255 int_native plan TypeError on 9; 14716 missing toml FileNotFoundError: HOLD no View
+- 01:46 tick host 実機 14807 -c custom.ini displaces pyproject native/toml/ini/setup.cfg (only_cini all); -c toml native displaces named pytest.toml on 9: HOLD no View
+- 01:47 tick host 実機 5203/14095 --ff swaps rebuild miss; --sw hides; --nf still original; 13246 --lf still shadow; 14104 --lf 6 pass: HOLD no View
+- 01:49 tick host 実機 13246 --ff/--nf still shadow; --sw stuck on first fail; 14011 --sw hides Test2; 14691 --nf/--sw still sample missing; --tb=line still miss: HOLD no View
+- 01:50 tick host 実機 13479 --ff/--sw still ff missing; 14811 --nf/--sw still getini fail; 14737 --nf still 1 fail; 14011 --maxfail=1 hides Test2; 14004 --lf 4 pass: HOLD no View
+- 01:52 tick host 実機 14812 --lf still INTERNALERROR after pass; 14447 --lf still 3 fail; 13699 --lf still AttributeError; 14841 --lf reruns resource_tracker; 14488 --lf reruns StashKey; 14560 --lf collect-error not last-failed: HOLD no View
+- 01:53 tick host 実機 14447 --ff still 3 fail; 14841 --ff still resource_tracker first; 14488 --ff still StashKey; 14560 --ff collect-error not last-failed; 14812 --ff still INTERNALERROR after pass; 13699 --ff still AttributeError: HOLD no View
+- 01:54 tick host 実機 14447 --sw hides later walrus fails; 14841 --sw still resource_tracker; 14488 --sw still StashKey; 14812 --sw still INTERNALERROR after pass; 13699 --sw still AttributeError: HOLD no View
+- 01:56 tick host 実機 14447 --nf still 3 fail; 14841 --nf still 1 fail 3 pass; 14488 --nf still StashKey; 14812 --nf still INTERNALERROR after pass; 13699 --nf still AttributeError: HOLD no View
+- 01:56 tick host 実機 14973/14148 --ff pass (miss is not last-failed); 14762/14323/9298 --lf 1 pass; 14560 --sw still collect-error: HOLD no View
+- 01:58 tick host 実機 14051 --ff/--nf/--sw pass; 14323/14762/9298 --sw 1 pass: HOLD no View
+- 01:59 tick host 実機 14819/14820/14445 --lf still rewrite miss; 13784 --lf 1 pass (doubling is stdout): HOLD no View
+- 02:00 tick host 実機 14819/14445 --sw hides later rewrite fails; 14819/14820/14445 --ff still rewrite miss: HOLD no View
+- 02:01 tick host 実機 14807 -c toml unread [pytest] displaces pyproject native on 9 (defaults); -c ini displaces tox.ini and ini_options: HOLD no View
+- 02:03 tick host 実機 14819/14445/14820/14817/14448 --nf still rewrite miss; 13784 --ff/--sw/--nf 1 pass (doubling is stdout); 14815/14816/14389 --lf still fail; 14814 --lf reruns starred fail: HOLD no View
+- 02:04 tick host 実機 14815/14816/14389 --ff/--nf still 1 fail; 14814 --sw 1 fail 2 deselected; 14817/14448 --sw hides later rewrite fail: HOLD no View
+- 02:05 tick host 実機 14819/14445/14447/14448/14817 --maxfail=1 hides later rewrite fail; 14814 --maxfail=1 still starred after 2 pass; 14444 parent --lf collect-error 4: HOLD no View
+- 02:07 tick host 実機 14444 isolated --lf 2 pass; 14819 --assert=plain 1 fail 1 pass (hides boom); 14445/14820/14814 plain pass; 14815/14816/14817/14448/14389 plain --lf still fail: HOLD no View
+- 02:08 tick host 実機 14819 --assert=plain --ff/--nf 1 fail 1 pass; 14445/14820 plain --ff/--sw 2 pass; 14815/14816/14817 plain --ff still fail: HOLD no View
+- 02:09 tick host 実機 14447 --assert=plain 3 pass no last-failed; 14448 plain --ff still 2 fail; 14814 plain 3 pass; 14389 plain --ff still fail; 13784 plain --lf 1 pass: HOLD no View
+- 02:10 tick host 実機 14800 --assert=plain still _finalizers from 9.1.0; --lf/--ff/--sw hide it; 14775 -Werror plain still 2 errors on 9.1.0; 13755b plain --lf hides session miss: HOLD no View
+- 02:12 tick host 実機 14800/14775 plain --nf still 9.1.0 errors; 13755b plain --ff swaps miss; --sw hides; 14964d plain --lf later miss not last-failed: HOLD no View
+- 02:13 tick host 実機 5203/14095 --assert=plain --lf/--sw hide rebuild miss; --ff swaps; 14800 --maxfail=1 plain hides second _finalizers: HOLD no View
+- 02:14 tick host 実機 14640/14971 plain --ff later miss visible; --sw stuck on later ERROR; 14964d plain --sw hides later miss; 14101 plain --lf XPASS not last-failed: HOLD no View
+- 02:15 tick host 実機 14640/14971 plain --nf later miss visible; 14964d plain --nf later also ERROR; 14101 plain --ff/--nf still XPASS; 13885 plain --ff/--sw still 8/9: HOLD no View
+- 02:16 tick host 実機 14700/14683/14702/14004/13965/13754/14104/9298 --lf/--ff/--nf pass or skip (miss not last-failed): HOLD no View
+- 02:17 tick host 実機 14700/14683/14702 --ff pass/skip; 14004 --nf 4 pass; 11502/14431 --lf 1 pass: HOLD no View
+- 02:19 tick host 実機 14412/13957/14877 --lf; 14323/14762/14051 --nf pass; 14431/11502 --ff 1 pass: HOLD no View
+- 02:20 tick host 実機 14412/13957/14877/14323/14762/14051 --ff pass; 13957b --lf 4 pass; 9703b --nf 2 pass: HOLD no View
+- 02:20 tick host 実機 13957b --ff 4 pass; 14412/13957 --nf pass; 13755 --lf pass; 14650b --ff/--nf 2 pass no last-failed: HOLD no View
+- 02:21 tick host 実機 13755 --ff/--nf pass; 14476/14271 --ff pass; 14700/14683 --nf pass/skip: HOLD no View
+- 02:27 tick host 実機 13755/14476/14271/14700/14683/14702/14004 --sw pass or skip; 11502 -p no:cacheprovider --nf/--sw unrecognized; 14412 parent --sw collect collision; 14877 no test_ files rc=5; 14716/3062/14808 --lf pass: HOLD no View
+- 02:28 tick host 実機 14412 isolated --nf/--sw 1 pass; 11502 --nf/--sw with cacheprovider 1 pass; 13957/13882/14635/14716/14808/3062 --ff/--sw pass: HOLD no View
+- 02:30 tick host 実機 14808 tool_pytest --lf 8.4.1 pass / pytest9 TypeError still; 13985 string TypeError still / list pass; 14255 int_native TypeError on 9 not last-failed; 14650c --nf/--sw collect-error not last-failed: HOLD no View
+- 02:32 tick host 実機 13985 string --ff/--sw still TypeError on 9 / ini_options --lf 1 pass; 14255 int_native --nf/--sw still TypeError on 9 not last-failed; 14613/14696 --nf/--sw pass; 14048 --ff 1 pass: HOLD no View
+- 02:33 tick host 実機 14253/14092 parent --lf leftover dummy collisions on 8.4.1 / TypeError on pytest 9; isolated ini_options --lf 1 pass; 14808 ini_options --lf still list AssertionError; 14560 --nf collect-error; 14148 --nf 1 pass; 13985 list --ff/--sw 1 pass; 14705 --lf 1 pass: HOLD no View
+- 02:41 tick host 実機 14253/14092 isolated --ff/--nf/--sw 1 pass; 14808 ini_options --ff/--nf/--sw still list AssertionError; tool_pytest --nf 8.4.1 pass / pytest9 TypeError still; 14705 --ff/--nf/--sw 1 pass; 14560 --maxfail=1 still collect-error; 13985 list/ini_options pass / string --nf TypeError on 9 not last-failed; 14255 quoted --ff/--nf 1 pass; 14048 --sw/--nf 1 pass: HOLD no View
+- 02:43 tick host 実機 leftover-0251 started (14412 isolated --lf/--ff; 14004b --ff/--nf/--sw; 11502 --cache-show; 14608c alt_inside leftover); ~02:44 fire not waited: HOLD no View
+- 02:46 tick host 実機 14412 isolated --lf/--ff 1 pass; 14004b --ff/--nf/--sw 3 pass no last-failed; 14808 pytest_ini --nf 1 pass; 14650c --maxfail=1 collect-error on 9; 13985/14255 --maxfail=1 TypeError on 9 not last-failed; 14808 tool --maxfail=1 TypeError still; 11502 --cache-show after run lists ::test_a; 14608c alt_inside --lf/--ff/--sw 1 pass including 9.1.0: HOLD no View
+- 02:49 tick host 実機 14650c ini_options --lf/--ff/--nf/--sw collect-error on 9; 14608c --nf 1 pass including 9.1.0; 13913 no-path --ff/--sw 8.4.1 pass / pytest9 unrecognized; --maxfail=1 pass minis 1/3 pass; 11502 --cache-clear 1 pass; 14048 --maxfail=1 1 pass: HOLD no View
+- 02:51 tick host 実機 14608c alt_lo_base --lf/--ff/--nf/--sw 9.1.0 unrecognized not last-failed; 13913 tests/ --ff/--sw 1 pass; 14514c importlib --lf/--ff/--sw 1 pass; 13922 --lf/--ff/--sw 1 pass; 14431 alt_pyfiles --lf/--ff/--sw 1 pass; 14084 PYTHONPATH --lf/--ff 1 pass: HOLD no View
+- 02:54 tick host 実機 14514c default --lf/--ff/--sw collect ImportError not last-failed; 14608c alt_lo_base --maxfail=1 9.1.0 unrecognized; 13913 tests/ --lf/--nf 1 pass; 13922 -- extra rc=4 not last-failed; 14084 --nf/--sw 1 pass; 14431 alt_pyfiles --nf 1 pass; 14514c importlib --nf 1 pass; 13922 --nf 1 pass: HOLD no View
+- 02:56 tick host 実機 14807 pytest.cfg pairings: ignored filename; native/toml from 9.0.1; pytest.ini/tox.ini/setup.cfg/ini_options win all; tox.ini beats setup.cfg; -c custom.ini only_cini; -c toml unread default: HOLD no View
+- 02:55 tick host 実機 14094 --lf/--ff/--nf still 2 fail Monkeypatch; --sw hides later; 14916 --lf/--ff/--nf still 2 fail; --sw hides later; 14094b --lf reruns 2 fail; --sw hides later; 14811 parent --nf/--sw 1 pass: HOLD no View
+- 02:57 tick host 実機 14436 happy/nolog --lf/--ff/--sw 1 pass; session_fix --lf/--sw still ScopeMismatch; 14094/14916 --maxfail=1 hides later fail; 14094b --nf still 2 fail 1 pass; 14811 implicit --ff still 1 fail getini: HOLD no View
+- 02:59 tick host 実機 14436 session_fix --ff/--nf/--maxfail still ScopeMismatch; 14811 implicit --maxfail still 1 fail; 14488 --nf still StashKey; --sw hides later pass; 14841 --nf 8.4.1 1 fail 3 pass: HOLD no View
+- 03:00 tick host 実機 14812 --maxfail=1 still INTERNALERROR after pass rc=3; 14737 --maxfail=1 still 1 fail; 13699 --maxfail=1 still AttributeError; 14841 --maxfail=1 still 1 fail 3 pass: HOLD no View
+- 03:05 tick host 実機 14807 setup.cfg [pytest] vs tox/ini: 8.4.1 sibling wins no Failed / pytest9 Failed; vs native/toml Failed all; pytest.ini [tool:pytest] displaces tox.ini (default files); -c toml native vs pytest.cfg 8.4.1 default / pytest9 native; -c ini [tool:pytest] ignored: HOLD no View
+- 03:01 tick host 実機 14488 test_handler --maxfail=1 still 1 fail 1 pass; 14973 --nf/--sw/--maxfail 2 pass; 14702 --nf/--sw/--maxfail 2 pass 1 skip; 9298 --nf/--sw/--maxfail 1 pass: HOLD no View
+- 03:02 tick host 実機 14323/14762/14051 --nf/--sw/--maxfail 1 pass: HOLD no View
+- 03:09 tick host 実機 leftover-0281 through leftover-0317 pass-mini --maxfail occupancy; leftover-0320 started: HOLD no View
+- 03:17 tick host 実機 14807 leftover-0347: setup.cfg [pytest] vs pytest.cfg Failed all; -c ini/toml suppress Failed all versions; ini_options 8.4.1 only; pytest.ini [tool:pytest] displaces pyproject native/ini_options: HOLD no View
+- 03:20 tick host 実機 leftover-0350: 3062 getini keeps %% on pytest.ini/pyproject; tox [pytest] raw format; --config-file=/dev/null displaces cwd pytest.ini/native/setup.cfg (test_default); tox [tool:pytest] ignored: HOLD no View
+- 03:21 tick host 実機 leftover-0353: 3062 setup.cfg fully escaped live-log ValueError %W; pytest.ini/pyproject -s 1 pass no live-log print: HOLD no View
+- 03:22 tick host 実機 leftover-0356/0359: --log-cli unrecognized rc=4; -o log_cli=true without -s still no live-log print: HOLD no View
+- 03:32 tick host 実機 leftover-0371: PYTEST_ADDOPTS -o python_files=only_native.py replaces tox/ini/cfg/native/toml python_files; does not suppress setup.cfg [pytest] Failed: HOLD no View
+- 03:37 tick host 実機 leftover-0368/0374–0398: PYTEST_ADDOPTS python_files same as CLI -o (rc=5 if absent; beats pytest.ini+native); --override-ini same; CLI -o/--override-ini win over env; python_files=test_*.py restores test_default; env still applies with /dev/null and beats -c; -o addopts=-q is additive quiet not python_files replace; 3062 --log-cli-format/-o log_format/-o log_cli_format override setup.cfg live-log; asctime+date-format prints HH:MM:SS; pytest.ini/pyproject --log-file empty and no live-log: HOLD no View
+- 03:43 tick host 実機 leftover-0401–0422: -o addopts=-q additive quiet; --log-file-date-format writes HH:MM:SS on setup.cfg; -o pythonpath does not replace python_files; -o minversion=99 8.4.1 still collects / pytest 9 rc=4 citing active config (None: for pytest.cfg, /dev/null, custom.ini); minversion=9.1 9.0.1–9.0.3 rc=4 / 9.1.0+ pass / 8.4.1 still collects: HOLD no View
+- 03:45 tick host 実機 leftover-0425–0431: last -o minversion wins; minversion=9.0.2 9.0.1-only rc=4; minversion=9.1.1 only 9.1.1 pass; CLI minversion wins over PYTEST_ADDOPTS; 8.4.1 never enforces -o minversion: HOLD no View
+- 03:49 tick host 実機 leftover-0434–0449: minversion=9.0.1 all pass; 9.1.0 splits 9.0.3 vs 9.1.0; /dev/null cites /dev/null; pytest.cfg cites None:; tox.ini minversion=9.1 9.0.1–9.0.3 rc=4; minversion=9.0.1 + python_files=test_*.py restores test_default: HOLD no View
+- 03:55 tick host 実機 leftover-0473: named pytest.toml -o minversion=9.0.1 8.4.1 test_default / pytest9 only_pytest_toml; 9.1.1 only 9.1.1 pass citing pytest.toml; 99 pytest9 rc=4 citing pytest.toml; setup.cfg [pytest] Failed first vs -o minversion (does not suppress); tox.ini 9.0.1 only_tox all / 9.0.3 9.0.1 rc=4 citing tox.ini; pytest.ini [tool:pytest] minversion=99 cites pytest.ini: HOLD no View
+- 03:55 tick host 実機 leftover-0452–0470: minversion=9.1.1 vs tox only 9.1.1 pass; python_files restore + minversion=9.0.1 test_default vs setup.cfg/native/tox; 14101 -o xfail_strict 8.4.1 xE / pytest 9 XPASS-as-fail; -o verbosity=2 unknown on pytest 9; --strict-config -o verbosity=2 8.4.1 rc=0 / pytest 9 rc=4; 3062 -o log_file vs pytest.ini still empty: HOLD no View
+- 03:57 tick host 実機 leftover-0473–0479: --strict-config known python_files all pass; minversion=99 still 8.4.1 collects; -o addopts=--strict-config -o verbosity=2 is 8.4.1/9.0.1/9.0.3 rc=0 and 9.1.0+ rc=4 (unlike CLI --strict-config which is pytest9 rc=4 all); --strict-markers does not make verbosity fatal: HOLD no View
+- 04:01 tick host 実機 leftover-0488: --strict-config -o verbosity=2 vs named pytest.toml/ignored pytest.ini/-c custom.ini 8.4.1 collects / pytest9 rc=4 unknown verbosity; setup.cfg [pytest] Failed first; --override-ini verbosity same as CLI; env --strict-config vs named toml pytest9 rc=4; --strict-config minversion=99 vs named toml 8.4.1 test_default / pytest9 citing pytest.toml; --strict-config python_files only_pytest_toml all including 8.4.1: HOLD no View
+- 04:04 tick host 実機 leftover-0491–0500: addopts=--strict-config verbosity vs tox/setup.cfg/ignored table 8.4.1/9.0.1/9.0.3 rc=0 9.1.0+ rc=4; CLI --strict-config vs ignored table pytest9 rc=4; 14101 --strict-config xfail_strict same xE/XPASS; 3062 --strict-config log_cli pytest.ini still no live-log / setup.cfg still prints; --strict-config python_files=test_*.py restores test_default: HOLD no View
+- 04:11 tick host 実機 leftover-0512–0521: --strict-config/-o python_files/PYTEST_ADDOPTS do not suppress setup.cfg [pytest] Failed; -c custom.ini suppresses Failed; --config-file=/dev/null displaces Failed (test_default); python_classes still only_ini: HOLD no View
+- 04:16 tick host 実機 leftover-0533: PYTEST_ADDOPTS=-c custom.ini vs Failed with only_cini.py only_cini all; --strict-config -c verbosity Failed suppressed then pytest9 unknown; -c + override-ini python_files restores test_default; -c unread TOML test_default / native TOML 8.4.1 default pytest9 only_native: HOLD no View
+- 04:18 tick host 実機 leftover-0536–0542: env -c custom.ini -o python_files=test_*.py vs Failed test_default; -c /dev/null vs Failed test_default (same as --config-file=/dev/null); --override-ini python_files=only_cfg.py still Failed; env -c /dev/null -o only_cfg.py: only_cfg: HOLD no View
+- 04:20 tick host 実機 leftover-0545–0548: -c /dev/null vs native/ini/tox/setup.cfg [tool:pytest] test_default all (displaces cwd python_files); vs pytest.cfg still test_default; -c /dev/null -o python_files=test_*.py vs pytest.ini test_default: HOLD no View
+- 04:25 tick host 実機 leftover-0551–0560: -c /dev/null vs named toml/ignored table/pytest.ini+native/setup.cfg+native/pytest.ini+tox/tox+native/pytest.ini+setup.cfg/tox+setup.cfg: test_default all (displaces both cwd configs); -c /dev/null -o python_files=only_native.py vs native: only_native; only_tox.py vs tox.ini: only_tox; only_ini.py vs pytest.ini: only_ini: HOLD no View
+- 04:31 tick host 実機 leftover-0563: --strict-config -c /dev/null vs dual cwd (ini+toml/toml+native/toml+tox/scfg+native/ini+iniopt/scfg+iniopt) test_default all; -c /dev/null displaces pytest.ini+pyproject both-tables UsageError; -o python_files=only_native.py vs pyboth only_native: HOLD no View
+- 04:49 tick host 実機 leftover-0626: 3062 -c /dev/null --log-file-format FILE:hello-log no live-log; env/strict -c /dev/null --log-file default WARNING format; cfg-log -c /dev/null displaces compact setup.cfg format; setup.cfg --log-cli-format CLI:test_log.py:3 hello-log: HOLD no View
+- 05:01 tick host 実機 leftover-0665: -o addopts=--strict-config -c /dev/null -o verbosity=2 vs tox/named toml/Failed/native/ignored table 8.4.1 rc=0 / 9.0.1-9.0.3 warning / 9.1.0+ rc=4; Failed displaced: HOLD no View
+- 05:04 tick host 実機 leftover-0668: --strict-config -c /dev/null -o minversion=99 vs pytest.ini/native/setup.cfg [pytest] Failed 8.4.1 test_default / pytest 9 rc=4 citing /dev/null; Failed displaced: HOLD no View
+- 05:16 tick host 実機 leftover-0671: --strict-config -c /dev/null -o minversion=99 vs tox.ini/named toml/ignored pytest.ini table 8.4.1 test_default / pytest 9 rc=4 citing /dev/null: HOLD no View
+- 05:20 tick host 実機 leftover-0674: --strict-config -c /dev/null -o minversion=99 vs pytest.cfg/setup.cfg [tool:pytest] 8.4.1 test_default / pytest 9 rc=4 citing /dev/null; minversion=9.1 after /dev/null 8.4.1 test_default / 9.0.1-9.0.3 rc=4 citing /dev/null / 9.1.0+ test_default (leftover-0422 split survives /dev/null; Failed displaced); env/override-ini/--config-file=/dev/null same as CLI: HOLD no View
+- 05:22 tick host 実機 leftover-0677: --strict-config -c /dev/null -o minversion=9.1.1 8.4.1 test_default / 9.0.1-9.1.0 rc=4 citing /dev/null / only 9.1.1 test_default; minversion=9.0.2 9.0.1-only rc=4 citing /dev/null; addopts=--strict-config minversion=9.1/99 same as CLI --strict-config (leftover-0476 weaker split does not apply to known minversion); Failed displaced: HOLD no View
+- 05:31 tick host 実機 leftover-0680: leftover-0665 addopts verbosity after /dev/null vs pytest.ini/pytest.cfg/setup.cfg tool/dual cwd leftover-0476 weaker split; minversion=8.0/9.0/9.0.1 all test_default; minversion=9.1.0 leftover-0422 split citing /dev/null; dual cwd minversion=9.1/99 same; Failed/UsageError displaced: HOLD no View
+- 05:32 tick host 実機 leftover-0683: leftover-0665 addopts verbosity after /dev/null vs more dual cwd leftover-0476 weaker split; env vs Failed same Failed displaced; minversion=9.0.3 after /dev/null 8.4.1 test_default / 9.0.1 rc=4 citing /dev/null / 9.0.3+ test_default; dual cwd minversion=9.1 leftover-0422 split: HOLD no View
+- 05:47 tick host 実機 leftover-0686: leftover-0665 remaining dual cwd iniopt leftover-0476 weaker split; --config-file=/dev/null same as -c; leftover-14101 --strict-config -c /dev/null xfail_strict 8.4.1 subtests missing / pytest 9 XPASS leftover-0470 survives /dev/null; leftover-3062 iso-log leftover-0476 weaker split: HOLD no View
+- 05:47 tick host 実機 leftover-0689: 14101 addopts=--strict-config xfail_strict after /dev/null same as CLI --strict-config XPASS(strict) all pytest 9 (leftover-0476 weaker split does not apply to known xfail_strict); leftover-0476 verbosity 9.0.x still runs / 9.1.0+ rc=4 hides XPASS; CLI --strict-config verbosity pytest 9 all rc=4 hides XPASS: HOLD no View
+- 03:23 tick host 実機 leftover-0362: pytest.ini/pyproject even with -s -o log_cli=true --log-cli-level=WARNING do not print live log; setup.cfg [tool:pytest] does: HOLD no View
+- 03:24 tick host 実機 leftover-0365: -o python_files replaces cwd python_files (rc=5 if that file is absent); beats pytest.ini+native and setup.cfg+native: HOLD no View
+- 00:39 tick host 実機 14412 alt_ini/alt_iniopt collect-only 1 UnitTestCase all; 14696 iso_miss existing+missing both 9.1.0-only unrecognized; 14048 setup-show --pyargs no PYTHONPATH rc=4 / PYTHONPATH=. 1 pass; 13965 setup-show 1 pass pytest9 1000 subtests; 14004b collect-only from sdk/ 3 all; 13755b collect-only 4; 9703b collect-only 2 ::test_same; 14800/14101/14775/13882/14683/14700/14635/14323 collect-only (miss is execute): HOLD no View
+- 20:15 tick host 実機 14807-both/14514-importlib/version-matrix: HOLD no View
+- 20:01 tick host 実機 13985: HOLD no View; leftover 13913/14700/14762/9298 HOLD
+- 05:52 tick host 実機 leftover-0692: 14608c alt_inside --override-ini addopts=tests -c /dev/null/--config-file=/dev/null --db-url 1 pass all including 9.1.0 (leftover-0251 rescue survives /dev/null); alt_lo_base same flags rc=5 all (tests/conftest loaded, test_it.py outside tests/); leftover-0566 alt_lo_base -c /dev/null --db-url still 9.1.0 unrecognized: HOLD no View
+- 06:02 tick host 実機 leftover-0695: leftover-0251 --override-ini addopts=tests overwritten by later -o addopts=--strict-config after /dev/null 9.1.0 unrecognized --db-url / 9.1.1 leftover-0476 unknown verbosity; env PYTEST_ADDOPTS=-o addopts=tests survives /dev/null 1 pass including 9.1.0; ini addopts=tests displaced leftover-0566 split; CLI --strict-config verbosity pytest 9 all rc=4 hides rescue: HOLD no View
+- 06:03 tick host 実機 leftover-0698: leftover-0251 vs leftover-0476 addopts last-wins after /dev/null later --override-ini addopts=tests or later -o addopts=tests rescues 9.1.0; later -o addopts=--strict-config loses rescue; leftover-0251 + -o verbosity=2 without --strict-config 1 pass all with pytest 9 warning: HOLD no View
+- 06:05 tick host 実機 leftover-0701: 13913 no-path -c /dev/null --db --write-idents 8.4.1 rc=2 parent leftover dummy --db collisions (testpaths displaced); pytest 9 rc=4 unrecognized inifile /dev/null rootdir /dev; tests/ -c /dev/null and --config-file=/dev/null 1 pass all including 9.1.0 (rescue survives /dev/null): HOLD no View
+- 06:17 tick host 実機 leftover-0704: 13913 isolated no-path -c /dev/null 8.4.1 1 pass / pytest 9 unrecognized (leftover-0701 8.4.1 rc=2 was leftover-dir --db collisions); tests/ rescue survives /dev/null; leftover-0476 + tests/ 9.1.0+ rc=4 hides rescue; leftover-0251 --override-ini addopts=tests 1 pass all; later -o addopts=--strict-config loses rescue; later --override-ini/env addopts=tests wins: HOLD no View
+- 06:18 tick host 実機 leftover-0707: 13913 isolated leftover-0251 last-wins later --override-ini addopts=tests 1 pass all; later -o addopts=--strict-config 8.4.1 1 pass / pytest 9 unrecognized no leftover-dir collisions; env addopts=tests 1 pass all; tests/ + -o verbosity=2 without --strict-config 1 pass all with pytest 9 warning: HOLD no View
+- 06:20 tick host 実機 leftover-0710: 14048 PYTHONPATH=. -c /dev/null/--config-file=/dev/null --pyargs amodule.tests 1 pass all (PYTHONPATH rescue survives /dev/null); no PYTHONPATH -c /dev/null --pyargs rc=4 missing __init__.py all: HOLD no View
+- 06:32 tick host 実機 leftover-0713: leftover-0476 + leftover-14048 PYTHONPATH=. leftover-0476 weaker split hides PYTHONPATH rescue on 9.1.0+; -o/--override-ini pythonpath=. does not rescue --pyargs rc=4 all; leftover-14084 PYTHONPATH=. and subdir PYTHONPATH=.. survive /dev/null; leftover-0476 verbosity without --strict-config 1 pass all: HOLD no View
+- 06:32 tick host 実機 leftover-0716: leftover-14084 leftover-0476 + PYTHONPATH=. or subdir PYTHONPATH=.. leftover-0476 weaker split hides rescue on 9.1.0+; leftover-0476 verbosity without --strict-config 1 pass all; leftover-14048 PYTHONPATH=. --pyargs amodule -c /dev/null 1 pass all: HOLD no View
+- 06:35 tick host 実機 leftover-0719: 11502 --cache-show -c /dev/null/--config-file=/dev/null after normal run cachedir /dev/.pytest_cache cache is empty all (does not read project cache); leftover-0251 --cache-show after /dev/null run listed collapsed ::test_a: HOLD no View
+- 06:47 tick host 実機 leftover-0722: leftover-0476/--strict-config verbosity + leftover-0719 --cache-show -c /dev/null cache empty rc=0 all including 9.1.0+ (leftover-0476 does not apply to --cache-show); leftover-0719 --cache-show without /dev/null lists tests/test_a.py::test_a; leftover-14148 leftover-0719 --cache-show cache empty: HOLD no View
+- 07:08 tick host 実機 leftover-0725: leftover-14148 leftover-0476 + leftover-0719 --cache-show cache empty rc=0 all; leftover-14148 leftover-14148 -p no:cacheprovider leftover-0719 -c /dev/null AttributeError all; leftover-0476 + leftover-14148 no:cacheprovider 9.1.0+ leftover-0476 rc=4 hides AttributeError; leftover-11502 leftover-14148 no:cacheprovider leftover-0719 --cache-show unrecognized --cache-show all: HOLD no View
+- 08:12 tick 保全: day_end.py save complete; restore hashes identical; leftover-0728 not started; KEEP 0; HARD_STOP.md absent until 09:00; HOLD no View
+- 08:15 tick 保全: day_end.py save re-run complete; restore hashes identical; leftover-0728 not started; KEEP 0; HARD_STOP.md absent until 09:00; HOLD no View
+- 08:30 tick 保全: day_end.py save re-run complete; restore hashes identical; leftover-0728 not started; KEEP 0; HARD_STOP.md absent until 09:00; HOLD no View
+- 2026-09-10 08:30:13 JST HARD_STOP user-authorized: live=0; HARD_STOP.md written; leftover-0728 not started; KEEP 0; original 09:00 not extended; 9/2 and lab-hdd PIDs not killed; HOLD no View

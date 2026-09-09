@@ -1,0 +1,153 @@
+{
+  "revision": "2f09eba036325935011974b898acbd86cf1991c261ca22b999e0372ec21a7b56",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "2b03716695067d7afda95c89195cfa6bd032be6ba819f261c6e075a2ecb1981c",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2025-11-01T20:42:01Z",
+    "provider_id": "3578427445",
+    "provider_updated_at": "2026-07-06T04:33:54Z",
+    "quality": "PENDING",
+    "resource_blob": "a8177ed35e6b5d0b71e0a2d868c7831967f0e1d4018418e92795c730158f9d31",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "61492003-44d7-4d2b-ba59-af2b880cff3e",
+    "url": "https://github.com/rust-lang/cargo/pull/16192"
+  },
+  "body": "*[View all comments](https://triagebot.infra.rust-lang.org/gh-comments/rust-lang/cargo/pull/16192)*\n\n### Description\r\n\r\n- Add a new formatting option `{ver-req}` to `cargo tree` that prints the resolved version requirement of packages as specified in Cargo.toml.\r\n- Add a unit test to verify that the version constraint is printed correctly.\r\n- Update the `cargo tree` command documentation with the new option.\r\n\r\nAs per the issue linked below, I implemented the second suggestion which was to add a new formatting option.\r\nAdding a new flag would also be relatively simple, but I'd like to know what people think before adding a commit.\r\n\r\nFixes: #16163\r\n\r\n### Example\r\n\r\nExample output using the cargo repo:\r\n\r\n<details>\r\n\r\n<summary>cargo tree output</summary>\r\n\r\n```shell-session\r\n$ cargo tree --format '{p} satisfies {vr}'\r\ncargo v0.93.0 (E:\\dev\\github.com\\rust-lang\\cargo) satisfies *\r\n├── annotate-snippets v0.12.4 satisfies ^0.12.4\r\n│   ├── anstyle v1.0.13 satisfies ^1.0.4\r\n│   ├── memchr v2.7.6 satisfies ^2.7.4\r\n│   └── unicode-width v0.2.1 satisfies ^0.2.0\r\n├── anstream v0.6.20 satisfies ^0.6.20\r\n│   ├── anstyle v1.0.13 satisfies ^1.0.0\r\n│   ├── anstyle-parse v0.2.7 satisfies ^0.2.0\r\n│   │   └── utf8parse v0.2.2 satisfies ^0.2.1\r\n│   ├── anstyle-query v1.1.4 satisfies ^1.0.0\r\n│   │   └── windows-sys v0.60.2 satisfies ^0.60.0\r\n│   │       └── windows-targets v0.53.4 satisfies ^0.53.2\r\n│   │           └── windows_x86_64_msvc v0.53.0 satisfies ^0.53.0\r\n│   ├── anstyle-wincon v3.0.10 satisfies ^3.0.5\r\n│   │   ├── anstyle v1.0.13 satisfies ^1.0.0\r\n│   │   ├── once_cell_polyfill v1.70.1 satisfies ^1.56.0\r\n│   │   └── windows-sys v0.60.2 satisfies ^0.60.0 (*)\r\n│   ├── colorchoice v1.0.4 satisfies ^1.0.0\r\n│   ├── is_terminal_polyfill v1.70.1 satisfies ^1.48\r\n│   └── utf8parse v0.2.2 satisfies ^0.2.1\r\n├── anstyle v1.0.13 satisfies ^1.0.13\r\n├── anyhow v1.0.100 satisfies ^1.0.100\r\n├── base64 v0.22.1 satisfies ^0.22.1\r\n├── blake3 v1.8.2 satisfies ^1.8.2\r\n│   ├── arrayref v0.3.9 satisfies ^0.3.5\r\n│   ├── arrayvec v0.7.6 satisfies ^0.7.4\r\n│   ├── cfg-if v1.0.3 satisfies ^1.0.0\r\n│   └── constant_time_eq v0.3.1 satisfies ^0.3.1\r\n│   [build-dependencies]\r\n│   └── cc v1.2.39 satisfies ^1.1.12\r\n│       ├── find-msvc-tools v0.1.2 satisfies ^0.1.2\r\n│       ├── jobserver v0.1.34 satisfies ^0.1.30\r\n│       │   └── getrandom v0.3.3 satisfies ^0.3.2\r\n│       │       └── cfg-if v1.0.3 satisfies ^1\r\n│       └── shlex v1.3.0 satisfies ^1.3.0\r\n├── cargo-credential v0.4.9 (E:\\dev\\github.com\\rust-lang\\cargo\\credential\\cargo-credential) satisfies ^0.4.2\r\n│   ├── anyhow v1.0.100 satisfies ^1.0.100\r\n│   ├── serde v1.0.228 satisfies ^1.0.228\r\n│   │   ├── serde_core v1.0.228 satisfies =1.0.228\r\n│   │   └── serde_derive v1.0.228 (proc-macro) satisfies ^1\r\n│   │       ├── proc-macro2 v1.0.101 satisfies ^1.0.74\r\n│   │       │   └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │       ├── quote v1.0.41 satisfies ^1.0.35\r\n│   │       │   └── proc-macro2 v1.0.101 satisfies ^1.0.80\r\n│   │       │       └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │       └── syn v2.0.106 satisfies ^2.0.81\r\n│   │           ├── proc-macro2 v1.0.101 satisfies ^1.0.91\r\n│   │           │   └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │           ├── quote v1.0.41 satisfies ^1.0.35 (*)\r\n│   │           └── unicode-ident v1.0.20 satisfies ^1\r\n```\r\n\r\n</details>\r\n",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "body": "*[View all comments](https://triagebot.infra.rust-lang.org/gh-comments/rust-lang/cargo/pull/16192)*\n\n### Description\r\n\r\n- Add a new formatting option `{ver-req}` to `cargo tree` that prints the resolved version requirement of packages as specified in Cargo.toml.\r\n- Add a unit test to verify that the version constraint is printed correctly.\r\n- Update the `cargo tree` command documentation with the new option.\r\n\r\nAs per the issue linked below, I implemented the second suggestion which was to add a new formatting option.\r\nAdding a new flag would also be relatively simple, but I'd like to know what people think before adding a commit.\r\n\r\nFixes: #16163\r\n\r\n### Example\r\n\r\nExample output using the cargo repo:\r\n\r\n<details>\r\n\r\n<summary>cargo tree output</summary>\r\n\r\n```shell-session\r\n$ cargo tree --format '{p} satisfies {vr}'\r\ncargo v0.93.0 (E:\\dev\\github.com\\rust-lang\\cargo) satisfies *\r\n├── annotate-snippets v0.12.4 satisfies ^0.12.4\r\n│   ├── anstyle v1.0.13 satisfies ^1.0.4\r\n│   ├── memchr v2.7.6 satisfies ^2.7.4\r\n│   └── unicode-width v0.2.1 satisfies ^0.2.0\r\n├── anstream v0.6.20 satisfies ^0.6.20\r\n│   ├── anstyle v1.0.13 satisfies ^1.0.0\r\n│   ├── anstyle-parse v0.2.7 satisfies ^0.2.0\r\n│   │   └── utf8parse v0.2.2 satisfies ^0.2.1\r\n│   ├── anstyle-query v1.1.4 satisfies ^1.0.0\r\n│   │   └── windows-sys v0.60.2 satisfies ^0.60.0\r\n│   │       └── windows-targets v0.53.4 satisfies ^0.53.2\r\n│   │           └── windows_x86_64_msvc v0.53.0 satisfies ^0.53.0\r\n│   ├── anstyle-wincon v3.0.10 satisfies ^3.0.5\r\n│   │   ├── anstyle v1.0.13 satisfies ^1.0.0\r\n│   │   ├── once_cell_polyfill v1.70.1 satisfies ^1.56.0\r\n│   │   └── windows-sys v0.60.2 satisfies ^0.60.0 (*)\r\n│   ├── colorchoice v1.0.4 satisfies ^1.0.0\r\n│   ├── is_terminal_polyfill v1.70.1 satisfies ^1.48\r\n│   └── utf8parse v0.2.2 satisfies ^0.2.1\r\n├── anstyle v1.0.13 satisfies ^1.0.13\r\n├── anyhow v1.0.100 satisfies ^1.0.100\r\n├── base64 v0.22.1 satisfies ^0.22.1\r\n├── blake3 v1.8.2 satisfies ^1.8.2\r\n│   ├── arrayref v0.3.9 satisfies ^0.3.5\r\n│   ├── arrayvec v0.7.6 satisfies ^0.7.4\r\n│   ├── cfg-if v1.0.3 satisfies ^1.0.0\r\n│   └── constant_time_eq v0.3.1 satisfies ^0.3.1\r\n│   [build-dependencies]\r\n│   └── cc v1.2.39 satisfies ^1.1.12\r\n│       ├── find-msvc-tools v0.1.2 satisfies ^0.1.2\r\n│       ├── jobserver v0.1.34 satisfies ^0.1.30\r\n│       │   └── getrandom v0.3.3 satisfies ^0.3.2\r\n│       │       └── cfg-if v1.0.3 satisfies ^1\r\n│       └── shlex v1.3.0 satisfies ^1.3.0\r\n├── cargo-credential v0.4.9 (E:\\dev\\github.com\\rust-lang\\cargo\\credential\\cargo-credential) satisfies ^0.4.2\r\n│   ├── anyhow v1.0.100 satisfies ^1.0.100\r\n│   ├── serde v1.0.228 satisfies ^1.0.228\r\n│   │   ├── serde_core v1.0.228 satisfies =1.0.228\r\n│   │   └── serde_derive v1.0.228 (proc-macro) satisfies ^1\r\n│   │       ├── proc-macro2 v1.0.101 satisfies ^1.0.74\r\n│   │       │   └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │       ├── quote v1.0.41 satisfies ^1.0.35\r\n│   │       │   └── proc-macro2 v1.0.101 satisfies ^1.0.80\r\n│   │       │       └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │       └── syn v2.0.106 satisfies ^2.0.81\r\n│   │           ├── proc-macro2 v1.0.101 satisfies ^1.0.91\r\n│   │           │   └── unicode-ident v1.0.20 satisfies ^1.0\r\n│   │           ├── quote v1.0.41 satisfies ^1.0.35 (*)\r\n│   │           └── unicode-ident v1.0.20 satisfies ^1\r\n```\r\n\r\n</details>\r\n",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/rust-lang/cargo/issues/16192/comments",
+    "created_at": "2025-11-01T20:42:01Z",
+    "draft": true,
+    "events_url": "https://api.github.com/repos/rust-lang/cargo/issues/16192/events",
+    "html_url": "https://github.com/rust-lang/cargo/pull/16192",
+    "id": 3578427445,
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "fbca04",
+        "default": false,
+        "description": "Area: Cargo's documentation",
+        "id": 137469209,
+        "name": "A-documenting-cargo-itself",
+        "node_id": "MDU6TGFiZWwxMzc0NjkyMDk=",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/A-documenting-cargo-itself"
+      },
+      {
+        "color": "ffff00",
+        "default": false,
+        "description": "Status: The marked PR is awaiting some action (such as code changes) from the PR author.",
+        "id": 1261895984,
+        "name": "S-waiting-on-author",
+        "node_id": "MDU6TGFiZWwxMjYxODk1OTg0",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/S-waiting-on-author"
+      },
+      {
+        "color": "fbca04",
+        "default": false,
+        "description": "Area: semver specifications, version matching, etc.",
+        "id": 1964840368,
+        "name": "A-semver",
+        "node_id": "MDU6TGFiZWwxOTY0ODQwMzY4",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/A-semver"
+      },
+      {
+        "color": "fbca04",
+        "default": false,
+        "description": "Area: built-in command-line help",
+        "id": 1964900368,
+        "name": "A-cli-help",
+        "node_id": "MDU6TGFiZWwxOTY0OTAwMzY4",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/A-cli-help"
+      },
+      {
+        "color": "5319e7",
+        "default": false,
+        "description": "",
+        "id": 1985552011,
+        "name": "Command-tree",
+        "node_id": "MDU6TGFiZWwxOTg1NTUyMDEx",
+        "url": "https://api.github.com/repos/rust-lang/cargo/labels/Command-tree"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/rust-lang/cargo/issues/16192/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "PR_kwDOAQnScc6xAf-9",
+    "number": 16192,
+    "performed_via_github_app": null,
+    "pull_request": {
+      "diff_url": "https://github.com/rust-lang/cargo/pull/16192.diff",
+      "html_url": "https://github.com/rust-lang/cargo/pull/16192",
+      "merged_at": null,
+      "patch_url": "https://github.com/rust-lang/cargo/pull/16192.patch",
+      "url": "https://api.github.com/repos/rust-lang/cargo/pulls/16192"
+    },
+    "reactions": {
+      "+1": 0,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 1,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 1,
+      "url": "https://api.github.com/repos/rust-lang/cargo/issues/16192/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/rust-lang/cargo",
+    "state": "open",
+    "state_reason": null,
+    "timeline_url": "https://api.github.com/repos/rust-lang/cargo/issues/16192/timeline",
+    "title": "Add format option to `cargo tree` to print the package version requirement",
+    "type": null,
+    "updated_at": "2026-07-06T04:33:54Z",
+    "url": "https://api.github.com/repos/rust-lang/cargo/issues/16192",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/48306674?v=4",
+      "events_url": "https://api.github.com/users/devodev/events{/privacy}",
+      "followers_url": "https://api.github.com/users/devodev/followers",
+      "following_url": "https://api.github.com/users/devodev/following{/other_user}",
+      "gists_url": "https://api.github.com/users/devodev/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/devodev",
+      "id": 48306674,
+      "login": "devodev",
+      "node_id": "MDQ6VXNlcjQ4MzA2Njc0",
+      "organizations_url": "https://api.github.com/users/devodev/orgs",
+      "received_events_url": "https://api.github.com/users/devodev/received_events",
+      "repos_url": "https://api.github.com/users/devodev/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/devodev/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/devodev/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/devodev",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "23673048fcf466b1eef40c3e8c1586d6e90aa6936ba7e7be2985bfb30f67db88",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "1c7ed67bec41fe0cfda7b7a66731f3d363055ea23809b61fc9875f35618e066d",
+      "job_id": "0f35feca0fb1f897fb208521a1491c01ce171667b7a16456e5d89ca478f6a2e7",
+      "locator": "",
+      "observed_at": "2026-09-09T08:49:27.055635+00:00",
+      "raw_blob": "4f4c3d67671225893e0d2cf81dfdc3c122130bd98eea4dc5249b24de385939c9",
+      "source_revision": "2f09eba036325935011974b898acbd86cf1991c261ca22b999e0372ec21a7b56"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

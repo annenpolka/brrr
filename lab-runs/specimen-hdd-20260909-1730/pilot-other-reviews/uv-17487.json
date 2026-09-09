@@ -1,0 +1,121 @@
+{
+  "revision": "48bac8fef61211e1b9f8e5411f9f1eb5871843088317d3a82c305590a4e6c89e",
+  "source": {
+    "acquisition": "github_http",
+    "body_blob": "8b964765654c775375e8abf4dac31c54c108490d83fa3871185edd17e07c5085",
+    "content_available_at": null,
+    "historical_content": "HISTORICAL_CONTENT_UNVERIFIED",
+    "leakage": "PENDING",
+    "origin": "real",
+    "provider": "github",
+    "provider_created_at": "2026-01-15T16:04:58Z",
+    "provider_id": "3818174070",
+    "provider_updated_at": "2026-01-15T16:42:03Z",
+    "quality": "PENDING",
+    "resource_blob": "9f281dfce7b70fc832bc52d6d9e1c3516ebe3d0737c075b5d6bc616efb3eceb3",
+    "resource_kind": "issue",
+    "schema_version": 1,
+    "source_id": "91505543-aeee-430d-b5c3-6968962b780f",
+    "url": "https://github.com/astral-sh/uv/issues/17487"
+  },
+  "body": "### Question\n\nHi, \n\nI am trying to use uv with a package (`causal-conv1d`) that has no wheels and is known not to build without nvidia cuda and related software on your machine (`nvcc` in the error below)\n\nI work with Mac, which does not typically come with an Nvidia GPU\n\nNow the workflow that I would envision doing is:\n* lock my libraries on local with `uv lock`, potentially with this lib as optional dependency so that I can still execute some CPU-only scripts and linting on local\n* build a docker image in a CI with `uv sync --frozen`\n* execute on a server with the proper GPU\n\nBut it seems I cannot uv lock without building this lib, is it by design?\n\npyproject.toml\n```toml\n[project]\nname = \"testuv\"\nversion = \"0.1.0\"\ndescription = \"Add your description here\"\nrequires-python = \">=3.11\"\ndependencies = [\n    \"boto3>=1.42.28\", # Only this works fine\n    \"causal-conv1d==1.5.3.post1\"   # This breaks uv lock\n\n]\n```\n\n```sh\nuv lock\n  × Failed to build `causal-conv1d==1.5.3.post1`\n  ├─▶ The build backend returned an error\n  ╰─▶ Call to `setuptools.build_meta.build_wheel` failed (exit status: 1)\n\n      [stdout]\n\n\n      torch.__version__  = 2.9.1\n\n\n\n      [stderr]\n      /Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/torch/_subclasses/functional_tensor.py:279:\n      UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at\n      /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)\n        cpu = _conversion_method_template(device=torch.device(\"cpu\"))\n      <string>:119: UserWarning: causal_conv1d was requested, but nvcc was not found.  Are you sure your environment has nvcc available?\n      If you're installing within a container from https://hub.docker.com/r/pytorch/pytorch, only images whose names contain 'devel' will\n      provide nvcc.\n      Traceback (most recent call last):\n        File \"<string>\", line 14, in <module>\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 331, in\n      get_requires_for_build_wheel\n          return self._get_build_requires(config_settings, requirements=[])\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 301, in\n      _get_build_requires\n          self.run_setup()\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 317, in run_setup\n          exec(code, locals())\n        File \"<string>\", line 176, in <module>\n      NameError: name 'bare_metal_version' is not defined\n\n      hint: This usually indicates a problem with the package or the build environment.\n  help: `causal-conv1d` (v1.5.3.post1) was included because `testuv` (v0.1.0) depends on `causal-conv1d==1.5.3.post1`\n```\n\nNo-build does not help\n```sh\nuv lock --no-build\n  × No solution found when resolving dependencies:\n  ╰─▶ Because causal-conv1d==1.5.3.post1 has no usable wheels and your project depends on causal-conv1d==1.5.3.post1, we can conclude that\n      your project's requirements are unsatisfiable.\n\n      hint: Wheels are required for `causal-conv1d` because building from source is disabled for all packages (i.e., with `--no-build`)\n```\n\n### Platform\n\nmacOs\n\n### Version\n\nuv 0.9.25 (Homebrew 2026-01-13)",
+  "resource": {
+    "active_lock_reason": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "body": "### Question\n\nHi, \n\nI am trying to use uv with a package (`causal-conv1d`) that has no wheels and is known not to build without nvidia cuda and related software on your machine (`nvcc` in the error below)\n\nI work with Mac, which does not typically come with an Nvidia GPU\n\nNow the workflow that I would envision doing is:\n* lock my libraries on local with `uv lock`, potentially with this lib as optional dependency so that I can still execute some CPU-only scripts and linting on local\n* build a docker image in a CI with `uv sync --frozen`\n* execute on a server with the proper GPU\n\nBut it seems I cannot uv lock without building this lib, is it by design?\n\npyproject.toml\n```toml\n[project]\nname = \"testuv\"\nversion = \"0.1.0\"\ndescription = \"Add your description here\"\nrequires-python = \">=3.11\"\ndependencies = [\n    \"boto3>=1.42.28\", # Only this works fine\n    \"causal-conv1d==1.5.3.post1\"   # This breaks uv lock\n\n]\n```\n\n```sh\nuv lock\n  × Failed to build `causal-conv1d==1.5.3.post1`\n  ├─▶ The build backend returned an error\n  ╰─▶ Call to `setuptools.build_meta.build_wheel` failed (exit status: 1)\n\n      [stdout]\n\n\n      torch.__version__  = 2.9.1\n\n\n\n      [stderr]\n      /Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/torch/_subclasses/functional_tensor.py:279:\n      UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at\n      /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)\n        cpu = _conversion_method_template(device=torch.device(\"cpu\"))\n      <string>:119: UserWarning: causal_conv1d was requested, but nvcc was not found.  Are you sure your environment has nvcc available?\n      If you're installing within a container from https://hub.docker.com/r/pytorch/pytorch, only images whose names contain 'devel' will\n      provide nvcc.\n      Traceback (most recent call last):\n        File \"<string>\", line 14, in <module>\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 331, in\n      get_requires_for_build_wheel\n          return self._get_build_requires(config_settings, requirements=[])\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 301, in\n      _get_build_requires\n          self.run_setup()\n        File \"/Users/remi/.cache/uv/builds-v0/.tmppppoU9/lib/python3.11/site-packages/setuptools/build_meta.py\", line 317, in run_setup\n          exec(code, locals())\n        File \"<string>\", line 176, in <module>\n      NameError: name 'bare_metal_version' is not defined\n\n      hint: This usually indicates a problem with the package or the build environment.\n  help: `causal-conv1d` (v1.5.3.post1) was included because `testuv` (v0.1.0) depends on `causal-conv1d==1.5.3.post1`\n```\n\nNo-build does not help\n```sh\nuv lock --no-build\n  × No solution found when resolving dependencies:\n  ╰─▶ Because causal-conv1d==1.5.3.post1 has no usable wheels and your project depends on causal-conv1d==1.5.3.post1, we can conclude that\n      your project's requirements are unsatisfiable.\n\n      hint: Wheels are required for `causal-conv1d` because building from source is disabled for all packages (i.e., with `--no-build`)\n```\n\n### Platform\n\nmacOs\n\n### Version\n\nuv 0.9.25 (Homebrew 2026-01-13)",
+    "closed_at": null,
+    "closed_by": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/astral-sh/uv/issues/17487/comments",
+    "created_at": "2026-01-15T16:04:58Z",
+    "events_url": "https://api.github.com/repos/astral-sh/uv/issues/17487/events",
+    "html_url": "https://github.com/astral-sh/uv/issues/17487",
+    "id": 3818174070,
+    "issue_dependencies_summary": {
+      "blocked_by": 0,
+      "blocking": 0,
+      "total_blocked_by": 0,
+      "total_blocking": 0
+    },
+    "issue_field_values": [],
+    "labels": [
+      {
+        "color": "BFD4F2",
+        "default": true,
+        "description": "Asking for clarification or support",
+        "id": 6034754246,
+        "name": "question",
+        "node_id": "LA_kwDOKbIFZc8AAAABZ7MKxg",
+        "url": "https://api.github.com/repos/astral-sh/uv/labels/question"
+      }
+    ],
+    "labels_url": "https://api.github.com/repos/astral-sh/uv/issues/17487/labels{/name}",
+    "locked": false,
+    "milestone": null,
+    "node_id": "I_kwDOKbIFZc7jlLZ2",
+    "number": 17487,
+    "performed_via_github_app": null,
+    "pinned_comment": null,
+    "reactions": {
+      "+1": 1,
+      "-1": 0,
+      "confused": 0,
+      "eyes": 0,
+      "heart": 0,
+      "hooray": 0,
+      "laugh": 0,
+      "rocket": 0,
+      "total_count": 1,
+      "url": "https://api.github.com/repos/astral-sh/uv/issues/17487/reactions"
+    },
+    "repository_url": "https://api.github.com/repos/astral-sh/uv",
+    "state": "open",
+    "state_reason": null,
+    "sub_issues_summary": {
+      "completed": 0,
+      "percent_completed": 0,
+      "total": 0
+    },
+    "timeline_url": "https://api.github.com/repos/astral-sh/uv/issues/17487/timeline",
+    "title": "Why needing to build when locking?",
+    "type": null,
+    "updated_at": "2026-01-15T16:42:03Z",
+    "url": "https://api.github.com/repos/astral-sh/uv/issues/17487",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/16523229?v=4",
+      "events_url": "https://api.github.com/users/remidebette/events{/privacy}",
+      "followers_url": "https://api.github.com/users/remidebette/followers",
+      "following_url": "https://api.github.com/users/remidebette/following{/other_user}",
+      "gists_url": "https://api.github.com/users/remidebette/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/remidebette",
+      "id": 16523229,
+      "login": "remidebette",
+      "node_id": "MDQ6VXNlcjE2NTIzMjI5",
+      "organizations_url": "https://api.github.com/users/remidebette/orgs",
+      "received_events_url": "https://api.github.com/users/remidebette/received_events",
+      "repos_url": "https://api.github.com/users/remidebette/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/remidebette/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/remidebette/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/remidebette",
+      "user_view_type": "public"
+    }
+  },
+  "observations": [
+    {
+      "id": "73143423ebd5365fd445d4c5f37cd55cc049c169fe55dbbe645c291c88c0d6c1",
+      "attempt": 1,
+      "body_pointer": "/body",
+      "collection_id": "a9328ef43806b624ae4b461fea9d53947e459228bc24bd2fe1fb90773d4ff216",
+      "job_id": "0653ff78d5a3bdc5cad160ad803f7f71cdb7851c089aef0d0eb06b51b5841f68",
+      "locator": "",
+      "observed_at": "2026-09-09T08:50:04.001627+00:00",
+      "raw_blob": "fbcaba4a1c585c37b2b251d3ccb0c5ab5d8974298436428c96c7d46b13e06226",
+      "source_revision": "48bac8fef61211e1b9f8e5411f9f1eb5871843088317d3a82c305590a4e6c89e"
+    }
+  ],
+  "quality": "PENDING_UNLESS_VIEW_REVIEWED"
+}

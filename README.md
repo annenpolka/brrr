@@ -22,12 +22,17 @@ Coordinator stays in the parent workspace. Candidates live in isolated git workt
 
 ## Layout
 
-- `Overnight Developer Tool Evolution Lab — Master Prompt.md` — the night's constitution
-- `lab/STATE.md` — live experiment board (generation, workers, decisions)
-- `lab/PROTOCOL.md` — how candidates report, how judges score
-- `lab/heartbeat.md` — heartbeat log
-- `lab/lineages/` — harvested reports **and implementations** (CLI + fixtures/tests). Worktrees were the authoring surface; this tree is the archive.
-- `EVOLUTION_REPORT.md` — final jury + preservation pass
+Coordinator product and corpus live here. Historical overnight boards stay read-only.
+
+- `src/brrr_corpus/` — corpus store, collection, selection, review boundary
+- `scripts/corpus.py`, `scripts/check_corpus.py` — corpus CLI and its tests
+- `recipes/` — collection and selection recipes
+- `runpair/` — twice-run directory snapshot CLI (promoted from 2026-09-09)
+- `docs/execplans/`, `docs/execution/`, `docs/preparation/` — plans, start prompts, corpus receipts
+- `lab-runs/<run-id>/` — one experiment's coordinator records; `lab-runs/current` points at the latest initialized run
+- `.hdd-runs/<run-id>/` — Dreamer trial transcripts for that run
+- `lab/`, `lab-hdd/`, `.hdd/` — previous overnight archives; do not overwrite
+- Root `*Master Prompt*.md` and `EVOLUTION_REPORT.md` / `HDD_EVOLUTION_REPORT.md` — previous constitutions and jury reports; read-only
 
 ## Phases (JST)
 

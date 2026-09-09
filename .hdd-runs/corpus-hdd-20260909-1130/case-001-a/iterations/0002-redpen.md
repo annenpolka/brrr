@@ -1,0 +1,1 @@
+Host Red Pen. Dream text invented a cli facade over Deno and reconstructed a lockfile after being told not to. Host 実機 (separate, not sent to Dreamer) already showed a first-run sidecar file on this machine; the Dreamer is being asked only to list new names/sizes after one invocation, not told the host result. THIN_WRAPPER until that directory-delta is actually observed.

@@ -1,0 +1,1 @@
+Host Red Pen. Stop Dreaming this trial. Host 実機 (separate file) already showed deno.lock 727 bytes after first deno run a.js and the reported second-run error. The Dreamer reached the same shape with fabricated names/sizes. Harvest runpair, not unfamiliar-cli.

@@ -14,6 +14,8 @@ collection IDを記録してください。同じrecipeのcollectは既存の初
 
 終了時に、完了・不足・失敗・SourceObservation件数・原文の由来をreportに記録してください。`python3 scripts/corpus.py audit` を通し、新しい名前でDBとobjectをバックアップしてください。出典URLや修正SHAがあるだけでローカル再現済みとしないでください。
 
+現在の実資料ミニパイロットは、ユーザーから委任されたCodexの内容審査で品質HOLDになっています。`docs/preparation/mini-content-review.md` の不足条件を確認し、実際の失敗入力と設定・実行環境が確認できる原資料の追加収集、または別の十分な事例の選定から進めてください。修正後テストを報告時の入力とみなさないでください。内容審査はエージェントとして実施・記録でき、人間になりすましてPASSを登録しません。
+
 少数で試す場合は `docs/preparation/mini-loop.md` を使ってください。`mini-demo` は収集から復元まで合成資料で動きます。実資料には `.brrr-corpus/mini-real/pilot` の審査パッケージがあり、Case/Claim/reprocess/selectは実装済みです。
 
 以降は保存原文から既存のCLIでCase/Claim/Viewを整理します。品質と意味的漏洩の審査は対象hashに結び付け、実際の人間の内容審査を受ける前にhuman PASSを作らないでください。pilotの目標24事例、同一機構最大8、同一repository最大6、holdout目標6を守り、不足は不足として残してください。同じ障害・派生系列や公開履歴不明の資料を未知事例用holdoutへ流さないでください。

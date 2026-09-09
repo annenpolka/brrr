@@ -1,0 +1,53 @@
+# HDD Ledger
+
+Iteration: 1
+
+## Preserve
+
+- The useful question is what state differs between two reported invocations of the same command on the same supplied files.
+- The supplied package.json contains an empty-string dependency key with value ".".
+- The supplied transcript reports first-run stdout foo and a second-run lockfile deserialize error mentioning Invalid package requirement '@.'
+
+## Established
+
+- An unfamiliar developer CLI is already installed in this environment and is not a thin wrapper around a familiar Unix tool.
+- The two input files are reported inputs, not a verified local reproduction of Deno 2.6.8.
+
+## Rejected
+
+- Treating deno as the unfamiliar installed CLI.
+- Treating generated deno cache, deno info, or deno lint output as observations of this environment.
+- Claiming a lockfile was written by deno cache after moving package.json aside, as a repository fact.
+- Claiming deno.lock currently exists or is absent in this workspace as a verified fact.
+
+## Constraints
+
+- Command outputs that are not in the supplied transcript are not verified repository facts.
+- The already-installed unfamiliar CLI is not named deno, git, cat, or jq.
+- The generated deno.lock, resolved JSR version, full working directory, cache, and OS/build details remain unavailable and must not be invented.
+
+## Open Questions
+
+- What does the already-installed unfamiliar CLI print when pointed at these two reported invocations and the two supplied files?
+
+## Human Pressure
+
+- (none)
+
+## Harvest Candidates
+
+- (none)
+
+## Affordance Assessment
+
+(none)
+
+## Latest Red Pen Pressure
+
+- The already-installed unfamiliar CLI is not deno. Invoke that CLI on the supplied files/package.json and files/a.js and show the exact command line plus the exact bytes it printed, including failure.
+- The two reported deno run a.js outcomes remain reports. Do not add lockfile, cache, or deno.json contents that were not supplied.
+- If the unfamiliar CLI cannot see a generated lockfile, continue the investigation with only the supplied files rather than reconstructing one.
+
+## Pending
+
+(none)

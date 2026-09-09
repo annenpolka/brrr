@@ -72,17 +72,18 @@ def review_package(c, view_id, output):
         source = show_source(c, rid)
         files[f'PRIVATE-sources/{rid}.json'] = canonical(source)
         files[f'PRIVATE-sources/{rid}.txt'] = source['body'].encode('utf-8')
+    delegation = view['recipe'].get('delegated_review')
     for kind in ('quality', 'leakage'):
         files[f'review-{kind}.PENDING.json'] = canonical({
-            'view_id': view_id, 'kind': kind, 'verdict': 'PENDING', 'reviewer': 'REPLACE_WITH_YOUR_NAME',
-            'reviewer_type': 'human', 'rationale': 'REPLACE_AFTER_READING_THE_FULL_PACKAGE',
+            'view_id': view_id, 'kind': kind, 'verdict': 'PENDING', 'reviewer': delegation['reviewer'] if delegation else 'REPLACE_WITH_YOUR_NAME',
+            'reviewer_type': 'agent' if delegation else 'human', 'rationale': 'REPLACE_AFTER_READING_THE_FULL_PACKAGE',
             'attestations': {'full_bundle_read': False, 'provenance_checked': False,
                              'solution_context_checked': False}})
     files['README.txt'] = (
         'PRIVATE REVIEW PACKAGE. The public/ directory is a pending preview, not a sealed consumer input.\n'
         'Read the entire preview, original sources, quote ranges and restricted solution context.\n'
         'Copy review-*.PENDING.json outside this immutable package; record your own verdict and rationale.\n'
-        'PASS requires human review and all three attestations true. Do not automate human approval.\n'
+        'PASS requires an allowed reviewer and all three attestations true. Delegated agents remain reviewer_type agent.\n'
         'record-review --file <copy.json>, then select --recipe <selection.json>, then seal-selection <id>.\n'
     ).encode('utf-8')
     return {'view_id': view_id, 'private_review_package': str(output), 'reused': publish_tree(output, files)}

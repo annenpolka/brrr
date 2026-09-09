@@ -1,4 +1,4 @@
-"""P0: explicit, content-bound human review before static HDD publication.
+"""Explicit, content-bound review before static HDD publication.
 
 This is not an automatic semantic classifier or a consumer OS sandbox.
 """
@@ -28,9 +28,13 @@ def exporter_hash():
 def validate_recipe(recipe):
     keys(recipe, ['schema_version', 'recipe_id', 'view_mode', 'target_cases',
                   'max_cases_per_repository', 'max_cases_per_primary_mechanism',
-                  'allow_synthetic', 'allow_shortfall', 'prior_ideas_access', 'isolation_level'])
+                  'allow_synthetic', 'allow_shortfall', 'prior_ideas_access', 'isolation_level'], ['delegated_review'])
     require(recipe['schema_version'] == 1 and type(recipe['schema_version']) is int, 'Unsupported recipe schema')
     nonempty(recipe['recipe_id'], 'recipe_id')
+    if 'delegated_review' in recipe:
+        keys(recipe['delegated_review'], ['reviewer', 'authorization'])
+        nonempty(recipe['delegated_review']['reviewer'], 'delegated reviewer')
+        nonempty(recipe['delegated_review']['authorization'], 'delegated authorization')
     require(recipe['view_mode'] == 'blind_problem', 'Only blind_problem is implemented')
     require(recipe['isolation_level'] == 'static_bundle_only', 'Consumer isolation has not been implemented')
     require(recipe['prior_ideas_access'] in ('denied', 'allowed'), 'Invalid prior ideas policy')
@@ -183,8 +187,8 @@ def review(corpus, view_id, *, kind, verdict, reviewer, reviewer_type, rationale
     nonempty(reviewer, 'reviewer')
     nonempty(rationale, 'rationale')
     if verdict == 'PASS':
-        require(reviewer_type == 'human' or (reviewer_type == 'fixture' and fixture_allowed(corpus, view)),
-                'Pilot PASS requires human content review; fixture PASS is synthetic-only')
+        require(reviewer_allowed(corpus, view, reviewer_type, reviewer),
+                'Pilot PASS requires human content review or the explicitly delegated reviewer; fixture PASS is synthetic-only')
         keys(attestations, ['full_bundle_read', 'provenance_checked', 'solution_context_checked'])
         require(all(v is True for v in attestations.values()), 'PASS requires all explicit attestations')
     with corpus.transaction():
@@ -202,11 +206,19 @@ def approvals(corpus, view_id):
                                 (view_id, kind)).fetchone()
         require(row is not None, f'{kind} review is PENDING')
         r = corpus.get(row[0], 'review')
-        require(r['verdict'] == 'PASS' and (r['reviewer_type'] == 'human' or
-                (r['reviewer_type'] == 'fixture' and fixture_allowed(corpus, corpus.get(view_id, 'view')))),
-                f'{kind} review is not human PASS or synthetic fixture PASS')
+        require(r['verdict'] == 'PASS' and reviewer_allowed(
+                corpus, corpus.get(view_id, 'view'), r['reviewer_type'], r['reviewer']),
+                f'{kind} review is not PASS by a permitted reviewer')
         result[kind] = row[0]
     return result
+
+
+def reviewer_allowed(corpus, view, reviewer_type, reviewer):
+    # This records the user's delegation; like human review, it is not identity authentication.
+    delegation = view['recipe'].get('delegated_review')
+    return (reviewer_type == 'human'
+            or (reviewer_type == 'fixture' and fixture_allowed(corpus, view))
+            or (reviewer_type == 'agent' and delegation is not None and reviewer == delegation['reviewer']))
 
 
 def fixture_allowed(corpus, view):

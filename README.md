@@ -10,8 +10,10 @@ The new corpus CLI is `python3 scripts/corpus.py`; its tests are
 `python3 scripts/corpus.py collect --recipe recipes/collection/github-pilot-v1.json`.
 See [collection startup and verification](docs/preparation/collection-readiness.md).
 Try the complete offline reuse loop with
-`python3 scripts/corpus.py mini-demo --output .brrr-corpus/mini-demo`.
+`python3 scripts/corpus.py mini-demo --output .brrr-corpus/mini-demo-v2`.
 See [the small trial and real-data review workflow](docs/preparation/mini-loop.md).
+One real reported-input case is now reviewed and exported; see
+[the ready evidence pilot](docs/preparation/evidence-pilot.md).
 The new 24-case HDD input still requires content review and selection.
 
 Experiment window: **2026-08-19 23:45 JST → 2026-08-20 09:00 JST**.

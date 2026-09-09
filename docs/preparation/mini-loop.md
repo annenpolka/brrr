@@ -1,5 +1,7 @@
 # 小さく一巡する収集・再利用の手順
 
+最新: [実資料1事例の審査・出力が完了](evidence-pilot.md)。次回は確定済みsnapshotの再出力から始められる。以下の旧PR由来資料は品質HOLDの履歴として保全している。
+
 2026-09-09。合成3事例なら、収集の中断・再開→保存原文の検索→Case/Claim→View→fixture審査→2種類の選別→snapshot→オフライン再出力→バックアップ復元まで、1コマンドで試せる。実資料は2件のPRから1事例・2種類のViewを準備済みで、人間の審査から続けられる。
 
 追加の委任レビューを [内容審査結果](mini-content-review.md) に記録した。実資料v1/v2は内容漏洩の混入を認めなかったが、失敗入力・環境が不足して品質HOLD。次回は原資料の補完から進める。
@@ -9,7 +11,7 @@
 repository rootで実行する。Python標準ライブラリのみを使い、ネットワークもモデル呼び出しも発生しない。
 
 ```sh
-python3 scripts/corpus.py mini-demo --output .brrr-corpus/mini-demo
+python3 scripts/corpus.py mini-demo --output .brrr-corpus/mini-demo-v2
 ```
 
 出力の `collection_state: COMPLETE_FOR_POLICY`、`searchable_sources: 3`、`human_reviews: 0`、`offline_restore_and_export_verified: true` を確認する。同じコマンドの2回目は保存済みsnapshotを再出力し、同一ファイル集合・hashを検証して `reused: true` を返す。コードやrecipeが変わった後は別のoutput名を指定する。
@@ -33,9 +35,9 @@ python3 scripts/corpus.py mini-demo --output .brrr-corpus/mini-demo
 合成demoを使って、IDを読みながら各コマンドを試せる。
 
 ```sh
-python3 scripts/corpus.py --root .brrr-corpus/mini-demo/corpus sources --query 'SYNTHETIC REPORT'
-python3 scripts/corpus.py --root .brrr-corpus/mini-demo/corpus list-cases
-python3 scripts/corpus.py --root .brrr-corpus/mini-demo/corpus select --recipe recipes/selection/mini-one-v1.json
+python3 scripts/corpus.py --root .brrr-corpus/mini-demo-v2/corpus sources --query 'SYNTHETIC REPORT'
+python3 scripts/corpus.py --root .brrr-corpus/mini-demo-v2/corpus list-cases
+python3 scripts/corpus.py --root .brrr-corpus/mini-demo-v2/corpus select --recipe recipes/selection/mini-one-v1.json
 ```
 
 `show-source SOURCE_REVISION` は原文全文、providerメタデータ、取得時刻、生HTTPのobject hashとJSON Pointerを表示する。`sources` は `--repository owner/repo --kind issue --origin real --limit 50` で絞れる。保存済みの全revisionが対象で、最新や網羅性を推測しない。URLのないPR patchも保存されたPRのprovider IDからrepository検索に含める。

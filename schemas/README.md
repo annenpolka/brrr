@@ -82,3 +82,10 @@ OS権限によるconsumer隔離、敵対する同一ユーザーの同時ファ�
 `seal-selection ID` は確定した選別リストを厳密に使用する。新しいViewが追加されても古い母集団を黙って選び直さない。Case/関係graph、selector/pipeline/exporterコード、選んだViewの審査が変われば再選別・必要な再審査を要求する。export時も検証する。新しいdiscovery exposureが同じscope内でholdoutと重なれば停止する。`record-exposure --split discovery|holdout|all` で実際に渡した側を記録する（省略はall）。
 
 Case/関係の索引テーブルは既存DBに追加し、過去recordを変更しない。全情報はバックアップ・復元対象。現在はschema v1と現在のpipeline/selector/exporterの組で動作し、古い実装の自動再起動は提供しない。
+
+
+## 明示された委任レビュー
+
+View recipeには任意の `delegated_review` を指定できる。厳密なキーは `reviewer, authorization` で、どちらも空でない文字列。ユーザーの委任に基づいて設定し、view hashへ結合する。この条件があるViewでは、その名前と一致する `reviewer_type: agent` のPASSを受け付ける。指定なしでは従来のhuman/合成fixture契約を維持する。両種類の審査、全attestation、後続HOLD/FAIL、変更による失効は従来どおり。現行例は `recipes/selection/mini-evidence-v1.json`。
+
+委任を変更しても旧ViewのPASSを新しいViewへ流用できない。審査前テンプレートは、委任があれば指定agent、なければhumanで生成し、どちらもPENDINGとfalseのattestationを初期値にする。

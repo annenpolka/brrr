@@ -1,4 +1,8 @@
-# 次回実行プロンプト — GitHub収集から開始
+# 次回実行プロンプト — 実資料snapshotの小規模試行
+
+最新の状態は `docs/preparation/evidence-pilot.md`。入力不足だった旧PR由来CaseのHOLDは維持し、原文に入力ファイルがある別Issueから1事例の品質・漏洩審査とsnapshot出力が完了しています。小さく試す場合は、そのsnapshotを再出力するところから始めてください。ユーザーはCodexへの内容審査を委任済みで、新recipeは指定エージェントの実際のPASSを受け付けます。人間の審査として記録しないでください。
+
+以下は追加収集を行う場合の指示です。
 
 `docs/preparation/collection-readiness.md` の収集準備が済んでいます。収集器の実装をやり直さず、既存の `.brrr-corpus` を使ってGitHub収集から開始してください。設計の正本は `brrr-issue-collection-redesign.md` です。
 
@@ -14,7 +18,7 @@ collection IDを記録してください。同じrecipeのcollectは既存の初
 
 終了時に、完了・不足・失敗・SourceObservation件数・原文の由来をreportに記録してください。`python3 scripts/corpus.py audit` を通し、新しい名前でDBとobjectをバックアップしてください。出典URLや修正SHAがあるだけでローカル再現済みとしないでください。
 
-現在の実資料ミニパイロットは、ユーザーから委任されたCodexの内容審査で品質HOLDになっています。`docs/preparation/mini-content-review.md` の不足条件を確認し、実際の失敗入力と設定・実行環境が確認できる原資料の追加収集、または別の十分な事例の選定から進めてください。修正後テストを報告時の入力とみなさないでください。内容審査はエージェントとして実施・記録でき、人間になりすましてPASSを登録しません。
+旧PR由来の実資料ミニパイロットは、ユーザーから委任されたCodexの内容審査で品質HOLDになっています。新しいIssue由来の確定済みsnapshotとは別です。`docs/preparation/mini-content-review.md` の不足条件を確認し、実際の失敗入力と設定・実行環境が確認できる原資料の追加収集、または別の十分な事例の選定から進めてください。修正後テストを報告時の入力とみなさないでください。内容審査はエージェントとして実施・記録でき、人間になりすましてPASSを登録しません。
 
 少数で試す場合は `docs/preparation/mini-loop.md` を使ってください。`mini-demo` は収集から復元まで合成資料で動きます。実資料には `.brrr-corpus/mini-real/pilot` の審査パッケージがあり、Case/Claim/reprocess/selectは実装済みです。
 

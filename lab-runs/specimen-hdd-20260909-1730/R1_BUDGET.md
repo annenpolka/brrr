@@ -1,6 +1,6 @@
 # R1 budget
 
-Updated: 2026-09-09 17:40:54 JST
+Updated: 2026-09-09 17:53:09 JST
 
 ## Caps
 
@@ -17,11 +17,11 @@ Updated: 2026-09-09 17:40:54 JST
 
 ## Totals
 
-- Total R1 calls: **1**
-- Observed spend (OpenRouter usage delta): **$0.000000**
-- Conservative transcript estimate (sum): **$0.027377**
-- Gate spend (max observed, estimate) + in-flight reserve: **$0.027377** + **$0.000000**
-- Remaining effective budget: **$16.127172**
+- Total R1 calls: **3**
+- Observed spend (OpenRouter usage delta): **$0.028512**
+- Conservative transcript estimate (sum): **$0.087480**
+- Gate spend (max observed, estimate) + in-flight reserve: **$0.087480** + **$0.000000**
+- Remaining effective budget: **$16.067069**
 
 ## Pricing used for estimates
 
@@ -33,19 +33,22 @@ Updated: 2026-09-09 17:40:54 JST
 
 | Trial | Calls | Observed USD | Estimated USD |
 | --- | ---: | ---: | ---: |
-| case-001-a | 1 | 0.000000 | 0.027377 |
+| case-001-a | 3 | 0.000000 | 0.087480 |
 
 ## Calls by experiment phase
 
 | Phase | Calls | Observed USD | Estimated USD |
 | --- | ---: | ---: | ---: |
-| first-turn | 1 | 0.000000 | 0.027377 |
+| first-turn | 2 | 0.000000 | 0.057518 |
+| follow-up | 1 | 0.000000 | 0.029962 |
 
 ## Call log
 
 | When JST | Trial | Iter | Phase | Status | HTTP | Tool | Observed USD | Estimated USD |
 | --- | --- | ---: | --- | --- | --- | --- | ---: | ---: |
 | 2026-09-09 17:33:23 JST | case-001-a | 1 | first-turn | http-ok | True | False | 0.000000 | 0.027377 |
+| 2026-09-09 17:42:37 JST | case-001-a | 2 | first-turn | http-ok | True | False | 0.000000 | 0.030141 |
+| 2026-09-09 17:48:37 JST | case-001-a | 3 | follow-up | http-ok | True | False | 0.000000 | 0.029962 |
 
 ## Notes
 

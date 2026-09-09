@@ -5,8 +5,13 @@
 - Not-before: 2026-09-09 17:30:00 JST
 - Hard end: 2026-09-10 09:00:00 JST (not extended)
 - Preservation start: 2026-09-10 08:00:00 JST
-- Phase: first Dream in flight (case-001-a via dream.sh / hdd.py); host filling vacancy with collect/review/実機
-- Dream 0001 started: 2026-09-09 17:33:22 JST (live `deepseek/deepseek-r1`; HTTP success will not be tool success)
+- Phase: case-001-a Dreaming stopped after turn 3 (THIN_WRAPPER). Vacancy is collect/review/reconstitute, not isomorphic R1.
+- Dream 0003: 17:48:37–17:53:09 JST http-ok, tool_success=false (invented javix). CHAIN-003.json
+- First selection: KEEP 0, KILL fictional CLIs, HOLD extras. FIRST_SELECTION does not disable contamination.
+- Dream 0001: 17:33:23–17:40:54 JST http-ok, tool_success=false (Deno collapse). CHAIN-001.json
+- Dream 0002: 17:42:37–17:46:56 JST http-ok, tool_success=false (invented `tool` CLI reprinting the transcript). CHAIN-002.json
+- Dream 0003 started: 2026-09-09 17:48:37 JST
+- Additional inputs: still 1 discovery (小規模試行). Expand screens HOLD. 32113 is not 未知holdout.
 - Parent role: coordinator only (no candidate product merge onto main)
 - Dreamer: `deepseek/deepseek-r1` via OpenRouter through `/Users/annenpolka/.codex/skills/hdd-loop/scripts/hdd.py` `--root /Users/annenpolka/ghq/github.com/annenpolka/brrr/.hdd-runs/specimen-hdd-20260909-1730`
 - Critic: host Red Pen

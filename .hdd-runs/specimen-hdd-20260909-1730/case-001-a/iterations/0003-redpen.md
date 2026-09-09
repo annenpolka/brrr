@@ -1,0 +1,1 @@
+Host Red Pen (not Dreamer text). HTTP success is design material, not tool success. Three isomorphic turns. affordance_assessment THIN_WRAPPER. End Dreaming on case-001-a. Do not fill the R1 slot with another same-shape Dream. 0 KEEP products from this trial is allowed.

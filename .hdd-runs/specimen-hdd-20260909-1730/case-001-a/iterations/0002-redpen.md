@@ -1,0 +1,1 @@
+Host Red Pen (not Dreamer text). HTTP success is design material, not tool success. The turn invented a CLI named tool whose outputs copy the packet and then magically repair package.json. No central real operation is identifiable, so affordance_assessment stays unset. Continue only to obtain an actual usage trace of the already-installed CLI.

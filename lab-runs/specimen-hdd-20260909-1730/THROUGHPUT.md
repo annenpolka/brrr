@@ -3,9 +3,9 @@
 Vacant inference slots take the next ready job. Clock milestones are deadlines.
 R1/test waits register a handle and free the slot. No isomorphic-Dream filler.
 
-Updated: 2026-09-09 17:44:04 JST
+Updated: 2026-09-09 17:55:25 JST
 
-Jobs recorded: 14
+Jobs recorded: 30
 Intentional idle gaps >120s: 0
 
 | When JST | Job | Status | Slot | Note |
@@ -24,3 +24,19 @@ Intentional idle gaps >120s: 0
 | 2026-09-09 17:42:09 JST | redpen-0001 | completed | coordinator | host Red Pen; HTTP not treated as tool success |
 | 2026-09-09 17:42:37 JST | dream-0002 | started | r1-1 | second live R1 after host Red Pen; HTTP will not be tool success |
 | 2026-09-09 17:44:04 JST | collect-pilot-expand-resume-200 | completed | worker-2 | 200 requests, INVOCATION_REQUEST_LIMIT, unfinished remain; HOLD screens not flipped to PASS |
+| 2026-09-09 17:45:36 JST | collect-pilot-expand-resume-200b | started | worker-2 | second 200-req resume slice; Dreamer not waiting |
+| 2026-09-09 17:48:24 JST | dream-0002 | completed | r1-1 | http-ok tool_success=false; invented tool CLI; host Red Pen recorded |
+| 2026-09-09 17:48:24 JST | redpen-0002 | completed | coordinator | host Red Pen; HTTP not treated as tool success |
+| 2026-09-09 17:48:37 JST | dream-0003 | started | r1-1 | third live R1 after Red Pen 0002; HTTP will not be tool success |
+| 2026-09-09 17:48:37 JST | collect-other-1730 | started | worker-3 | isolated root .brrr-corpus/pilot-1730-other github-other-ecosystems-v1 200/600; expand root still busy |
+| 2026-09-09 17:49:42 JST | collect-pilot-expand-resume-200b | completed | worker-2 | 200 requests INVOCATION_REQUEST_LIMIT EXIT:3; expand coordinator free |
+| 2026-09-09 17:49:42 JST | collect-pilot-expand-resume-200c | started | worker-2 | resume a9328ef4 after busy coordinator exited; 200/600 |
+| 2026-09-09 17:50:45 JST | host-verify-index | completed | worker-1 | index of HOLD 実機; not Dreamer-facing; no PASS minted |
+| 2026-09-09 17:53:10 JST | collect-expand-resume-200c | completed | worker-2 | EXIT:3 RATE_WAIT; uv issues now complete_for_policy |
+| 2026-09-09 17:53:10 JST | collect-other-1730 | completed | worker-3 | EXIT:3 INVOCATION_REQUEST_LIMIT 16 cargo complete; pending 25 |
+| 2026-09-09 17:53:10 JST | collect-other-1730-resume | started | worker-3 | resume 1c7ed67b 200/600 isolated 1730-other root |
+| 2026-09-09 17:54:16 JST | dream-0003 | completed | r1-1 | http-ok tool_success=false; invented javix; THIN_WRAPPER; stop isomorphic Dreams |
+| 2026-09-09 17:54:16 JST | redpen-0003 | completed | coordinator | host Red Pen THIN_WRAPPER; no further isomorphic R1 on this trial |
+| 2026-09-09 17:54:49 JST | uv-review | completed | worker-1 | 9 uv issues HOLD; no PASS; not Dreamer |
+| 2026-09-09 17:54:49 JST | first-selection | completed | coordinator | KEEP 0; KILL fictional CLIs; HOLD extras; FIRST_SELECTION does not disable contamination |
+| 2026-09-09 17:54:49 JST | collect-expand-resume-200d | started | worker-2 | resume a9328ef4 after RATE_WAIT passed; 200/600; not isomorphic Dream filler |

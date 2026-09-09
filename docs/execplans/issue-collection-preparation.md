@@ -44,7 +44,7 @@
 
 ## Context and Orientation
 
-作業rootは `/Users/annenpolka/ghq/github.com/annenpolka/brrr`。設計は同rootの `brrr-issue-collection-redesign.md`。HEADは `caabebcc37a699388a8a7691c055bb323916ed48`。
+作業rootは `/Users/annenpolka/ghq/github.com/annenpolka/brrr`。設計は `docs/archive/issue-collection-redesign.md`。HEADは `caabebcc37a699388a8a7691c055bb323916ed48`。
 `lab-runs/specimen-hdd-20260902-1112` と `.hdd-runs/specimen-hdd-20260902-1112` は旧実験の不変履歴。新コードは `src/brrr_corpus`、ローカルデータは `.brrr-corpus`。オブジェクトとはSHA-256で名前を固定したバイト列、snapshotとは出力ファイルと審査対象を固定したmanifestである。
 
 ## Plan of Work

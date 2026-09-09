@@ -16,4 +16,4 @@ cwd: repository root `/Users/annenpolka/ghq/github.com/annenpolka/brrr`
 5. Dreamer remains `deepseek/deepseek-r1`. No silent substitute.
 6. Candidate tool:
 
-       PYTHONPATH=lab-runs/corpus-hdd-20260909-1130/worktrees/runpair python3 -m runpair --cwd DIR -- deno run a.js
+       python3 scripts/runpair.py --cwd DIR -- deno run a.js

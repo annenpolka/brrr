@@ -6,7 +6,7 @@
 
 以下は追加収集を行う場合の指示です。
 
-`docs/preparation/collection-readiness.md` の収集準備が済んでいます。収集器の実装をやり直さず、既存の `.brrr-corpus` を使ってGitHub収集から開始してください。設計の正本は `brrr-issue-collection-redesign.md` です。
+`docs/preparation/collection-readiness.md` の収集準備が済んでいます。収集器の実装をやり直さず、既存の `.brrr-corpus` を使ってGitHub収集から開始してください。設計の正本は `docs/archive/issue-collection-redesign.md` です。
 
 開始時に `python3 scripts/corpus.py audit` を確認し、次を実行してください。
 

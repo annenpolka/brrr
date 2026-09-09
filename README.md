@@ -25,14 +25,14 @@ Coordinator stays in the parent workspace. Candidates live in isolated git workt
 Coordinator product and corpus live here. Historical overnight boards stay read-only.
 
 - `src/brrr_corpus/` — corpus store, collection, selection, review boundary
+- `src/runpair/` — twice-run directory snapshot CLI (promoted 2026-09-09); entry `python3 scripts/runpair.py`
 - `scripts/corpus.py`, `scripts/check_corpus.py` — corpus CLI and its tests
 - `recipes/` — collection and selection recipes
-- `runpair/` — twice-run directory snapshot CLI (promoted from 2026-09-09)
-- `docs/execplans/`, `docs/execution/`, `docs/preparation/` — plans, start prompts, corpus receipts
+- `docs/execplans/`, `docs/execution/`, `docs/preparation/` — live plans, start prompts, corpus receipts
+- `docs/archive/` — previous master prompts, collection design, and overnight jury reports (read-only)
 - `lab-runs/<run-id>/` — one experiment's coordinator records; `lab-runs/current` points at the latest initialized run
 - `.hdd-runs/<run-id>/` — Dreamer trial transcripts for that run
-- `lab/`, `lab-hdd/`, `.hdd/` — previous overnight archives; do not overwrite
-- Root `*Master Prompt*.md` and `EVOLUTION_REPORT.md` / `HDD_EVOLUTION_REPORT.md` — previous constitutions and jury reports; read-only
+- `lab/`, `lab-hdd/`, `.hdd/` — previous overnight working trees; do not overwrite
 
 ## Phases (JST)
 

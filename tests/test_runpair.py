@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from runpair import file_delta, runpair, snapshot_files  # noqa: E402
 
@@ -133,7 +133,7 @@ class RunpairCliTests(unittest.TestCase):
     def test_cli_json_on_true(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = subprocess.run(
-                [sys.executable, "-m", "runpair", "--cwd", tmp, "--", "true"],
+                [sys.executable, str(ROOT / "scripts" / "runpair.py"), "--cwd", tmp, "--", "true"],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,

@@ -38,7 +38,7 @@ def parser():
         cmd.add_argument('--run', required=True)
         cmd.add_argument('--companion')
         if name in ('inventory', 'verify-baseline'):
-            cmd.add_argument('--design', default='brrr-issue-collection-redesign.md')
+            cmd.add_argument('--design', default='docs/archive/issue-collection-redesign.md')
         if name == 'inventory':
             cmd.add_argument('--output', required=True)
         elif name == 'verify-baseline':

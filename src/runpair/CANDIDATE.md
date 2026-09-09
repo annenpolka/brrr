@@ -7,7 +7,7 @@ Smallest host-grounded candidate from this run.
 Run the same command twice in one working directory. After each invocation, report regular files that were added, removed, or changed in size. Do not open or interpret those files.
 
 ```
-python3 -m runpair --cwd DIR -- CMD [ARGS...]
+python3 scripts/runpair.py --cwd DIR -- CMD [ARGS...]
 ```
 
 JSON stdout. The process exit of `runpair` is 0 if both invocations were started; command rc lives in `first.rc` / `second.rc`.

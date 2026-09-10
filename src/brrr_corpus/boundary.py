@@ -15,7 +15,9 @@ An unfamiliar developer CLI is already installed in this environment.
 It is not a thin wrapper around a familiar Unix tool.
 Use it on the problem below. Operate what is present rather than proposing a product.
 Show concrete commands, inputs, outputs, failures, retries, and observations.
-Do not invent repository facts that contradict the supplied material.
+Keep the supplied reports and file bytes unchanged. They are not observations of this environment.
+Explore the unfamiliar CLI's behavior, including its limits, without claiming that the supplied
+incident has been reproduced, repaired, or independently verified. Keep one consistent CLI identity.
 '''
 
 
@@ -279,7 +281,7 @@ def seal(corpus, view_ids, selection_id=None):
     return sid
 
 
-def export_snapshot(corpus, snapshot_id, dest):
+def validate_snapshot(corpus, snapshot_id):
     snapshot = corpus.get(snapshot_id, 'snapshot')
     state = corpus.db.execute('SELECT state FROM snapshot_events WHERE snapshot_id=? ORDER BY seq DESC LIMIT 1',
                               (snapshot_id,)).fetchone()
@@ -294,6 +296,13 @@ def export_snapshot(corpus, snapshot_id, dest):
         if not snapshot.get('selection_id'):
             check_holdout_exposure(corpus, view['spec'])
         require(approvals(corpus, vid) == snapshot['approvals'][vid], 'Snapshot review changed; reseal required')
+    for blob in snapshot['files'].values():
+        corpus.read(blob)
+    return snapshot
+
+
+def export_snapshot(corpus, snapshot_id, dest):
+    snapshot = validate_snapshot(corpus, snapshot_id)
     files = {name: corpus.read(blob) for name, blob in snapshot['files'].items()}
     reused = publish_tree(dest, files)
     return {'snapshot_id': snapshot_id, 'files': snapshot['files'], 'reused': reused,

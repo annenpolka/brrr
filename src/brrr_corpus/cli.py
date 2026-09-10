@@ -57,6 +57,34 @@ def parser():
         cmd = commands.add_parser(name)
         cmd.add_argument('--file', required=True)
     commands.add_parser('list-cases')
+    cmd = commands.add_parser('save-recovery', help='Record actionable blockers; never grants PASS')
+    cmd.add_argument('--file', required=True)
+    cmd = commands.add_parser('recovery-status')
+    cmd.add_argument('case_id')
+    cmd = commands.add_parser('prepare-review', help='Reprocess resolved recovery into a private review package')
+    cmd.add_argument('recovery_id')
+    cmd.add_argument('--config', required=True)
+    cmd.add_argument('--recipe', required=True)
+    cmd.add_argument('--output', required=True)
+    cmd = commands.add_parser('init-experiment', help='Freeze run policy; does not start models')
+    cmd.add_argument('--file', required=True)
+    cmd = commands.add_parser('record-discovery', help='Assess speculative usage separately from runtime evidence')
+    cmd.add_argument('--file', required=True)
+    cmd.add_argument('--trace', required=True)
+    cmd = commands.add_parser('experiment-status')
+    cmd.add_argument('run_id')
+    cmd = commands.add_parser('experiment-progress')
+    cmd.add_argument('run_id')
+    cmd.add_argument('--kind', choices=['input_ready', 'blocker_resolved', 'affordance_found'], required=True)
+    cmd.add_argument('--evidence', required=True)
+    cmd = commands.add_parser('admit-job', help='Gate and reserve one attempt before starting a job')
+    cmd.add_argument('run_id')
+    cmd.add_argument('--kind', choices=['recovery', 'dream', 'grounding'], required=True)
+    cmd.add_argument('--subject', required=True)
+    cmd.add_argument('--hypothesis', required=True)
+    cmd = commands.add_parser('close-experiment')
+    cmd.add_argument('run_id')
+    cmd.add_argument('--reason', required=True)
     cmd = commands.add_parser('show-case')
     cmd.add_argument('revision')
     cmd = commands.add_parser('reprocess')
@@ -205,7 +233,29 @@ def dispatch(args):
         require((Path(args.root) / 'corpus.sqlite').is_file(), 'Corpus does not exist; import data first')
     c = Corpus(args.root)
     try:
+        if args.command in ('init-experiment', 'record-discovery', 'experiment-status',
+                            'experiment-progress', 'admit-job', 'close-experiment'):
+            from . import experiment
+            if args.command == 'init-experiment':
+                return experiment.init(c, read_json(args.file))
+            if args.command == 'record-discovery':
+                return experiment.discovery(c, read_json(args.file), no_symlink_components(args.trace).read_bytes())
+            if args.command == 'experiment-status':
+                return experiment.status(c, args.run_id)
+            if args.command == 'experiment-progress':
+                return experiment.progress(c, args.run_id, args.kind, args.evidence)
+            if args.command == 'admit-job':
+                return experiment.admit(c, args.run_id, args.kind, args.subject, args.hypothesis)
+            return experiment.close(c, args.run_id, args.reason)
         from . import cases, catalog, selection
+        if args.command in ('save-recovery', 'recovery-status', 'prepare-review'):
+            from . import recovery
+            if args.command == 'save-recovery':
+                return recovery.save(c, read_json(args.file))
+            if args.command == 'recovery-status':
+                return recovery.status(c, args.case_id)
+            return recovery.prepare(c, args.recovery_id, read_json(args.config),
+                                    read_json(args.recipe), args.output)
         if args.command == 'sources':
             return catalog.sources(c, query=args.query, repository=args.repository,
                                    kind=args.kind, origin=args.origin, limit=args.limit)
@@ -307,6 +357,8 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if result.get('ok') is False:
             return 1
+        if args.command == 'experiment-status' and result['action'] != 'WORK':
+            return 3
         if args.command == 'select' and result['status'] != 'READY':
             return 3
         if args.command == 'readiness' and not result['ready_for_selection']:
